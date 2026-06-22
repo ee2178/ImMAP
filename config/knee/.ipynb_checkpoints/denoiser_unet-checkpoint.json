@@ -1,0 +1,87 @@
+{
+    "task": "denoiser",
+
+    "experiment": {
+        "name": "NormUNet_knee"
+    },
+
+    "model": {
+        "type": "NormUnet",
+
+        "params": {
+            "chans": 32,
+            "num_pools": 4,
+            "in_chans": 2,
+            "out_chans": 2,
+            "drop_prob": 0.0
+        }
+    },
+
+    "paths": {
+        "save_dir": "trained_nets/knee/NormUNet",
+        "ckpt": null
+    },
+
+    "data": {
+        "train": {
+            "task": "denoising",
+            "anatomy": "knee",
+            "batch_size": 64,
+            "crop_size": 256,
+            "center_crop": null,
+            "random_flips": true,
+            "start_slice": 12,
+            "end_slice": 25,
+            "scale_fac": 5000.0,
+            "kspace_root": "../datasets/fastmri/knee/multicoil_train",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/train"
+        },
+
+        "val": {
+            "task": "denoising",
+            "anatomy": "knee",
+            "batch_size": 1,
+            "crop_size": null,
+            "center_crop": null,
+            "random_flips": false,
+            "start_slice": 12,
+            "end_slice": 25,
+            "scale_fac": 5000.0,
+            "kspace_root": "../datasets/fastmri/knee/multicoil_val",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/val"
+        }
+    },
+
+    "training": {
+        "max_steps": 300000,
+        "noise_std": [0.01, 0.1],
+        "noise_dist": "log",
+        "noise_log_base": 100,
+        "loss_type": "complex-mse",
+        "clip_grad": 1.0,
+        "log_every": 100,
+        "val_every": 5000,
+        "save_every": 5000
+    },
+
+    "optimizer": {
+        "type": "Adam",
+
+        "params": {
+            "lr": 0.0001
+        }
+    },
+    
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 300000
+        }
+    },
+
+    "wandb": {
+        "project": "denoiser_training"
+    }
+}

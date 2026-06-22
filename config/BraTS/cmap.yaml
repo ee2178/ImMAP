@@ -1,0 +1,50 @@
+# ============================================================================
+# Constraint-map generation config  (MR-contrast guided contrastive learning)
+# Per-subject HDF5 files, written in place next to the BraTS niftis.
+# Edit this file instead of passing command-line arguments.
+# ============================================================================
+
+# --- paths -------------------------------------------------------------------
+data_root:    /home/ee2178/scratch/ee2178/datasets/BraTS
+train_subdir: BraTS2021_DataSet         # processed
+test_subdir:  BraTS2021_Test            # NOT processed unless process_test: true
+output_root:  null                      # null = write each subject's maps INTO its own
+                                        #        source folder (in place);
+                                        #        or set a path to mirror <output_root>/<case>/
+repo_root:    /home/ee2178/scratch/ee2178/ImMAP   # so preprocessing.* / solvers.* import
+                                                  # (adjust if your repo lives elsewhere)
+
+# --- what to process ---------------------------------------------------------
+process_test:  false
+contrasts:     [flair, t1, t1ce, t2]    # channel order stored in the img h5
+cases:         null                     # optional explicit list of case names; null = all
+
+# --- constraint-map params (match the notebook) ------------------------------
+n_clusters:    20
+n_pca:         4
+tvd_lam:       0.0125       # = 1/80
+tvd_eta:       8.0
+tvd_maxit:     500
+tvd_tol:       0.001
+mask_background: true       # cluster foreground only; background -> reserved label 0
+
+# --- preprocessing -----------------------------------------------------------
+clip_lo:       0.01
+clip_hi:       99.9
+normalize:     zscore      # 'zscore' (signed; spec endpoint) or 'minmax' ([0,1]; makes PSNR data_range=1 valid)
+crop_size:     null         # e.g. 160 -> center-crop to 160x160; null = keep native (240)
+
+# --- output options ----------------------------------------------------------
+save_image:        true     # also write <case>_img.h5 (aligned, normalized); set false to
+                            #   save space since the niftis are right there in the same folder
+drop_empty_slices: true     # keep slices with brain fraction >= min_brain_frac
+min_brain_frac:    0.02      # fine trim: drop near-empty slices (fraction of FOV that is brain)
+start_slice:       40        # focus on middle slices; index on the ORIGINAL 0-154 z-axis. null = no lower bound
+end_slice:         122       # exclusive upper bound on original z-axis. null = no upper bound
+img_dtype:         float32  # float16 halves image storage
+compress:          false    # gzip; false = faster random reads at train time
+skip_existing:     false    # true -> skip subjects whose constraint-map h5 already exists
+write_manifest:    true     # write constraint_maps_manifest_K<K>.csv at the subdir root
+
+# --- runtime -----------------------------------------------------------------
+device: cuda

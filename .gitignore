@@ -1,0 +1,10 @@
+trained_nets/
+wandb/
+immap.egg-info/
+slurm/logs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.err
+*.out

@@ -1,0 +1,83 @@
+{
+    "task": "denoiser",
+    "experiment": {
+        "name": "GroupCDL_knee"
+    },
+    "model": {
+        "type": "GroupCDL",
+        "params": {
+            "K": 30,
+            "M": 169,
+            "Mh": 64,
+            "W": 35,
+            "dK": 5,
+            "C": 1,
+            "sc": 2,
+            "P": 7,
+            "flex_block_size": 128,
+            "attn_backend": "flex",
+            "sim_fun": "distance",
+            "complex": true
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/knee/GroupCDL_Denoiser",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "task": "denoising",
+            "anatomy": "knee",
+            "batch_size": 10,
+            "crop_size": 128,
+            "center_crop": null,
+            "random_flips": true,
+            "start_slice": 12,
+            "end_slice": 25,
+            "scale_fac": 5000.0,
+            "kspace_root": "../datasets/fastmri/knee/multicoil_train",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/train"
+        },
+        "val": {
+            "task": "denoising",
+            "anatomy": "knee",
+            "batch_size": 1,
+            "crop_size": null,
+            "center_crop": null,
+            "random_flips": false,
+            "start_slice": 12,
+            "end_slice": 25,
+            "scale_fac": 5000.0,
+            "kspace_root": "../datasets/fastmri/knee/multicoil_val",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/val"
+        }
+    },
+    "training": {
+        "num_epochs": 6000,
+        "steps_per_epoch": 100,
+        "val_every_epochs": 50,
+        "noise_std": [0.01, 0.75],
+        "noise_dist": "log",
+        "loss_type": "complex-mse",
+        "clip_grad": 5e-2,
+        "backtrack_thresh": 0.5,
+        "backtrack_factor": 0.9
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 5.0e-4
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 2.0e-6,
+            "T_max": 600000
+        }
+    },
+    "wandb": {
+        "project": "denoiser_training",
+        "id": null
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "task": "synthesis",
+    "experiment": {
+        "name": "Synth_T1ce_from_T1T2FLAIR"
+    },
+    "model": {
+        "type": "Unet2D",
+        "params": {
+            "in_chans": 3,
+            "out_chans": 1,
+            "chans": 16,
+            "num_pool_layers": 4,
+            "max_chans": 128,
+            "convs_per_block": 1,
+            "up_mode": "nearest"
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/Synth_T1ce_Pretrain",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "synthesis",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
+            "input_idx": [0, 1, 3],
+            "target_idx": [2],
+            "crop_size":192,
+            "random_flips": true,
+            "batch_size": 16,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "synthesis",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
+            "input_idx": [0, 1, 3],
+            "target_idx": [2],
+            "random_flips": false,
+            "batch_size": 16,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 6000,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 100,
+        "clip_grad": 1.0,
+        "backtrack_thresh": 0.5,
+        "backtrack_factor": 0.9,
+        "loss_type": "lpips-vgg",
+        "use_mask": true,
+        "psnr_only": false,
+        "pretrained": "trained_nets/brats/CCL_Pretrain_K20/ccl_encoder.pt"
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0005
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "contrast-synthesis",
+        "id": null
+    }
+}

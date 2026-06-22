@@ -1,0 +1,76 @@
+{
+    "task": "denoiser",
+    "experiment": {
+        "name": "GroupLPDS_BSD432"
+    },
+    "model": {
+        "type": "GroupCDL",
+        "params": {
+            "K": 30,
+            "M": 169,
+            "Mh": 64,
+            "W": 35,
+            "dK": 5,
+            "C": 1,
+            "sc": 2,
+            "P": 7,
+            "flex_block_size": 128,
+            "attn_backend": "flex",
+            "sim_fun": "distance",
+            "fenchel": true,
+            "is_complex": false
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/bsd432/GroupLPDS_Denoiser_Real",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "BSD432",
+            "color": false,
+            "batch_size": 12,
+            "crop_size": 128,
+            "center_crop": null,
+            "random_flips": true,
+            "root": "../datasets/CBSD432"
+        },
+        "val": {
+            "name": "BSD432",
+            "color": false,
+            "batch_size": 1,
+            "crop_size": null,
+            "center_crop": null,
+            "random_flips": false,
+            "root": "../datasets/CBSD68"
+        }
+    },
+    "training": {
+        "num_epochs": 6000,
+        "steps_per_epoch": 100,
+        "val_every_epochs": 50,
+        "noise_std": [0.098, 0.098],
+        "noise_dist": "uniform",
+        "loss_type": "magnitude-mse",
+        "clip_grad": 5e-2,
+        "backtrack_thresh": 2.0,
+        "backtrack_factor": 0.9
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 5.0e-4
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 2.0e-6,
+            "T_max": 600000
+        }
+    },
+    "wandb": {
+        "project": "denoiser_training",
+        "id": null
+    }
+}

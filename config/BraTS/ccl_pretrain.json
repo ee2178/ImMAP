@@ -1,0 +1,85 @@
+{
+    "task": "ccl_pretrain",
+    "experiment": {
+        "name": "CCL_Pretrain_BraTS_K20"
+    },
+    "model": {
+        "type": "CCLNet",
+        "params": {
+            "in_chans": 3,
+            "proj_dim": 64,
+            "chans": 16,
+            "num_pool_layers": 4,
+            "max_chans": 128,
+            "convs_per_block": 1,
+            "up_mode": "nearest"
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/CCL_Pretrain_K20",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "ccl",
+            "n_clusters": 20,
+            "contrast_idx": [
+                0,
+                1,
+                3
+            ],
+            "patch_size": 4,
+            "num_samples_loss_eval": 100,
+            "foreground_from_label": true,
+            "batch_size": 16,
+            "num_workers": 8,
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train"
+        },
+        "val": {
+            "name": "ccl",
+            "n_clusters": 20,
+            "contrast_idx": [
+                0,
+                1,
+                3
+            ],
+            "patch_size": 4,
+            "num_samples_loss_eval": 100,
+            "foreground_from_label": true,
+            "batch_size": 16,
+            "num_workers": 8,
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val"
+        }
+    },
+    "training": {
+        "num_epochs": 400,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 5,
+        "clip_grad": 1.0,
+        "backtrack_thresh": 0.5,
+        "backtrack_factor": 0.9,
+        "patch_size": 4,
+        "topk": 100,
+        "num_samples_loss_eval": 100,
+        "temperature": 0.1,
+        "contrastive_loss_type": 2,
+        "partial_decoder": false
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0005
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-06,
+            "T_max": 20000
+        }
+    },
+    "wandb": {
+        "project": "ccl-pretrain",
+        "id": null
+    }
+}
