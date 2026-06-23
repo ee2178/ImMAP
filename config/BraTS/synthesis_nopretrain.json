@@ -9,10 +9,15 @@
             "in_chans": 3,
             "out_chans": 1,
             "chans": 16,
-            "num_pool_layers": 4,
+            "num_pool_layers": 5,
             "max_chans": 128,
-            "convs_per_block": 1,
-            "up_mode": "nearest"
+            "convs_per_block": 2,
+            "norm": "group",
+            "act": "relu",
+            "group_size": 4,
+            "up_mode": "nearest",
+            "up_conv": true,
+            "head": "conv"
         }
     },
     "paths": {
