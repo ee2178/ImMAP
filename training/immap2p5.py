@@ -357,12 +357,16 @@ def train_joint_denoising_recon(
                         dist=image_noise_dist,
                         k=k,
                     )
-
+                    '''
                     if ssdu_masking:
                         ssdu_op.shuffle_mask(image_v)
                         D_v = ssdu_op @ FFT2D() @ Sense(torch.ones_like(image_v))
                     else:
                         D_v = Identity()
+                    '''
+
+                    # We want D_v to be Identity() during inference
+                    D_v = Identity()
 
                     recon_v, _ = net(
                         y_v,
@@ -392,25 +396,34 @@ def train_joint_denoising_recon(
                     k: v / n_samples
                     for k, v in val_metrics.items()
                 }
-
+ 
                 if wandb:
                     gt_img = image_v[:1].abs()
                     recon_img = recon_v[:1].abs()
                     noisy_img = x_init_v[:1].abs()
 
+                    # GT | Noisy | Recon, shared scale from GT+Noisy (unchanged)
                     grid = torch.cat([gt_img, noisy_img, recon_img], dim=0)
-                    grid = grid - grid.min()
-                    grid = grid / grid.max()
+                    grid = grid - grid[0:2].min()
+                    grid = grid / grid[0:2].max().clamp(min=1e-8)
 
+                    # Residual on its own symmetric scale: 0.5 = zero error, 0/1 = -/+ max|error|
+                    res = (gt_img - recon_img).abs()
+                    res = res / res.max().clamp(min=1e-8)
+                    
                     wandb.log({
                         "val/jdr_example": wandb.Image(
                             vutils.make_grid(grid, nrow=3),
                             caption=f"sigma={sigma_t_v.flatten()[0].item():.2f}"
                         ),
+                        "val/jdr_residual": wandb.Image(
+                            vutils.make_grid(res, nrow=1),
+                            caption="GT - Recon"
+                        ),
                         **{f"val/{k}": v.item() for k, v in mean_metrics.items()},
                     }, step=global_step)
-
                     wandb.log(get_filter_grids(net), step=global_step)
+
 
                 else:
                     print(

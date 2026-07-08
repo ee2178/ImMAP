@@ -169,6 +169,8 @@ class FastMRIDataset(Dataset):
                 image_2ch[0],
                 image_2ch[1],
             )
+            # Return image as a one-channel image
+            image = image.unsqueeze(0)
 
             return image * self.scale_fac
 

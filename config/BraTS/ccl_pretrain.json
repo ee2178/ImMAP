@@ -35,7 +35,7 @@
             "patch_size": 4,
             "num_samples_loss_eval": 100,
             "foreground_from_label": true,
-            "batch_size": 16,
+            "batch_size": 10,
             "num_workers": 8,
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train"
         },
@@ -50,15 +50,15 @@
             "patch_size": 4,
             "num_samples_loss_eval": 100,
             "foreground_from_label": true,
-            "batch_size": 16,
+            "batch_size": 10,
             "num_workers": 8,
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val"
         }
     },
     "training": {
-        "num_epochs": 400,
-        "steps_per_epoch": 50,
-        "val_every_epochs": 5,
+        "num_epochs": 35,
+        "steps_per_epoch": 1750,
+        "val_every_epochs": 1,
         "clip_grad": 1.0,
         "backtrack_thresh": 0.5,
         "backtrack_factor": 0.9,
@@ -72,14 +72,17 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 0.0005
+            "lr": 1.0e-3
         }
     },
-    "scheduler": {
-        "type": "CosineAnnealingLR",
+   "scheduler": {
+        "type": "ReduceLROnPlateau",
         "params": {
-            "eta_min": 1.0e-06,
-            "T_max": 20000
+            "mode": "min",
+            "factor": 0.5,
+            "patience": 10,
+            "threshold": 1.0e-4,
+            "threshold_mode": "abs"
         }
     },
     "wandb": {

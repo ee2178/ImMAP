@@ -109,7 +109,7 @@ def immap2(y, sigma_y, denoiser, E,
             p_t = lam*sigma_y**2 / (sigma_t_sq/(1+sigma_t_sq))
 
             # Try clamping to 0.01
-            p_t = torch.clamp(p_t, min = lam_min)
+            # p_t = torch.clamp(p_t, min = lam_min)
             
             # Update step size
             h_t = h_0 * t/(1+h_0*(t-1))

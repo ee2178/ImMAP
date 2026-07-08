@@ -21,6 +21,9 @@ from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mas
 from training.metrics import compute_metrics
 from training.losses import LOSS_REGISTRY
 
+# For reducing LR on plateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 def brain_mask(x, eps=1e-6):
     """Foreground from z-scored input: background is the per-image-per-channel min (constant)."""
     bg = x.amin(dim=(-1, -2), keepdim=True)
@@ -112,7 +115,8 @@ def train_synthesis(
             if clip_grad is not None:
                 nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
             opt.step()
-            if sched is not None:
+
+            if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
             running_loss += float(loss.item())
@@ -183,20 +187,38 @@ def train_synthesis(
                             agg[k] += mets[k] * bs
                     n_samples += bs
             mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
-
+            val_loss = mean_metrics["loss"]      # <-- capture for the scheduler
+                        
             if wandb:
-                gt_img = yv[:1].abs(); pred_img = pv[:1].abs(); in_img = Xv[:1, :1].abs()
+                gt_img = yv[:1]; pred_img = pv[:1]; in_img = Xv[:1, :1]
+                mask = organ_maskv[:1]
+
+                # Input | GT | Pred, shared scale from input+GT (unchanged)
                 grid = torch.cat([in_img, gt_img, pred_img], dim=0)
-                grid = grid - grid.min(); grid = grid / grid.max().clamp(min=1e-8)
+                grid = grid - grid[0:2].min(); grid = grid / grid[0:2].max().clamp(min=1e-8)
+
+                # Mask our grid after normalization
+                grid = mask*grid
+                # Residual on its own symmetric scale: 0.5 = zero error, 0/1 = -/+ max|error|
+                res = (gt_img - pred_img).abs()
+                res = res / res.max().clamp(min=1e-8)
+
                 wandb.log({
                     "val/example": wandb.Image(vutils.make_grid(grid, nrow=3),
                                                caption="Input(ch0) | T1ce GT | Predicted"),
+                    "val/residual": wandb.Image(vutils.make_grid(res, nrow=1),
+                                                caption="| GT - Pred |"),
                     **{f"val/{k}": v for k, v in mean_metrics.items()},
                 }, step=global_step)
+
+
             else:
                 print(f"[VAL] epoch={epoch} " +
                       " ".join(f"{k}={v:.4f}" for k, v in mean_metrics.items()))
             net.train()
+                    # ReduceLROnPlateau: metric-driven, one step per epoch on the val loss
 
+            if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
+                sched.step(val_loss)
     pbar.close()
     return net

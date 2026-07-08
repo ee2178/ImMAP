@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=a100
+#SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
 #SBATCH --time=48:00:00
@@ -22,6 +22,6 @@ conda activate env      # Replace with your actual env name
 # Navigate to the directory containing train.py
 
 cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
-python3 train.py config/knee/joint_denoising_recon.json
+# python3 train.py config/knee/joint_denoising_recon.json
 # Continue training from checkpoint
-# python3 train.py trained_nets/knee/LPDS_JDR_R6_polynomialsteps/config.json
+python3 train.py trained_nets/knee/LPDS_JDR_R6_polynomialsteps_RHO_Range/config.json

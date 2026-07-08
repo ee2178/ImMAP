@@ -19,13 +19,16 @@ def mri_awgn(x_coils, acceleration_map, smaps, noise_std, noise_dist):
     # Always return masked kspace
     return y_mask, sigma
 
-def awgn(input, noise_std, dist = 'uniform', k = 2, eps = 1e-8):
+def awgn(input, noise_std, dist = 'uniform', k = 1, eps = 1e-8):
     """ Additive White Gaussian Noise
     y: clean input image
     noise_std: (tuple) noise_std of batch size N is uniformly sampled
                 between noise_std[0] and noise_std[1]. Expected to be in interval
                 [0,1]
     """
+    # one sigma per batch element, singleton elsewhere -> broadcasts against
+    # input whether it's (B, C, H, W), (B, H, W), etc.
+    shape = (input.shape[0],) + (1,) * (input.dim() - 1)
 
     if not isinstance(noise_std, (list, tuple)):
         sigma = noise_std
@@ -33,12 +36,6 @@ def awgn(input, noise_std, dist = 'uniform', k = 2, eps = 1e-8):
         sigma = noise_std[0] + \
                (noise_std[1] - noise_std[0])*torch.rand(len(input),1,1,1, device=input.device)
     
-    # elif isinstance(noise_std, (list, tuple)) and dist == 'log':
-        # Draw uniform on [log(a), log(b)] and then exponentiate
-        # log base controls the "temperature"
-    #     sigma = 10**(math.log(noise_std[0]+eps, log_base) + \
-    #         (math.log(noise_std[1], log_base) - math.log(noise_std[0]+eps, log_base))*torch.rand(len(input),1,1,1, device=input.device))
-
     # Implement a power warp on the log distribution. 
     elif isinstance(noise_std, (list, tuple)) and dist == 'log':
         # log-uniform on [a, b] with a shape/"temperature" knob k
@@ -47,8 +44,7 @@ def awgn(input, noise_std, dist = 'uniform', k = 2, eps = 1e-8):
         #   k < 1 -> mass pushed toward high sigma (b)
         a = noise_std[0] + eps
         b = noise_std[1]
-        u = torch.rand(len(input), 1, 1, 1, device=input.device)
-        w = u ** k                    # k is your real tunable; endpoints unchanged
+        w = torch.rand(shape, device=input.device) ** k   # endpoints unchanged
         sigma = a * (b / a) ** w
 
     elif isinstance(noise_std, (list, tuple)) and dist == 'cosine':

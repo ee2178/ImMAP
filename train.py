@@ -32,7 +32,6 @@ def build_optimizer(model, cfg):
 
     raise ValueError(f"Unknown optimizer {opt_cfg['type']}")
 
-
 def build_scheduler(optimizer, cfg):
     sched_cfg = cfg["scheduler"]
 
@@ -48,8 +47,20 @@ def build_scheduler(optimizer, cfg):
             **sched_cfg["params"]
         )
 
-    return None
+    if sched_cfg["type"] == "ReduceLROnPlateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            **sched_cfg["params"]
+        )
 
+    if sched_cfg["type"] in ("Constant", "None", None):
+        # LR stays at the optimizer's initial value; step() is a no-op.
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda _: 1.0
+        )
+
+    raise ValueError(f"Unknown scheduler {sched_cfg['type']}")
 
 def save_config(cfg):
     """

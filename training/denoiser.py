@@ -84,7 +84,7 @@ def train_denoiser(
                 recon = torch.view_as_complex(recon.contiguous())
             else:
                 recon, _ = net(noisy, E=E, sigma=sigma)
-
+            
             loss = loss_fn(gt, recon, sigma)
             loss.backward()
 

@@ -1,7 +1,7 @@
 {
     "task": "synthesis",
     "experiment": {
-        "name": "Synth_T1ce_from_T1T2FLAIR"
+        "name": "Synth_T1ce_from_T1T2FLAIR_VGG_CosLR"
     },
     "model": {
         "type": "Unet2D",
@@ -21,7 +21,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/brats/Synth_T1ce_Pretrain",
+        "save_dir": "trained_nets/brats/Synth_T1ce_Pretrain_VGG_CosLR",
         "ckpt": null
     },
     "data": {
@@ -32,7 +32,7 @@
             "target_idx": [2],
             "crop_size":192,
             "random_flips": true,
-            "batch_size": 16,
+            "batch_size": 8,
             "num_workers": 8
         },
         "val": {
@@ -41,18 +41,18 @@
             "input_idx": [0, 1, 3],
             "target_idx": [2],
             "random_flips": false,
-            "batch_size": 16,
+            "batch_size": 8,
             "num_workers": 8
         }
     },
     "training": {
-        "num_epochs": 6000,
-        "steps_per_epoch": 50,
-        "val_every_epochs": 100,
+        "num_epochs": 300,
+        "steps_per_epoch": 1750,
+        "val_every_epochs": 1,
         "clip_grad": 1.0,
         "backtrack_thresh": 0.5,
         "backtrack_factor": 0.9,
-        "loss_type": "lpips-vgg",
+        "loss_type": "magnitude-l1",
         "use_mask": true,
         "psnr_only": false,
         "pretrained": "trained_nets/brats/CCL_Pretrain_K20/ccl_encoder.pt"
@@ -60,14 +60,14 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 0.0005
+            "lr": 1.0e-2
         }
     },
     "scheduler": {
         "type": "CosineAnnealingLR",
         "params": {
-            "eta_min": 1.0e-6,
-            "T_max": 300000
+            "eta_min":1.0e-4,
+            "T_max": 525000
         }
     },
     "wandb": {

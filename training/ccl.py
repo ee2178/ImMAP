@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr
 from training.ccl_loss import ConstrainedContrastiveLoss
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 def train_ccl(
     net, opt, sched, device,
@@ -97,7 +97,7 @@ def train_ccl(
             if clip_grad is not None:
                 nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
             opt.step()
-            if sched is not None:
+            if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
             running_loss += float(loss.item())
@@ -156,6 +156,9 @@ def train_ccl(
             else:
                 print(f"[VAL] epoch={epoch} loss={vloss:.6f}")
             net.train()
-
+            
+            # ReduceLROnPlateau: metric-driven, one step per epoch on the val loss
+            if isinstance(sched, ReduceLROnPlateau) and vloss is not None:
+                sched.step(vloss)
     pbar.close()
     return net

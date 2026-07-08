@@ -1,7 +1,7 @@
 {
     "task": "immap",
     "experiment": {
-        "name": "LPDS_ImMAP2p5_R6_whitened_PolynomialStepSizesLOGScale"
+        "name": "LPDS_ImMAP2p5_R6_whitened_PolynomialStepSizesRHO_Range"
     },
     "model": {
         "type": "DiffLPDSNet",
@@ -16,7 +16,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/knee/LPDS_JDR_R6_polynomialsteps_LOG",
+        "save_dir": "trained_nets/knee/LPDS_JDR_R6_polynomialsteps_RHO_Range",
         "ckpt": null
     },
     "data": {
@@ -65,12 +65,12 @@
         "backtrack_factor": 0.9,
         "sigma_scaling": true,
         "init_type": null,
-        "recon_path": null,
+        "recon_path": "trained_nets/knee/LPDS_MRI_Recon_R6/config.json",
         "denoiser_path": null,
         "ssdu_masking": true,
         "ssdu_base_accel": 1,
         "ssdu_acs": 20,
-        "ssdu_rho": [0.2, 0.2]
+        "ssdu_rho": [0.0, 0.2]
     },
     "mri": {
         "R": 6,

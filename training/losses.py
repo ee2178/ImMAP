@@ -2,72 +2,78 @@ import torch
 import numpy as np
 import lpips
 
-# Cache models by net name so we build AlexNet/VGG only once.
-_LPIPS_CACHE = {}
+# ---------------------------------------------------------------------------
+# VGG16 block4_conv3 feature-MSE perceptual loss
+# Faithful port of the TF reference `custom_perceptualLoss`
+# (CCL-Synthetis/Synthesis/synthesis_losses.py). NOT the same as lpips-vgg:
+# single layer, raw feature MSE, no learned weights.
+# ---------------------------------------------------------------------------
+_VGG_CACHE = {}
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def _get_lpips(net, device):
-    model = _LPIPS_CACHE.get(net)
+def _get_vgg_relu43(device):
+    """VGG16 (ImageNet) truncated at relu4_3 == Keras 'block4_conv3' output.
+    torchvision `features[:23]` keeps blocks 1-4 up to and including relu4_3
+    (index 23 is block4's maxpool, excluded). Frozen + eval, cached per device.
+    Needs the ImageNet VGG16 weights (downloaded/cached on first use)."""
+    key = str(device)
+    model = _VGG_CACHE.get(key)
     if model is None:
-        model = lpips.LPIPS(net=net)
-        model.eval()
+        try:
+            vgg = torchvision.models.vgg16(
+                weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
+        except AttributeError:                      # older torchvision API
+            vgg = torchvision.models.vgg16(pretrained=True)
+        model = vgg.features[:23].eval()
         for p in model.parameters():
             p.requires_grad_(False)
-        _LPIPS_CACHE[net] = model
-    # No-op when already on `device`; keeps lazy init device-agnostic.
+        _VGG_CACHE[key] = model
     return model.to(device)
 
 
-def _reduce(t, percentile):
-    """Per (batch, channel) scale, shape (N, C, 1, 1)."""
-    flat = t.flatten(start_dim=2)  # (N, C, H*W)
-    if percentile >= 1.0:
-        val = flat.amax(dim=-1)
-    else:
-        val = torch.quantile(flat, percentile, dim=-1)
-    return val.unsqueeze(-1).unsqueeze(-1)
+def _imagenet_prep(t):
+    """Per-sample min-max to [0,1] then ImageNet mean/std. t: (B, 3, H, W)."""
+    lo = t.amin(dim=(1, 2, 3), keepdim=True)
+    hi = t.amax(dim=(1, 2, 3), keepdim=True)
+    t = (t - lo) / (hi - lo).clamp_min(1e-8)
+    mean = t.new_tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = t.new_tensor(_IMAGENET_STD).view(1, 3, 1, 1)
+    return (t - mean) / std
 
 
-def _prepare_lpips_inputs(x, y, scale=None, percentile=0.99):
-    x = x.abs()
-    y = y.abs()
+def vgg_feature_loss(x, y, sigma=None, weight=0.5, size_normalize=True, imagenet_norm=False):
+    """Single-layer VGG16 (block4_conv3 / relu4_3) feature-MSE perceptual loss.
 
-    if scale is None:
-        # Joint-to-target: reference both to the target's stat, detached so the
-        # normalizer is a fixed reference and gradients don't flow through it.
-        scale = _reduce(y, percentile).clamp_min(1e-8).detach()
-    else:
-        # Fixed constant (e.g. dataset-level dynamic range).
-        scale = torch.as_tensor(scale, dtype=x.dtype, device=x.device)
+    Faithful port of the TF reference: for each output channel, replicate grayscale
+    -> RGB, extract block4_conv3 features, take the feature MSE, optionally divide by
+    the feature-map size (the reference's 1/(H*W*C) factor), scale by `weight`, and
+    sum over channels.
 
-    # Clamp to [0, 1]: joint scaling can push values past 1, and with
-    # percentile < 1 the target's brightest pixels exceed `scale` too.
-    x = (x / scale).clamp(0, 1)
-    y = (y / scale).clamp(0, 1)
-
-    # Single channel -> RGB (LPIPS backbones expect 3 channels).
-    if x.shape[1] == 1:
-        x = x.repeat(1, 3, 1, 1)
-        y = y.repeat(1, 3, 1, 1)
-
-    # [0, 1] -> [-1, 1] (default LPIPS normalize=False expects this range).
-    x = 2 * x - 1
-    y = 2 * y - 1
-    return x, y
-
-
-# `sigma` is kept for signature compatibility with the loss registry; unused.
-def lpips_alex(x, y, sigma=None, scale=None, percentile=0.99):
-    x, y = _prepare_lpips_inputs(x, y, scale=scale, percentile=percentile)
-    model = _get_lpips("alex", x.device)
-    return model(x, y).mean()
-
-
-def lpips_vgg(x, y, sigma=None, scale=None, percentile=0.99):
-    x, y = _prepare_lpips_inputs(x, y, scale=scale, percentile=percentile)
-    model = _get_lpips("vgg", x.device)
-    return model(x, y).mean()
-
+    x, y : (B, C, H, W). Brain masking is applied by the training loop before this call.
+    weight         : reference perceptualLoss_weight (0.5).
+    size_normalize : reference multiplies the (already mean-reduced) MSE by 1/(H*W*C);
+                     keep True to match it exactly, False for a plain mean feature-MSE.
+    imagenet_norm  : the reference feeds RAW (un-preprocessed) intensities to VGG
+                     (default False). True per-sample min-maxes to [0,1] then applies
+                     ImageNet mean/std (how the backbone was trained) -- better
+                     conditioned, but a deviation from the reference.
+    """
+    net = _get_vgg_relu43(x.device)
+    total = x.new_zeros(())
+    for c in range(x.shape[1]):
+        xc = x[:, c:c + 1].repeat(1, 3, 1, 1)
+        yc = y[:, c:c + 1].repeat(1, 3, 1, 1)
+        if imagenet_norm:
+            xc, yc = _imagenet_prep(xc), _imagenet_prep(yc)
+        fx, fy = net(xc), net(yc)
+        mse = ((fx - fy) ** 2).mean()               # mean over all elements (Keras MSE)
+        if size_normalize:
+            _, CH, H, W = fx.shape
+            mse = mse / (H * W * CH)                 # reference's extra 1/(H*W*C)
+        total = total + weight * mse
+    return total
 
 def complex_mse(x, y, sigma):
     return torch.mean((x - y).abs() ** 2)
@@ -81,7 +87,7 @@ def sigma_scaled_complex_mse(x, y, sigma):
     return torch.mean((sigma + 1e-3) ** (-2) * (x - y).abs() ** 2)
 
 def magnitude_l1(x, y, sigma):
-    return torch.mean(torch.abs(x.abs() - y.abs()))
+    return torch.mean(torch.abs(x - y))
 
 def complex_nl1_nl2(x, y, sigma, eps=1e-8):
     diff = x - y
@@ -109,6 +115,5 @@ LOSS_REGISTRY = {
     "sigma-scaled-complex-mse": sigma_scaled_complex_mse,
     "complex-nl1-nl2": complex_nl1_nl2,
     "magnitude-nl1-nl2": mag_nl1_nl2,
-    "lpips-alex": lpips_alex,
-    "lpips-vgg": lpips_vgg,
+    "vgg-feature": vgg_feature_loss,
 }

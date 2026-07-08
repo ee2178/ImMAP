@@ -57,107 +57,39 @@ class ConstrainedContrastiveLoss(nn.Module):
         self.eps = eps
 
     # ------------------------------------------------------------------ tokens
-    def _extract_tokens(self, ft_img):
+    def _extract_tokens(self, features):
         """
-        ft_img : (C, H, W) feature map for one image.
-        Returns (N, D) memory bank of patch tokens, row-major over patch positions.
+        features : (B, C, H, W) feature maps.
+        Returns (B, N, D) memory banks of patch tokens, row-major over patch
+        positions — comparisons still happen strictly within each image's bank.
         """
-        C, H, W = ft_img.shape
+        B, C, H, W = features.shape
         patch = 1 if self.partial_decoder else self.patch_size
         if patch == 1:
-            tokens = ft_img.reshape(C, H * W).transpose(0, 1).contiguous()   # (H*W, C)
+            tokens = features.reshape(B, C, H * W).transpose(1, 2).contiguous()   # (B, H*W, C)
         else:
-            # (1, C, H, W) -> (1, C*patch*patch, L) -> (L, C*patch*patch)
-            unf = F.unfold(ft_img.unsqueeze(0), kernel_size=patch, stride=patch)
-            tokens = unf.squeeze(0).transpose(0, 1).contiguous()             # (L, C*patch^2)
+            # (B, C, H, W) -> (B, C*patch*patch, L) -> (B, L, C*patch*patch)
+            unf = F.unfold(features, kernel_size=patch, stride=patch)
+            tokens = unf.transpose(1, 2).contiguous()                            # (B, L, C*patch^2)
         return tokens
 
-    # ------------------------------------------------------- per-image anchors
-    def _anchor_indices(self, labels, mask, num_patches, device):
-        """Return 1-D LongTensor of anchor indices into the flattened token grid."""
+    # ------------------------------------------------- per-image anchor masks
+    def _valid_anchor_mask(self, labels, mask, B, N, Hc, Wc, device, dtype):
+        """(B, N) float mask of patches eligible to be anchors, one row per image.
+
+        * use_mask_sampling : the generator's sampling mask (foreground anchors).
+        * otherwise         : interior patches, excluding a border of exclude_border
+                              (shared across the batch).
+        """
         if self.use_mask_sampling:
-            idx = torch.nonzero(mask.reshape(-1) > 0, as_tuple=False).squeeze(-1)
-            if idx.numel() > 1:
-                idx = idx[torch.randperm(idx.numel(), device=device)]
-            return idx
-        # no mask: random interior patches, excluding a border of `exclude_border`
+            return (mask.reshape(B, N) > 0).to(dtype)
         b = self.exclude_border
-        grid = torch.arange(num_patches * num_patches, device=device).reshape(num_patches, num_patches)
-        if 2 * b < num_patches:
-            grid = grid[b:-b, b:-b]
-        flat = grid.reshape(-1)
-        n = min(self.num_samples_loss_eval, flat.numel())
-        sel = torch.randperm(flat.numel(), device=device)[:n]
-        return flat[sel]
-
-    # --------------------------------------------------------- per-image loss
-    def _image_loss(self, ft_img, labels, mask):
-        device = ft_img.device
-        tokens = self._extract_tokens(ft_img)            # (N, D)
-        N = tokens.shape[0]
-        labels = labels.reshape(-1)                      # (N,)
-
-        if labels.shape[0] != N:
-            raise ValueError(f"constraint labels ({labels.shape[0]}) do not match "
-                             f"token count ({N}); check patch_size / partial_decoder "
-                             f"vs the constraint-map downsampling.")
-
-        # guard: need more than topk+1 patches to form a neighborhood (matches TF)
-        if N <= self.topk + 1:
-            return ft_img.new_zeros(())
-
-        anchor_idx = self._anchor_indices(labels, mask, int(round(N ** 0.5)), device)
-        if self.use_mask_sampling:
-            anchor_idx = anchor_idx[: self.num_samples_loss_eval]
-        if anchor_idx.numel() == 0:
-            return ft_img.new_zeros(())
-
-        # cosine similarity of every anchor to every token: (A, N)
-        tok_n = F.normalize(tokens, dim=-1)
-        anc_n = tok_n[anchor_idx]                        # (A, D), already normalized rows
-        sim = anc_n @ tok_n.transpose(0, 1)              # (A, N)
-        probs = torch.exp(sim / self.temperature)        # (A, N)
-
-        # background neighbors = top-(topk+1) most similar tokens per anchor
-        k = min(self.topk + 1, N)
-        topk_idx = torch.topk(sim, k=k, dim=1).indices   # (A, k) — non-differentiable selection
-        bg = torch.zeros_like(sim, dtype=torch.bool)
-        bg.scatter_(1, topk_idx, True)
-
-        # same-cluster mask
-        anc_labels = labels[anchor_idx].unsqueeze(1)     # (A, 1)
-        same = labels.unsqueeze(0) == anc_labels         # (A, N)
-
-        if self.exclude_self:
-            self_mask = torch.zeros_like(bg)
-            self_mask.scatter_(1, anchor_idx.unsqueeze(1), True)
-            bg = bg & (~self_mask)
-
-        pos_mask = bg & same                             # (A, N)
-        neg_mask = bg & (~same)                          # (A, N)
-
-        neg_sum = (probs * neg_mask).sum(dim=1)          # (A,)
-
-        if self.contrastive_loss_type == 2:
-            # pairwise (recommended): per positive p -> p / (p + sum_neg)
-            denom = probs + neg_sum.unsqueeze(1)         # (A, N)
-            rel = probs / denom
-            log_rel = torch.log(rel + self.eps) * pos_mask
-            n_pos = pos_mask.sum(dim=1).clamp_min(1)
-            per_anchor = -(log_rel.sum(dim=1) / n_pos)   # (A,)
-        elif self.contrastive_loss_type == 1:
-            # setwise: sum_pos / (sum_pos + sum_neg)
-            pos_sum = (probs * pos_mask).sum(dim=1)      # (A,)
-            rel = pos_sum / (pos_sum + neg_sum)
-            per_anchor = -torch.log(rel + self.eps)      # (A,)
+        interior = torch.zeros(Hc, Wc, device=device, dtype=dtype)
+        if 2 * b < Hc and 2 * b < Wc:
+            interior[b:Hc - b, b:Wc - b] = 1.0
         else:
-            raise ValueError("contrastive_loss_type must be 1 (setwise) or 2 (pairwise)")
-
-        # only count anchors that actually have positives (matches having self/same-label)
-        valid = pos_mask.any(dim=1)
-        if valid.any():
-            return per_anchor[valid].mean()
-        return ft_img.new_zeros(())
+            interior[:] = 1.0
+        return interior.reshape(1, N).expand(B, N)
 
     # ----------------------------------------------------------------- forward
     def forward(self, features, y_true):
@@ -165,18 +97,91 @@ class ConstrainedContrastiveLoss(nn.Module):
         features : (B, C, H, W)
         y_true   : (B, Hc, Wc, K)  [..., 0] = labels, [..., -1] = sampling mask
         Returns scalar loss averaged over the batch.
+
+        Fully batched: the former per-image Python loop is replaced by (B, A, N)
+        tensor ops, where A = num_samples_loss_eval anchors are sampled per image
+        (padded when an image has fewer eligible patches and masked out via
+        `anchor_valid`). The result is identical to the per-image loop: each image's
+        loss is the mean over its anchors-with-positives, and the batch loss is the
+        sum of per-image losses divided by B (degenerate images contribute 0).
         """
         if features.dim() != 4:
             raise ValueError("features must be (B, C, H, W)")
+        device, dtype = features.device, features.dtype
         B = features.shape[0]
         labels = y_true[..., 0]                          # (B, Hc, Wc)
+        Hc, Wc = labels.shape[1], labels.shape[2]
+        labels = labels.reshape(B, -1)                   # (B, N)
+        N = labels.shape[1]
         mask = y_true[..., -1] if self.use_mask_sampling else None
 
-        total = features.new_zeros(())
-        for b in range(B):
-            m = mask[b] if mask is not None else None
-            total = total + self._image_loss(features[b], labels[b], m)
-        return total / B
+        tokens = self._extract_tokens(features)          # (B, N, D)
+        if tokens.shape[1] != N:
+            raise ValueError(f"constraint labels ({N}) do not match token count "
+                             f"({tokens.shape[1]}); check patch_size / partial_decoder "
+                             f"vs the constraint-map downsampling.")
+
+        # guard: need more than topk+1 patches to form a neighborhood (matches TF)
+        if N <= self.topk + 1:
+            return features.new_zeros(())
+
+        # ---- anchor selection (sync-free): top-A of a randomized key over eligible
+        # patches. Eligible patches all outrank padding; ties among them are broken
+        # at random, so >A eligible -> a random A subset; <A eligible -> all of them
+        # plus padding flagged by anchor_valid=False.
+        A = min(self.num_samples_loss_eval, N)
+        eligible = self._valid_anchor_mask(labels, mask, B, N, Hc, Wc, device, dtype)
+        key = eligible * (1.0 + torch.rand(B, N, device=device, dtype=dtype))
+        anchor_idx = torch.topk(key, k=A, dim=1).indices                 # (B, A)
+        anchor_valid = torch.gather(eligible, 1, anchor_idx) > 0.5       # (B, A) bool
+
+        # cosine similarity of every anchor to every token in its own image: (B, A, N)
+        tok_n = F.normalize(tokens, dim=2)                               # (B, N, D)
+        D = tok_n.shape[2]
+        anc_n = torch.gather(tok_n, 1, anchor_idx.unsqueeze(-1).expand(B, A, D))
+        sim = torch.bmm(anc_n, tok_n.transpose(1, 2))                    # (B, A, N)
+        probs = torch.exp(sim / self.temperature)                       # (B, A, N)
+
+        # background neighbors = top-(topk+1) most similar tokens per anchor
+        k = min(self.topk + 1, N)
+        topk_idx = torch.topk(sim, k=k, dim=2).indices                  # (B, A, k)
+        bg = torch.zeros_like(sim, dtype=torch.bool)
+        bg.scatter_(2, topk_idx, True)
+
+        # same-cluster mask
+        anc_labels = torch.gather(labels, 1, anchor_idx)                # (B, A)
+        same = labels.unsqueeze(1) == anc_labels.unsqueeze(2)          # (B, A, N)
+
+        if self.exclude_self:
+            self_mask = torch.zeros_like(bg)
+            self_mask.scatter_(2, anchor_idx.unsqueeze(2), True)
+            bg = bg & (~self_mask)
+
+        pos_mask = bg & same                                           # (B, A, N)
+        neg_mask = bg & (~same)                                        # (B, A, N)
+
+        neg_sum = (probs * neg_mask).sum(dim=2)                        # (B, A)
+
+        if self.contrastive_loss_type == 2:
+            # pairwise (recommended): per positive p -> p / (p + sum_neg)
+            denom = probs + neg_sum.unsqueeze(2)                       # (B, A, N)
+            rel = probs / denom
+            log_rel = torch.log(rel + self.eps) * pos_mask
+            n_pos = pos_mask.sum(dim=2).clamp_min(1)
+            per_anchor = -(log_rel.sum(dim=2) / n_pos)                 # (B, A)
+        elif self.contrastive_loss_type == 1:
+            # setwise: sum_pos / (sum_pos + sum_neg)
+            pos_sum = (probs * pos_mask).sum(dim=2)                    # (B, A)
+            rel = pos_sum / (pos_sum + neg_sum)
+            per_anchor = -torch.log(rel + self.eps)                   # (B, A)
+        else:
+            raise ValueError("contrastive_loss_type must be 1 (setwise) or 2 (pairwise)")
+
+        # an anchor counts only if it is a real (non-padded) anchor with >=1 positive
+        contributing = (pos_mask.any(dim=2) & anchor_valid).to(dtype)  # (B, A)
+        n_anchors = contributing.sum(dim=1).clamp_min(1.0)            # (B,)
+        per_image = (per_anchor * contributing).sum(dim=1) / n_anchors  # (B,)
+        return per_image.sum() / B
 
 
 # Convenience: build the loss from a config object with matching attribute names.
@@ -212,3 +217,4 @@ if __name__ == "__main__":
     loss = loss_fn(feats, y_true)
     loss.backward()
     print("loss:", float(loss), "| grad finite:", bool(torch.isfinite(feats.grad).all()))
+
