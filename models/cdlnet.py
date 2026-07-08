@@ -1,25 +1,25 @@
 import torch
 import torch.nn as nn
 
-from models.components import ST, ComplexConvTranspose2d
+from models.components import ST, Conv2d, ConvTranspose2d
 from models.base import BaseUnrolledModel
 from preprocessing.image import pre_process, post_process
 
 
 class CDLNet(BaseUnrolledModel):
-    def __init__(self, K=3, M=64, P=7, s=1, C=1, t0=0, adaptive=False, init=True):
+    def __init__(self, K=3, M=64, P=7, s=1, C=1, t0=0, adaptive=False, init=True, complex = True):
         super().__init__()
 
         self.K, self.M, self.P, self.s, self.C = K, M, P, s, C
         self.adaptive = adaptive
 
         self.A = nn.ModuleList([
-            nn.Conv2d(C, M, P, stride=s, padding=(P-1)//2, bias=False, dtype=torch.cfloat)
+            Conv2d(C, M, P, stride=s, bias=False, complex = complex)
             for _ in range(K)
         ])
 
         self.B = nn.ModuleList([
-            ComplexConvTranspose2d(M, C, P, stride=s, bias=False)
+            ConvTranspose2d(M, C, P, stride=s, bias=False, complex = complex)
             for _ in range(K)
         ])
 
@@ -50,7 +50,7 @@ class CDLNet(BaseUnrolledModel):
         # K ISTA iterations, now with operator E
         for k in range(self.K):
             z = ST(
-                z - self.A[k](EH(E(self.B[k](z)) - yp)),
+                z - self.A[k](E.H(E(self.B[k](z)) - yp)),
                 self.t[k, :1] + c * self.t[k, 1:2],
             )
 
