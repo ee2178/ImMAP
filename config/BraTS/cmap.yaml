@@ -37,6 +37,11 @@ crop_size:     null         # e.g. 160 -> center-crop to 160x160; null = keep na
 # --- output options ----------------------------------------------------------
 save_image:        true     # also write <case>_img.h5 (aligned, normalized); set false to
                             #   save space since the niftis are right there in the same folder
+save_raw_image:    true     # also store an UNNORMALIZED, UNCLIPPED 'img_raw' dataset (true raw
+                            #   intensities, background zeroed) in the same <case>_img.h5 next to
+                            #   the normalized 'img'. Clustering
+                            #   still runs on 'img' (constraint maps unchanged). Needed for I2SB
+                            #   translation, which wants the true inter-contrast intensities.
 drop_empty_slices: true     # keep slices with brain fraction >= min_brain_frac
 min_brain_frac:    0.02      # fine trim: drop near-empty slices (fraction of FOV that is brain)
 start_slice:       40        # focus on middle slices; index on the ORIGINAL 0-154 z-axis. null = no lower bound

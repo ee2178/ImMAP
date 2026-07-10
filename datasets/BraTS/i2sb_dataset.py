@@ -71,11 +71,16 @@ class I2SBDataset(Dataset):
             cond_idx  (list)    stored channels used as conditioning; [] disables conditioning
             scales    (list)    per-STORED-channel multipliers (len >= max stored idx + 1);
                                 None -> all ones. NO other normalization is applied.
+            image_key (str)     h5 dataset to read: "img" (normalized) or "img_raw"
+                                (unnormalized; requires the generator's save_raw_image: true).
             center_crop, crop_size, random_flips   (optional geometric augmentation)
         """
         self.x0_idx = int(getattr(cfg, "x0_idx", 2))     # T1ce
         self.x1_idx = int(getattr(cfg, "x1_idx", 1))     # T1
         self.cond_idx = list(getattr(cfg, "cond_idx", [0, 1, 3]))   # FLAIR, T1, T2
+        # which stored image to read: "img" (normalized) or "img_raw" (raw: no clip/normalize).
+        # img_raw preserves the true inter-contrast intensities and needs save_raw_image: true.
+        self.image_key = str(getattr(cfg, "image_key", "img"))
 
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
@@ -121,7 +126,11 @@ class I2SBDataset(Dataset):
         fi = int(self.file_id[idx])
         li = int(self.local[idx])
         h = self._handle(self.img_paths[fi])
-        img = np.asarray(h["img"][li])                    # (H, W, Cstored)
+        if self.image_key not in h:
+            raise KeyError(
+                f"'{self.image_key}' not in {self.img_paths[fi]} (keys={list(h.keys())}). "
+                f"Regenerate with save_raw_image: true to get 'img_raw', or set image_key: 'img'.")
+        img = np.asarray(h[self.image_key][li])           # (H, W, Cstored)
         mask = np.asarray(h["mask"][li])                  # (H, W, 1)
 
         # per-contrast scaling (the ONLY intensity transform); no channel normalization

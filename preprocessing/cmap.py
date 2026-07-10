@@ -13,7 +13,9 @@ Output: ONE HDF5 per subject, written into that subject's own folder (in place b
 named to match the BraTS file convention:
     <case>/<case>_constraint_map_K<K>.h5   ['param']       (n, H, W, 1)  int16
                                            ['slice_index']  (n,)         int32  -> original z
-    <case>/<case>_img.h5  (optional)       ['img']          (n, H, W, C) float
+    <case>/<case>_img.h5  (optional)       ['img']          (n, H, W, C) float  normalized
+                                           ['img_raw']      (n, H, W, C) float  unnormalized (raw)
+                                           ['mask']         (n, H, W, 1) uint8  brain mask
                                            ['slice_index']  (n,)         int32
 Plus a manifest CSV at the subdir root listing every subject and its kept-slice count.
 
@@ -116,11 +118,16 @@ def center_crop_spatial(a, size, h_axis, w_axis):
 @torch.no_grad()
 def constraint_map_for_subject(case_dir, cfg, pca_fn, tvd_fn, kmeans_fn):
     """
-    Returns (param, image, fg, stats):
-        param : (D, H, W) int16        constraint map (background = 0 if mask_background)
-        image : (D, C, H, W) float32   preprocessed image (within-brain normalized, bg=0)
-        fg    : (D, H, W) bool         brain mask (from raw intensities)
-        stats : (C, 2) float32         per-channel normalization stats (invertible)
+    Returns (param, image, image_raw, fg, stats):
+        param     : (D, H, W) int16      constraint map (background = 0 if mask_background)
+        image     : (D, C, H, W) float32 NORMALIZED image (within-brain zscore/minmax, bg=0)
+        image_raw : (D, C, H, W) float32 UNNORMALIZED, UNCLIPPED raw intensities (bg=0)
+        fg        : (D, H, W) bool        brain mask (from raw intensities)
+        stats     : (C, 2) float32        per-channel normalization stats (invertible)
+
+    Clustering (PCA/TVD/kmeans) runs on the NORMALIZED image so the constraint maps are
+    unchanged; the unnormalized image is carried alongside for tasks (e.g. I2SB translation)
+    that need the true inter-contrast intensity relationship preserved.
     """
     device = cfg.device
 
@@ -131,10 +138,11 @@ def constraint_map_for_subject(case_dir, cfg, pca_fn, tvd_fn, kmeans_fn):
 
     fg = (x.abs().sum(dim=1) > 0)                               # (D, H, W) bool, from RAW
 
+    x_raw = (x * fg.unsqueeze(1)).contiguous()                  # UNnormalized, UNclipped, bg -> 0
     x = channelwise_percentile_clip(x, fg, cfg.clip_lo, cfg.clip_hi)
     x, stats = normalize_masked(x, fg, mode=getattr(cfg, "normalize", "zscore"))
 
-    pca_out = pca_fn(x, n_components=cfg.n_pca)
+    pca_out = pca_fn(x, n_components=cfg.n_pca)                  # cluster on the NORMALIZED image
     x_pc = pca_out[0] if isinstance(pca_out, (tuple, list)) else pca_out
 
     tvd_out = tvd_fn(x_pc.unsqueeze(1), lam=cfg.tvd_lam, eta=cfg.tvd_eta,
@@ -159,8 +167,9 @@ def constraint_map_for_subject(case_dir, cfg, pca_fn, tvd_fn, kmeans_fn):
 
     param = param.reshape(D, H, W).to(torch.int16).cpu().numpy()
     image = x.cpu().numpy().astype(np.float32)
+    image_raw = x_raw.cpu().numpy().astype(np.float32)
     fg = fg.cpu().numpy()
-    return param, image, fg, stats
+    return param, image, image_raw, fg, stats
 
 
 # ----------------------------------------------------------------------------
@@ -178,10 +187,12 @@ def _common_attrs(f, case, slice_idx, orig_depth, stats, cfg):
                               int(getattr(cfg, "end_slice", -1) or -1)]
     f.attrs["normalize"] = getattr(cfg, "normalize", "zscore")
     f.attrs["norm_stats"] = stats                 # (C,2): (mean,std) or (lo,range) per channel
+    f.attrs["has_raw_image"] = bool(getattr(cfg, "save_raw_image", True))
     f.attrs["axis_order"] = "N,H,W,C ; slice_index maps N back to the original nifti z-axis"
 
 
-def save_subject(out_dir, case, image_hwc, param_hwc, mask_hwc, slice_idx, orig_depth, stats, cfg):
+def save_subject(out_dir, case, image_hwc, image_raw_hwc, param_hwc, mask_hwc,
+                 slice_idx, orig_depth, stats, cfg):
     os.makedirs(out_dir, exist_ok=True)
     comp = "gzip" if cfg.compress else None
 
@@ -195,21 +206,25 @@ def save_subject(out_dir, case, image_hwc, param_hwc, mask_hwc, slice_idx, orig_
     if cfg.save_image:
         img_path = os.path.join(out_dir, f"{case}_img.h5")
         with h5py.File(img_path, "w") as f:
-            f.create_dataset("img", data=image_hwc.astype(cfg.img_dtype),
+            f.create_dataset("img", data=image_hwc.astype(cfg.img_dtype),         # NORMALIZED
                              chunks=(1,) + image_hwc.shape[1:], compression=comp)
+            if getattr(cfg, "save_raw_image", True) and image_raw_hwc is not None:
+                f.create_dataset("img_raw", data=image_raw_hwc.astype(cfg.img_dtype),  # UNNORMALIZED
+                                 chunks=(1,) + image_raw_hwc.shape[1:], compression=comp)
             f.create_dataset("mask", data=mask_hwc.astype(np.uint8),     # brain mask (n,H,W,1)
                              chunks=(1,) + mask_hwc.shape[1:], compression=comp)
             _common_attrs(f, case, slice_idx, orig_depth, stats, cfg)
     return cmap_path, img_path
 
 
-def prepare_arrays(param, image, fg, cfg):
-    """Crop + brain-fraction slice selection; return (img_hwc, param_hwc, mask_hwc,
-    slice_idx, orig_depth). A slice is kept iff brain covers >= min_brain_frac of the FOV
-    (subsumes the old 'any foreground' rule and drops near-empty top/bottom slices)."""
+def prepare_arrays(param, image, image_raw, fg, cfg):
+    """Crop + brain-fraction slice selection; return (img_hwc, img_raw_hwc, param_hwc,
+    mask_hwc, slice_idx, orig_depth). A slice is kept iff brain covers >= min_brain_frac of
+    the FOV (subsumes the old 'any foreground' rule and drops near-empty top/bottom slices)."""
     orig_depth = param.shape[0]
     if cfg.crop_size:
         image = center_crop_spatial(image, cfg.crop_size, h_axis=2, w_axis=3)
+        image_raw = center_crop_spatial(image_raw, cfg.crop_size, h_axis=2, w_axis=3)
         param = center_crop_spatial(param, cfg.crop_size, h_axis=1, w_axis=2)
         fg = center_crop_spatial(fg, cfg.crop_size, h_axis=1, w_axis=2)
 
@@ -231,10 +246,11 @@ def prepare_arrays(param, image, fg, cfg):
         keep = in_range
     slice_idx = np.where(keep)[0]
 
-    img_hwc = np.transpose(image[keep], (0, 2, 3, 1))           # (n, H, W, C)
+    img_hwc = np.transpose(image[keep], (0, 2, 3, 1))           # (n, H, W, C) normalized
+    img_raw_hwc = np.transpose(image_raw[keep], (0, 2, 3, 1))   # (n, H, W, C) unnormalized
     param_hwc = param[keep][..., np.newaxis]                    # (n, H, W, 1)
     mask_hwc = fg[keep][..., np.newaxis]                        # (n, H, W, 1) bool
-    return img_hwc, param_hwc, mask_hwc, slice_idx, orig_depth
+    return img_hwc, img_raw_hwc, param_hwc, mask_hwc, slice_idx, orig_depth
 
 
 # ----------------------------------------------------------------------------
@@ -269,9 +285,10 @@ def process_split(cases, subdir_path, cfg, fns, manifest_rows):
             continue
 
         try:
-            param, image, fg, stats = constraint_map_for_subject(src_dir, cfg, pca_fn, tvd_fn, kmeans_fn)
-            img_hwc, param_hwc, mask_hwc, slice_idx, orig_depth = prepare_arrays(param, image, fg, cfg)
-            cpath, ipath = save_subject(out_dir, case, img_hwc, param_hwc, mask_hwc,
+            param, image, image_raw, fg, stats = constraint_map_for_subject(src_dir, cfg, pca_fn, tvd_fn, kmeans_fn)
+            img_hwc, img_raw_hwc, param_hwc, mask_hwc, slice_idx, orig_depth = prepare_arrays(
+                param, image, image_raw, fg, cfg)
+            cpath, ipath = save_subject(out_dir, case, img_hwc, img_raw_hwc, param_hwc, mask_hwc,
                                         slice_idx, orig_depth, stats, cfg)
             manifest_rows.append([case, param_hwc.shape[0], cpath, ipath])
             n_ok += 1

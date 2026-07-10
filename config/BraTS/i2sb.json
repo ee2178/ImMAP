@@ -42,6 +42,7 @@
             "x1_idx": 1,
             "cond_idx": [],
             "scales": [1.0, 1.0, 1.0, 1.0],
+            "image_key": "img_raw",
             "crop_size": 192,
             "random_flips": true,
             "batch_size": 8,
@@ -54,6 +55,7 @@
             "x1_idx": 1,
             "cond_idx": [],
             "scales": [1.0, 1.0, 1.0, 1.0],
+            "image_key": "img_raw",
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8

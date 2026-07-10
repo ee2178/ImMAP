@@ -23,6 +23,7 @@ def build_i2sb_loader(root=None,
                       x1_idx=1,                 # T1
                       cond_idx=(0, 1, 3),       # FLAIR, T1, T2  ([] to disable conditioning)
                       scales=None,              # per-stored-channel multipliers; None = ones
+                      image_key="img",          # "img" (normalized) or "img_raw" (unnormalized)
                       center_crop=None,
                       crop_size=None,
                       random_flips=False,
@@ -36,7 +37,7 @@ def build_i2sb_loader(root=None,
     ds_cfg = SimpleNamespace(
         root=root, manifest=manifest,
         x0_idx=x0_idx, x1_idx=x1_idx, cond_idx=list(cond_idx),
-        scales=scales,
+        scales=scales, image_key=image_key,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
     )
     dataset = I2SBDataset(ds_cfg)
