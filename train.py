@@ -13,7 +13,8 @@ from training import (
     train_joint_denoising_recon,
     train_ipalm,
     train_ccl,
-    train_synthesis
+    train_synthesis,
+    train_i2sb
 )
 from training.common import load_ckpt
 
@@ -259,6 +260,22 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
             **cfg["training"],
+            **cfg["paths"],
+            )
+    elif task == "i2sb":
+        steps_per_epoch = cfg["training"]["steps_per_epoch"]
+
+        train_i2sb(
+            net=model,
+            opt=optimizer,
+            sched=scheduler,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            wandb=wandb,
+            start_epoch=start_step//steps_per_epoch,
+            **cfg["training"],
+            **cfg["i2sb"],
             **cfg["paths"],
             )
     else:

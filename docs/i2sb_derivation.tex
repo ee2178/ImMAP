@@ -1,0 +1,147 @@
+% Deriving I2SB as Annealed Conditional-Tweedie Ascent
+% Full-quality source. Compiles with pdflatex / xelatex, or paste into Overleaf.
+% The committed PDF (i2sb_derivation.pdf) was rendered without a LaTeX toolchain
+% (matplotlib STIX mathtext); recompile this for the polished version.
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{mathtools}          % \lVert, \coloneqq, \DeclarePairedDelimiter
+\usepackage{bm}
+\usepackage[T1]{fontenc}
+\usepackage{newtxtext, newtxmath} % Times-like text + math (drop if unavailable)
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue}
+
+\DeclarePairedDelimiter{\norm}{\lVert}{\rVert}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\eps}{\varepsilon}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+\title{\vspace{-2em}Deriving I2SB as Annealed Conditional-Tweedie Ascent}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3em}
+\begin{center}\itshape A corrected derivation for pure image-to-image translation
+(T1 $\to$ T1CE)\end{center}
+\vspace{0.5em}
+\hrule
+\vspace{1em}
+
+We translate a source $y$ (domain A, e.g.\ T1) into a target $x$ (domain B, e.g.\ T1CE),
+from paired data $(x,y)\sim p(x,y)$ and with \emph{no} measurement operator. This note
+derives the I2SB algorithm as an annealed ascent driven by a conditional-Tweedie residual,
+and isolates the one substitution that separates a blurry one-shot regressor from the bridge.
+
+\section{The MAP objective, and why the Bayes split fails}
+The translation MAP problem is
+\begin{equation}
+  x^\star = \argmax_x\; p(x \mid y).
+\end{equation}
+The usual move is Bayes, $\argmax_x\,[\log p(y\mid x) + \log p(x)]$, which needs an
+\emph{analytic} likelihood $p(y\mid x)$. That exists only when $y$ is a measurement of $x$
+through a known operator. In pure translation the entire inter-domain relationship is what
+we are learning, so a Gaussian stand-in
+\begin{equation}
+  p(y\mid x) = \N(y; x, \tau)
+  \;\;\Longrightarrow\;\;
+  \log p(y\mid x) = -\frac{1}{2\tau}\norm{x-y}_2^2
+\end{equation}
+is not an approximation but a \emph{different problem} (restoration): it pulls $x$ toward
+$y$, biasing the synthesized T1CE back toward T1. We therefore drop the factorization and
+build a path of densities between the two domains instead.
+
+\section{A homotopy between the two data densities}
+Introduce a stochastic interpolant between target and source, indexed by $t\in[0,1]$:
+\begin{equation}
+  x_t = \mu_0(t)\,x + \mu_1(t)\,y + \sigma(t)\,\eps,
+  \qquad \eps \sim \N(0, I),
+\end{equation}
+with boundary conditions $\mu_0(0)=1,\ \mu_1(0)=0$ (so $x_0=x$) and
+$\mu_0(1)=0,\ \mu_1(1)=1$ (so $x_1=y$), and $\sigma$ vanishing at both ends. Its marginals
+$p_t$ form a continuous homotopy from $p_0=p(x)$ to $p_1=p(y)$. The Brownian-bridge choice of
+$(\mu_0,\mu_1,\sigma)$ recovers I2SB exactly; any other valid interpolant yields a sibling
+method (flow / bridge matching).
+
+\section{Conditional Tweedie on the bridge variable (the correction)}
+The reverse dynamics carrying $p(y)$ back to $p(x\mid y)$ have a single unknown, the denoiser
+\begin{equation}
+  D(x_t, t) \coloneqq \E[\,x \mid x_t\,],
+\end{equation}
+estimated by plain regression, $\min_\theta \E\,\norm{D_\theta(x_t,t) - x}_2^2$. This is the
+conditional-Tweedie object, done correctly. Because, given the pairing,
+\begin{equation}
+  x_t \mid (x,y) \;\sim\; \N\!\big(\mu_0 x + \mu_1 y,\ \sigma^2 I\big),
+\end{equation}
+$x_t$ is a genuine Gaussian perturbation of $x$, and the residual is a valid score of the
+time-$t$ marginal:
+\begin{equation}
+  D(x_t,t) - x_t \;\propto\; \nabla \log p_t(x_t).
+\end{equation}
+Contrast the tempting but \emph{wrong} residual $\E[x\mid y] - y$: since $y$ is not a
+Gaussian corruption of $x$, it is the score of nothing, and it is \emph{static} --- one
+fixed vector, with nothing to anneal. The valid residual is evaluated at the \emph{evolving}
+iterate $x_t$, not at $y$.
+
+\section{The annealed update is the ImMAP relaxation step}
+Discretizing the reverse dynamics gives the update
+\begin{equation}
+  x_{t-1} = x_t + h_t\,\underbrace{\big(D(x_t,t) - x_t\big)}_{\text{ascent direction}}
+            + \underbrace{\gamma_t\,\eps}_{\text{annealed noise}},
+  \qquad x_{t_{\max}} = y,
+\end{equation}
+a relaxation toward the denoiser output plus annealed noise. It is structurally identical to
+the ImMAP solver
+\begin{equation}
+  x_t = x_t + h_t\,(v_t - x_t) + \gamma_t\,\eps,
+\end{equation}
+with the two differences that make translation differ from reconstruction:
+\begin{enumerate}[label=(\roman*), nosep]
+  \item the denoiser $v_t = D(x_t,t)$ is trained on the bridge marginals rather than on
+        Gaussian noise, and
+  \item the source $y$ is absorbed into $D$ through the interpolant, so no measurement
+        operator or data-consistency solve ever appears.
+\end{enumerate}
+
+\section{\texorpdfstring{$\E[x\mid y]$}{E[x|y]} is exactly the first step}
+Your instinct was almost right: the very first iterate uses
+\begin{equation}
+  x_{t_{\max}} = y, \qquad D(y, t_{\max}) \approx \E[\,x \mid y\,],
+\end{equation}
+so $\E[x\mid y] - y$ is precisely the \emph{first} step of I2SB --- the blurry MMSE mean. The
+algorithm does not stop there: it re-evaluates $D$ on the refined iterate $x_{t-1}$ and
+repeats. That re-evaluation is the anneal, self-consistent only because the bridge trained
+$D$ on the whole path, not just at $x_t = y$. In one line:
+\begin{quote}
+  \emph{I2SB applies the paired regressor to its own progressively refined output, instead of
+  once to $y$.}
+\end{quote}
+
+\section{MMSE vs.\ MAP (a bookkeeping caveat)}
+Tweedie yields the posterior \emph{mean} $\E[x\mid x_t]$, not the mode, so the stochastic
+iteration \emph{samples} $p(x\mid y)$ rather than solving $\argmax$. The two coincide only for
+symmetric posteriors. For a single deterministic estimate --- the honest stand-in for MAP ---
+take the OT-ODE limit $\gamma_t \equiv 0$, a deterministic transport $y \mapsto x$. Keep the
+noise for diverse samples; drop it for one canonical T1CE (often the safer clinical choice,
+given the risk of hallucinated enhancement).
+
+\begin{center}\rule{0.5\textwidth}{0.4pt}\end{center}
+
+\paragraph{Algorithm (stochastic I2SB sampling).}
+\begin{equation*}
+\begin{aligned}
+  &\textbf{initialize } x = y \\
+  &\textbf{for } t = t_{\max}, \ldots, 1:\\
+  &\qquad \hat{x} = D(x, t) \hspace{3.2em}\text{\small\# paired regressor at the current iterate}\\
+  &\qquad x = x + h_t\,(\hat{x} - x) + \gamma_t\,\eps \\
+  &\textbf{return } x \hspace{3.4em}\text{\small\# sample of }p(x\mid y);\ \gamma_t\!=\!0\text{ for the MAP-like transport}
+\end{aligned}
+\end{equation*}
+
+\end{document}

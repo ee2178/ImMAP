@@ -136,3 +136,23 @@ def pad_to_shape(x, shape, value=0):
         pad.extend([left, right])
 
     return F.pad(x, pad, value=value)
+
+
+def unsqueeze_xdim(v, xdim):
+    """
+    Broadcast a per-sample vector over image dimensions.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Shape (B,).
+    xdim : tuple or torch.Size
+        Trailing dimensions to append as singletons (e.g. x.shape[1:]).
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (B, 1, 1, ...) with len(xdim) trailing singleton dims, so it
+        broadcasts against a tensor of shape (B, *xdim).
+    """
+    return v.reshape(v.shape[0], *([1] * len(xdim)))
