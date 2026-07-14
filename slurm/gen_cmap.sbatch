@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=a100
+#SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=8           # mostly GPU + nifti/h5 IO; 8 is plenty
 #SBATCH --mem=32GB                  # one volume at a time -> light; 32GB is generous
 #SBATCH --time=01:00:00             # ~1251 subjects; lower it for faster scheduling

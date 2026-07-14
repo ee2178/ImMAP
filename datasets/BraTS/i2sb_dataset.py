@@ -135,7 +135,8 @@ class I2SBDataset(Dataset):
 
         # per-contrast scaling (the ONLY intensity transform); no channel normalization
         if self.scales is not None:
-            img = img * self.scales[None, None, :]
+            # We choose to divide by the scale factor in practice. 
+            img = img / self.scales[None, None, :]
 
         def chw(a):
             return torch.from_numpy(np.ascontiguousarray(np.transpose(a, (2, 0, 1)), dtype=np.float32))

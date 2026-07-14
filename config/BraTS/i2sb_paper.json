@@ -6,10 +6,10 @@
     "model": {
         "type": "CDLNet",
         "params": {
-            "K": 8,
-            "M": 64,
+            "K": 30,
+            "M": 169,
             "P": 7,
-            "s": 1,
+            "s": 2,
             "C": 1,
             "t0": 0.0,
             "adaptive": true,
@@ -19,14 +19,15 @@
     },
     "i2sb": {
         "bridge_type": "i2sb",
-        "tau": 0.19,
+        "tau": 1.0,
         "n_points": 1000,
         "bridge_shape": "constant",
         "beta_max": 0.3,
         "ot_ode": false,
-        "parameterization": "eps",
+        "parameterization": "x0",
         "clip_denoise": false,
         "ema_decay": 0.99,
+        "val_mode": "single_pass",
         "val_nfe": 20,
         "target_channels": 1
     },
@@ -41,9 +42,9 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [],
-            "scales": [1.0, 1.0, 1.0, 1.0],
-            "image_key": "img_raw",
-            "crop_size": 192,
+            "image_key": "img",
+            "scales": [1, 1, 1, 1],
+            "crop_size": 128,
             "random_flips": true,
             "batch_size": 8,
             "num_workers": 8
@@ -54,19 +55,19 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [],
-            "scales": [1.0, 1.0, 1.0, 1.0],
-            "image_key": "img_raw",
+            "image_key": "img",
+            "scales": [1, 1, 1, 1],
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8
         }
     },
     "training": {
-        "num_epochs": 300,
-        "steps_per_epoch": 1750,
-        "val_every_epochs": 5,
+        "num_epochs": 3000,
+        "steps_per_epoch": 100,
+        "val_every_epochs": 50,
         "clip_grad": 1.0,
-        "backtrack_thresh": 0.5,
+        "backtrack_thresh": 1000,
         "backtrack_factor": 0.9,
         "use_mask": true,
         "psnr_only": false
@@ -74,18 +75,18 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 1.0e-3
+            "lr": 2.0e-4
         }
     },
     "scheduler": {
         "type": "CosineAnnealingLR",
         "params": {
-            "eta_min": 1.0e-5,
-            "T_max": 525000
+            "eta_min": 1.0e-6,
+            "T_max": 300000
         }
     },
     "wandb": {
-        "project": "contrast-synthesis",
+        "project": "schrodinger-bridge",
         "id": null
     }
 }

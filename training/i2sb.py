@@ -118,7 +118,9 @@ def train_i2sb(
     parameterization="x0",
     clip_denoise=False,
     ema_decay=0.99,
-    val_nfe=20,
+    val_mode="single_pass",          # "single_pass" (one random-step denoise) or "full_recon"
+    val_seed = None,
+    val_nfe=20,                      # only used when val_mode == "full_recon"
     target_channels=1,
     # ---- paths (cfg["paths"]) ----
     save_dir=None,
@@ -190,6 +192,8 @@ def train_i2sb(
             if clip_grad is not None:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
             opt.step()
+            # Important for our unrolled models
+            if hasattr(net, "project"): net.project()
             ema.update()
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
@@ -240,7 +244,7 @@ def train_i2sb(
         # ---- validation: sample with EMA weights ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
             val_loss = _validate(
-                net, ema, bridge, val_loader, device,
+                net, ema, bridge, val_loader, device, interval=interval, val_mode=val_mode, val_seed = val_seed,
                 use_mask=use_mask, ot_ode=ot_ode, parameterization=parameterization,
                 clip_denoise=clip_denoise, val_nfe=val_nfe, target_channels=target_channels,
                 psnr_only=psnr_only, wandb=wandb, global_step=global_step,
@@ -271,49 +275,80 @@ def _assert_cond_matches_model(net, loader, device, target_channels):
 
 
 @torch.no_grad()
-def _validate(net, ema, bridge, val_loader, device, *,
-              use_mask, ot_ode, parameterization, clip_denoise, val_nfe,
-              target_channels, psnr_only, wandb, global_step):
+def _validate(net, ema, bridge, val_loader, device, *, interval, val_mode, val_seed, 
+                use_mask, ot_ode, parameterization, clip_denoise, val_nfe, 
+                target_channels, psnr_only, wandb, global_step):
+    """Validate with EMA weights. Two modes:
+      "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
+                                  score the single-pass pred_x0 (mirrors the training objective;
+                                  cheap). Steps use a fixed seed so metrics are comparable epoch
+                                  to epoch.
+      "full_recon"            -- run the full val_nfe-step DDPM sampler (end-to-end recon quality).
+    """
     net.eval()
-    agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0}
+    agg = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "nrmse": 0.0}
     n_samples = 0
     last = None
-
+    if val_seed is not None:
+        gen = torch.Generator(device=device).manual_seed(val_seed)   # fixed val steps -> comparable
+    else:
+        gen = None
     with ema.average_parameters():
         for batch in val_loader:
             x0, x1, cond, mask = _split_batch(batch, device)
-            recon, _, _ = i2sb_sample(
-                net, x1, bridge, cond=cond, nfe=val_nfe, ot_ode=ot_ode,
-                parameterization=parameterization, clip_denoise=clip_denoise,
-                target_channels=target_channels, log_count=1, verbose=False,
-            )
-            x0_m, recon_m = apply_loss_mask(x0, recon, mask, use_mask)
-            mets = compute_metrics(x0_m, recon_m, psnr_only=psnr_only)
             bs = x0.shape[0]
-            for k in agg:
+
+            if val_mode == "full_recon":
+                pred, _, _ = i2sb_sample(
+                    net, x1, bridge, cond=cond, nfe=val_nfe, ot_ode=ot_ode,
+                    parameterization=parameterization, clip_denoise=clip_denoise,
+                    target_channels=target_channels, log_count=1, verbose=False,
+                )
+                loss = masked_mse(pred, x0, mask, use_mask)
+                xt, step = x1, None
+            else:  # single_pass: one random step, one forward (same as a training step)
+                step = torch.randint(0, interval, (bs,), generator=gen, device=device)
+                xt = q_sample(bridge, step, x0, x1, ot_ode=ot_ode)
+                std_fwd = get_std_fwd(bridge, step, xdim=x0.shape[1:])
+                out = cdlnet_pred(net, xt, std_fwd, cond=cond, target_channels=target_channels)
+                if parameterization == "x0":
+                    pred = out
+                    loss = masked_mse(pred, x0, mask, use_mask)
+                else:
+                    label = compute_label(bridge, step, x0, xt)
+                    loss = masked_mse(out, label, mask, use_mask)
+                    pred = compute_pred_x0(bridge, step, xt, out)
+
+            x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
+            mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only)
+            agg["loss"] += float(loss) * bs
+            for k in ("psnr", "ssim", "nrmse"):
                 if k in mets:
                     agg[k] += float(mets[k].detach()) * bs
             n_samples += bs
-            last = (x1, x0_m, recon_m, mask)
+            last = (x1, xt, x0_m, pred_m, mask, step)
 
     mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
 
     if wandb and last is not None:
-        x1, x0_m, recon_m, mask = last
-        prior = x1[:1]; gt = x0_m[:1]; pred = recon_m[:1]
-        grid = torch.cat([prior, gt, pred], dim=0)
-        grid = grid - grid.min(); grid = grid / grid.max().clamp(min=1e-8)
-        grid = mask[:1] * grid
-        res = (gt - pred).abs(); res = res / res.max().clamp(min=1e-8)
+        x1, xt, x0_m, pred_m, mask, step = last
+        if val_mode == "single_pass":
+            cols = [x1[:1], xt[:1], pred_m[:1], x0_m[:1]]
+            cap = f"T1 prior | x_t (step={int(step[0])}) | single-pass pred_x0 | T1ce GT"
+        else:
+            cols = [x1[:1], pred_m[:1], x0_m[:1]]
+            cap = f"T1 prior | I2SB recon (nfe={val_nfe}) | T1ce GT"
+        ref = torch.cat([cols[0], cols[-1]], dim=0)          # scale from prior + GT (clean)
+        lo = float(ref.amin()); hi = max(float(ref.amax()), lo + 1e-8)
+        grid = mask[:1] * torch.cat([((c - lo) / (hi - lo)).clamp(0, 1) for c in cols], dim=0)
+        res = (x0_m[:1] - pred_m[:1]).abs(); res = res / res.max().clamp(min=1e-8)
         wandb.log({
-            "val/example": wandb.Image(vutils.make_grid(grid, nrow=3),
-                                       caption="T1 prior | T1ce GT | I2SB recon"),
-            "val/residual": wandb.Image(vutils.make_grid(res, nrow=1), caption="| GT - recon |"),
+            "val/example": wandb.Image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
+            "val/residual": wandb.Image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
             **{f"val/{k}": v for k, v in mean_metrics.items()},
         }, step=global_step)
     elif not wandb:
-        print(f"[VAL] " + " ".join(f"{k}={v:.4f}" for k, v in mean_metrics.items()))
+        print(f"[VAL {val_mode}] " + " ".join(f"{k}={v:.4f}" for k, v in mean_metrics.items()))
 
     net.train()
-    # negative PSNR as a "lower is better" scalar for ReduceLROnPlateau
-    return -mean_metrics.get("psnr", 0.0)
+    return mean_metrics["loss"]   # lower is better -> valid for ReduceLROnPlateau
