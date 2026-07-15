@@ -1,7 +1,7 @@
 {
     "task": "i2sb",
     "experiment": {
-        "name": "I2SB_paper_baseline_T1ce_from_T1T2FlAIR_VGG_Loss"
+        "name": "I2SB_paper_baseline_T1ce_from_T1"
     },
     "model": {
         "type": "CDLNet",
@@ -10,7 +10,7 @@
             "M": 169,
             "P": 7,
             "s": 2,
-            "C": 3,
+            "C": 1,
             "t0": 0.0,
             "adaptive": true,
             "init": true,
@@ -32,7 +32,7 @@
         "target_channels": 1
     },
     "paths": {
-        "save_dir": "trained_nets/brats/I2SB_paper_baseline_T1ce_from_ALL_VGG_Loss",
+        "save_dir": "trained_nets/brats/I2SB_paper_baseline_T1ce_from_T1",
         "ckpt": null
     },
     "data": {
@@ -41,7 +41,7 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [0, 3],
+            "cond_idx": [],
             "image_key": "img",
             "scales": [1, 1, 1, 1],
             "crop_size": 128,
@@ -54,7 +54,7 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [0, 3],
+            "cond_idx": [],
             "image_key": "img",
             "scales": [1, 1, 1, 1],
             "random_flips": false,
