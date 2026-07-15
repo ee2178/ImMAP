@@ -43,7 +43,7 @@
             "x1_idx": 1,
             "cond_idx": [0, 3],
             "image_key": "img",
-            "scales": [1, 1, 1, 1],
+            "scales": [2, 2, 2, 2],
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 8,
@@ -56,7 +56,7 @@
             "x1_idx": 1,
             "cond_idx": [0, 3],
             "image_key": "img",
-            "scales": [1, 1, 1, 1],
+            "scales": [2, 2, 2, 2],
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8
