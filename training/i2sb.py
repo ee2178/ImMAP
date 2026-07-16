@@ -37,6 +37,7 @@ from physics.bbridge import build_bridge, n_steps
 from diffusion.i2sb import (
     cdlnet_pred, i2sb_sample, q_sample, compute_label, compute_pred_x0, get_std_fwd,
 )
+from visualization.filters import get_filter_grids
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +348,11 @@ def _validate(net, ema, bridge, val_loader, device, *, interval, val_mode, val_s
             "val/residual": wandb.Image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
             **{f"val/{k}": v for k, v in mean_metrics.items()},
         }, step=global_step)
+        # learned dictionary filters (works for real or complex CDLNet); no-op if absent
+        try:
+            wandb.log(get_filter_grids(net), step=global_step)
+        except (AttributeError, NotImplementedError, AssertionError):
+            pass
     elif not wandb:
         print(f"[VAL {val_mode}] " + " ".join(f"{k}={v:.4f}" for k, v in mean_metrics.items()))
 

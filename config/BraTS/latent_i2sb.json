@@ -28,7 +28,7 @@
     },
     "i2sb": {
         "bridge_type": "brownian",
-        "tau": 0.19,
+        "tau": 0.024,
         "n_points": 1000,
         "bridge_shape": "constant",
         "beta_max": 0.3,
