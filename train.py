@@ -14,7 +14,8 @@ from training import (
     train_ipalm,
     train_ccl,
     train_synthesis,
-    train_i2sb
+    train_i2sb,
+    train_latent_i2sb
 )
 from training.common import load_ckpt
 
@@ -274,6 +275,25 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
+            **cfg["training"],
+            **cfg["i2sb"],
+            **cfg["paths"],
+            )
+    elif task == "latent_i2sb":
+        steps_per_epoch = cfg["training"]["steps_per_epoch"]
+
+        # `model` (built by build_model) is the NEW regressor R; the two convolutional
+        # dictionaries are loaded frozen inside the loop from cfg["dicts"] config paths.
+        train_latent_i2sb(
+            R=model,
+            opt=optimizer,
+            sched=scheduler,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            wandb=wandb,
+            start_epoch=start_step//steps_per_epoch,
+            **cfg["dicts"],
             **cfg["training"],
             **cfg["i2sb"],
             **cfg["paths"],

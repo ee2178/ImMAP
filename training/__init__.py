@@ -5,3 +5,4 @@ from .ipalm import train_ipalm
 from .ccl import train_ccl
 from .synthesis import train_synthesis
 from .i2sb import train_i2sb
+from .latent_i2sb import train_latent_i2sb

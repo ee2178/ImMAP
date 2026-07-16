@@ -1,0 +1,105 @@
+{
+    "task": "latent_i2sb",
+    "experiment": {
+        "name": "Latent_I2SB_T1ce"
+    },
+    "model": {
+        "type": "GroupCDL",
+        "params": {
+            "K": 8,
+            "M": 128,
+            "Mh": 64,
+            "W": 35,
+            "dK": 5,
+            "C": 128,
+            "sc": 2,
+            "P": 7,
+            "flex_block_size": 128,
+            "attn_backend": "flex",
+            "sim_fun": "distance",
+            "fenchel": false,
+            "is_complex": false,
+            "init": true
+        }
+    },
+    "dicts": {
+        "joint_dict_config": "trained_nets/brats/GroupCDL_Dict_Joint/config.json",
+        "t1ce_dict_config": "trained_nets/brats/GroupCDL_Dict_T1ce/config.json"
+    },
+    "i2sb": {
+        "bridge_type": "brownian",
+        "tau": 0.19,
+        "n_points": 1000,
+        "bridge_shape": "constant",
+        "beta_max": 0.3,
+        "ot_ode": false,
+        "parameterization": "x0",
+        "conditional": true,
+        "ema_decay": 0.99,
+        "val_mode": "single_pass",
+        "val_seed": 1234,
+        "val_nfe": 20,
+        "target_channels": 1,
+        "decode_dc": "x1_mean"
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/Latent_I2SB_T1ce",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "i2sb",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [0, 1, 3],
+            "scales": [2.0, 2.0, 2.0, 2.0],
+            "image_key": "img",
+            "crop_size": 192,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "i2sb",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [0, 1, 3],
+            "scales": [2.0, 2.0, 2.0, 2.0],
+            "image_key": "img",
+            "center_crop": 192,
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 300,
+        "steps_per_epoch": 1750,
+        "val_every_epochs": 5,
+        "clip_grad": 1.0,
+        "backtrack_thresh": 0.5,
+        "backtrack_factor": 0.9,
+        "use_mask": true,
+        "loss_type": "complex-mse",
+        "psnr_only": false
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 1.0e-3
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-5,
+            "T_max": 525000
+        }
+    },
+    "wandb": {
+        "project": "contrast-synthesis",
+        "id": null
+    }
+}
