@@ -23,6 +23,13 @@ conda activate env      # Replace with your actual env name
 
 cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
 
+# flex_attention JIT-compiles Triton kernels on the FIRST iteration (looks like a "freeze" at
+# step 0 -- it is compiling, not hung). Point the Inductor/Triton caches at PERSISTENT scratch so
+# that compile is paid ONCE, not every job: the default lands in job-ephemeral
+# /state/partition1/job-*/torchinductor_* and is wiped when the job ends, so every job recompiles.
+export TORCHINDUCTOR_CACHE_DIR=/scratch/ee2178/.cache/torchinductor
+export TRITON_CACHE_DIR=/scratch/ee2178/.cache/triton
+
 # Latent-I2SB "step 3": trains a NEW GroupCDL to bridge joint-latent -> T1ce-latent, with the
 # loss in the T1ce IMAGE domain. Requires steps 1 & 2 (config/BraTS/groupcdl_dict_joint.json,
 # groupcdl_dict_t1ce.json) to have finished -- their saved config.json + net.ckpt are loaded

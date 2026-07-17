@@ -82,6 +82,15 @@ class I2SBDataset(Dataset):
         # img_raw preserves the true inter-contrast intensities and needs save_raw_image: true.
         self.image_key = str(getattr(cfg, "image_key", "img"))
 
+        # bridge prior x1: "contrast" -> stored channel x1_idx (default T1); "synth" -> the
+        # precomputed e2e synthesis output (h5 dataset `yhat_key`, from synth_precompute.py) for the
+        # yhat -> T1ce bridge. yhat is stored in the "img" (z-scored) space and gets scales[x0_idx]
+        # applied below, exactly like x0, so the two share a scale.
+        self.x1_source = str(getattr(cfg, "x1_source", "contrast"))
+        self.yhat_key = str(getattr(cfg, "yhat_key", "yhat"))
+        if self.x1_source not in ("contrast", "synth"):
+            raise ValueError(f"x1_source must be 'contrast' or 'synth', got {self.x1_source!r}")
+
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
 
@@ -142,7 +151,17 @@ class I2SBDataset(Dataset):
             return torch.from_numpy(np.ascontiguousarray(np.transpose(a, (2, 0, 1)), dtype=np.float32))
 
         x0 = chw(img[..., [self.x0_idx]])                 # (1, H, W)
-        x1 = chw(img[..., [self.x1_idx]])                 # (1, H, W)
+        if self.x1_source == "synth":
+            if self.yhat_key not in h:
+                raise KeyError(
+                    f"'{self.yhat_key}' not in {self.img_paths[fi]} (keys={list(h.keys())}). Run "
+                    f"datasets/BraTS/synth_precompute.py first, or set x1_source='contrast'.")
+            yhat = np.asarray(h[self.yhat_key][li]).astype(np.float32)   # (H, W) z-scored, unscaled
+            if self.scales is not None:
+                yhat = yhat / float(self.scales[self.x0_idx])           # match x0's per-contrast scale
+            x1 = torch.from_numpy(np.ascontiguousarray(yhat[None]))     # (1, H, W)
+        else:
+            x1 = chw(img[..., [self.x1_idx]])             # (1, H, W)  stored contrast (default T1)
         cond = chw(img[..., self.cond_idx]) if self.cond_idx else torch.zeros(0, *img.shape[:2])
         mask = chw(mask)                                  # (1, H, W)
 
