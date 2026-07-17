@@ -58,6 +58,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.utils as vutils
 from tqdm import tqdm
 
@@ -115,6 +116,28 @@ def _apply_loss(loss_fn, target, pred, mask, use_mask, sigma):
     return loss_fn(target, pred, sigma)
 
 
+def _combine_loss(loss_fn, loss_mode, latent_weight, image_weight,
+                  z0, z0_hat, x0, pred_x0, mask, use_mask, sigma):
+    """Latent-I2SB training loss. The reverse posterior lives in the latent, so R must predict the
+    latent endpoint z0: an image-only loss leaves z0_hat free in the decoder's (huge) null space
+    (z0_hat decodes to x0 yet is ~orthogonal to z0), and the sampler then collapses. Modes:
+      'latent' -- MSE(z0_hat, z0), UNMASKED over the full code (the fix; the bridge noise is added
+                  unmasked, so the whole code is the relevant population).
+      'image'  -- the registry loss on the decoded image, masked (legacy; under-determined).
+      'mixed'  -- latent_weight * latent + image_weight * image.
+    NOTE the two terms live on very different scales (code std ~O(0.05) vs image std ~O(0.5), so raw
+    image MSE is ~100x the latent MSE); in 'mixed' weight the latent term up so it is not swamped.
+    Metrics and visualizations always use the decoded image regardless of mode."""
+    if loss_mode not in ("latent", "image", "mixed"):
+        raise ValueError(f"loss_mode {loss_mode!r} must be 'latent', 'image', or 'mixed'.")
+    total = z0_hat.new_zeros(())
+    if loss_mode in ("latent", "mixed"):
+        total = total + latent_weight * F.mse_loss(z0_hat, z0)
+    if loss_mode in ("image", "mixed"):
+        total = total + image_weight * _apply_loss(loss_fn, x0, pred_x0, mask, use_mask, sigma)
+    return total
+
+
 def _split_batch(batch, device):
     """Batch is (x0, x1, cond, mask). cond must be non-empty (the joint dictionary is
     conditioned on FLAIR/T1/T2), so unlike train_i2sb we keep it as a tensor."""
@@ -129,13 +152,21 @@ def _split_batch(batch, device):
 # ---------------------------------------------------------------------------
 # frozen-dictionary loading
 # ---------------------------------------------------------------------------
-def _load_frozen_dict(config_path, device):
+def _load_frozen_dict(config_path, device, backend=None):
     """Rebuild a trained GroupCDL dictionary from its SAVED config.json (which carries
-    init=false and paths.ckpt), load its weights, freeze, eval, and compile flex if used."""
+    init=false and paths.ckpt), load its weights, freeze, eval, and compile flex if used.
+
+    `backend` overrides the saved config's attn_backend. GroupCDL's weights are backend-agnostic
+    (attn_backend only changes HOW the circulant attention is applied, not the parameters), so a
+    dict trained on "flex" can be run on "gather" — the pure-eager path that needs NO torch.compile.
+    Set backend="gather" to skip flex's first-iteration Triton compile (big win interactively);
+    leave None to keep the trained backend (compiled flex is faster once warm)."""
     net = load_model(config_path, device=device)          # build_model + load ckpt + eval()
     for p in net.parameters():
         p.requires_grad_(False)
     net.eval()
+    if backend is not None:
+        net.attn_backend = backend
     if getattr(net, "attn_backend", None) == "flex":
         net.compile_flex()
     return net
@@ -252,6 +283,7 @@ def train_latent_i2sb(
     # ---- frozen dictionaries (cfg["dicts"]) ----
     joint_dict_config=None,          # path to trained_nets/.../GroupCDL_Dict_Joint/config.json
     t1ce_dict_config=None,           # path to trained_nets/.../GroupCDL_Dict_T1ce/config.json
+    dict_backend=None,               # None = keep trained backend; "gather" = compile-free eager
     # ---- generic loop (cfg["training"]) ----
     num_epochs=300,
     steps_per_epoch=200,
@@ -260,7 +292,10 @@ def train_latent_i2sb(
     backtrack_thresh=0.5,
     backtrack_factor=0.9,
     use_mask=True,
-    loss_type="complex-mse",         # any key in training.losses.LOSS_REGISTRY
+    loss_type="complex-mse",         # image-loss key in training.losses.LOSS_REGISTRY (image/mixed)
+    loss_mode="latent",              # "latent" (MSE on z0) | "image" | "mixed"
+    latent_weight=1.0,               # weight on the z0 MSE term (latent / mixed)
+    image_weight=1.0,                # weight on the decoded-image loss term (image / mixed)
     psnr_only=False,
     # ---- I2SB method (cfg["i2sb"]) ----
     bridge_type="brownian",
@@ -292,18 +327,21 @@ def train_latent_i2sb(
                          "(paths to each frozen dictionary's saved config.json).")
     if loss_type not in LOSS_REGISTRY:
         raise ValueError(f"loss_type {loss_type!r} not in LOSS_REGISTRY {sorted(LOSS_REGISTRY)}.")
+    if loss_mode not in ("latent", "image", "mixed"):
+        raise ValueError(f"loss_mode {loss_mode!r} must be 'latent', 'image', or 'mixed'.")
     loss_fn = LOSS_REGISTRY[loss_type]
 
     R.to(device)
     R.train()
 
     # ---- frozen convolutional dictionaries ----
-    D_joint = _load_frozen_dict(joint_dict_config, device)
-    D_t1ce = _load_frozen_dict(t1ce_dict_config, device)
+    D_joint = _load_frozen_dict(joint_dict_config, device, backend=dict_backend)
+    D_t1ce = _load_frozen_dict(t1ce_dict_config, device, backend=dict_backend)
     M = D_joint.M
     print(f"[latent-i2sb] dicts: joint C={D_joint.C} M={D_joint.M} sc={D_joint.sc} | "
-          f"t1ce C={D_t1ce.C} M={D_t1ce.M} sc={D_t1ce.sc} | R C={R.C} M={R.M} "
-          f"| conditional={conditional} loss={loss_type}")
+          f"t1ce C={D_t1ce.C} M={D_t1ce.M} sc={D_t1ce.sc} | R C={R.C} M={R.M} attn={R.attn_backend} "
+          f"| dict_attn={D_joint.attn_backend} conditional={conditional} "
+          f"loss={loss_mode}(img={loss_type}, λz={latent_weight}, λx={image_weight})")
     _assert_latent_shapes(D_joint, R, D_t1ce, train_loader, target_channels, conditional)
 
     # LATENT bridge schedule. tau/std_sb are now in latent units -- almost certainly needs
@@ -351,8 +389,9 @@ def train_latent_i2sb(
 
             opt.zero_grad()
             z0_hat = latent_regress(R, zt, cond_lat, std_fwd, M)    # (B, M, Q1, Q2)
-            pred_x0 = decode(D_t1ce, z0_hat, dc=_decode_dc(x1, decode_dc))   # (B, 1, N1, N2)
-            loss = _apply_loss(loss_fn, x0, pred_x0, mask, use_mask, std_fwd)
+            pred_x0 = decode(D_t1ce, z0_hat, dc=_decode_dc(x1, decode_dc))   # (B, 1, N1, N2) for metrics
+            loss = _combine_loss(loss_fn, loss_mode, latent_weight, image_weight,
+                                 z0, z0_hat, x0, pred_x0, mask, use_mask, std_fwd)
 
             loss.backward()
             if clip_grad is not None:
@@ -412,7 +451,8 @@ def train_latent_i2sb(
                 D_joint, R, D_t1ce, ema, bridge, val_loader, device, M=M, interval=interval,
                 loss_fn=loss_fn, val_mode=val_mode, val_seed=val_seed, use_mask=use_mask,
                 ot_ode=ot_ode, conditional=conditional, decode_dc=decode_dc, val_nfe=val_nfe,
-                psnr_only=psnr_only, wandb=wandb, global_step=global_step,
+                psnr_only=psnr_only, loss_mode=loss_mode, latent_weight=latent_weight,
+                image_weight=image_weight, wandb=wandb, global_step=global_step,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -424,7 +464,7 @@ def train_latent_i2sb(
 @torch.no_grad()
 def _validate(D_joint, R, D_t1ce, ema, bridge, val_loader, device, *, M, interval, loss_fn,
               val_mode, val_seed, use_mask, ot_ode, conditional, decode_dc, val_nfe, psnr_only,
-              wandb, global_step):
+              loss_mode, latent_weight, image_weight, wandb, global_step):
     """Validate with EMA weights on R. Two modes mirror train_i2sb:
       "single_pass" -- one random latent-bridge step, one latent regression + decode (matches
                        training; cheap). "full_recon" -- the val_nfe-step latent reverse bridge
@@ -445,6 +485,8 @@ def _validate(D_joint, R, D_t1ce, ema, bridge, val_loader, device, *, M, interva
                                           conditional=conditional, M=M, nfe=val_nfe,
                                           ot_ode=ot_ode, decode_dc=decode_dc, verbose=False)
                 sigma = torch.zeros(bs, 1, 1, 1, device=device)     # end-to-end: no single step
+                # full_recon has no single z0_hat -> report the image-domain recon error regardless
+                # of loss_mode (this is the end-to-end quality the LR scheduler should track).
                 loss = _apply_loss(loss_fn, x0, pred, mask, use_mask, sigma)
                 xt, step = x1, None
             else:  # single_pass
@@ -456,7 +498,8 @@ def _validate(D_joint, R, D_t1ce, ema, bridge, val_loader, device, *, M, interva
                 std_fwd = get_std_fwd(bridge, step, xdim=z0.shape[1:])
                 z0_hat = latent_regress(R, zt, cond_lat, std_fwd, M)
                 pred = decode(D_t1ce, z0_hat, dc=_decode_dc(x1, decode_dc))
-                loss = _apply_loss(loss_fn, x0, pred, mask, use_mask, std_fwd)
+                loss = _combine_loss(loss_fn, loss_mode, latent_weight, image_weight,
+                                     z0, z0_hat, x0, pred, mask, use_mask, std_fwd)
                 xt = x1  # for display: latent zt is not an image; show the prior instead
 
             x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)

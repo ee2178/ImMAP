@@ -24,7 +24,8 @@
     },
     "dicts": {
         "joint_dict_config": "trained_nets/brats/GroupCDL_Dict_Joint/config.json",
-        "t1ce_dict_config": "trained_nets/brats/GroupCDL_Dict_T1ce/config.json"
+        "t1ce_dict_config": "trained_nets/brats/GroupCDL_Dict_T1ce/config.json",
+        "dict_backend": null
     },
     "i2sb": {
         "bridge_type": "brownian",
@@ -83,6 +84,9 @@
         "backtrack_factor": 0.9,
         "use_mask": true,
         "loss_type": "complex-mse",
+        "loss_mode": "latent",
+        "latent_weight": 1.0,
+        "image_weight": 1.0,
         "psnr_only": false
     },
     "optimizer": {
