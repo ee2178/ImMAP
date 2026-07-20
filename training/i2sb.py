@@ -31,7 +31,8 @@ from tqdm import tqdm
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask
+from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, snr_loss_weight
+from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
 from physics.bbridge import build_bridge, n_steps
 from diffusion.i2sb import (
@@ -82,6 +83,24 @@ def masked_mse(pred, target, organ_mask, use_mask):
     return F.mse_loss(pred, target)
 
 
+def _apply_loss(loss_fn, target, pred, organ_mask, use_mask, sigma):
+    """Mask (optionally) then evaluate a training.losses registry loss. Registry convention is
+    loss_fn(target, pred, sigma) (see train_denoiser); masked complex-mse reproduces masked_mse.
+    NOTE: for a perceptual loss (e.g. vgg-feature) use parameterization="x0" so the loss sees IMAGES
+    (pred_x0 vs x0); with "eps" the loss is on the scaled-residual target, where VGG is meaningless."""
+    target, pred = apply_loss_mask(target, pred, organ_mask, use_mask)
+    return loss_fn(target, pred, sigma)
+
+
+def _x0_weighted_mse(x0, pred_x0, mask, use_mask, std_fwd, loss_weight):
+    """Per-sample masked x0-MSE reweighted by snr_loss_weight(sigma_t) -- the item-3 t-weighting.
+    'snr' reproduces the I2SB eps objective as an x0 loss (toward t=0); 't1' biases toward t=1. This
+    is MSE-based, so it bypasses loss_type (VGG etc.); use it with parameterization='x0'."""
+    tgt, prd = apply_loss_mask(x0, pred_x0, mask, use_mask)
+    per_sample = ((prd - tgt).abs() ** 2).flatten(1).mean(dim=1)          # (B,) per-sample MSE
+    return (snr_loss_weight(std_fwd, loss_weight) * per_sample).mean()
+
+
 def _split_batch(batch, device):
     """Batch is (x0, x1, cond, mask). cond may have 0 channels (conditioning off) -> None."""
     x0, x1, cond, mask = batch
@@ -108,6 +127,8 @@ def train_i2sb(
     backtrack_thresh=0.5,
     backtrack_factor=0.9,
     use_mask=True,
+    loss_type="complex-mse",         # any key in training.losses.LOSS_REGISTRY (e.g. "vgg-feature")
+    loss_weight="uniform",           # per-sample t-weighting: "uniform" | "snr" (~t=0) | "t1" (~t=1)
     psnr_only=False,
     # ---- I2SB method (cfg["i2sb"]) ----
     bridge_type="brownian",          # "brownian" (tau-parameterized) or "i2sb" (paper baseline)
@@ -131,6 +152,15 @@ def train_i2sb(
 ):
     net.to(device)
     net.train()
+
+    if loss_type not in LOSS_REGISTRY:
+        raise ValueError(f"loss_type {loss_type!r} not in LOSS_REGISTRY {sorted(LOSS_REGISTRY)}.")
+    loss_fn = LOSS_REGISTRY[loss_type]
+    # loss_weight reweights the x0 loss by sigma_t; "eps" already bakes in the 1/sigma^2 weight, so
+    # combining the two would double-count -- require x0 parameterization for an explicit weight.
+    if loss_weight != "uniform" and parameterization != "x0":
+        raise ValueError(f"loss_weight={loss_weight!r} needs parameterization='x0' (eps already "
+                         f"carries the SNR weight); got {parameterization!r}.")
 
     # bridge schedule toggle: "brownian" = tau-parameterized (t(1-t) or paper profile), "i2sb" =
     # the faithful paper schedule (symmetric quadratic betas via beta_max) for baseline comparison.
@@ -181,10 +211,12 @@ def train_i2sb(
 
             if parameterization == "x0":
                 pred_x0 = out
-                loss = masked_mse(pred_x0, x0, mask, use_mask)
+                loss = (_apply_loss(loss_fn, x0, pred_x0, mask, use_mask, std_fwd)
+                        if loss_weight == "uniform"
+                        else _x0_weighted_mse(x0, pred_x0, mask, use_mask, std_fwd, loss_weight))
             elif parameterization == "eps":
                 label = compute_label(bridge, step, x0, xt)
-                loss = masked_mse(out, label, mask, use_mask)
+                loss = _apply_loss(loss_fn, label, out, mask, use_mask, std_fwd)
                 pred_x0 = compute_pred_x0(bridge, step, xt, out)
             else:
                 raise ValueError(f"Unknown parameterization {parameterization!r}")
@@ -248,7 +280,8 @@ def train_i2sb(
                 net, ema, bridge, val_loader, device, interval=interval, val_mode=val_mode, val_seed = val_seed,
                 use_mask=use_mask, ot_ode=ot_ode, parameterization=parameterization,
                 clip_denoise=clip_denoise, val_nfe=val_nfe, target_channels=target_channels,
-                psnr_only=psnr_only, wandb=wandb, global_step=global_step,
+                psnr_only=psnr_only, loss_fn=loss_fn, loss_weight=loss_weight,
+                wandb=wandb, global_step=global_step,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -278,7 +311,7 @@ def _assert_cond_matches_model(net, loader, device, target_channels):
 @torch.no_grad()
 def _validate(net, ema, bridge, val_loader, device, *, interval, val_mode, val_seed, 
                 use_mask, ot_ode, parameterization, clip_denoise, val_nfe, 
-                target_channels, psnr_only, wandb, global_step):
+                target_channels, psnr_only, loss_fn, loss_weight, wandb, global_step):
     """Validate with EMA weights. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -305,7 +338,8 @@ def _validate(net, ema, bridge, val_loader, device, *, interval, val_mode, val_s
                     parameterization=parameterization, clip_denoise=clip_denoise,
                     target_channels=target_channels, log_count=1, verbose=False,
                 )
-                loss = masked_mse(pred, x0, mask, use_mask)
+                sigma_v = torch.zeros(bs, 1, 1, 1, device=device)   # end-to-end: no single step
+                loss = _apply_loss(loss_fn, x0, pred, mask, use_mask, sigma_v)
                 xt, step = x1, None
             else:  # single_pass: one random step, one forward (same as a training step)
                 step = torch.randint(0, interval, (bs,), generator=gen, device=device)
@@ -314,10 +348,12 @@ def _validate(net, ema, bridge, val_loader, device, *, interval, val_mode, val_s
                 out = cdlnet_pred(net, xt, std_fwd, cond=cond, target_channels=target_channels)
                 if parameterization == "x0":
                     pred = out
-                    loss = masked_mse(pred, x0, mask, use_mask)
+                    loss = (_apply_loss(loss_fn, x0, pred, mask, use_mask, std_fwd)
+                            if loss_weight == "uniform"
+                            else _x0_weighted_mse(x0, pred, mask, use_mask, std_fwd, loss_weight))
                 else:
                     label = compute_label(bridge, step, x0, xt)
-                    loss = masked_mse(out, label, mask, use_mask)
+                    loss = _apply_loss(loss_fn, label, out, mask, use_mask, std_fwd)
                     pred = compute_pred_x0(bridge, step, xt, out)
 
             x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)

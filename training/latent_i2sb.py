@@ -65,7 +65,8 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from operators import Identity
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, load_model
+from training.common import (save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, load_model,
+                             snr_loss_weight)
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
 from physics.bbridge import build_bridge, n_steps, space_indices
@@ -116,7 +117,7 @@ def _apply_loss(loss_fn, target, pred, mask, use_mask, sigma):
     return loss_fn(target, pred, sigma)
 
 
-def _combine_loss(loss_fn, loss_mode, latent_weight, image_weight,
+def _combine_loss(loss_fn, loss_mode, latent_weight, image_weight, loss_weight,
                   z0, z0_hat, x0, pred_x0, mask, use_mask, sigma):
     """Latent-I2SB training loss. The reverse posterior lives in the latent, so R must predict the
     latent endpoint z0: an image-only loss leaves z0_hat free in the decoder's (huge) null space
@@ -127,14 +128,29 @@ def _combine_loss(loss_fn, loss_mode, latent_weight, image_weight,
       'mixed'  -- latent_weight * latent + image_weight * image.
     NOTE the two terms live on very different scales (code std ~O(0.05) vs image std ~O(0.5), so raw
     image MSE is ~100x the latent MSE); in 'mixed' weight the latent term up so it is not swamped.
-    Metrics and visualizations always use the decoded image regardless of mode."""
+    `loss_weight` != 'uniform' reweights EACH SAMPLE by snr_loss_weight(sigma_t) ('t1' -> emphasize
+    t=1) and is MSE-based, so it bypasses loss_type. Metrics/visualizations stay image-domain."""
     if loss_mode not in ("latent", "image", "mixed"):
         raise ValueError(f"loss_mode {loss_mode!r} must be 'latent', 'image', or 'mixed'.")
+
+    if loss_weight == "uniform":                              # batch-reduced registry losses
+        total = z0_hat.new_zeros(())
+        if loss_mode in ("latent", "mixed"):
+            total = total + latent_weight * F.mse_loss(z0_hat, z0)
+        if loss_mode in ("image", "mixed"):
+            total = total + image_weight * _apply_loss(loss_fn, x0, pred_x0, mask, use_mask, sigma)
+        return total
+
+    # per-sample sigma_t weighting (MSE-based): weight each sample's loss by snr_loss_weight
+    w = snr_loss_weight(sigma, loss_weight)                   # (B,)
     total = z0_hat.new_zeros(())
     if loss_mode in ("latent", "mixed"):
-        total = total + latent_weight * F.mse_loss(z0_hat, z0)
+        lat = ((z0_hat - z0) ** 2).flatten(1).mean(dim=1)     # (B,) per-sample latent MSE (unmasked)
+        total = total + latent_weight * (w * lat).mean()
     if loss_mode in ("image", "mixed"):
-        total = total + image_weight * _apply_loss(loss_fn, x0, pred_x0, mask, use_mask, sigma)
+        tgt, prd = apply_loss_mask(x0, pred_x0, mask, use_mask)
+        img = ((prd - tgt) ** 2).flatten(1).mean(dim=1)       # (B,) per-sample image MSE
+        total = total + image_weight * (w * img).mean()
     return total
 
 
@@ -296,6 +312,7 @@ def train_latent_i2sb(
     loss_mode="latent",              # "latent" (MSE on z0) | "image" | "mixed"
     latent_weight=1.0,               # weight on the z0 MSE term (latent / mixed)
     image_weight=1.0,                # weight on the decoded-image loss term (image / mixed)
+    loss_weight="uniform",           # per-sample t-weighting: "uniform" | "snr" (~t=0) | "t1" (~t=1)
     psnr_only=False,
     # ---- I2SB method (cfg["i2sb"]) ----
     bridge_type="brownian",
@@ -390,7 +407,7 @@ def train_latent_i2sb(
             opt.zero_grad()
             z0_hat = latent_regress(R, zt, cond_lat, std_fwd, M)    # (B, M, Q1, Q2)
             pred_x0 = decode(D_t1ce, z0_hat, dc=_decode_dc(x1, decode_dc))   # (B, 1, N1, N2) for metrics
-            loss = _combine_loss(loss_fn, loss_mode, latent_weight, image_weight,
+            loss = _combine_loss(loss_fn, loss_mode, latent_weight, image_weight, loss_weight,
                                  z0, z0_hat, x0, pred_x0, mask, use_mask, std_fwd)
 
             loss.backward()
@@ -452,7 +469,7 @@ def train_latent_i2sb(
                 loss_fn=loss_fn, val_mode=val_mode, val_seed=val_seed, use_mask=use_mask,
                 ot_ode=ot_ode, conditional=conditional, decode_dc=decode_dc, val_nfe=val_nfe,
                 psnr_only=psnr_only, loss_mode=loss_mode, latent_weight=latent_weight,
-                image_weight=image_weight, wandb=wandb, global_step=global_step,
+                image_weight=image_weight, loss_weight=loss_weight, wandb=wandb, global_step=global_step,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -464,7 +481,7 @@ def train_latent_i2sb(
 @torch.no_grad()
 def _validate(D_joint, R, D_t1ce, ema, bridge, val_loader, device, *, M, interval, loss_fn,
               val_mode, val_seed, use_mask, ot_ode, conditional, decode_dc, val_nfe, psnr_only,
-              loss_mode, latent_weight, image_weight, wandb, global_step):
+              loss_mode, latent_weight, image_weight, loss_weight, wandb, global_step):
     """Validate with EMA weights on R. Two modes mirror train_i2sb:
       "single_pass" -- one random latent-bridge step, one latent regression + decode (matches
                        training; cheap). "full_recon" -- the val_nfe-step latent reverse bridge
@@ -498,7 +515,7 @@ def _validate(D_joint, R, D_t1ce, ema, bridge, val_loader, device, *, M, interva
                 std_fwd = get_std_fwd(bridge, step, xdim=z0.shape[1:])
                 z0_hat = latent_regress(R, zt, cond_lat, std_fwd, M)
                 pred = decode(D_t1ce, z0_hat, dc=_decode_dc(x1, decode_dc))
-                loss = _combine_loss(loss_fn, loss_mode, latent_weight, image_weight,
+                loss = _combine_loss(loss_fn, loss_mode, latent_weight, image_weight, loss_weight,
                                      z0, z0_hat, x0, pred, mask, use_mask, std_fwd)
                 xt = x1  # for display: latent zt is not an image; show the prior instead
 

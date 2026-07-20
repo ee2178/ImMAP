@@ -193,6 +193,29 @@ def apply_loss_mask(image, recon, organ_mask, use_mask):
     return image, recon
 
 
+def snr_loss_weight(std_fwd, mode="uniform"):
+    """Per-sample I2SB loss weight as a function of the forward std sigma_t = std_fwd, normalized to
+    batch-mean 1 (so the loss scale, and thus LR / backtrack_thresh, stays comparable across modes):
+
+        "uniform" -> 1
+        "snr"     -> 1 / sigma_t^2   (emphasize LOW sigma_t ~ t=0; == the eps objective's implicit
+                                      weight -- parameterization="eps" is the numerically stabler route)
+        "t1"      -> sigma_t^2       (emphasize HIGH sigma_t ~ t=1; trains the initial reverse steps)
+
+    std_fwd: (B, ...) or (B,) tensor of per-sample sigma_t. Returns a (B,) weight.
+    """
+    s2 = (std_fwd.reshape(std_fwd.shape[0], -1)[:, 0] ** 2).clamp_min(1e-12)   # (B,) sigma_t^2
+    if mode == "uniform":
+        return torch.ones_like(s2)
+    if mode == "snr":
+        w = 1.0 / s2
+    elif mode == "t1":
+        w = s2
+    else:
+        raise ValueError(f"loss_weight must be 'uniform', 'snr', or 't1'; got {mode!r}")
+    return w / w.mean().clamp_min(1e-12)
+
+
 def prepare_measurement(
     image, kspace, mask, smaps,
     kspace_type,
