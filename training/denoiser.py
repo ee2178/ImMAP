@@ -68,15 +68,19 @@ def train_denoiser(
         for _ in range(steps_per_epoch):
             try:
                 # Grab next batch, only returns batched image
-                gt = next(train_iter)
+                batch = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                gt = next(train_iter)
-            # Send to GPU
-            gt = gt.to(device, non_blocking = True)
+                batch = next(train_iter)
+            # bridge-sample datasets pre-noise ch0 and return (noisy, clean, sigma); everything else
+            # returns one clean image that awgn() noises here.
+            if isinstance(batch, (list, tuple)):
+                noisy, gt, sigma = (b.to(device, non_blocking=True) for b in batch)
+            else:
+                gt = batch.to(device, non_blocking=True)
+                noisy, sigma = awgn(gt, noise_std, dist=noise_dist)
 
             opt.zero_grad()
-            noisy, sigma = awgn(gt, noise_std, dist=noise_dist)
 
             # UNet variants need a different I/O format. Short term cheat:
             if net.__class__.__name__ in ("Unet", "NormUnet"):
@@ -181,15 +185,13 @@ def train_denoiser(
             n_samples = 0
 
             with torch.no_grad():
-                for gt_v in val_loader:
-                    gt_v = gt_v.to(device, non_blocking=True)
+                for batch_v in val_loader:
+                    if isinstance(batch_v, (list, tuple)):        # bridge-sample: (noisy, clean, sigma)
+                        noisy_v, gt_v, sigma_v = (b.to(device, non_blocking=True) for b in batch_v)
+                    else:
+                        gt_v = batch_v.to(device, non_blocking=True)
+                        noisy_v, sigma_v = awgn(gt_v, noise_std, dist=noise_dist)
                     batch_size = gt_v.shape[0]
-
-                    noisy_v, sigma_v = awgn(
-                        gt_v,
-                        noise_std,
-                        dist=noise_dist,
-                    )
 
                     # Forward
                     if net.__class__.__name__ in ["Unet", "NormUnet"]:

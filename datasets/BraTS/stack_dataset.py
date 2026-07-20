@@ -59,19 +59,24 @@ class ContrastStackDataset(Dataset):
         if self.ch0 not in ("bridge", "x0", "x1"):
             raise ValueError(f"ch0 must be 'bridge', 'x0' or 'x1', got {self.ch0!r}")
 
+        # bridge_sample: ch0 becomes a bridge SAMPLE (mean + std_sb(k)*noise) with CLEAN cond, and
+        # the net conditions on std_fwd(k) -- aligning the dict with the I2SB bridge state it sees at
+        # inference. False (default, legacy) = noiseless mean, and train_denoiser's awgn adds the noise.
+        self.bridge_sample = bool(getattr(cfg, "bridge_sample", False))
         if self.ch0 == "bridge":
-            # tau is left at build_bridge's default on purpose: it cancels out of mu_x0/mu_x1
-            # (see module docstring). It must stay nonzero -- tau=0 zeros every beta and mu
-            # goes 0/0 -- so do not "clean this up" by passing tau=0.
+            # tau NOW matters when bridge_sample=True (it sets the absolute std_sb / std_fwd); it still
+            # cancels out of mu_x0 / mu_x1, so the legacy noiseless-mean path is unaffected by it.
             sched = build_bridge(
                 bridge_type=str(getattr(cfg, "bridge_type", "brownian")),
                 n_points=int(getattr(cfg, "n_points", 1000)),
                 device="cpu",
+                tau=float(getattr(cfg, "tau", 0.19)),
                 shape=str(getattr(cfg, "bridge_shape", "constant")),
                 beta_max=float(getattr(cfg, "beta_max", 0.3)),
             )
             # mu_x0 + mu_x1 == 1 (Gaussian-product coefficients), so this is a convex mix.
             self.mu_x0, self.mu_x1 = sched.mu_x0, sched.mu_x1
+            self.std_sb, self.std_fwd = sched.std_sb, sched.std_fwd   # used only when bridge_sample
             self.n_points = n_steps(sched)
 
     def __len__(self):
@@ -84,7 +89,16 @@ class ContrastStackDataset(Dataset):
             # torch RNG, not numpy: the DataLoader reseeds torch per worker but numpy's global
             # seed is shared, which would repeat the same steps across workers.
             k = int(torch.randint(self.n_points, (1,)))
-            ch0 = self.mu_x0[k] * x0 + self.mu_x1[k] * x1
+            mean = self.mu_x0[k] * x0 + self.mu_x1[k] * x1           # noiseless bridge mean at step k
+            if self.bridge_sample:
+                # input: bridge SAMPLE in ch0 (noise on ch0 only) + CLEAN cond; target: the mean +
+                # clean cond; the net conditions on std_fwd(k). Same step k for mean and noise.
+                noisy_ch0 = mean + self.std_sb[k] * torch.randn_like(mean)
+                noisy = torch.cat([noisy_ch0, cond], dim=0)          # network input
+                clean = torch.cat([mean, cond], dim=0)               # denoising target
+                sigma = self.std_fwd[k].reshape(1, 1, 1)             # conditioning sigma (I2SB fwd std)
+                return noisy, clean, sigma
+            ch0 = mean
         else:
             ch0 = x0 if self.ch0 == "x0" else x1
 

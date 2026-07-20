@@ -1,0 +1,100 @@
+{
+    "task": "denoiser",
+    "experiment": {
+        "name": "GroupCDL_Dict_Joint_Bridge"
+    },
+    "model": {
+        "type": "GroupCDL",
+        "params": {
+            "K": 8,
+            "M": 64,
+            "Mh": 32,
+            "W": 35,
+            "dK": 5,
+            "C": 4,
+            "sc": 2,
+            "P": 7,
+            "flex_block_size": 128,
+            "attn_backend": "flex",
+            "sim_fun": "distance",
+            "fenchel": false,
+            "is_complex": false,
+            "init": true
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/GroupCDL_Dict_Joint_Bridge",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "contrast_stack",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [0, 1, 3],
+            "ch0": "bridge",
+            "bridge_sample": true,
+            "bridge_type": "brownian",
+            "tau": 0.19,
+            "n_points": 1000,
+            "bridge_shape": "constant",
+            "beta_max": 0.3,
+            "scales": [2.0, 2.0, 2.0, 2.0],
+            "image_key": "img",
+            "crop_size": 128,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "contrast_stack",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [0, 1, 3],
+            "ch0": "bridge",
+            "bridge_sample": true,
+            "bridge_type": "brownian",
+            "tau": 0.19,
+            "n_points": 1000,
+            "bridge_shape": "constant",
+            "beta_max": 0.3,
+            "scales": [2.0, 2.0, 2.0, 2.0],
+            "image_key": "img",
+            "center_crop": 128,
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 300,
+        "steps_per_epoch": 500,
+        "val_every_epochs": 10,
+        "noise_std": [0.0, 0.4],
+        "noise_dist": "uniform",
+        "loss_type": "complex-mse",
+        "clip_grad": 5.0e-2,
+        "backtrack_thresh": 0.025,
+        "backtrack_factor": 0.9,
+        "psnr_only": true
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 5.0e-4
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 2.0e-6,
+            "T_max": 150000
+        }
+    },
+    "wandb": {
+        "project": "contrast-synthesis",
+        "id": null
+    }
+}
