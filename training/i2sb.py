@@ -1,18 +1,16 @@
 """
-I2SB training loop for a CDLNet denoiser. Same skeleton as train_synthesis (epoch =
-steps_per_epoch gradient steps, averaged-loss backtracking, checkpoint-on-improvement,
-wandb logging) but the step is the Schrodinger-bridge regression:
+I2SB training loop for a denoiser regressor (CDLNet, GroupCDL, ...). Same skeleton as
+train_synthesis (epoch = steps_per_epoch gradient steps, averaged-loss backtracking,
+checkpoint-on-improvement, wandb logging) but the step is the Schrodinger-bridge regression:
 
     x0, x1, cond  <- batch          (x0=T1ce target, x1=T1 prior, cond=FLAIR/T1/T2)
     step ~ U{0..interval-1}
-    xt = q_sample(step, x0, x1)                                   # bridge interpolant
-    out = CDLNet(cat[xt, cond]; sigma = std_fwd(step))[:, :1]     # denoise xt
-    loss = MSE(out, x0)               (parameterization="x0",  in the T1ce domain)
-         | MSE(out, (xt-x0)/std_fwd)  (parameterization="eps", faithful Eq 12)
+    xt = forward_sample(step, x0, x1)                            # bridge interpolant
+    out = net(cat[xt, cond]; sigma = forward_std(step))[:, :1]   # predict the clean endpoint x0
+    loss = MSE(out, x0)                                          # in the T1ce domain
 
-An EMA of the weights is maintained (I2SB relies on it for sample quality) and used for the
-validation sampling pass. The schedule design lives in physics/bbridge.py and the bridge
-algorithm functions in diffusion/i2sb.py; this file only drives them.
+The schedule design lives in sb/base.py and the bridge algorithm helpers there too; this file only
+drives them. The network always predicts x0 directly (the only parameterization).
 
 Conditioning is a single toggle: set the data loader's `cond_idx` and the model's `C` together
 (C == 1 + len(cond_idx)). We assert they agree so a mismatch fails loudly rather than silently
@@ -21,7 +19,6 @@ mis-slicing channels.
 
 import os
 import math
-from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -34,46 +31,9 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, snr_loss_weight
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
-from physics.bbridge import build_bridge, n_steps
-from diffusion.i2sb import (
-    cdlnet_pred, i2sb_sample, q_sample, compute_label, compute_pred_x0, get_std_fwd,
-)
+from sb.base import build_schedule, n_steps, forward_sample, forward_std, predict_x0
+from sb.i2sb import i2sb_sample
 from visualization.filters import get_filter_grids
-
-
-# ---------------------------------------------------------------------------
-# EMA (tiny; avoids a torch_ema dependency). Shadows the module's Parameters in place,
-# so load_ckpt's in-place load during backtracking keeps the references valid.
-# ---------------------------------------------------------------------------
-class EMA:
-    def __init__(self, parameters, decay):
-        self.decay = decay
-        self.params = [p for p in parameters if p.requires_grad]
-        self.shadow = [p.detach().clone() for p in self.params]
-
-    @torch.no_grad()
-    def update(self):
-        for s, p in zip(self.shadow, self.params):
-            s.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
-
-    @contextmanager
-    def average_parameters(self):
-        backup = [p.detach().clone() for p in self.params]
-        for p, s in zip(self.params, self.shadow):
-            p.data.copy_(s)
-        try:
-            yield
-        finally:
-            for p, b in zip(self.params, backup):
-                p.data.copy_(b)
-
-    def state_dict(self):
-        return {"decay": self.decay, "shadow": self.shadow}
-
-    def load_state_dict(self, sd):
-        self.decay = sd["decay"]
-        for s, v in zip(self.shadow, sd["shadow"]):
-            s.copy_(v.to(s.device))
 
 
 def masked_mse(pred, target, organ_mask, use_mask):
@@ -86,8 +46,8 @@ def masked_mse(pred, target, organ_mask, use_mask):
 def _apply_loss(loss_fn, target, pred, organ_mask, use_mask, sigma):
     """Mask (optionally) then evaluate a training.losses registry loss. Registry convention is
     loss_fn(target, pred, sigma) (see train_denoiser); masked complex-mse reproduces masked_mse.
-    NOTE: for a perceptual loss (e.g. vgg-feature) use parameterization="x0" so the loss sees IMAGES
-    (pred_x0 vs x0); with "eps" the loss is on the scaled-residual target, where VGG is meaningless."""
+    The network predicts x0 directly, so the loss always sees IMAGES (pred_x0 vs x0) and a
+    perceptual loss (e.g. vgg-feature) is meaningful."""
     target, pred = apply_loss_mask(target, pred, organ_mask, use_mask)
     return loss_fn(target, pred, sigma)
 
@@ -95,7 +55,7 @@ def _apply_loss(loss_fn, target, pred, organ_mask, use_mask, sigma):
 def _x0_weighted_mse(x0, pred_x0, mask, use_mask, std_fwd, loss_weight):
     """Per-sample masked x0-MSE reweighted by snr_loss_weight(sigma_t) -- the item-3 t-weighting.
     'snr' reproduces the I2SB eps objective as an x0 loss (toward t=0); 't1' biases toward t=1. This
-    is MSE-based, so it bypasses loss_type (VGG etc.); use it with parameterization='x0'."""
+    is MSE-based, so it bypasses loss_type (VGG etc.)."""
     tgt, prd = apply_loss_mask(x0, pred_x0, mask, use_mask)
     per_sample = ((prd - tgt).abs() ** 2).flatten(1).mean(dim=1)          # (B,) per-sample MSE
     return (snr_loss_weight(std_fwd, loss_weight) * per_sample).mean()
@@ -131,17 +91,15 @@ def train_i2sb(
     loss_weight="uniform",           # per-sample t-weighting: "uniform" | "snr" (~t=0) | "t1" (~t=1)
     psnr_only=False,
     # ---- I2SB method (cfg["i2sb"]) ----
-    bridge_type="brownian",          # "brownian" (tau-parameterized) or "i2sb" (paper baseline)
-    tau=0.19,                        # brownian: peak bridge-noise std; max std_fwd (sigma) = 2*tau
+    kind="brownian",                 # schedule: "brownian" (tau-parameterized) or "i2sb" (paper)
+    tau=0.19,                        # brownian: peak bridge-noise std; max forward_std (sigma) = 2*tau
     n_points=1000,                   # number of discrete bridge steps (paper's "interval")
-    bridge_shape="constant",         # brownian: "constant" (t(1-t)) or "symmetric" (paper profile)
     beta_max=0.3,                    # i2sb: peak-diffusivity knob of the faithful paper schedule
-    ot_ode=False,
-    parameterization="x0",
+    deterministic=False,             # drop the bridge / posterior noise (the OT-ODE limit)
+    posterior="ddpm",                # reverse update: "ddpm" (moving average) | "interpolant" (x1<->x0_hat)
     clip_denoise=False,
-    ema_decay=0.99,
     val_mode="single_pass",          # "single_pass" (one random-step denoise) or "full_recon"
-    val_seed = None,
+    val_seed=None,
     val_nfe=20,                      # only used when val_mode == "full_recon"
     target_channels=1,
     # ---- paths (cfg["paths"]) ----
@@ -156,30 +114,17 @@ def train_i2sb(
     if loss_type not in LOSS_REGISTRY:
         raise ValueError(f"loss_type {loss_type!r} not in LOSS_REGISTRY {sorted(LOSS_REGISTRY)}.")
     loss_fn = LOSS_REGISTRY[loss_type]
-    # loss_weight reweights the x0 loss by sigma_t; "eps" already bakes in the 1/sigma^2 weight, so
-    # combining the two would double-count -- require x0 parameterization for an explicit weight.
-    if loss_weight != "uniform" and parameterization != "x0":
-        raise ValueError(f"loss_weight={loss_weight!r} needs parameterization='x0' (eps already "
-                         f"carries the SNR weight); got {parameterization!r}.")
 
-    # bridge schedule toggle: "brownian" = tau-parameterized (t(1-t) or paper profile), "i2sb" =
-    # the faithful paper schedule (symmetric quadratic betas via beta_max) for baseline comparison.
-    # For a fully custom schedule, build your own betas -> physics.bbridge.bridge_schedule(betas).
-    bridge = build_bridge(bridge_type=bridge_type, n_points=n_points, device=device,
-                          tau=tau, shape=bridge_shape, beta_max=beta_max)
+    # bridge schedule: "brownian" = the constant t(1-t) Brownian bridge (tau = peak noise std),
+    # "i2sb" = the faithful paper schedule (mirrored-quadratic betas via beta_max). For a fully
+    # custom schedule, build your own betas -> sb.base.from_betas(betas).
+    bridge = build_schedule(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max, device=device)
     interval = n_steps(bridge)
-    ema = EMA(net.parameters(), decay=ema_decay)
 
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
-    ema_path = os.path.join(save_dir, "ema.pt")
 
-    # resume EMA alongside the model (main() already reloaded model/opt/sched via load_ckpt)
-    if start_epoch > 0 and os.path.exists(ema_path):
-        ema.load_state_dict(torch.load(ema_path, map_location=device))
-        print(f"[i2sb] resumed EMA from {ema_path}")
-
-    # sanity: conditioning channels must match CDLNet's input width (C = 1 + n_cond)
+    # sanity: conditioning channels must match the network's input width (C = 1 + n_cond)
     _assert_cond_matches_model(net, train_loader, device, target_channels)
 
     best_loss = float("inf")
@@ -200,26 +145,17 @@ def train_i2sb(
                 batch = next(train_iter)
             x0, x1, cond, mask = _split_batch(batch, device)
 
-            # ----- sample a bridge point and regress -----
+            # ----- sample a bridge point and regress the clean endpoint x0 -----
             b = x0.shape[0]
             step = torch.randint(0, interval, (b,), device=device)
-            xt = q_sample(bridge, step, x0, x1, ot_ode=ot_ode)
-            std_fwd = get_std_fwd(bridge, step, xdim=x0.shape[1:])   # (B,1,1,1) noise level
+            xt = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
+            std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])   # (B,1,1,1) noise level
 
             opt.zero_grad()
-            out = cdlnet_pred(net, xt, std_fwd, cond=cond, target_channels=target_channels)
-
-            if parameterization == "x0":
-                pred_x0 = out
-                loss = (_apply_loss(loss_fn, x0, pred_x0, mask, use_mask, std_fwd)
-                        if loss_weight == "uniform"
-                        else _x0_weighted_mse(x0, pred_x0, mask, use_mask, std_fwd, loss_weight))
-            elif parameterization == "eps":
-                label = compute_label(bridge, step, x0, xt)
-                loss = _apply_loss(loss_fn, label, out, mask, use_mask, std_fwd)
-                pred_x0 = compute_pred_x0(bridge, step, xt, out)
-            else:
-                raise ValueError(f"Unknown parameterization {parameterization!r}")
+            pred_x0 = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
+            loss = (_apply_loss(loss_fn, x0, pred_x0, mask, use_mask, std_fwd)
+                    if loss_weight == "uniform"
+                    else _x0_weighted_mse(x0, pred_x0, mask, use_mask, std_fwd, loss_weight))
 
             loss.backward()
             if clip_grad is not None:
@@ -227,7 +163,6 @@ def train_i2sb(
             opt.step()
             # Important for our unrolled models
             if hasattr(net, "project"): net.project()
-            ema.update()
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
@@ -253,8 +188,6 @@ def train_i2sb(
             if os.path.exists(ckpt_path) and math.isfinite(best_loss):
                 net, opt, sched, _ = load_ckpt(ckpt_path, model=net, optimizer=opt,
                                                scheduler=sched, device=device)
-                if os.path.exists(ema_path):
-                    ema.load_state_dict(torch.load(ema_path, map_location=device))
                 new_lr = np.array(get_lr(opt)) * backtrack_factor
                 set_lr(opt, new_lr)
                 print("Updated LR:", new_lr)
@@ -263,7 +196,6 @@ def train_i2sb(
                                    f"(best_loss={best_loss}).")
         elif save_ckpt_fn and avg_loss < best_loss:
             save_ckpt_fn(ckpt_path, model=net, optimizer=opt, scheduler=sched, step=global_step)
-            torch.save(ema.state_dict(), ema_path)
             best_loss = avg_loss
 
         # ---- logging ----
@@ -274,14 +206,14 @@ def train_i2sb(
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 
-        # ---- validation: sample with EMA weights ----
+        # ---- validation ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
             val_loss = _validate(
-                net, ema, bridge, val_loader, device, interval=interval, val_mode=val_mode, val_seed = val_seed,
-                use_mask=use_mask, ot_ode=ot_ode, parameterization=parameterization,
-                clip_denoise=clip_denoise, val_nfe=val_nfe, target_channels=target_channels,
-                psnr_only=psnr_only, loss_fn=loss_fn, loss_weight=loss_weight,
-                wandb=wandb, global_step=global_step,
+                net, bridge, val_loader, device, interval=interval, val_mode=val_mode,
+                val_seed=val_seed, use_mask=use_mask, deterministic=deterministic,
+                posterior=posterior, clip_denoise=clip_denoise, val_nfe=val_nfe,
+                target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
+                loss_weight=loss_weight, wandb=wandb, global_step=global_step,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -291,7 +223,7 @@ def train_i2sb(
 
 
 def _assert_cond_matches_model(net, loader, device, target_channels):
-    """Peek one batch: CDLNet's input width self.C must equal target_channels + n_cond."""
+    """Peek one batch: the network's input width self.C must equal target_channels + n_cond."""
     n_cond = 0
     try:
         cond = next(iter(loader))[2]
@@ -302,22 +234,22 @@ def _assert_cond_matches_model(net, loader, device, target_channels):
     model_C = getattr(net, "C", None)
     if model_C is not None and model_C != expected_C:
         raise ValueError(
-            f"Conditioning/model mismatch: data provides {n_cond} cond channel(s) so CDLNet "
+            f"Conditioning/model mismatch: data provides {n_cond} cond channel(s) so the net "
             f"needs C={expected_C}, but model.C={model_C}. Set model.params.C = 1 + len(cond_idx) "
             f"(or cond_idx=[] and C=1 to disable conditioning)."
         )
 
 
 @torch.no_grad()
-def _validate(net, ema, bridge, val_loader, device, *, interval, val_mode, val_seed, 
-                use_mask, ot_ode, parameterization, clip_denoise, val_nfe, 
-                target_channels, psnr_only, loss_fn, loss_weight, wandb, global_step):
-    """Validate with EMA weights. Two modes:
+def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
+              use_mask, deterministic, posterior, clip_denoise, val_nfe,
+              target_channels, psnr_only, loss_fn, loss_weight, wandb, global_step):
+    """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
                                   cheap). Steps use a fixed seed so metrics are comparable epoch
                                   to epoch.
-      "full_recon"            -- run the full val_nfe-step DDPM sampler (end-to-end recon quality).
+      "full_recon"            -- run the full val_nfe-step reverse sampler (end-to-end recon).
     """
     net.eval()
     agg = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "nrmse": 0.0}
@@ -327,43 +259,36 @@ def _validate(net, ema, bridge, val_loader, device, *, interval, val_mode, val_s
         gen = torch.Generator(device=device).manual_seed(val_seed)   # fixed val steps -> comparable
     else:
         gen = None
-    with ema.average_parameters():
-        for batch in val_loader:
-            x0, x1, cond, mask = _split_batch(batch, device)
-            bs = x0.shape[0]
+    for batch in val_loader:
+        x0, x1, cond, mask = _split_batch(batch, device)
+        bs = x0.shape[0]
 
-            if val_mode == "full_recon":
-                pred, _, _ = i2sb_sample(
-                    net, x1, bridge, cond=cond, nfe=val_nfe, ot_ode=ot_ode,
-                    parameterization=parameterization, clip_denoise=clip_denoise,
-                    target_channels=target_channels, log_count=1, verbose=False,
-                )
-                sigma_v = torch.zeros(bs, 1, 1, 1, device=device)   # end-to-end: no single step
-                loss = _apply_loss(loss_fn, x0, pred, mask, use_mask, sigma_v)
-                xt, step = x1, None
-            else:  # single_pass: one random step, one forward (same as a training step)
-                step = torch.randint(0, interval, (bs,), generator=gen, device=device)
-                xt = q_sample(bridge, step, x0, x1, ot_ode=ot_ode)
-                std_fwd = get_std_fwd(bridge, step, xdim=x0.shape[1:])
-                out = cdlnet_pred(net, xt, std_fwd, cond=cond, target_channels=target_channels)
-                if parameterization == "x0":
-                    pred = out
-                    loss = (_apply_loss(loss_fn, x0, pred, mask, use_mask, std_fwd)
-                            if loss_weight == "uniform"
-                            else _x0_weighted_mse(x0, pred, mask, use_mask, std_fwd, loss_weight))
-                else:
-                    label = compute_label(bridge, step, x0, xt)
-                    loss = _apply_loss(loss_fn, label, out, mask, use_mask, std_fwd)
-                    pred = compute_pred_x0(bridge, step, xt, out)
+        if val_mode == "full_recon":
+            pred, _, _ = i2sb_sample(
+                net, x1, bridge, cond=cond, nfe=val_nfe, deterministic=deterministic,
+                posterior=posterior, clip_denoise=clip_denoise,
+                target_channels=target_channels, log_count=1, verbose=False,
+            )
+            sigma_v = torch.zeros(bs, 1, 1, 1, device=device)   # end-to-end: no single step
+            loss = _apply_loss(loss_fn, x0, pred, mask, use_mask, sigma_v)
+            xt, step = x1, None
+        else:  # single_pass: one random step, one forward (same as a training step)
+            step = torch.randint(0, interval, (bs,), generator=gen, device=device)
+            xt = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
+            std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
+            pred = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
+            loss = (_apply_loss(loss_fn, x0, pred, mask, use_mask, std_fwd)
+                    if loss_weight == "uniform"
+                    else _x0_weighted_mse(x0, pred, mask, use_mask, std_fwd, loss_weight))
 
-            x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
-            mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only)
-            agg["loss"] += float(loss) * bs
-            for k in ("psnr", "ssim", "nrmse"):
-                if k in mets:
-                    agg[k] += float(mets[k].detach()) * bs
-            n_samples += bs
-            last = (x1, xt, x0_m, pred_m, mask, step)
+        x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
+        mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only)
+        agg["loss"] += float(loss) * bs
+        for k in ("psnr", "ssim", "nrmse"):
+            if k in mets:
+                agg[k] += float(mets[k].detach()) * bs
+        n_samples += bs
+        last = (x1, xt, x0_m, pred_m, mask, step)
 
     mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
 

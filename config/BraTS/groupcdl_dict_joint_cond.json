@@ -1,7 +1,7 @@
 {
     "task": "denoiser",
     "experiment": {
-        "name": "GroupCDL_Dict_Joint_Bridge"
+        "name": "GroupCDL_Dict_Joint_Cond"
     },
     "model": {
         "type": "GroupCDL",
@@ -11,7 +11,7 @@
             "Mh": 32,
             "W": 35,
             "dK": 5,
-            "C": 4,
+            "C": 3,
             "sc": 2,
             "P": 7,
             "flex_block_size": 128,
@@ -23,7 +23,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/brats/GroupCDL_Dict_Joint_Bridge",
+        "save_dir": "trained_nets/brats/GroupCDL_Dict_Joint_Cond",
         "ckpt": null
     },
     "data": {
@@ -33,12 +33,7 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [0, 1, 3],
-            "ch0": "bridge",
-            "bridge_sample": true,
-            "kind": "brownian",
-            "tau": 0.19,
-            "n_points": 1000,
-            "beta_max": 0.3,
+            "ch0": "none",
             "scales": [2.0, 2.0, 2.0, 2.0],
             "image_key": "img",
             "crop_size": 128,
@@ -52,12 +47,7 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [0, 1, 3],
-            "ch0": "bridge",
-            "bridge_sample": true,
-            "kind": "brownian",
-            "tau": 0.19,
-            "n_points": 1000,
-            "beta_max": 0.3,
+            "ch0": "none",
             "scales": [2.0, 2.0, 2.0, 2.0],
             "image_key": "img",
             "center_crop": 128,

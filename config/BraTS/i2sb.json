@@ -18,15 +18,13 @@
         }
     },
     "i2sb": {
-        "bridge_type": "brownian",
+        "kind": "brownian",
         "tau": 0.19,
         "n_points": 1000,
-        "bridge_shape": "constant",
         "beta_max": 0.3,
-        "ot_ode": false,
-        "parameterization": "x0",
+        "deterministic": false,
+        "posterior": "ddpm",
         "clip_denoise": false,
-        "ema_decay": 0.99,
         "val_nfe": 20,
         "target_channels": 1
     },

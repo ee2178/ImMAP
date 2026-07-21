@@ -34,6 +34,8 @@ def build_contrast_stack_loader(root=None,
                                 n_points=1000,
                                 bridge_shape="constant",
                                 beta_max=0.3,
+                                tau=0.19,                 # absolute bridge-noise scale (bridge_sample only)
+                                bridge_sample=False,      # True -> ch0 is a bridge SAMPLE, cond stays clean
                                 center_crop=None,
                                 crop_size=None,
                                 random_flips=False,
@@ -49,7 +51,7 @@ def build_contrast_stack_loader(root=None,
         x0_idx=x0_idx, x1_idx=x1_idx, cond_idx=list(cond_idx), ch0=ch0,
         scales=scales, image_key=image_key,
         bridge_type=bridge_type, n_points=n_points, bridge_shape=bridge_shape,
-        beta_max=beta_max,
+        beta_max=beta_max, tau=tau, bridge_sample=bridge_sample,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
     )
     dataset = ContrastStackDataset(ds_cfg)

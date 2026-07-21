@@ -23,20 +23,18 @@
         }
     },
     "dicts": {
-        "joint_dict_config": "trained_nets/brats/GroupCDL_Dict_Joint/config.json",
+        "joint_dict_config": "trained_nets/brats/GroupCDL_Dict_Joint_Cond/config.json",
         "t1ce_dict_config": "trained_nets/brats/GroupCDL_Dict_T1ce/config.json",
         "dict_backend": null
     },
     "i2sb": {
-        "bridge_type": "brownian",
+        "kind": "brownian",
         "tau": 0.024,
         "n_points": 1000,
-        "bridge_shape": "constant",
         "beta_max": 0.3,
-        "ot_ode": false,
-        "parameterization": "x0",
-        "conditional": true,
-        "ema_decay": 0.99,
+        "deterministic": false,
+        "posterior": "ddpm",
+        "bridge_domain": "latent",
         "val_mode": "single_pass",
         "val_seed": 1234,
         "val_nfe": 20,
@@ -87,6 +85,8 @@
         "loss_mode": "latent",
         "latent_weight": 1.0,
         "image_weight": 1.0,
+        "loss_weight": "uniform",
+        "latent_loss": "l1",
         "psnr_only": false
     },
     "optimizer": {
