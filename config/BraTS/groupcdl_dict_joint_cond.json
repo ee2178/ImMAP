@@ -57,14 +57,14 @@
         }
     },
     "training": {
-        "num_epochs": 300,
-        "steps_per_epoch": 500,
-        "val_every_epochs": 10,
+        "num_epochs": 3000,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 100,
         "noise_std": [0.0, 0.4],
         "noise_dist": "uniform",
         "loss_type": "complex-mse",
         "clip_grad": 5.0e-2,
-        "backtrack_thresh": 0.025,
+        "backtrack_thresh": 100,
         "backtrack_factor": 0.9,
         "psnr_only": true
     },
@@ -82,7 +82,7 @@
         }
     },
     "wandb": {
-        "project": "contrast-synthesis",
+        "project": "schrodinger-bridge",
         "id": null
     }
 }

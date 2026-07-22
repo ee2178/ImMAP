@@ -1,17 +1,17 @@
 {
-    "task": "i2sb",
+    "task": "latent_i2sb",
     "experiment": {
-        "name": "I2SB_T1ce_from_T1"
+        "name": "Latent_I2SB_T1ce"
     },
     "model": {
         "type": "GroupCDL",
         "params": {
             "K": 8,
             "M": 64,
-            "Mh": 32,
+            "Mh": 64,
             "W": 35,
             "dK": 5,
-            "C": 4,
+            "C": 128,
             "sc": 2,
             "P": 7,
             "flex_block_size": 128,
@@ -22,19 +22,27 @@
             "init": true
         }
     },
+    "dicts": {
+        "joint_dict_config": "trained_nets/brats/GroupCDL_Dict_Joint_Cond/config.json",
+        "t1ce_dict_config": "trained_nets/brats/GroupCDL_Dict_T1ce/config.json",
+        "dict_backend": null
+    },
     "i2sb": {
         "kind": "brownian",
-        "tau": 0.19,
+        "tau": 0.024,
         "n_points": 1000,
         "beta_max": 0.3,
         "deterministic": false,
         "posterior": "ddpm",
-        "clip_denoise": false,
+        "bridge_domain": "latent",
+        "val_mode": "single_pass",
+        "val_seed": null,
         "val_nfe": 20,
-        "target_channels": 1
+        "target_channels": 1,
+        "decode_dc": "x1_mean"
     },
     "paths": {
-        "save_dir": "trained_nets/brats/I2SB_T1ce_from_T1",
+        "save_dir": "trained_nets/brats/Latent_I2SB_T1ce_LatentInferenceLatentBridge",
         "ckpt": null
     },
     "data": {
@@ -43,7 +51,7 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [],
+            "cond_idx": [0, 1, 3],
             "scales": [2.0, 2.0, 2.0, 2.0],
             "image_key": "img",
             "crop_size": 192,
@@ -56,9 +64,10 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [],
+            "cond_idx": [0, 1, 3],
             "scales": [2.0, 2.0, 2.0, 2.0],
             "image_key": "img",
+            "center_crop": 192,
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8
@@ -72,12 +81,18 @@
         "backtrack_thresh": 100,
         "backtrack_factor": 0.9,
         "use_mask": true,
+        "loss_type": "complex-mse",
+        "loss_mode": "mixed",
+        "latent_weight": 1.0,
+        "image_weight": 0.1,
+        "loss_weight": "uniform",
+        "latent_loss": "l1",
         "psnr_only": false
     },
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 5.0e-4
+            "lr": 1.0e-4
         }
     },
     "scheduler": {

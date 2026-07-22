@@ -17,7 +17,7 @@
 # Activate Conda environment
 
 source ~/.bashrc                   # Ensure conda is available
-conda activate env      # Replace with your actual env name
+conda activate gcdl      # Replace with your actual env name
 
 # Navigate to the directory containing train.py
 
@@ -28,7 +28,10 @@ cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
 # Keep M and sc identical across the two, or step 3 has no shared latent shape to bridge in.
 
 # step 2 -- T1ce dictionary        (C=1, cond_idx: [], ch0: "x0")
-python train.py config/BraTS/groupcdl_dict_t1ce.json
+# python train.py config/BraTS/groupcdl_dict_t1ce.json
 
-# step 1 -- joint dictionary       (C=4, cond_idx: [0,1,3], ch0: "bridge")
-# python train.py config/BraTS/groupcdl_dict_joint.json
+# step 1 -- joint dictionary       (C=3, takes in [T1 T2 FLAIR])
+python train.py config/BraTS/groupcdl_dict_joint_cond.json
+
+# train encoder for image domain bride (C = 4, takes in [x_t, T1, T2, FLAIR])
+# python train.py config/Brats/groupcdl_dict_joint_bridge.json
