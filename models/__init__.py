@@ -1,4 +1,5 @@
 from .cdlnet import CDLNet
+from .dt_cdlnet import DTCDLNet
 from .lpdsnet import LPDSNet
 from .difflpdsnet import DiffLPDSNet
 from .unet import Unet
@@ -16,6 +17,9 @@ def build_model(cfg):
 
     if model_type == "CDLNet":
         return CDLNet(**params)
+
+    elif model_type == "DTCDLNet":
+        return DTCDLNet(**params)
 
     elif model_type == "LPDSNet":
         return LPDSNet(**params)

@@ -14,6 +14,7 @@ from training import (
     train_ipalm,
     train_ccl,
     train_synthesis,
+    train_dt_synthesis,
     train_i2sb,
     train_latent_i2sb
 )
@@ -260,6 +261,21 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
+            **cfg["training"],
+            **cfg["paths"],
+            )
+    elif task == "dt_synthesis":
+        steps_per_epoch = cfg["training"]["steps_per_epoch"]
+
+        train_dt_synthesis(
+            net=model,
+            opt=optimizer,
+            sched=scheduler,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            wandb=wandb,
+            start_epoch=start_step // steps_per_epoch,
             **cfg["training"],
             **cfg["paths"],
             )
