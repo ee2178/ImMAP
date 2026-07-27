@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
 #SBATCH --time=48:00:00
-#SBATCH --job-name=LatentI2SB-BraTS-LatentInfImageBridge
+#SBATCH --job-name=LatentI2SB-BraTS-LatentInfLatentBridge
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%j.out
@@ -35,5 +35,5 @@ export TRITON_CACHE_DIR=/scratch/ee2178/.cache/triton
 # groupcdl_dict_t1ce.json) to have finished -- their saved config.json + net.ckpt are loaded
 # frozen via cfg["dicts"] in the config below.
 
-# python train.py config/BraTS/latent_inf_image_bridge.json
-python train.py config/BraTS/latent_inf_image_bridge.json
+python train.py config/BraTS/latent_inf_latent_bridge.json
+# python train.py config/BraTS/latent_inf_img_bridge.json

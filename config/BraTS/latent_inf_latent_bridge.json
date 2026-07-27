@@ -6,8 +6,8 @@
     "model": {
         "type": "GroupCDL",
         "params": {
-            "K": 8,
-            "M": 64,
+            "K": 30,
+            "M": 169,
             "Mh": 64,
             "W": 35,
             "dK": 5,

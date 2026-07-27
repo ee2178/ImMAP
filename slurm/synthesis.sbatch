@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
 #SBATCH --time=48:00:00
-#SBATCH --job-name=ContrastSynth-NoPretrain-BraTS
+#SBATCH --job-name=DT-CDLNet-ContrastSynth-NoPretrain-BraTS
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%j.out
@@ -22,5 +22,7 @@ conda activate env      # Replace with your actual env name
 # Navigate to the directory containing train.py
 
 cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
-python3 train.py config/BraTS/synthesis.json
+# python3 train.py config/BraTS/synthesis.json
 # python3 train.py config/BraTS/synthesis_nopretrain.json
+#
+python train.py config/BraTS/dt_synthesis.json

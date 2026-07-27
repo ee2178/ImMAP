@@ -6,8 +6,8 @@
     "model": {
         "type": "GroupCDL",
         "params": {
-            "K": 8,
-            "M": 64,
+            "K": 30,
+            "M": 169,
             "Mh": 32,
             "W": 35,
             "dK": 5,
@@ -43,7 +43,7 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [],
+            "cond_idx": [0, 1, 3],
             "scales": [2.0, 2.0, 2.0, 2.0],
             "image_key": "img",
             "crop_size": 192,
@@ -56,7 +56,7 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [],
+            "cond_idx": [0, 1, 3],
             "scales": [2.0, 2.0, 2.0, 2.0],
             "image_key": "img",
             "random_flips": false,

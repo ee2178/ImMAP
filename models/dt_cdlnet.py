@@ -47,7 +47,7 @@ from models.cdlnet import CDLNet
 from models.components import ST, ConvTranspose2d
 from operators.projections import uball_project
 from preprocessing.image import pre_process, post_process
-
+from operators import Identity
 
 class DTCDLNet(CDLNet):
     """CDLNet with two synthesis dictionaries (z -> y and z -> x) for domain transfer.
@@ -88,7 +88,7 @@ class DTCDLNet(CDLNet):
 
     def forward(self,
                 y,                    # Source-domain measurement
-                E,                    # Forward operator (Identity for pure transfer)
+                E = Identity(),       # Forward operator (Identity for pure transfer)
                 sigma=None,           # Noise level (optional; only if adaptive)
                 return_source=False,  # Also return the source reconstruction y_hat
                 ):

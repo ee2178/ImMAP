@@ -31,7 +31,7 @@ cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
 # python train.py config/BraTS/groupcdl_dict_t1ce.json
 
 # step 1 -- joint dictionary       (C=3, takes in [T1 T2 FLAIR])
-python train.py config/BraTS/groupcdl_dict_joint_cond.json
+# python train.py config/BraTS/groupcdl_dict_joint_cond.json
 
 # train encoder for image domain bride (C = 4, takes in [x_t, T1, T2, FLAIR])
-# python train.py config/Brats/groupcdl_dict_joint_bridge.json
+python train.py config/Brats/groupcdl_dict_joint_bridge.json
