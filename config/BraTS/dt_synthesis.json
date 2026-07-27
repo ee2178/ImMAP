@@ -12,6 +12,8 @@
             "s": 2,
             "C": 3,
             "Cx": 1,
+            "coupling": "additive",
+            "coupling_src_idx": 1,
             "t0": 1.0e-2,
             "adaptive": false,
             "complex": false,
