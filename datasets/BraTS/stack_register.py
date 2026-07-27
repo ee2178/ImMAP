@@ -27,12 +27,12 @@ def build_contrast_stack_loader(root=None,
                                 ch0="bridge",             # "bridge" | "x0" | "x1"
                                 scales=None,              # per-stored-channel divisors; None = ones
                                 image_key="img",          # "img" (zscore, signed) or "img_raw"
-                                # bridge knobs, used only when ch0 == "bridge". No tau: it
-                                # cancels out of the interpolant mean (see stack_dataset docs);
-                                # set the noise level via the training block's noise_std.
-                                bridge_type="brownian",
+                                # bridge knobs, used only when ch0 == "bridge". tau matters ONLY
+                                # when bridge_sample=True (it cancels out of the interpolant mean);
+                                # otherwise set the noise level via the training block's noise_std.
+                                kind=None,                # "brownian" | "i2sb" (sb.base.build_schedule)
+                                bridge_type=None,         # deprecated alias for `kind`
                                 n_points=1000,
-                                bridge_shape="constant",
                                 beta_max=0.3,
                                 tau=0.19,                 # absolute bridge-noise scale (bridge_sample only)
                                 bridge_sample=False,      # True -> ch0 is a bridge SAMPLE, cond stays clean
@@ -50,7 +50,7 @@ def build_contrast_stack_loader(root=None,
         root=root, manifest=manifest,
         x0_idx=x0_idx, x1_idx=x1_idx, cond_idx=list(cond_idx), ch0=ch0,
         scales=scales, image_key=image_key,
-        bridge_type=bridge_type, n_points=n_points, bridge_shape=bridge_shape,
+        kind=(kind or bridge_type or "brownian"), n_points=n_points,
         beta_max=beta_max, tau=tau, bridge_sample=bridge_sample,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
     )

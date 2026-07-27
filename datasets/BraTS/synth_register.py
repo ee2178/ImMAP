@@ -12,6 +12,8 @@ def build_synthesis_loader(root=None,
                            manifest=None,
                            input_idx=(1, 3, 0),     # T1, T2, FLAIR  (stored: flair,t1,t1ce,t2)
                            target_idx=(2,),         # T1ce
+                           center_crop=None,        # SynthesisDataset applies these jointly to
+                           crop_size=None,          # input+target; must be forwarded or they no-op
                            random_flips=False,
                            batch_size=16,
                            num_workers=8,
@@ -21,6 +23,7 @@ def build_synthesis_loader(root=None,
                            **unused):
     ds_cfg = SimpleNamespace(root=root, manifest=manifest,
                              input_idx=list(input_idx), target_idx=list(target_idx),
+                             center_crop=center_crop, crop_size=crop_size,
                              random_flips=random_flips)
     dataset = SynthesisDataset(ds_cfg)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
