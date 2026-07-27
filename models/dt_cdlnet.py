@@ -1,229 +1,230 @@
 """
-Domain-Transfer CDLNet (DT-CDLNet).
+Domain-Transfer CDLNet (DT-CDLNet): an unrolled FISTA network with an additive
+enhancement map delta-S.
 
-A convolutional-dictionary unrolled network for *domain transfer* (image-to-image
-translation between two acquisition contrasts / modalities), built directly on top
-of CDLNet.
+Model
+-----
+Paired (x, y) with only y observable at inference (y = source contrasts, x = target
+contrast). The target is the base synthesis plus a sparse, one-sided ENHANCEMENT map:
 
-Idea
-----
-CDLNet infers a sparse code z from a source measurement y by unrolled ISTA on the
-convolutional BPDN problem, then synthesizes the image with a single dictionary
-D = B[0] (z -> y). DT-CDLNet keeps that sparse-coding stage *unchanged* -- z is a
-shared, contrast-agnostic content code -- but decodes it into a DIFFERENT domain
-with a SECOND, independent synthesis dictionary:
+    x = D_{z->x} z + dS ,      dS >= 0
 
-    preprocess:  y~ = pre(E^H y)                     # source domain, mean-subtracted + padded
-    z^(0) = 0
-    for k = 0..K-1:                                  # identical to CDLNet
-        z^(k+1) = ST( z^(k) - A^(k)( E^H( E( B^(k) z^(k) ) - y~ ) ) ; t^(k) )
-    x_hat = post( Dx z^(K) )                         # z -> x   (TARGET domain)
-    y_hat = post( Dy z^(K) )   (optional)            # z -> y   (SOURCE domain)
+Training-time objective (x IS observed), jointly convex because the coupling
+[D_x  I][z; dS] is LINEAR, not bilinear -- which is why this is FISTA on a stacked
+variable rather than iPALM:
 
-So the two "separate dictionaries" are:
-  * Dy := B[0]  -- the z -> y (source) synthesis, already learned by the CDLNet
-                   sparse-coding stage and used inside the unrolling.
-  * Dx          -- a z -> x (target) synthesis.
+    min_{z, dS}  1/2 ||y - D_{z->y} z||_2^2  +  gamma/2 ||x - D_{z->x} z - dS||_2^2
+                 + lam ||z||_1  +  lam_S ||dS||_1  +  i_{>=0}(dS)
 
-`forward(..., return_source=True)` returns y_hat as well, for a source-reconstruction
-(cycle/consistency) loss alongside the target-transfer loss.
+Stacking w = [z; dS], K = [[D_y, 0], [sqrt(g) D_x, sqrt(g) I]], b = [y; sqrt(g) x], the
+smooth part is one quadratic and the nonsmooth part is block-separable:
 
-Coupling between the two dictionaries (`coupling`)
---------------------------------------------------
-"independent" (default)
-    Dx is a free dictionary, unrelated to Dy (warm-started as a copy of Dy when the
-    channel counts match, so training begins at an identity transfer).
+    prox_{eta g}(w) = [ soft_{eta lam}(z) ; max(dS - eta lam_S, 0) ]
 
-"additive"
-    Dx = Dy[:, src_idx] + delS : the target dictionary IS the source dictionary
-    (restricted to the source channel(s) `coupling_src_idx`) plus a learned
-    perturbation delS, initialized to ZERO. By linearity of the transposed
-    convolution this makes the target decode
+so one FISTA step (with inertia zbar^k = z^k + beta^k (z^k - z^{k-1})) is
 
-        x_hat = Dy[:, src_idx] z  +  delS z
-              = (reconstruction of the source channel)  +  (learned enhancement)
+    r_y = D_y z - y ,   r_x = D_x z + dS - x
+    z^{k+1}  = soft_{eta lam}( zbar^k - eta D_y^T r_y - eta gamma D_x^T r_x )
+    dS^{k+1} = ReLU( dS^k - eta_S gamma r_x - eta_S lam_S )
 
-    i.e. exactly the ADDITIVE image model  x = y_src + S,  with the enhancement map
-    S = delS z produced by a dedicated dictionary. For T1ce-from-T1 set
-    `coupling_src_idx` to the position of T1 in the source stack: the model then
-    predicts T1ce as its own T1 reconstruction plus S. delS = 0 at init, so training
-    starts from a pure copy of the source channel and only has to learn S.
+The obstruction, and the unrolling
+----------------------------------
+r_x contains x, which vanishes at inference. Expanding the dS step isolates exactly what
+is lost:
 
-    NOTE: because x_hat now depends on Dy, the TARGET loss also backpropagates into
-    Dy = B[0], which is part of the unrolled sparse-coding stage. That coupling is
-    the point, but it means the target loss shapes the source dictionary even when
-    lam_src = 0.
+    dS^k - eta_S gamma r_x = (1 - eta_S gamma) dS^k  +  eta_S gamma (x - D_x zbar^k)
+                             \_____ leak _____/        \___ enhancement residual ___/
 
-The target decode is un-padded and re-centered with the SOURCE mean/pad
-(post_process with the source params). That is exact for y_hat, and for x_hat under
-"additive" it is consistent for the Dy[:, src_idx] part (which lives in the source
-mean's frame); the residual DC of S is absorbed by delS.
+The leak is computable; ONLY the enhancement residual becomes a learned operator. In the
+z-branch the analogous unavailable piece is gamma D_x^T x, which we DROP (v1) -- so the
+z-branch is exactly CDLNet and the ablation baseline is this network with the dS branch
+removed. The unrolled layer:
+
+    r^k      = B^k zbar^k - y
+    z^{k+1}  = soft_{tau^k}( zbar^k - A^k r^k )
+    dS^{k+1} = ReLU( (1 - rho^k) dS^k + E^k z^{k+1} - tauS^k )
+    x_hat    = D_x z^K + dS^K
+
+E^k is a synthesis convolution (code -> target image) standing in for the enhancement
+residual; rho^k in [0,1] is a learned leak; tauS^k is a learned ReLU bias. The dS step uses
+z^{k+1} (not zbar^k) -- the Gauss-Seidel ordering PALM uses, which is free and strictly
+better information.
+
+Parameters: {A^k, B^k, tau^k, E^k, rho^k, tauS^k, beta^k} plus D_x -- one convolution and
+three scalars per layer over CDLNet.
+
+Initialization makes layer 0 an exact algorithm step: A^k = eta D_y^T, B^k = D_y (both from
+CDLNet's spectral init), E^k = eta_S gamma D_x, rho^k = eta_S gamma, tauS^k = eta_S lam_S,
+beta^k on the FISTA schedule.
+
+On rho0 (the step size eta_S gamma). For the ADDITIVE model L_dS = gamma exactly, so the
+prox-gradient step that jumps straight to the dS-subproblem optimum is eta_S = 1/gamma, i.e.
+rho = 1. That is mathematically the "exact" choice, but it sets the leak (1 - rho) to ZERO,
+which makes the dS branch MEMORYLESS: dS^{k+1} = ReLU(E^k z^{k+1} - tauS^k) depends only on
+the last layer, so E^0..E^{K-2} receive no gradient at initialization and sit unused unless
+rho later moves off 1. The default rho0 = 0.5 keeps the accumulator live so every layer's E^k
+contributes from step one; set rho0 = 1.0 if you want the literal one-step-to-optimum form.
+
+Known quirk inherited from CDLNet: z^0 = 0, so B^0 is applied to zero inside the loop and is
+inert there. In plain CDLNet B[0] doubles as the output dictionary D, but here the read-out
+uses D_x, so B[0] only gets gradient through the SOURCE reconstruction -- i.e. only when
+lam_src > 0. With lam_src = 0 it is effectively an unused parameter.
+
+Note on `gamma`
+---------------
+Once E^k and rho^k are untied and learnable, an explicit gamma is REDUNDANT -- it is
+absorbed into them. `learn_gamma=True` is still offered because it gives one interpretable
+"enhancement drive" scalar shared across layers: it multiplies BOTH the injection and the
+leak, preserving the algorithmic relation that each is proportional to eta_S gamma, while
+E^k carries only the shape. It is a no-op at initialization (gamma = 1).
+
+dS is one-sided (ReLU), so this model is REAL-valued only; a one-sided threshold has no
+meaning for complex codes.
 """
 
+import math
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from models.cdlnet import CDLNet
 from models.components import ST, ConvTranspose2d
 from operators.projections import uball_project
+from operators.padding import unpad
 from preprocessing.image import pre_process, post_process
 from operators import Identity
 
+
+def _fista_betas(K):
+    """The classical FISTA inertia schedule beta_k = (t_k - 1)/t_{k+1}, beta_0 = 0."""
+    betas, t = [], 1.0
+    for _ in range(K):
+        t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+        betas.append((t - 1.0) / t_next)
+        t = t_next
+    return torch.tensor(betas, dtype=torch.float32)
+
+
 class DTCDLNet(CDLNet):
-    """CDLNet with two synthesis dictionaries (z -> y and z -> x) for domain transfer.
+    """Unrolled FISTA for  x = D_x z + dS  with dS >= 0 sparse (see module docstring).
 
     Parameters
     ----------
-    K, M, P, s, C, t0, adaptive, init, complex
-        Passed straight through to :class:`CDLNet` -- these configure the shared
-        sparse-coding stage (analysis A, source synthesis B, thresholds t) exactly
-        as in a standard CDLNet. `C` is the number of SOURCE channels.
+    K, M, P, s, C, t0, adaptive, init
+        Passed to :class:`CDLNet` -- they configure the shared sparse-coding trunk
+        (analysis A, source synthesis B, thresholds t). `C` = number of SOURCE channels.
     Cx : int or None
-        Number of TARGET channels for the z -> x dictionary. Defaults to `C`
-        (same channel count in both domains, e.g. single-channel MRI contrasts).
-    coupling : {"independent", "additive"}
-        How the target dictionary relates to the source dictionary (see module docstring).
-        "independent" (default) keeps the original behaviour; "additive" parameterizes
-        Dx = Dy[:, coupling_src_idx] + delS with delS initialized to zero.
-    coupling_src_idx : int, list[int] or None
-        Only used when coupling="additive". Which SOURCE channel(s) of Dy the target is
-        anchored to, indexed in the order the network receives them (i.e. positions within
-        the loader's `input_idx`, NOT stored BraTS channel indices). Must have length `Cx`.
-        None means "all source channels" and then requires Cx == C.
-
-        Example: input_idx [0, 1, 3] feeds the net [FLAIR, T1, T2], so T1 is network
-        channel 1 -> coupling_src_idx = 1 for a T1ce = T1 + S model.
+        Number of TARGET channels (default `C`). The dS map has this many channels.
+    rho0 : float
+        Initial leak parameter rho^k = eta_S gamma, in [0, 1]. rho = 1 is the exact
+        one-step-to-optimum step size but makes the dS branch memoryless (only the last
+        layer's E^k matters, the rest start with zero gradient); the default 0.5 keeps the
+        accumulator live across layers. See the module docstring.
+    tauS0 : float
+        Initial ReLU bias tauS^k = eta_S lam_S. 0.0 = no thresholding at init.
+    momentum : bool
+        Learn the FISTA inertia beta^k (initialized to the classical schedule). False
+        pins beta = 0, giving an ISTA trunk.
+    learn_gamma, gamma0 : bool, float
+        Optional shared "enhancement drive" scalar; see the module docstring (redundant
+        with untied E/rho, and a no-op at gamma0 = 1).
     """
 
     def __init__(self, K=3, M=64, P=7, s=1, C=1, t0=0, adaptive=False,
-                 init=True, complex=True, Cx=None, coupling="independent",
-                 coupling_src_idx=None):
-        # Builds A, B, t and runs (spectral) init for the source sparse-coding stage.
-        super().__init__(K=K, M=M, P=P, s=s, C=C, t0=t0,
-                         adaptive=adaptive, init=init, complex=complex)
-
-        if coupling not in ("independent", "additive"):
+                 init=True, complex=False, Cx=None,
+                 rho0=0.5, tauS0=0.0, momentum=True, learn_gamma=False, gamma0=1.0):
+        if complex:
             raise ValueError(
-                f"coupling must be 'independent' or 'additive', got {coupling!r}")
-        self.Cx = C if Cx is None else Cx
-        self.coupling = coupling
+                "DTCDLNet is real-valued only: the dS branch uses a ONE-SIDED (ReLU) prox, "
+                "which has no meaning for complex codes. Build with complex=False.")
+        # Builds A, B, t and runs the (spectral) init for the source sparse-coding trunk.
+        super().__init__(K=K, M=M, P=P, s=s, C=C, t0=t0,
+                         adaptive=adaptive, init=init, complex=False)
 
-        # z -> y (source) decoder. B[0] already plays this role inside CDLNet, both
-        # in the unrolling and as the reconstruction dictionary; alias it as Dy.
+        self.Cx = C if Cx is None else Cx
+        self.momentum = bool(momentum)
+        self.learn_gamma = bool(learn_gamma)
+
+        # z -> y (source) synthesis: B[k] inside the unrolling; alias B[0] for readability.
         self.Dy = self.B[0]
 
-        if coupling == "independent":
-            # z -> x (target) decoder: a SEPARATE dictionary, independent of Dy.
-            self.Dx = ConvTranspose2d(M, self.Cx, P, stride=s, bias=False, complex=complex)
-            self.delS = None
-            self.src_idx = None
+        # z -> x (target) synthesis: the algorithm's D_x, applied once at read-out.
+        self.Dx = ConvTranspose2d(M, self.Cx, P, stride=s, bias=False, complex=False)
 
-            # Warm-start Dx from the (already spectrally-normalized) source dictionary
-            # when the channel counts match, so training begins at an identity transfer
-            # (x_hat == y_hat). If Cx != C the shapes differ, so we keep the default init.
-            if self.Cx == C:
-                self.Dx.weight = self.B[0].weight
-        else:
-            # Dx = Dy[:, src_idx] + delS. Dx is DERIVED, so there is no free target
-            # dictionary module; only the perturbation delS is a parameter.
-            self.src_idx = self._resolve_src_idx(coupling_src_idx, C)
-            self.Dx = None
-            self.delS = ConvTranspose2d(M, self.Cx, P, stride=s, bias=False, complex=complex)
-            # delS = 0 -> the model starts as an exact copy of the source channel(s),
-            # so it only ever has to learn the enhancement S on top of that.
-            self.delS.weight = torch.zeros_like(self.delS.weight)
+        # E^k: code -> target image, the learned surrogate for the enhancement residual.
+        self.E_S = nn.ModuleList([
+            ConvTranspose2d(M, self.Cx, P, stride=s, bias=False, complex=False)
+            for _ in range(K)
+        ])
+        # E^k = eta_S gamma D_x = rho0 * D_x  makes layer 0 an exact algorithm step.
+        for k in range(K):
+            self.E_S[k].weight = rho0 * self.Dx.weight
 
-    def _resolve_src_idx(self, coupling_src_idx, C):
-        """Validate/normalize the source-channel selector into a list of length Cx."""
-        if coupling_src_idx is None:
-            if self.Cx != C:
-                raise ValueError(
-                    f"coupling='additive' with coupling_src_idx=None couples ALL source "
-                    f"channels and so needs Cx == C, but Cx={self.Cx} and C={C}. Pass "
-                    f"coupling_src_idx (length Cx={self.Cx}) to pick which source "
-                    f"channel(s) the target is anchored to.")
-            return list(range(C))
+        self.rho = nn.Parameter(rho0 * torch.ones(K, 1, 1, 1))     # leak,       in [0, 1]
+        self.tauS = nn.Parameter(tauS0 * torch.ones(K, 1, 1, 1))   # ReLU bias,  >= 0
+        self.beta = nn.Parameter(_fista_betas(K).reshape(K, 1, 1, 1)) if self.momentum else None
+        self.gamma = nn.Parameter(torch.tensor(float(gamma0))) if self.learn_gamma else None
 
-        idx = [coupling_src_idx] if isinstance(coupling_src_idx, int) else list(coupling_src_idx)
-        if len(idx) != self.Cx:
-            raise ValueError(
-                f"coupling_src_idx must have length Cx={self.Cx}, got {len(idx)}: {idx}.")
-        if any((not isinstance(i, int)) or i < 0 or i >= C for i in idx):
-            raise ValueError(
-                f"coupling_src_idx entries must be ints in [0, C={C}), got {idx}. They index "
-                f"the SOURCE channels as fed to the network (positions within input_idx).")
-        return idx
-
-    @torch.no_grad()
-    def effective_target_weight(self):
-        """The z -> x dictionary actually applied, for inspection/visualization.
-        Detached (built from the `.weight` property, which returns `.data`)."""
-        if self.coupling == "independent":
-            return self.Dx.weight
-        return self.Dy.weight[:, self.src_idx] + self.delS.weight
-
+    # ------------------------------------------------------------------
     def forward(self,
-                y,                    # Source-domain measurement
-                E = Identity(),       # Forward operator (Identity for pure transfer)
-                sigma=None,           # Noise level (optional; only if adaptive)
-                return_source=False,  # Also return the source reconstruction y_hat
+                y,                    # source-domain measurement
+                E=Identity(),         # forward operator (Identity for pure transfer)
+                sigma=None,           # noise level (only used if adaptive)
+                return_source=False,  # also return the source reconstruction y_hat
                 ):
         EHy = E.H(y)
-
         yp, params = pre_process(EHy, self.s)
-
+        pad = params[1]                       # keep: post_process pops `params`
         c = 0 if sigma is None or not self.adaptive else sigma
 
-        # ------------------------------------------------------------------
-        # Shared sparse code z, inferred from the SOURCE measurement.
-        # This block is identical to CDLNet: the data term E^H(E(B z) - y~)
-        # lives in the source domain, so B is the z -> y synthesis.
-        # ------------------------------------------------------------------
         z = torch.zeros_like(self.A[0](yp))
+        z_prev = z
+        dS = None                             # lazily shaped from the first E^k decode
 
         for k in range(self.K):
-            z = ST(
-                z - self.A[k](E.H(E(self.B[k](z)) - yp)),
+            # FISTA inertia on the code
+            zbar = z if self.beta is None else z + self.beta[k] * (z - z_prev)
+
+            # ---- z-branch: exactly CDLNet (the dropped gamma D_x^T x term lives here) ----
+            z_next = ST(
+                zbar - self.A[k](E.H(E(self.B[k](zbar)) - yp)),
                 self.t[k, :1] + c * self.t[k, 1:2],
             )
 
-        # ------------------------------------------------------------------
-        # Decode the shared code into the TARGET domain (z -> x).
-        # pass a copy of params so post_process (which pops) can be reused below.
-        # ------------------------------------------------------------------
-        # The source decode is needed for y_hat, and also for the additive coupling.
-        y_dec = self.Dy(z) if (return_source or self.coupling == "additive") else None
+            # ---- dS-branch: leaky accumulator + one-sided threshold ----
+            # Gauss-Seidel: uses the JUST-updated z^{k+1}, not zbar^k.
+            inj = self.E_S[k](z_next)
+            rho = self.rho[k]
+            if self.gamma is not None:        # shared drive: both terms scale with eta_S gamma
+                inj = self.gamma * inj
+                rho = self.gamma * rho
+            dS = inj if dS is None else (1.0 - rho) * dS + inj
+            dS = F.relu(dS - self.tauS[k])
 
-        if self.coupling == "additive":
-            # Dx = Dy[:, src_idx] + delS, applied via LINEARITY of the transposed conv:
-            #   (Dy[:, src_idx] + delS) z  ==  Dy(z)[:, src_idx] + delS(z)
-            # (slicing output channels commutes with the conv). Doing it this way keeps
-            # autograd flowing into BOTH Dy and delS -- materializing the summed weight
-            # via the `.weight` property would detach it, since that property returns .data.
-            x_dec = y_dec[:, self.src_idx] + self.delS(z)
-        else:
-            x_dec = self.Dx(z)
+            z_prev, z = z, z_next
 
-        x_hat = post_process(x_dec, list(params))
+        # ---- read-out:  x_hat = D_x z^K + dS^K ----
+        x_hat = post_process(self.Dx(z) + dS, list(params))
+        dS_img = unpad(dS, pad)               # residual: unpad only, NO mean added back
 
         if return_source:
-            # Source reconstruction (z -> y) for a consistency / cycle loss.
-            y_hat = post_process(y_dec, list(params))
-            return x_hat, y_hat, z
+            y_hat = post_process(self.Dy(z), list(params))
+            return x_hat, dS_img, y_hat, z
+        return x_hat, dS_img, z
 
-        return x_hat, z
-
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def project(self):
         # Clamps thresholds t and projects A, B (hence Dy = B[0]) onto the unit ball.
         super().project()
-        if self.coupling == "independent":
-            # Apply the same unit-ball constraint to the independent target dictionary.
-            self.Dx.weight = uball_project(self.Dx.weight)
-        else:
-            # delS is not itself a dictionary -- the object that must stay on the unit ball
-            # is the EFFECTIVE target dictionary Dy[:, src_idx] + delS (same constraint set
-            # as the independent branch). Project it, then store the residual back in delS.
-            # Runs AFTER super().project(), so Dy is already normalized; at init delS = 0
-            # makes this an exact no-op.
-            Dy_src = self.Dy.weight[:, self.src_idx]
-            self.delS.weight = uball_project(Dy_src + self.delS.weight) - Dy_src
+        self.tauS.clamp_(0.0)                 # it is a threshold
+        self.rho.clamp_(0.0, 1.0)             # leak (1 - rho) must stay a convex weight
+        if self.beta is not None:
+            self.beta.clamp_(0.0, 1.0)        # FISTA inertia
+        if self.gamma is not None:
+            self.gamma.clamp_(0.0)
+        # D_x is a synthesis dictionary -> same unit-ball discipline as B. E^k is a learned
+        # surrogate operator (not a dictionary whose atoms set an ISTA step size), so it is
+        # left free -- constraining it would cap how strongly dS can be driven.
+        self.Dx.weight = uball_project(self.Dx.weight)
