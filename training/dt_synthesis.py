@@ -5,16 +5,22 @@ A thin variant of train_synthesis (training/synthesis.py). Same paired-data pipe
 (X = source contrast(s), y = target contrast, organ_mask), same backtracking / metrics /
 logging / checkpointing. Three differences, all forced by the CDLNet-family model:
 
-  1. Forward interface. DT-CDLNet is `x_hat, y_hat, z = net(X, E=Identity, return_source=True)`
-     (an unrolled model, not a plain `pred = net(X)`): x_hat is the z -> x TARGET decode,
-     y_hat is the z -> y SOURCE reconstruction from the same shared code z.
+  1. Forward interface. DT-CDLNet is
+     `x_hat, dS, y_hat, z = net(X, E=Identity, return_source=True)` (an unrolled model, not a
+     plain `pred = net(X)`): x_hat = D_x z^K + dS^K is the TARGET decode, dS is the additive
+     ENHANCEMENT map, y_hat is the z -> y SOURCE reconstruction from the same shared code z.
   2. Source-consistency term. loss = L(x_hat, y) + lam_src * L(y_hat, X). The second term
      supervises the source dictionary Dy = B[0] and the sparse-coding stage directly; set
-     lam_src = 0 to train the target path only. (This is also where the future additive
-     `delS` coupling will be exercised.)
+     lam_src = 0 (the default in the config) to train the target path only.
+     NOTE: dS is deliberately UNSUPERVISED -- no l1 penalty, no ET-mask term. The only
+     signal it gets is the image-domain loss on x_hat, so it is free to place enhancement
+     wherever that loss wants it. The two known failure modes (dS collapsing to 0, or dS
+     absorbing everything so the model degenerates to a generic residual connection) are
+     therefore invisible to the loss; the validation step logs dS's mean / active fraction
+     and an image panel so they stay visible to YOU.
   3. Projection. `net.project()` runs after every optimizer step to enforce the CDLNet
-     constraints (thresholds >= 0, dictionaries on the unit ball). train_synthesis omits
-     this because U-Nets are unconstrained; unrolled models require it.
+     constraints (thresholds >= 0, leak in [0,1], dictionaries on the unit ball).
+     train_synthesis omits this because U-Nets are unconstrained; unrolled models require it.
 
 DT-CDLNet is real-valued here (build with complex=False), matching the z-scored BraTS data.
 There is no CCL backbone to warm-start from, so this loop has no `pretrained` hook.
@@ -88,8 +94,9 @@ def train_dt_synthesis(
             organ_mask = organ_mask.to(device, non_blocking=True)
 
             opt.zero_grad()
-            # x_hat: (B, Cx, H, W) target decode;  y_hat: (B, C, H, W) source reconstruction
-            x_hat, y_hat, z = net(X, E=E, return_source=True)
+            # x_hat: (B, Cx, H, W) target decode;  dS: (B, Cx, H, W) enhancement map;
+            # y_hat: (B, C, H, W) source reconstruction
+            x_hat, dS, y_hat, z = net(X, E=E, return_source=True)
 
             # organ_mask is (B, 1, H, W) and broadcasts over channels
             y_t,  x_hat_m = apply_loss_mask(y, x_hat, organ_mask, use_mask)
@@ -152,14 +159,15 @@ def train_dt_synthesis(
         # ---- validation ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
             net.eval()
-            agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0, "src_loss": 0.0}
+            agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0, "src_loss": 0.0,
+                   "dS_mean": 0.0, "dS_active": 0.0, "base_psnr": 0.0}
             n_samples = 0
             with torch.no_grad():
                 for Xv, yv, organ_maskv in val_loader:
                     Xv = Xv.to(device, non_blocking=True)
                     yv = yv.to(device, non_blocking=True)
                     organ_maskv = organ_maskv.to(device, non_blocking=True)
-                    x_hat_v, y_hat_v, zv = net(Xv, E=E, return_source=True)
+                    x_hat_v, dS_v, y_hat_v, zv = net(Xv, E=E, return_source=True)
                     bs = Xv.shape[0]
 
                     yv_t, x_hat_vm = apply_loss_mask(yv, x_hat_v, organ_maskv, use_mask)
@@ -171,6 +179,19 @@ def train_dt_synthesis(
                     src_l = float(loss_fn(y_hat_vm, Xv_s, None).item())
                     mets["src_loss"] = src_l
                     mets["loss"] = float(loss_fn(x_hat_vm, yv_t, None).item()) + lam_src * src_l
+
+                    # ---- dS diagnostics (the loss cannot see these; you should) ----
+                    # dS_active ~ 0  -> the enhancement branch is dead (collapse to dS = 0).
+                    # dS_active ~ 1 with base_psnr low -> dS absorbed everything and the
+                    # decomposition is meaningless (generic residual connection).
+                    m_b = organ_maskv.bool().expand_as(dS_v) if use_mask else torch.ones_like(dS_v).bool()
+                    dS_in = dS_v[m_b]
+                    mets["dS_mean"] = float(dS_in.mean()) if dS_in.numel() else 0.0
+                    mets["dS_active"] = float((dS_in > 0).float().mean()) if dS_in.numel() else 0.0
+                    # base branch alone (D_x z, i.e. x_hat - dS) vs the TARGET: tells you
+                    # whether the base is really predicting pre-contrast anatomy.
+                    _, base_m = apply_loss_mask(yv, x_hat_v - dS_v, organ_maskv, use_mask)
+                    mets["base_psnr"] = float(compute_metrics(yv_t, base_m, psnr_only=True)["psnr"])
                     for k in agg:
                         if k in mets:
                             agg[k] += mets[k] * bs
@@ -181,20 +202,30 @@ def train_dt_synthesis(
             if wandb:
                 gt_img = yv_t[:1]; pred_img = x_hat_vm[:1]; in_img = Xv[:1, :1]
                 mask = organ_maskv[:1]
+                dS_img = (mask * dS_v[:1])                 # enhancement map, brain-masked
+                base_img = pred_img - dS_img               # D_x z alone (the base branch)
 
-                # Input(ch0) | target GT | target Pred, shared scale from input+GT
-                grid = torch.cat([in_img, gt_img, pred_img], dim=0)
-                grid = grid - grid[0:2].min(); grid = grid / grid[0:2].max().clamp(min=1e-8)
-                grid = mask * grid
+                # Source(ch0) | base D_x z | target Pred | target GT, shared scale from input+GT
+                grid = torch.cat([in_img, base_img, pred_img, gt_img], dim=0)
+                lo = grid[[0, 3]].min(); hi = grid[[0, 3]].max()
+                grid = mask * ((grid - lo) / (hi - lo).clamp(min=1e-8)).clamp(0, 1)
                 # Residual on its own scale
                 res = (gt_img - pred_img).abs()
                 res = res / res.max().clamp(min=1e-8)
+                # dS on ITS OWN scale (it is one-sided and usually small + sparse, so the
+                # shared window above would render it as flat black)
+                dS_show = dS_img / dS_img.max().clamp(min=1e-8)
 
                 wandb.log({
-                    "val/example": wandb.Image(vutils.make_grid(grid, nrow=3),
-                                               caption="Source(ch0) | Target GT | Target Pred"),
+                    "val/example": wandb.Image(
+                        vutils.make_grid(grid, nrow=4),
+                        caption="Source(ch0) | base D_x z | Pred (base + dS) | Target GT"),
                     "val/residual": wandb.Image(vutils.make_grid(res, nrow=1),
                                                 caption="| GT - Pred |"),
+                    "val/dS": wandb.Image(
+                        vutils.make_grid(dS_show, nrow=1),
+                        caption=f"enhancement map dS  (max={float(dS_img.max()):.3f}, "
+                                f"active={mean_metrics['dS_active']:.3f})"),
                     **{f"val/{k}": v for k, v in mean_metrics.items()},
                 }, step=global_step)
             else:
