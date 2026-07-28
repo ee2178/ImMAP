@@ -68,6 +68,24 @@ def index_img_from_root(root):
     return img_paths, n_slices
 
 
+def filter_by_key(img_paths, n_slices, key):
+    """Split an index into subjects whose h5 HAS `key` and those that don't.
+
+    Returns (kept_paths, kept_n_slices, dropped_paths). Checking up front costs one extra
+    open per subject and turns "crashes partway through epoch 3 on the one subject with no
+    segmentation" into a decision made before training starts.
+    """
+    keep_p, keep_n, dropped = [], [], []
+    for p, n in zip(img_paths, n_slices):
+        with h5py.File(p, "r") as f:
+            if key in f:
+                keep_p.append(p)
+                keep_n.append(n)
+            else:
+                dropped.append(p)
+    return keep_p, keep_n, dropped
+
+
 def index_img_from_manifest(manifest_csv):
     img_paths, n_slices = [], []
     with open(manifest_csv) as f:
@@ -131,6 +149,27 @@ class SynthesisDataset(Dataset):
             self.img_paths, n_slices = index_img_from_manifest(manifest)
         else:
             raise ValueError("SynthesisDataset needs cfg.root or cfg.manifest")
+
+        # Subjects with no segmentation nifti have no 'et' and never will -- BraTS ships a
+        # handful that way. Drop them here rather than raising from __getitem__ once the
+        # sampler happens to reach one: the message is useless mid-epoch, and one bad
+        # subject in several hundred should not decide whether the run happens.
+        if self.et_mask:
+            n_before = len(self.img_paths)
+            self.img_paths, n_slices, dropped = filter_by_key(self.img_paths, n_slices, "et")
+            if not self.img_paths:
+                raise KeyError(
+                    f"et_mask=True but NONE of the {n_before} subjects under {root or manifest} "
+                    f"have an 'et' dataset. Backfill them in place with: python "
+                    f"preprocessing/cmap.py --config config/BraTS/cmap.yaml --add-seg-only "
+                    f"--root <the root this config reads>")
+            if dropped:
+                names = [os.path.basename(os.path.dirname(p)) for p in dropped]
+                shown = ", ".join(names[:8]) + (" ..." if len(names) > 8 else "")
+                print(f"[SynthesisDataset] et_mask: excluded {len(dropped)}/{n_before} subject(s) "
+                      f"({len(dropped) / n_before:.1%}) with no 'et' in their h5: {shown}\n"
+                      f"[SynthesisDataset] these have no *_seg.nii.gz to derive ET from; supply "
+                      f"the missing segmentations and re-run the backfill to include them.")
 
         file_id, local = [], []
         for fi, n in enumerate(n_slices):

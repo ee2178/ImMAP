@@ -176,8 +176,10 @@ def train_dt_synthesis(
 
         # ---- logging ----
         if wandb and not nonfinite:
+            # see train_synthesis: et_share, not lam_et, is the tunable quantity
+            et_share = (lam_et * avg_et / avg_loss) if (lam_et and avg_loss) else 0.0
             wandb.log({"train/loss": avg_loss, "train/src_loss": avg_src,
-                       "train/et_loss": avg_et,
+                       "train/et_loss": avg_et, "train/et_share": et_share,
                        "train/lr": opt.param_groups[0]["lr"], "train/epoch": epoch,
                        **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
         elif not wandb:
@@ -261,6 +263,11 @@ def train_dt_synthesis(
                         vutils.make_grid(dS_show, nrow=1),
                         caption=f"enhancement map dS  (max={float(dS_img.max()):.3f}, "
                                 f"active={mean_metrics['dS_active']:.3f})"),
+                    # ET mask next to dS: the question this panel answers is whether the
+                    # enhancement the model produces lands where the tumor actually is.
+                    "val/et": wandb.Image(vutils.make_grid(etv[:1], nrow=1),
+                                          caption=f"ET mask (area frac "
+                                                  f"{mean_metrics['et_frac']:.5f})"),
                     **{f"val/{k}": v for k, v in mean_metrics.items()},
                 }, step=global_step)
             else:

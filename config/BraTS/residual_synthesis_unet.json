@@ -1,7 +1,7 @@
 {
     "task": "synthesis",
     "experiment": {
-        "name": "Residual_Unet_T1ce_minus_T1"
+        "name": "Residual_Unet_T1ce_minus_T1_ET"
     },
     "model": {
         "type": "Unet2D",
@@ -21,7 +21,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/brats/Residual_Unet_T1ce",
+        "save_dir": "trained_nets/brats/Residual_Unet_T1ce_ET",
         "ckpt": null
     },
     "data": {
@@ -30,7 +30,7 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
             "input_idx": [0, 1, 3],
             "target_idx": [2],
-            "scales": [2.0, 2.0, 2.0, 2.0],
+            "scales": [1.0, 1.0, 1.0, 1.0],
             "et_mask": true,
             "crop_size": 192,
             "random_flips": true,
@@ -42,7 +42,7 @@
             "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
             "input_idx": [0, 1, 3],
             "target_idx": [2],
-            "scales": [2.0, 2.0, 2.0, 2.0],
+            "scales": [1.0, 1.0, 1.0, 1.0],
             "et_mask": true,
             "random_flips": false,
             "batch_size": 16,

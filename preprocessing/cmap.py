@@ -378,24 +378,30 @@ def add_seg_to_existing(cases, subdir_path, cfg):
     cropped seg before anything is written; a mismatch means the h5 was made with different
     settings and the case is skipped rather than silently misaligned.
     """
-    n_ok = n_skip = n_fail = 0
+    reasons = {"ok": 0, "no_h5": 0, "already_had_et": 0, "no_seg_nifti": 0, "failed": 0}
+    first_err = None
+    # print the RESOLVED path once: the split dirs are symlink farms, so this is what tells
+    # you whether you are about to write the same files the training config reads.
+    print(f"  backfill target: {subdir_path}\n"
+          f"  resolves to    : {os.path.realpath(subdir_path)}\n"
+          f"  {len(cases)} case(s), et_labels={et_labels(cfg)}")
     for i, case in enumerate(cases):
         src_dir = os.path.join(subdir_path, case)
         img_path = os.path.join(out_dir_for(case, src_dir, cfg), f"{case}_img.h5")
         if not os.path.exists(img_path):
             print(f"[{i + 1}/{len(cases)}] {case}: no {os.path.basename(img_path)} -- skip")
-            n_skip += 1
+            reasons["no_h5"] += 1
             continue
         try:
             with h5py.File(img_path, "r+") as f:
                 if "et" in f and not cfg.overwrite_seg:
                     print(f"[{i + 1}/{len(cases)}] {case}: 'et' exists -- skip")
-                    n_skip += 1
+                    reasons["already_had_et"] += 1
                     continue
                 seg = load_seg(src_dir)
                 if seg is None:
-                    print(f"[{i + 1}/{len(cases)}] {case}: no *_seg.nii.gz -- skip")
-                    n_skip += 1
+                    print(f"[{i + 1}/{len(cases)}] {case}: no *_seg.nii.gz in {src_dir} -- skip")
+                    reasons["no_seg_nifti"] += 1
                     continue
                 seg = np.transpose(seg, (2, 0, 1))                  # (H,W,D) -> (D,H,W)
 
@@ -418,13 +424,37 @@ def add_seg_to_existing(cases, subdir_path, cfg):
                     f.create_dataset(key, data=data, chunks=(1,) + data.shape[1:],
                                      compression="gzip" if cfg.compress else None)
                 f.attrs["et_labels"] = np.asarray(labels, dtype=np.int16)
-            n_ok += 1
+            reasons["ok"] += 1
             print(f"[{i + 1}/{len(cases)}] {case}: +seg{seg.shape} +et "
                   f"(et fraction {float(et.mean()):.4f})")
         except Exception as e:
-            n_fail += 1
+            reasons["failed"] += 1
+            if first_err is None:
+                first_err = e
             print(f"[{i + 1}/{len(cases)}] {case}: FAILED ({type(e).__name__}: {e})")
-    print(f"  -> backfill done: ok={n_ok}, skipped={n_skip}, failed={n_fail}")
+
+    print("  -> backfill: " + ", ".join(f"{k}={v}" for k, v in reasons.items()))
+    if reasons["ok"] == 0 and reasons["already_had_et"] == 0:
+        # Exiting 0 here is how this silently "succeeded" while writing nothing, leaving the
+        # failure to surface much later as a KeyError inside the training loop. Fail loudly,
+        # at the point where the cause is still on screen.
+        hint = ""
+        if reasons["no_h5"]:
+            hint = ("No *_img.h5 under this path. Check data_root/train_subdir in the config, "
+                    "or pass --root with the directory your TRAINING config reads.")
+        elif reasons["no_seg_nifti"]:
+            hint = ("The case folders have no *_seg.nii.gz. Segmentations ship only with the "
+                    "BraTS training cohort -- confirm they were downloaded alongside the "
+                    "contrast volumes, and that et_labels matches this BraTS release.")
+        elif isinstance(first_err, OSError):
+            hint = ("h5py could not open the files read-write. On a networked filesystem this "
+                    "is usually HDF5 file locking: retry with HDF5_USE_FILE_LOCKING=FALSE set, "
+                    "and check the files are not read-only.")
+        elif isinstance(first_err, ValueError):
+            hint = ("Geometry mismatch: the seg does not line up with the stored images, so "
+                    "the h5 was written with different crop/slice settings than this config. "
+                    "Match crop_size / start_slice / end_slice to the generating run.")
+        raise SystemExit(f"ERROR: backfill wrote 0 files under {subdir_path}. {hint}")
 
 
 def write_manifest(subdir_path, rows, cfg):
@@ -444,6 +474,12 @@ def main():
                          "<case>_img.h5 files (see add_seg_to_existing)")
     ap.add_argument("--overwrite-seg", action="store_true",
                     help="with --add-seg-only, replace existing 'seg'/'et' datasets")
+    ap.add_argument("--root", action="append", default=None, metavar="DIR",
+                    help="with --add-seg-only: back-fill THIS directory instead of "
+                         "data_root/<train_subdir>. Repeatable. Give it the exact roots your "
+                         "TRAINING config reads (e.g. .../BraTS2021_DataSet_train and "
+                         "..._val) -- the config's train_subdir is the pre-split source, "
+                         "which is a different path even when the split dirs symlink into it.")
     args = ap.parse_args()
     cfg = load_config(args.config)
     cfg.overwrite_seg = args.overwrite_seg
@@ -451,23 +487,27 @@ def main():
     if cfg.repo_root:
         sys.path.insert(0, cfg.repo_root)
         os.chdir(cfg.repo_root)
-    from preprocessing.pca import pca_pixelwise as pca_fn
-    from solvers.tvd import tvd_fista as tvd_fn
-    from preprocessing.kmeans import minibatch_kmeans as kmeans_fn
-    fns = (pca_fn, tvd_fn, kmeans_fn)
 
-    cfg.device = torch.device(cfg.device)
+    # The backfill reads niftis and writes h5 -- no PCA/TVD/k-means, no GPU. Importing them
+    # anyway would make it fail on a login node for reasons unrelated to what it is doing.
+    fns = None
+    if not args.add_seg_only:
+        from preprocessing.pca import pca_pixelwise as pca_fn
+        from solvers.tvd import tvd_fista as tvd_fn
+        from preprocessing.kmeans import minibatch_kmeans as kmeans_fn
+        fns = (pca_fn, tvd_fn, kmeans_fn)
+        cfg.device = torch.device(cfg.device)
 
-    def run(subdir):
-        subdir_path = os.path.join(cfg.data_root, subdir)
+    def run(subdir_path):
+        if not os.path.isdir(subdir_path):
+            raise SystemExit(f"ERROR: not a directory: {subdir_path}")
         cases = cfg.cases if cfg.cases else sorted(
             d for d in os.listdir(subdir_path) if os.path.isdir(os.path.join(subdir_path, d)))
         if args.add_seg_only:
-            print(f"\n=== {subdir}: {len(cases)} subjects "
-                  f"(BACKFILL seg/et only, labels={et_labels(cfg)}) ===")
+            print(f"\n=== {subdir_path}: {len(cases)} subjects (BACKFILL seg/et only) ===")
             add_seg_to_existing(cases, subdir_path, cfg)
             return
-        print(f"\n=== {subdir}: {len(cases)} subjects "
+        print(f"\n=== {subdir_path}: {len(cases)} subjects "
               f"(K={cfg.n_clusters}, crop={cfg.crop_size}, save_image={cfg.save_image}, "
               f"in_place={cfg.output_root is None}) ===")
         rows = []
@@ -475,9 +515,15 @@ def main():
         if cfg.write_manifest:
             write_manifest(subdir_path, rows, cfg)
 
-    run(cfg.train_subdir)
-    if cfg.process_test:
-        run(cfg.test_subdir)
+    if args.root:
+        if not args.add_seg_only:
+            raise SystemExit("ERROR: --root is only supported with --add-seg-only.")
+        for r in args.root:
+            run(os.path.abspath(os.path.expanduser(r)))
+    else:
+        run(os.path.join(cfg.data_root, cfg.train_subdir))
+        if cfg.process_test:
+            run(os.path.join(cfg.data_root, cfg.test_subdir))
     print("\nAll done.")
 
 

@@ -155,9 +155,26 @@ def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False, 
         src = src * organ_mask if use_mask else src    # mask*(y-src) + mask*src == mask*y
         mets.update(compute_metrics(target + src, pred + src, psnr_only=psnr_only))
 
+    if src is not None:
+        # rms(predicted residual) / rms(true residual). This is the collapse detector: the
+        # degenerate solution in residual mode is to predict 0 everywhere, which reconstructs
+        # T1ce as exactly the T1 anchor -- a plausible-looking image that PSNR and SSIM both
+        # reward, because T1 already carries all the bulk anatomy. 1.0 = right magnitude,
+        # -> 0 = the net has stopped predicting enhancement at all.
+        eps = 1e-8
+        mets["resid_ratio"] = (pred.pow(2).mean().sqrt()
+                               / target.pow(2).mean().sqrt().clamp_min(eps))
+
     if et is not None:
         mets["et_psnr"] = region_psnr(target, pred, et)
         mets["et_frac"] = et.mean()
+        if src is not None:
+            # same ratio restricted to the tumor: where enhancement actually lives, and
+            # where a collapse shows up first
+            m = et.expand_as(pred).bool()
+            if m.any():
+                mets["et_resid_ratio"] = (pred[m].pow(2).mean().sqrt()
+                                          / target[m].pow(2).mean().sqrt().clamp_min(1e-8))
     return mets
 
 
@@ -295,7 +312,13 @@ def train_synthesis(
 
         # ---- logging ----
         if wandb and not nonfinite:
+            # et_share = fraction of the objective the ET term accounts for. This, not
+            # lam_et, is the number to tune on: lam_et's meaning depends on how much of the
+            # slice is brain and how much of the error concentrates in the tumor, both of
+            # which are properties of the data, not of the config.
+            et_share = (lam_et * avg_et / avg_loss) if (lam_et and avg_loss) else 0.0
             wandb.log({"train/loss": avg_loss, "train/et_loss": avg_et,
+                       "train/et_share": et_share,
                        "train/lr": opt.param_groups[0]["lr"], "train/epoch": epoch,
                        **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
         elif not wandb:
@@ -307,7 +330,8 @@ def train_synthesis(
             agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0,
                    "et_loss": 0.0, "et_psnr": 0.0, "et_frac": 0.0}
             if residual_mode:
-                agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0})
+                agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0,
+                            "resid_ratio": 0.0, "et_resid_ratio": 0.0})
             n_samples = 0
             with torch.no_grad():
                 for Xv, yv, organ_maskv, etv in val_loader:
@@ -377,15 +401,21 @@ def train_synthesis(
 
                 if residual_mode:
                     # The supervised quantity itself, GT vs prediction, on ONE shared
-                    # symmetric scale so over-/under-shoot is readable at a glance.
+                    # symmetric scale so over-/under-shoot is readable at a glance. The ET
+                    # mask rides along as a third panel on the same scale (it is 0/1, so it
+                    # renders solid red on white): without it you cannot tell whether a weak
+                    # prediction is missing the tumor or the tumor is simply not in view.
                     d_gt, d_pred = target_vm[:1], pv_m[:1]
                     vmax = torch.maximum(d_gt.abs().amax(), d_pred.abs().amax())
                     delta = torch.cat([diverging_rgb(d_gt, vmax),
-                                       diverging_rgb(d_pred, vmax)], dim=0)
+                                       diverging_rgb(d_pred, vmax),
+                                       diverging_rgb(etv[:1], 1.0)], dim=0)
+                    rr = mean_metrics.get("resid_ratio", float("nan"))
                     log["val/delta"] = wandb.Image(
-                        vutils.make_grid(delta, nrow=2),
-                        caption=f"residual (T1ce - T1): GT | Pred  "
-                                f"[bwr, white=0, ±{float(vmax):.3f}]")
+                        vutils.make_grid(delta, nrow=3),
+                        caption=f"residual (T1ce - T1): GT | Pred | ET mask  "
+                                f"[bwr, white=0, ±{float(vmax):.3f}] "
+                                f"rms(pred)/rms(gt)={rr:.3f}")
 
                 wandb.log(log, step=global_step)
 

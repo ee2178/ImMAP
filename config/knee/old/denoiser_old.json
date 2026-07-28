@@ -63,7 +63,7 @@
         "noise_std": [0.01, 1.0],
         "noise_dist": "log",
         "loss_type": "complex-mse",
-        "clip_grad": 5e-2,
+        "clip_grad": 5.0e-2,
         "backtrack_thresh": 5,
         "log_every": 50,
         "val_every": 5000
