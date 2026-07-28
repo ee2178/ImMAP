@@ -1,7 +1,7 @@
 {
-    "task": "dt_synthesis",
+    "task": "synthesis",
     "experiment": {
-        "name": "DT_CDLNet_dS_T1ce_from_FLAIR_T1_T2_ET"
+        "name": "Residual_DT_CDLNet_noDS_T1ce_minus_T1_ET"
     },
     "model": {
         "type": "DTCDLNet",
@@ -12,7 +12,7 @@
             "s": 2,
             "C": 3,
             "Cx": 1,
-            "use_dS": true,
+            "use_dS": false,
             "t0": 0.01,
             "rho0": 0.5,
             "tauS0": 0.0,
@@ -25,7 +25,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/brats/DT_CDLNet_dS_T1ce_ET",
+        "save_dir": "trained_nets/brats/Residual_DT_CDLNet_noDS_T1ce_ET",
         "ckpt": null
     },
     "data": {
@@ -63,8 +63,10 @@
         "loss_type": "complex-mse",
         "use_mask": true,
         "psnr_only": false,
-        "lam_src": 0.0,
-        "lam_et": 1.0
+        "residual_mode": true,
+        "residual_src_idx": 1,
+        "lam_et": 1.0,
+        "pretrained": null
     },
     "optimizer": {
         "type": "Adam",
