@@ -42,6 +42,14 @@ save_raw_image:    true     # also store an UNNORMALIZED, UNCLIPPED 'img_raw' da
                             #   the normalized 'img'. Clustering
                             #   still runs on 'img' (constraint maps unchanged). Needed for I2SB
                             #   translation, which wants the true inter-contrast intensities.
+save_seg:          true     # also store the BraTS segmentation ('seg', raw labels) and the
+                            #   derived enhancing-tumor mask ('et') in <case>_img.h5, put
+                            #   through the SAME crop + slice selection as the images.
+                            #   Needed for ET-weighted synthesis training (lam_et > 0).
+                            #   Subjects without a *_seg.nii.gz are written without them.
+et_labels:         [4]      # seg labels counted as ENHANCING TUMOR. BraTS2021: 1=necrotic
+                            #   core, 2=edema, 4=ET (3 unused). Later BraTS releases
+                            #   renumber ET to 3 -- change this, don't edit the code.
 drop_empty_slices: true     # keep slices with brain fraction >= min_brain_frac
 min_brain_frac:    0.02      # fine trim: drop near-empty slices (fraction of FOV that is brain)
 start_slice:       40        # focus on middle slices; index on the ORIGINAL 0-154 z-axis. null = no lower bound

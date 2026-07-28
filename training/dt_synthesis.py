@@ -2,7 +2,7 @@
 Domain-transfer synthesis training loop for DT-CDLNet.
 
 A thin variant of train_synthesis (training/synthesis.py). Same paired-data pipeline
-(X = source contrast(s), y = target contrast, organ_mask), same backtracking / metrics /
+(X = source contrast(s), y = target contrast, organ_mask, et), same backtracking / metrics /
 logging / checkpointing. Three differences, all forced by the CDLNet-family model:
 
   1. Forward interface. DT-CDLNet is
@@ -12,12 +12,16 @@ logging / checkpointing. Three differences, all forced by the CDLNet-family mode
   2. Source-consistency term. loss = L(x_hat, y) + lam_src * L(y_hat, X). The second term
      supervises the source dictionary Dy = B[0] and the sparse-coding stage directly; set
      lam_src = 0 (the default in the config) to train the target path only.
-     NOTE: dS is deliberately UNSUPERVISED -- no l1 penalty, no ET-mask term. The only
-     signal it gets is the image-domain loss on x_hat, so it is free to place enhancement
-     wherever that loss wants it. The two known failure modes (dS collapsing to 0, or dS
-     absorbing everything so the model degenerates to a generic residual connection) are
-     therefore invisible to the loss; the validation step logs dS's mean / active fraction
-     and an image panel so they stay visible to YOU.
+     NOTE: dS is deliberately UNSUPERVISED -- no l1 penalty, no direct ET-mask term. The
+     only signal it gets is the image-domain loss on x_hat, so it is free to place
+     enhancement wherever that loss wants it. `lam_et` does NOT change this: it reweights
+     x_hat inside the enhancing tumor, which reaches dS only through the read-out, exactly
+     as the plain reconstruction loss does. The two known failure modes (dS collapsing to
+     0, or dS absorbing everything so the model degenerates to a generic residual
+     connection) are therefore still invisible to the loss; the validation step logs dS's
+     mean / active fraction and an image panel so they stay visible to YOU.
+     Building the model with use_dS=False removes the branch outright -- that is the
+     ablation baseline, and it reports dS_mean = dS_active = 0 and base_psnr == psnr.
   3. Projection. `net.project()` runs after every optimizer step to enforce the CDLNet
      constraints (thresholds >= 0, leak in [0,1], dictionaries on the unit ball).
      train_synthesis omits this because U-Nets are unconstrained; unrolled models require it.
@@ -36,7 +40,8 @@ import torchvision.utils as vutils
 from tqdm import tqdm
 
 from operators import Identity
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask
+from training.common import (save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask,
+                             region_loss, region_psnr)
 from training.metrics import compute_metrics
 from training.losses import LOSS_REGISTRY
 
@@ -60,6 +65,8 @@ def train_dt_synthesis(
     use_mask=True,
     psnr_only=False,
     lam_src=1.0,                     # weight of the source-reconstruction consistency term
+    lam_et=0.0,                      # weight of the area-normalized enhancing-tumor term on
+                                     # x_hat; needs et_mask: true in the data config
     save_dir=None,
     ckpt=None,                       # signature parity; resume handled in main()
     save_ckpt_fn=save_ckpt,
@@ -79,19 +86,21 @@ def train_dt_synthesis(
     pbar = tqdm(total=total_steps, initial=start_epoch * steps_per_epoch,
                 desc="DT-SYNTHESIS", dynamic_ncols=True)
 
+    et_warned = False
     for epoch in range(start_epoch, num_epochs):
         net.train()
-        running_loss, running_src, n_batches = 0.0, 0.0, 0
+        running_loss, running_src, running_et, n_batches = 0.0, 0.0, 0.0, 0
 
         for _ in range(steps_per_epoch):
             try:
-                X, y, organ_mask = next(train_iter)
+                X, y, organ_mask, et = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                X, y, organ_mask = next(train_iter)
+                X, y, organ_mask, et = next(train_iter)
             X = X.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             organ_mask = organ_mask.to(device, non_blocking=True)
+            et = et.to(device, non_blocking=True)
 
             opt.zero_grad()
             # x_hat: (B, Cx, H, W) target decode;  dS: (B, Cx, H, W) enhancement map;
@@ -106,6 +115,19 @@ def train_dt_synthesis(
             src_loss = loss_fn(y_hat_m, X_s, None)
             loss = tgt_loss + lam_src * src_loss
 
+            # ET term on the TARGET reconstruction only -- same form and normalization as
+            # train_synthesis, so DT-CDLNet and the U-Net stay directly comparable. dS is
+            # still not supervised: it gets the ET signal only through x_hat.
+            et_loss = x_hat_m.new_zeros(())
+            if lam_et:
+                et_loss = region_loss(loss_fn, x_hat_m, y_t, et)
+                loss = loss + lam_et * et_loss
+                if not et_warned and float(et.sum()) == 0:
+                    et_warned = True
+                    print("[dt-synthesis] WARNING: lam_et > 0 but the first batch's ET mask is "
+                          "entirely zero. Set et_mask: true in the data config (and make sure "
+                          "the h5 has an 'et' dataset), or the ET term is a no-op.")
+
             loss.backward()
             if clip_grad is not None:
                 nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
@@ -118,6 +140,7 @@ def train_dt_synthesis(
 
             running_loss += float(loss.item())
             running_src += float(src_loss.item())
+            running_et += float(et_loss.item())
             n_batches += 1
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.3e}", src=f"{src_loss.item():.3e}", epoch=epoch)
@@ -125,9 +148,12 @@ def train_dt_synthesis(
         global_step = (epoch + 1) * steps_per_epoch
         avg_loss = running_loss / max(n_batches, 1)
         avg_src = running_src / max(n_batches, 1)
+        avg_et = running_et / max(n_batches, 1)
         nonfinite = not math.isfinite(avg_loss)
 
         train_metrics = compute_metrics(y_t, x_hat_m, psnr_only=psnr_only)
+        train_metrics["et_psnr"] = region_psnr(y_t, x_hat_m, et)
+        train_metrics["et_frac"] = et.mean()
         train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
         # ---- averaged-loss backtracking (on the TOTAL training loss) ----
@@ -151,22 +177,26 @@ def train_dt_synthesis(
         # ---- logging ----
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss, "train/src_loss": avg_src,
+                       "train/et_loss": avg_et,
                        "train/lr": opt.param_groups[0]["lr"], "train/epoch": epoch,
                        **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
         elif not wandb:
-            print({"epoch": epoch, "avg_loss": avg_loss, "avg_src": avg_src, **train_metrics})
+            print({"epoch": epoch, "avg_loss": avg_loss, "avg_src": avg_src,
+                   "avg_et": avg_et, **train_metrics})
 
         # ---- validation ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
             net.eval()
             agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0, "src_loss": 0.0,
-                   "dS_mean": 0.0, "dS_active": 0.0, "base_psnr": 0.0}
+                   "dS_mean": 0.0, "dS_active": 0.0, "base_psnr": 0.0,
+                   "et_loss": 0.0, "et_psnr": 0.0, "et_frac": 0.0}
             n_samples = 0
             with torch.no_grad():
-                for Xv, yv, organ_maskv in val_loader:
+                for Xv, yv, organ_maskv, etv in val_loader:
                     Xv = Xv.to(device, non_blocking=True)
                     yv = yv.to(device, non_blocking=True)
                     organ_maskv = organ_maskv.to(device, non_blocking=True)
+                    etv = etv.to(device, non_blocking=True)
                     x_hat_v, dS_v, y_hat_v, zv = net(Xv, E=E, return_source=True)
                     bs = Xv.shape[0]
 
@@ -178,7 +208,12 @@ def train_dt_synthesis(
                     mets = {k: float(v.detach()) for k, v in mets.items()}
                     src_l = float(loss_fn(y_hat_vm, Xv_s, None).item())
                     mets["src_loss"] = src_l
-                    mets["loss"] = float(loss_fn(x_hat_vm, yv_t, None).item()) + lam_src * src_l
+                    et_l = float(region_loss(loss_fn, x_hat_vm, yv_t, etv).item())
+                    mets["et_loss"] = et_l
+                    mets["et_psnr"] = float(region_psnr(yv_t, x_hat_vm, etv))
+                    mets["et_frac"] = float(etv.mean())
+                    mets["loss"] = (float(loss_fn(x_hat_vm, yv_t, None).item())
+                                    + lam_src * src_l + lam_et * et_l)
 
                     # ---- dS diagnostics (the loss cannot see these; you should) ----
                     # dS_active ~ 0  -> the enhancement branch is dead (collapse to dS = 0).

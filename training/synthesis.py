@@ -30,6 +30,21 @@ Validation additionally logs the ground-truth and predicted residuals side by si
 negative) -- a gray colormap would render a mostly-zero signed map as flat mid-gray and
 hide the sign entirely.
 
+ET-WEIGHTED SUPERVISION (`lam_et > 0`)
+--------------------------------------
+The loader's fourth item is the enhancing-tumor mask, and `lam_et` adds the SAME loss
+restricted to it:
+
+    loss = L(pred, target) + lam_et * L_ET(pred, target)
+
+L_ET is normalized by the ET area (training.common.region_loss), not by the image, so
+lam_et is interpretable -- 1.0 counts the tumor as heavily as the whole brain -- and does
+not silently shrink by the ~100x area ratio. Slices with no enhancing tumor contribute 0.
+`et_psnr` (PSNR inside the tumor) and `et_frac` are logged either way, including at
+lam_et = 0: global PSNR averages over the ~99.7% of the slice that is not tumor and so
+responds only weakly to what this weighting targets. Requires `et_mask: true` in the data
+config; a one-time warning fires if lam_et > 0 and the first batch's mask is empty.
+
 `pretrained` warm-starts the network from a CCL backbone (ccl_encoder.pt) with a partial,
 shape-tolerant load. It is applied ONLY on a fresh run (start_epoch == 0) so it never
 overrides a resumed checkpoint. Reuses training.common + training.metrics like the others.
@@ -44,7 +59,8 @@ import torch.nn as nn
 import torchvision.utils as vutils
 from tqdm import tqdm
 
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask
+from training.common import (save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask,
+                             region_loss, region_psnr)
 from training.metrics import compute_metrics
 from training.losses import LOSS_REGISTRY
 
@@ -119,21 +135,29 @@ def diverging_rgb(x, vmax=None, eps=1e-8):
     return torch.cat([1.0 - neg, 1.0 - neg - pos, 1.0 - pos], dim=1)
 
 
-def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False):
+def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False, et=None):
     """Metrics for one already-brain-masked (target, pred) pair.
 
     Plain mode (`src is None`): metrics on the network's own target.
     Residual mode: `delta_*` measure the supervised residual directly, and the unprefixed
     `psnr`/`ssim`/`nrmse` are lifted back to the T1ce domain by adding the identically
     masked anchor to both sides -- i.e. exactly the numbers a non-residual run reports.
+
+    `et` adds `et_psnr` (PSNR inside the enhancing tumor) and `et_frac` (its area
+    fraction). et_psnr needs no domain choice: GT - Pred is the same in both, since the
+    anchor cancels.
     """
     if src is None:
-        return compute_metrics(target, pred, psnr_only=psnr_only)
+        mets = compute_metrics(target, pred, psnr_only=psnr_only)
+    else:
+        mets = {f"delta_{k}": v
+                for k, v in compute_metrics(target, pred, psnr_only=psnr_only).items()}
+        src = src * organ_mask if use_mask else src    # mask*(y-src) + mask*src == mask*y
+        mets.update(compute_metrics(target + src, pred + src, psnr_only=psnr_only))
 
-    mets = {f"delta_{k}": v
-            for k, v in compute_metrics(target, pred, psnr_only=psnr_only).items()}
-    src = src * organ_mask if use_mask else src        # mask*(y-src) + mask*src == mask*y
-    mets.update(compute_metrics(target + src, pred + src, psnr_only=psnr_only))
+    if et is not None:
+        mets["et_psnr"] = region_psnr(target, pred, et)
+        mets["et_frac"] = et.mean()
     return mets
 
 
@@ -155,6 +179,8 @@ def train_synthesis(
     residual_mode=False,             # supervise on y - X[:, residual_src_idx] (see docstring)
     residual_src_idx=0,              # which INPUT channel is the anchor; with
                                      # input_idx=[0,1,3] (flair,t1,t2) the T1 anchor is 1
+    lam_et=0.0,                      # weight of the area-normalized enhancing-tumor loss
+                                     # term; needs et_mask: true in the data config
     pretrained=None,                 # path to ccl_encoder.pt; applied only when start_epoch == 0
     save_dir=None,
     ckpt=None,                       # signature parity; resume handled in main()
@@ -181,19 +207,21 @@ def train_synthesis(
     pbar = tqdm(total=total_steps, initial=start_epoch * steps_per_epoch,
                 desc="SYNTHESIS", dynamic_ncols=True)
 
+    et_warned = False
     for epoch in range(start_epoch, num_epochs):
         net.train()
-        running_loss, n_batches = 0.0, 0
+        running_loss, running_et, n_batches = 0.0, 0.0, 0
 
         for _ in range(steps_per_epoch):
             try:
-                X, y, organ_mask = next(train_iter)
+                X, y, organ_mask, et = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                X, y, organ_mask = next(train_iter)
+                X, y, organ_mask, et = next(train_iter)
             X = X.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             organ_mask = organ_mask.to(device, non_blocking=True)
+            et = et.to(device, non_blocking=True)
 
             # residual mode: the net predicts y - src, not y. Everything downstream
             # (mask, loss, backtracking) is unchanged; `src` carries the anchor forward
@@ -209,6 +237,19 @@ def train_synthesis(
             )
 
             loss = loss_fn(pred_m, target_m, None)
+
+            # ET term: the SAME loss restricted to the enhancing tumor and normalized by
+            # its area, so lam_et is on the same footing as the whole-brain term.
+            et_loss = pred_m.new_zeros(())
+            if lam_et:
+                et_loss = region_loss(loss_fn, pred_m, target_m, et)
+                loss = loss + lam_et * et_loss
+                if not et_warned and float(et.sum()) == 0:
+                    et_warned = True
+                    print("[synthesis] WARNING: lam_et > 0 but the first batch's ET mask is "
+                          "entirely zero. Set et_mask: true in the data config (and make sure "
+                          "the h5 has an 'et' dataset), or the ET term is a no-op.")
+
             loss.backward()
             if clip_grad is not None:
                 nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
@@ -220,16 +261,18 @@ def train_synthesis(
                 sched.step()
 
             running_loss += float(loss.item())
+            running_et += float(et_loss.item())
             n_batches += 1
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
         avg_loss = running_loss / max(n_batches, 1)
+        avg_et = running_et / max(n_batches, 1)
         nonfinite = not math.isfinite(avg_loss)
 
         train_metrics = synthesis_metrics(target_m, pred_m, src, organ_mask,
-                                          use_mask, psnr_only=psnr_only)
+                                          use_mask, psnr_only=psnr_only, et=et)
         train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
         # ---- averaged-loss backtracking ----
@@ -252,24 +295,26 @@ def train_synthesis(
 
         # ---- logging ----
         if wandb and not nonfinite:
-            wandb.log({"train/loss": avg_loss, "train/lr": opt.param_groups[0]["lr"],
-                       "train/epoch": epoch,
+            wandb.log({"train/loss": avg_loss, "train/et_loss": avg_et,
+                       "train/lr": opt.param_groups[0]["lr"], "train/epoch": epoch,
                        **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
         elif not wandb:
-            print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
+            print({"epoch": epoch, "avg_loss": avg_loss, "avg_et": avg_et, **train_metrics})
 
         # ---- validation ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
             net.eval()
-            agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0}
+            agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0,
+                   "et_loss": 0.0, "et_psnr": 0.0, "et_frac": 0.0}
             if residual_mode:
                 agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0})
             n_samples = 0
             with torch.no_grad():
-                for Xv, yv, organ_maskv in val_loader:
+                for Xv, yv, organ_maskv, etv in val_loader:
                     Xv = Xv.to(device, non_blocking=True)
                     yv = yv.to(device, non_blocking=True)
                     organ_maskv = organ_maskv.to(device, non_blocking=True)
+                    etv = etv.to(device, non_blocking=True)
 
                     src_v = anchor_channel(Xv, residual_src_idx) if residual_mode else None
                     target_v = yv - src_v if residual_mode else yv
@@ -285,9 +330,12 @@ def train_synthesis(
                     # yv_m = (yv + 2)/4
                     # pv_m = (pv + 2)/4
                     mets = synthesis_metrics(target_vm, pv_m, src_v, organ_maskv,
-                                             use_mask, psnr_only=psnr_only)
+                                             use_mask, psnr_only=psnr_only, et=etv)
                     mets = {k: float(v.detach()) for k, v in mets.items()}
-                    mets["loss"] = float(loss_fn(pv_m, target_vm, None).item())
+                    et_l = float(region_loss(loss_fn, pv_m, target_vm, etv).item())
+                    mets["et_loss"] = et_l
+                    # same total the training step optimizes, so val/loss stays comparable
+                    mets["loss"] = float(loss_fn(pv_m, target_vm, None).item()) + lam_et * et_l
                     for k in agg:
                         if k in mets:
                             agg[k] += mets[k] * bs

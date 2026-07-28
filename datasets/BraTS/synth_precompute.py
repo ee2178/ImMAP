@@ -5,11 +5,12 @@ slice of every subject *_img.h5, and WRITE IT BACK into that same h5 as a new da
 key 'yhat'). This is the I2SB bridge prior x1 for the yhat -> true-T1ce bridge -- a much shorter,
 better-posed bridge than the raw T1 -> T1ce one (the prior already lives in the T1ce domain).
 
-Representation: yhat is stored in the SAME space as the h5 "img" contrasts (z-scored; the synth
-net's own input/output space -- SynthesisDataset applies NO intensity scaling, so we feed "img"
-directly and store the raw output). The I2SB dataset (x1_source="synth") then divides yhat by
+Representation: yhat is stored in the SAME space as the h5 "img" contrasts (z-scored). If the
+training config set SynthesisDataset `scales`, the net lives in the SCALED space, so this script
+divides the input by those scales and multiplies the output back by scales[target_idx] -- the
+stored yhat is z-scored either way. The I2SB dataset (x1_source="synth") then divides yhat by
 scales[x0_idx] exactly as it divides x0, so x1 lands on x0's scale automatically -- no scale
-bookkeeping here.
+bookkeeping downstream.
 
 In-place: this ADDS one dataset ('yhat') per h5; it does not touch 'img'/'mask'. Existing 'yhat'
 is skipped unless --overwrite.
@@ -40,11 +41,19 @@ from datasets.BraTS.i2sb_dataset import index_img_from_root  # noqa: E402
 
 
 @torch.no_grad()
-def infer_volume(net, img, input_idx, mult, device, batch):
+def infer_volume(net, img, input_idx, mult, device, batch, scales=None, target_idx=2):
     """img: (n, H, W, C) z-scored. Returns yhat (n, H, W) float32 in the same z-scored space.
     Pads H, W up to a multiple of `mult` (= 2**num_pool_layers) for the Unet2D pooling, then crops
-    back, so full (non-32-divisible) slices work."""
+    back, so full (non-32-divisible) slices work.
+
+    `scales` must be the training run's SynthesisDataset scales. The net was trained on
+    img/scales, so it has to be fed img/scales; the output is then multiplied back by
+    scales[target_idx] so yhat stays stored in the unscaled z-scored space this file
+    documents (and that I2SBDataset expects, since it divides yhat by scales[x0_idx]
+    itself). Feeding unscaled data to a scale-trained net is a silent domain shift."""
     n, H, W, _ = img.shape
+    if scales is not None:
+        img = img / np.asarray(scales, dtype=np.float32)[None, None, :]
     x = np.transpose(img[..., input_idx], (0, 3, 1, 2))               # (n, Cin, H, W)
     x = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
     pad_h, pad_w = (-H) % mult, (-W) % mult
@@ -54,8 +63,13 @@ def infer_volume(net, img, input_idx, mult, device, batch):
         if pad_h or pad_w:
             xb = F.pad(xb, (0, pad_w, 0, pad_h), mode="replicate")
         yb = net(xb)                                                  # (b, 1, Hpad, Wpad)
+        if isinstance(yb, (tuple, list)):        # CDLNet-family: (x_hat, ...)
+            yb = yb[0]
         out[i:i + batch] = yb[..., :H, :W][:, 0].float().cpu()        # crop back, drop channel
-    return out.numpy()
+    out = out.numpy()
+    if scales is not None:
+        out = out * float(np.asarray(scales, dtype=np.float32)[target_idx])   # back to z-scored
+    return out
 
 
 def main():
@@ -71,12 +85,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with open(args.config) as f:
         cfg = json.load(f)
-    input_idx = list(cfg["data"]["train"]["input_idx"])              # EXACT training input channels/order
+    train_cfg = cfg["data"]["train"]
+    input_idx = list(train_cfg["input_idx"])                         # EXACT training input channels/order
+    scales = train_cfg.get("scales", None)                           # EXACT training intensity scaling
+    target_idx = int(train_cfg.get("target_idx", [2])[0])
     mult = 2 ** int(cfg["model"]["params"].get("num_pool_layers", 5))
+    if cfg["training"].get("residual_mode"):
+        raise SystemExit(
+            "This run was trained in residual_mode: net(X) predicts T1ce - T1, not T1ce, so "
+            "yhat would be a residual map. Add the anchor channel back before writing yhat.")
     net = load_model(args.config, device=device)                    # build_model + load ckpt + eval()
     net.eval()
-    print(f"[precompute] net={cfg['model']['type']} input_idx={input_idx} pad_mult={mult} "
-          f"key={args.key!r} device={device}\n[precompute] root={args.root}")
+    print(f"[precompute] net={cfg['model']['type']} input_idx={input_idx} scales={scales} "
+          f"pad_mult={mult} key={args.key!r} device={device}\n[precompute] root={args.root}")
 
     img_paths, _ = index_img_from_root(args.root)
     n_done = n_skip = 0
@@ -89,7 +110,8 @@ def main():
                     print(f"  skip (exists): {os.path.basename(p)}"); n_skip += 1; continue
                 del h[args.key]
             img = np.asarray(h["img"])                              # (n, H, W, C) z-scored
-            yhat = infer_volume(net, img, input_idx, mult, device, args.batch)
+            yhat = infer_volume(net, img, input_idx, mult, device, args.batch,
+                                scales=scales, target_idx=target_idx)
             h.create_dataset(args.key, data=yhat.astype(np.float32))
             n_done += 1
             print(f"  wrote {args.key} {yhat.shape} -> {os.path.basename(p)}")

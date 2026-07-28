@@ -12,9 +12,11 @@ def build_synthesis_loader(root=None,
                            manifest=None,
                            input_idx=(1, 3, 0),     # T1, T2, FLAIR  (stored: flair,t1,t1ce,t2)
                            target_idx=(2,),         # T1ce
+                           scales=None,             # per-STORED-channel divisor; None = none
+                           et_mask=False,           # return the enhancing-tumor mask (4th item)
                            center_crop=None,        # SynthesisDataset applies these jointly to
-                           crop_size=None,          # input+target; must be forwarded or they no-op
-                           random_flips=False,
+                           crop_size=None,          # input+target+masks; must be forwarded or
+                           random_flips=False,      # they no-op
                            batch_size=16,
                            num_workers=8,
                            pin_memory=True,
@@ -23,6 +25,7 @@ def build_synthesis_loader(root=None,
                            **unused):
     ds_cfg = SimpleNamespace(root=root, manifest=manifest,
                              input_idx=list(input_idx), target_idx=list(target_idx),
+                             scales=scales, et_mask=et_mask,
                              center_crop=center_crop, crop_size=crop_size,
                              random_flips=random_flips)
     dataset = SynthesisDataset(ds_cfg)

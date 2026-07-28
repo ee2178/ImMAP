@@ -116,6 +116,13 @@ class DTCDLNet(CDLNet):
         (analysis A, source synthesis B, thresholds t). `C` = number of SOURCE channels.
     Cx : int or None
         Number of TARGET channels (default `C`). The dS map has this many channels.
+    use_dS : bool
+        Enable the additive enhancement branch. False removes it entirely -- no E^k, rho,
+        or tauS parameters -- leaving x_hat = D_x z^K: a CDLNet trunk with a target-domain
+        read-out. That is precisely the ablation baseline the module docstring describes
+        ("the ablation baseline is this network with the dS branch removed"), so the two
+        settings isolate what dS actually contributes. `forward` still returns a dS in
+        the same tuple position, filled with zeros.
     rho0 : float
         Initial leak parameter rho^k = eta_S gamma, in [0, 1]. rho = 1 is the exact
         one-step-to-optimum step size but makes the dS branch memoryless (only the last
@@ -132,7 +139,7 @@ class DTCDLNet(CDLNet):
     """
 
     def __init__(self, K=3, M=64, P=7, s=1, C=1, t0=0, adaptive=False,
-                 init=True, complex=False, Cx=None,
+                 init=True, complex=False, Cx=None, use_dS=True,
                  rho0=0.5, tauS0=0.0, momentum=True, learn_gamma=False, gamma0=1.0):
         if complex:
             raise ValueError(
@@ -145,6 +152,7 @@ class DTCDLNet(CDLNet):
         self.Cx = C if Cx is None else Cx
         self.momentum = bool(momentum)
         self.learn_gamma = bool(learn_gamma)
+        self.use_dS = bool(use_dS)
 
         # z -> y (source) synthesis: B[k] inside the unrolling; alias B[0] for readability.
         self.Dy = self.B[0]
@@ -152,17 +160,28 @@ class DTCDLNet(CDLNet):
         # z -> x (target) synthesis: the algorithm's D_x, applied once at read-out.
         self.Dx = ConvTranspose2d(M, self.Cx, P, stride=s, bias=False, complex=False)
 
-        # E^k: code -> target image, the learned surrogate for the enhancement residual.
-        self.E_S = nn.ModuleList([
-            ConvTranspose2d(M, self.Cx, P, stride=s, bias=False, complex=False)
-            for _ in range(K)
-        ])
-        # E^k = eta_S gamma D_x = rho0 * D_x  makes layer 0 an exact algorithm step.
-        for k in range(K):
-            self.E_S[k].weight = rho0 * self.Dx.weight
+        if self.use_dS:
+            # E^k: code -> target image, the learned surrogate for the enhancement residual.
+            self.E_S = nn.ModuleList([
+                ConvTranspose2d(M, self.Cx, P, stride=s, bias=False, complex=False)
+                for _ in range(K)
+            ])
+            # E^k = eta_S gamma D_x = rho0 * D_x  makes layer 0 an exact algorithm step.
+            for k in range(K):
+                self.E_S[k].weight = rho0 * self.Dx.weight
 
-        self.rho = nn.Parameter(rho0 * torch.ones(K, 1, 1, 1))     # leak,       in [0, 1]
-        self.tauS = nn.Parameter(tauS0 * torch.ones(K, 1, 1, 1))   # ReLU bias,  >= 0
+            self.rho = nn.Parameter(rho0 * torch.ones(K, 1, 1, 1))     # leak,       in [0, 1]
+            self.tauS = nn.Parameter(tauS0 * torch.ones(K, 1, 1, 1))   # ReLU bias,  >= 0
+        else:
+            # The ablation baseline named in the module docstring: x_hat = D_x z^K, a pure
+            # CDLNet trunk with a target-domain read-out. E_S / rho / tauS are not created
+            # at all (rather than created and zeroed) so they never reach the optimizer and
+            # never land in the checkpoint -- a use_dS=False ckpt will not silently load
+            # into a use_dS=True model.
+            self.E_S = None
+            self.register_parameter("rho", None)
+            self.register_parameter("tauS", None)
+
         self.beta = nn.Parameter(_fista_betas(K).reshape(K, 1, 1, 1)) if self.momentum else None
         self.gamma = nn.Parameter(torch.tensor(float(gamma0))) if self.learn_gamma else None
 
@@ -194,19 +213,23 @@ class DTCDLNet(CDLNet):
 
             # ---- dS-branch: leaky accumulator + one-sided threshold ----
             # Gauss-Seidel: uses the JUST-updated z^{k+1}, not zbar^k.
-            inj = self.E_S[k](z_next)
-            rho = self.rho[k]
-            if self.gamma is not None:        # shared drive: both terms scale with eta_S gamma
-                inj = self.gamma * inj
-                rho = self.gamma * rho
-            dS = inj if dS is None else (1.0 - rho) * dS + inj
-            dS = F.relu(dS - self.tauS[k])
+            if self.use_dS:
+                inj = self.E_S[k](z_next)
+                rho = self.rho[k]
+                if self.gamma is not None:    # shared drive: both terms scale with eta_S gamma
+                    inj = self.gamma * inj
+                    rho = self.gamma * rho
+                dS = inj if dS is None else (1.0 - rho) * dS + inj
+                dS = F.relu(dS - self.tauS[k])
 
             z_prev, z = z, z_next
 
-        # ---- read-out:  x_hat = D_x z^K + dS^K ----
-        x_hat = post_process(self.Dx(z) + dS, list(params))
-        dS_img = unpad(dS, pad)               # residual: unpad only, NO mean added back
+        # ---- read-out:  x_hat = D_x z^K + dS^K  (dS^K = 0 when the branch is off) ----
+        decode = self.Dx(z) if dS is None else self.Dx(z) + dS
+        x_hat = post_process(decode, list(params))
+        # zeros (not None) with the branch off: the return arity is fixed, so the training
+        # loops' dS diagnostics read 0 / base_psnr == psnr instead of crashing.
+        dS_img = torch.zeros_like(x_hat) if dS is None else unpad(dS, pad)
 
         if return_source:
             y_hat = post_process(self.Dy(z), list(params))
@@ -218,8 +241,9 @@ class DTCDLNet(CDLNet):
     def project(self):
         # Clamps thresholds t and projects A, B (hence Dy = B[0]) onto the unit ball.
         super().project()
-        self.tauS.clamp_(0.0)                 # it is a threshold
-        self.rho.clamp_(0.0, 1.0)             # leak (1 - rho) must stay a convex weight
+        if self.use_dS:
+            self.tauS.clamp_(0.0)             # it is a threshold
+            self.rho.clamp_(0.0, 1.0)         # leak (1 - rho) must stay a convex weight
         if self.beta is not None:
             self.beta.clamp_(0.0, 1.0)        # FISTA inertia
         if self.gamma is not None:

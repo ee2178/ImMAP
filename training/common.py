@@ -193,6 +193,46 @@ def apply_loss_mask(image, recon, organ_mask, use_mask):
     return image, recon
 
 
+### Region-restricted supervision (enhancing-tumor / ET masks)
+def region_loss(loss_fn, pred, target, region, eps=1e-8):
+    """`loss_fn` restricted to a binary `region`, normalized by that region's AREA.
+
+    Zeroing outside the region and calling a mean-reduced loss would still divide by the
+    FULL pixel count. Enhancing tumor covers well under 1% of a slice, so the term would
+    arrive ~100x smaller than it reads and the weight in front of it would be meaningless.
+    Rescaling by numel/|region| converts that back into a mean over the region, so a
+    weight of 1.0 means "count the ET region as heavily as the whole brain".
+
+    Exact for the mean-reduced losses (magnitude-l1, complex-mse, magnitude-mse); for the
+    ratio and perceptual entries in LOSS_REGISTRY it is a monotone reweighting, not a
+    literal regional mean.
+
+    Returns 0 when the region is empty. That is not an edge case -- plenty of slices
+    contain no enhancing tumor -- and 0/0 would otherwise poison the batch's gradient.
+    """
+    region = region.expand_as(pred)
+    area = region.sum()
+    if float(area) <= 0:
+        return pred.new_zeros(())
+    return loss_fn(pred * region, target * region, None) * (region.numel() / area.clamp_min(eps))
+
+
+def region_psnr(gt, pred, region, eps=1e-12):
+    """PSNR with the MSE taken over `region` pixels only (0 if the region is empty).
+
+    This is the number to watch when tuning lam_et. Global PSNR does respond to ET-only
+    error, but weakly -- it averages over the ~99.7% of the slice that is not tumor, so a
+    change that costs it a few hundredths of a dB costs et_psnr several dB (measured at
+    roughly 20-250x more movement, the ratio growing as the error gets smaller).
+    """
+    region = region.expand_as(gt)
+    area = region.sum()
+    if float(area) <= 0:
+        return gt.new_zeros(())
+    mse = (((gt - pred) * region).abs() ** 2).sum() / area.clamp_min(eps)
+    return -10 * torch.log10(mse + eps)
+
+
 def snr_loss_weight(std_fwd, mode="uniform"):
     """Per-sample I2SB loss weight as a function of the forward std sigma_t = std_fwd, normalized to
     batch-mean 1 (so the loss scale, and thus LR / backtrack_thresh, stays comparable across modes):
