@@ -1,9 +1,11 @@
 # training/common.py
 
 import os
+import re
 import json
 import numpy as np
 import torch
+import yaml
 from physics.nle import whiten
 from operators.fourier import ifftc
 from models import build_model
@@ -118,6 +120,54 @@ def load_ckpt(
     step = ckpt.get("step", 0) + 1
 
     return model, optimizer, scheduler, step
+
+
+_SCI = re.compile(r"(?<![\w.])([-+]?[0-9][0-9_]*(?:\.[0-9_]*)?)([eE])([-+]?)([0-9]+)(?![\w.])")
+
+
+def _canon_sci(m):
+    """`1e-06` -> `1.0e-6`: a decimal point and an explicit exponent sign."""
+    mant, _, sign, exp = m.groups()
+    if "." not in mant:
+        mant += ".0"
+    return f"{mant}e{sign or '+'}{exp.lstrip('0') or '0'}"
+
+
+def write_config(cfg, path):
+    """Write a config as JSON that yaml.safe_load will also read correctly.
+
+    train.py reads configs with yaml.safe_load, so YAML 1.1 number rules apply, not JSON's:
+    a float needs BOTH a decimal point AND a signed exponent. json.dump writes 1e-06 for
+    eta_min, which yaml hands back as the STRING '1e-06' -- CosineAnnealingLR then dies
+    doing arithmetic on it. json.load is unaffected, which is what makes this so easy to
+    miss. Every config the repo writes goes through here, and the result is verified with
+    the same loader train.py uses before it is accepted.
+    """
+    text = _SCI.sub(_canon_sci, json.dumps(cfg, indent=4))
+
+    loaded = yaml.safe_load(text)
+    bad = []
+
+    def scan(o, p=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                scan(v, f"{p}.{k}" if p else k)
+        elif isinstance(o, list):
+            for i, v in enumerate(o):
+                scan(v, f"{p}[{i}]")
+        elif isinstance(o, str) and re.fullmatch(r"[-+]?[\d._]+[eE][-+]?\d+", o):
+            bad.append((p, o))
+
+    scan(loaded)
+    if bad:
+        raise ValueError(f"{path}: numeric values would load as strings under yaml: {bad}")
+    if loaded != json.loads(text):
+        raise ValueError(f"{path}: yaml and json disagree on the written config")
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    return path
 
 
 def save_args(

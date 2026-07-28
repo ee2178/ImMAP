@@ -18,7 +18,7 @@ from training import (
     train_i2sb,
     train_latent_i2sb
 )
-from training.common import load_ckpt
+from training.common import load_ckpt, write_config
 
 import datasets                       # triggers registration via __init__
 from datasets.registry import build_loader
@@ -91,9 +91,9 @@ def save_config(cfg):
 
     disable_init(cfg_to_save.get("model", {}))
 
-    cfg_save_path = os.path.join(save_dir, "config.json")
-    with open(cfg_save_path, "w") as f:
-        json.dump(cfg_to_save, f, indent=4)
+    # write_config, not json.dump: this file is re-read with yaml.safe_load on resume, and
+    # json's `1e-06` comes back as a string there (see training.common.write_config).
+    cfg_save_path = write_config(cfg_to_save, os.path.join(save_dir, "config.json"))
 
     print(f"Saved config to {cfg_save_path}")
 
