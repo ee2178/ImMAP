@@ -1,0 +1,82 @@
+{
+    "task": "synthesis",
+    "experiment": {
+        "name": "Residual_DT_CDLNet_T1ce_minus_T1"
+    },
+    "model": {
+        "type": "DTCDLNet",
+        "params": {
+            "K": 30,
+            "M": 169,
+            "P": 7,
+            "s": 2,
+            "C": 3,
+            "Cx": 1,
+            "t0": 1.0e-2,
+            "rho0": 0.5,
+            "tauS0": 0.0,
+            "momentum": true,
+            "learn_gamma": false,
+            "gamma0": 1.0,
+            "adaptive": false,
+            "complex": false,
+            "init": true
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/Residual_DT_CDLNet_T1ce",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "synthesis",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
+            "input_idx": [0, 1, 3],
+            "target_idx": [2],
+            "crop_size": 192,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "synthesis",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
+            "input_idx": [0, 1, 3],
+            "target_idx": [2],
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 6000,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 100,
+        "clip_grad": 0.1,
+        "backtrack_thresh": 10,
+        "backtrack_factor": 0.9,
+        "loss_type": "complex-mse",
+        "use_mask": true,
+        "psnr_only": false,
+        "residual_mode": true,
+        "residual_src_idx": 1,
+        "pretrained": null
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 5.0e-4
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "contrast-synthesis",
+        "id": null
+    }
+}

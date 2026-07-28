@@ -3,6 +3,33 @@ Contrast-synthesis training loop. Same structure as train_denoiser, minus the de
 specifics. Step: pred = net(X); loss = recon_loss(pred, y, brain_mask).
 X = multi-contrast input (e.g. T1,T2,FLAIR), y = target (e.g. T1ce).
 
+RESIDUAL MODE (`residual_mode=True`)
+-----------------------------------
+Instead of regressing the target itself, the network is supervised on the DIFFERENCE
+between the target and one input channel -- the "anchor" -- picked by `residual_src_idx`:
+
+    src    = X[:, residual_src_idx]              # the T1 anchor, already z-scored
+    target = y - src                             # e.g. T1ce - T1, what the net predicts
+    T1ce-domain estimate = pred + src
+
+The point is where the loss spends its budget. Regressing T1ce directly, almost all of
+the error mass is bulk anatomy that T1 already contains, so the enhancement -- the part
+that actually distinguishes the two contrasts -- is a small fraction of the objective.
+T1ce - T1 is near zero except at strong edges and in the enhancing tumor, so the loss is
+concentrated exactly there.
+
+Only the forward pass changes. Both sides of the loss are brain-masked as usual, and
+because the anchor is masked identically, adding it back commutes with the mask:
+mask*(y - src) + mask*src == mask*y. So metrics are reported in the ORDINARY T1ce domain
+(`psnr`, `ssim`, `nrmse`) and stay directly comparable to a non-residual run, with the
+residual-domain versions logged alongside as `delta_*`. `val/residual` (|GT - Pred|) is
+identical in both domains -- the anchor cancels -- so it is unchanged.
+
+Validation additionally logs the ground-truth and predicted residuals side by side under
+`val/delta`, on a shared symmetric diverging scale (white at zero, red positive, blue
+negative) -- a gray colormap would render a mostly-zero signed map as flat mid-gray and
+hide the sign entirely.
+
 `pretrained` warm-starts the network from a CCL backbone (ccl_encoder.pt) with a partial,
 shape-tolerant load. It is applied ONLY on a fresh run (start_epoch == 0) so it never
 overrides a resumed checkpoint. Reuses training.common + training.metrics like the others.
@@ -51,6 +78,65 @@ def load_pretrained_backbone(net, path, device):
           f"random (not in ckpt): {random_keys[:6]} | "
           f"shape-skipped: {shape_skipped} | ignored-from-ckpt: {not_in_model[:6]}")
 
+
+def predict(net, X):
+    """`pred = net(X)`, tolerating the CDLNet-family multi-output signature.
+
+    Unrolled models return a tuple whose FIRST element is the image estimate
+    (DTCDLNet: (x_hat, dS, z); GroupCDL: (x_hat, z)) and default their forward operator
+    to Identity, so a bare call works. U-Nets return the tensor itself. Plain CDLNet is
+    not usable here -- its `E` argument has no default.
+    """
+    out = net(X)
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+def anchor_channel(X, idx):
+    """The residual anchor (e.g. T1) as (B, 1, H, W).
+
+    The bounds check is not decoration: `X[:, i:i+1]` with an out-of-range `i` returns an
+    EMPTY tensor rather than raising, which would surface as a silent NaN loss instead of
+    a config error.
+    """
+    if not 0 <= idx < X.shape[1]:
+        raise IndexError(f"residual_src_idx={idx} is out of range for an input with "
+                         f"{X.shape[1]} channels")
+    return X[:, idx:idx + 1]
+
+
+def diverging_rgb(x, vmax=None, eps=1e-8):
+    """Signed (B, 1, H, W) map -> (B, 3, H, W) RGB on a diverging blue-white-red scale
+    (matplotlib 'bwr'): white at 0, red positive, blue negative, clamped to [-vmax, vmax].
+
+    Pass an explicit `vmax` to put several maps on ONE shared scale -- without that, a
+    per-map max makes a good prediction and a bad one look equally saturated.
+    """
+    x = x[:, :1]
+    if vmax is None:
+        vmax = x.abs().amax()
+    t = (x / max(float(vmax), eps)).clamp(-1.0, 1.0)
+    pos, neg = t.clamp(min=0.0), (-t).clamp(min=0.0)
+    return torch.cat([1.0 - neg, 1.0 - neg - pos, 1.0 - pos], dim=1)
+
+
+def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False):
+    """Metrics for one already-brain-masked (target, pred) pair.
+
+    Plain mode (`src is None`): metrics on the network's own target.
+    Residual mode: `delta_*` measure the supervised residual directly, and the unprefixed
+    `psnr`/`ssim`/`nrmse` are lifted back to the T1ce domain by adding the identically
+    masked anchor to both sides -- i.e. exactly the numbers a non-residual run reports.
+    """
+    if src is None:
+        return compute_metrics(target, pred, psnr_only=psnr_only)
+
+    mets = {f"delta_{k}": v
+            for k, v in compute_metrics(target, pred, psnr_only=psnr_only).items()}
+    src = src * organ_mask if use_mask else src        # mask*(y-src) + mask*src == mask*y
+    mets.update(compute_metrics(target + src, pred + src, psnr_only=psnr_only))
+    return mets
+
+
 def train_synthesis(
     net, opt, sched, device,
     train_loader,
@@ -66,6 +152,9 @@ def train_synthesis(
     loss_type="l1",
     use_mask=True,
     psnr_only=False,
+    residual_mode=False,             # supervise on y - X[:, residual_src_idx] (see docstring)
+    residual_src_idx=0,              # which INPUT channel is the anchor; with
+                                     # input_idx=[0,1,3] (flair,t1,t2) the T1 anchor is 1
     pretrained=None,                 # path to ccl_encoder.pt; applied only when start_epoch == 0
     save_dir=None,
     ckpt=None,                       # signature parity; resume handled in main()
@@ -78,6 +167,9 @@ def train_synthesis(
     # warm-start from pretraining ONLY on a fresh run (not when resuming)
     if pretrained and start_epoch == 0:
         load_pretrained_backbone(net, pretrained, device)
+
+    if residual_mode:
+        print(f"[synthesis] residual mode: supervising on target - X[:, {residual_src_idx}]")
 
     net.train()
     best_loss = float("inf")
@@ -103,18 +195,26 @@ def train_synthesis(
             y = y.to(device, non_blocking=True)
             organ_mask = organ_mask.to(device, non_blocking=True)
 
+            # residual mode: the net predicts y - src, not y. Everything downstream
+            # (mask, loss, backtracking) is unchanged; `src` carries the anchor forward
+            # so metrics and images can be lifted back to the T1ce domain.
+            src = anchor_channel(X, residual_src_idx) if residual_mode else None
+            target = y - src if residual_mode else y
+
             opt.zero_grad()
-            pred = net(X)                       # (B, 1, H, W)
-            
-            y, pred = apply_loss_mask(
-                y, pred, organ_mask, use_mask,
+            pred = predict(net, X)              # (B, 1, H, W)
+
+            target_m, pred_m = apply_loss_mask(
+                target, pred, organ_mask, use_mask,
             )
 
-            loss = loss_fn(pred, y, None)
+            loss = loss_fn(pred_m, target_m, None)
             loss.backward()
             if clip_grad is not None:
                 nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
             opt.step()
+            if hasattr(net, "project"):         # CDLNet-family constraint projection
+                net.project()
 
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
@@ -127,10 +227,9 @@ def train_synthesis(
         global_step = (epoch + 1) * steps_per_epoch
         avg_loss = running_loss / max(n_batches, 1)
         nonfinite = not math.isfinite(avg_loss)
-        
-        # y_m = (y+2)/4
-        # pred_m = (pred+2)/4
-        train_metrics = compute_metrics(y, pred, psnr_only=psnr_only)
+
+        train_metrics = synthesis_metrics(target_m, pred_m, src, organ_mask,
+                                          use_mask, psnr_only=psnr_only)
         train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
         # ---- averaged-loss backtracking ----
@@ -163,35 +262,50 @@ def train_synthesis(
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
             net.eval()
             agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0}
+            if residual_mode:
+                agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0})
             n_samples = 0
             with torch.no_grad():
                 for Xv, yv, organ_maskv in val_loader:
                     Xv = Xv.to(device, non_blocking=True)
                     yv = yv.to(device, non_blocking=True)
                     organ_maskv = organ_maskv.to(device, non_blocking=True)
-                    pv = net(Xv)
+
+                    src_v = anchor_channel(Xv, residual_src_idx) if residual_mode else None
+                    target_v = yv - src_v if residual_mode else yv
+
+                    pv = predict(net, Xv)
                     bs = Xv.shape[0]
                     # Apply mask
-                    yv, pv = apply_loss_mask(
-                        yv, pv, organ_maskv, use_mask,
+                    target_vm, pv_m = apply_loss_mask(
+                        target_v, pv, organ_maskv, use_mask,
                     )
                     # DO NOT CALL .ABS(), WE HAVE NEGATIVE NUMBERS
                     # Generally speaking, our data is mean 0 variance 1, so for the purposes of metric computations, We can do the following
                     # yv_m = (yv + 2)/4
                     # pv_m = (pv + 2)/4
-                    mets = compute_metrics(yv, pv, psnr_only=psnr_only)
+                    mets = synthesis_metrics(target_vm, pv_m, src_v, organ_maskv,
+                                             use_mask, psnr_only=psnr_only)
                     mets = {k: float(v.detach()) for k, v in mets.items()}
-                    mets["loss"] = float(loss_fn(pv, yv, None).item())
+                    mets["loss"] = float(loss_fn(pv_m, target_vm, None).item())
                     for k in agg:
                         if k in mets:
                             agg[k] += mets[k] * bs
                     n_samples += bs
             mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
             val_loss = mean_metrics["loss"]      # <-- capture for the scheduler
-                        
+
             if wandb:
-                gt_img = yv[:1]; pred_img = pv[:1]; in_img = Xv[:1, :1]
                 mask = organ_maskv[:1]
+                in_img = Xv[:1, residual_src_idx:residual_src_idx + 1] if residual_mode \
+                    else Xv[:1, :1]
+                if residual_mode:
+                    # lift both sides back to T1ce; the anchor is masked to match
+                    src_m = (src_v[:1] * mask) if use_mask else src_v[:1]
+                    gt_img = target_vm[:1] + src_m
+                    pred_img = pv_m[:1] + src_m
+                else:
+                    gt_img = target_vm[:1]; pred_img = pv_m[:1]
 
                 # Input | GT | Pred, shared scale from input+GT (unchanged)
                 grid = torch.cat([in_img, gt_img, pred_img], dim=0)
@@ -200,17 +314,32 @@ def train_synthesis(
                 # Mask our grid after normalization
                 grid = mask*grid
                 # Residual on its own symmetric scale: 0.5 = zero error, 0/1 = -/+ max|error|
+                # (identical in both modes -- the anchor cancels out of GT - Pred)
                 res = (gt_img - pred_img).abs()
                 res = res / res.max().clamp(min=1e-8)
 
-                wandb.log({
+                in_cap = f"T1 anchor(ch{residual_src_idx})" if residual_mode else "Input(ch0)"
+                log = {
                     "val/example": wandb.Image(vutils.make_grid(grid, nrow=3),
-                                               caption="Input(ch0) | T1ce GT | Predicted"),
+                                               caption=f"{in_cap} | T1ce GT | Predicted"),
                     "val/residual": wandb.Image(vutils.make_grid(res, nrow=1),
                                                 caption="| GT - Pred |"),
                     **{f"val/{k}": v for k, v in mean_metrics.items()},
-                }, step=global_step)
+                }
 
+                if residual_mode:
+                    # The supervised quantity itself, GT vs prediction, on ONE shared
+                    # symmetric scale so over-/under-shoot is readable at a glance.
+                    d_gt, d_pred = target_vm[:1], pv_m[:1]
+                    vmax = torch.maximum(d_gt.abs().amax(), d_pred.abs().amax())
+                    delta = torch.cat([diverging_rgb(d_gt, vmax),
+                                       diverging_rgb(d_pred, vmax)], dim=0)
+                    log["val/delta"] = wandb.Image(
+                        vutils.make_grid(delta, nrow=2),
+                        caption=f"residual (T1ce - T1): GT | Pred  "
+                                f"[bwr, white=0, ±{float(vmax):.3f}]")
+
+                wandb.log(log, step=global_step)
 
             else:
                 print(f"[VAL] epoch={epoch} " +

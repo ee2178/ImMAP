@@ -1,0 +1,79 @@
+{
+    "task": "synthesis",
+    "experiment": {
+        "name": "Residual_Unet_T1ce_minus_T1"
+    },
+    "model": {
+        "type": "Unet2D",
+        "params": {
+            "in_chans": 3,
+            "out_chans": 1,
+            "chans": 16,
+            "num_pool_layers": 5,
+            "max_chans": 128,
+            "convs_per_block": 2,
+            "norm": "group",
+            "act": "relu",
+            "group_size": 4,
+            "up_mode": "nearest",
+            "up_conv": true,
+            "head": "conv"
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/Residual_Unet_T1ce",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "synthesis",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
+            "input_idx": [0, 1, 3],
+            "target_idx": [2],
+            "crop_size": 192,
+            "random_flips": true,
+            "batch_size": 16,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "synthesis",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
+            "input_idx": [0, 1, 3],
+            "target_idx": [2],
+            "random_flips": false,
+            "batch_size": 16,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 300,
+        "steps_per_epoch": 1750,
+        "val_every_epochs": 1,
+        "clip_grad": 1.0,
+        "backtrack_thresh": 0.5,
+        "backtrack_factor": 0.9,
+        "loss_type": "magnitude-l1",
+        "use_mask": true,
+        "psnr_only": false,
+        "residual_mode": true,
+        "residual_src_idx": 1,
+        "pretrained": null
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.01
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-4,
+            "T_max": 525000
+        }
+    },
+    "wandb": {
+        "project": "contrast-synthesis",
+        "id": null
+    }
+}
