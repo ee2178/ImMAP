@@ -15,20 +15,22 @@
 #SBATCH --error=logs/slurm_%A_%a.err
 #SBATCH --array=0-5          # ONE TASK PER LAMBDA BELOW -- keep 0-(len(LAMS)-1) in sync with LAMS
 #
-# lam_et sweep over the RESIDUAL U-NET task (config/BraTS/residual_synthesis_unet.json:
+# et_weight sweep over the RESIDUAL U-NET task (config/BraTS/residual_synthesis_unet.json:
 # task=synthesis, Unet2D, residual_mode=true). The counterpart of
-# slurm/dt_synthesis_lam_et_sweep.sbatch, same grid, so the two architectures are directly
+# slurm/synth_lam_sweep.sbatch, same grid, so the two architectures are directly
 # comparable arm for arm.
 #
-# Six arms: lam_et = 0 (CONTROL) plus five log-spaced over [0.001, 0.1].
+# Six arms: et_weight = 1 (CONTROL, the unweighted loss) plus five log-spaced to ~34x.
 #
-#     lam_et:   0      0.001   0.00316   0.01    0.0316   0.1
-#     ET px:    1x     1.3x    2.1x      4.3x    11.5x    34x
-#     share:    0%     0.2%    0.7%      2.2%    6.6%     18%
+#     et_weight:  1      1.3     2.1       4.3     11.6     34.4
+#     share:      0%     0.2%    0.7%      2.2%    6.6%     18%
+#
+# et_weight IS the per-ET-pixel multiplier, so these are the same six arms as before,
+# restated in the units the loss now takes (old lam_et * 334 + 1).
 #
 # ARM 0 IS ALSO THE BASELINE YOU LOST. The un-weighted residual U-Net that used to live in
 # trained_nets/brats/Residual_Unet_T1ce was overwritten when the ET run was launched into
-# that directory. lam_et=0 short-circuits the ET term entirely, so arm 0 retrains exactly
+# that directory. et_weight=1 is exactly the unweighted loss, so arm 0 retrains exactly
 # that control -- and under the CURRENT code and configs, which the old one was not
 # (scales went 2.0 -> 1.0, plus the dataset transform fix and the ET-mask filter). It is
 # what makes "detail outside the ET mask looks worse" a statement with a referent, and it
@@ -40,7 +42,7 @@
 # plausible-looking, but with exactly that detail missing. Watch val/resid_ratio (rms of the
 # predicted residual over rms of the true one): ~1 is healthy, drifting to 0 is the collapse.
 #
-# Submit:   sbatch slurm/residual_unet_lam_et_sweep.sbatch
+# Submit:   sbatch slurm/residual_unet_et_weight_sweep.sbatch
 # Probe:    set SWEEP_EPOCHS below (e.g. 30) to rank cheaply before committing 48h x 6.
 #           T_max is rescaled to match so the cosine schedule still completes.
 #
@@ -50,8 +52,8 @@
 
 # ---- sweep knobs (edit these) ------------------------------------------------------------------
 BASE_CONFIG="config/BraTS/residual_synthesis_unet.json"   # task=synthesis, residual_mode=true
-SWEEP_NAME="Residual_Unet_lam_et_sweep"                   # subfolder under trained_nets/brats/
-LAMS=(0 0.001 0.00316 0.01 0.0316 0.1)                    # 0 = control, then log-spaced 1e-3 .. 1e-1
+SWEEP_NAME="Residual_Unet_et_weight_sweep"                   # subfolder under trained_nets/brats/
+LAMS=(1 1.3 2.1 4.3 11.6 34.4)                            # 1 = control (unweighted), then log-spaced
                                                           # LEN MUST MATCH --array
 SWEEP_EPOCHS=""                                           # empty = use the config's num_epochs
 # ------------------------------------------------------------------------------------------------
@@ -65,17 +67,17 @@ set -eo pipefail
 : "${SLURM_ARRAY_TASK_ID:?must be run as an array job (sbatch sets SLURM_ARRAY_TASK_ID)}"
 
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${#LAMS[@]}" ]; then
-    echo "[sweep] task ${SLURM_ARRAY_TASK_ID} >= ${#LAMS[@]} lambdas -- shrink --array or add values"
+    echo "[sweep] task ${SLURM_ARRAY_TASK_ID} >= ${#LAMS[@]} weights -- shrink --array or add values"
     exit 1
 fi
 LAM="${LAMS[${SLURM_ARRAY_TASK_ID}]}"
-TAG="lam_et_${LAM}"
+TAG="etw_${LAM}"
 RUN_DIR="trained_nets/brats/${SWEEP_NAME}/${TAG}"
 GEN_CONFIG="${RUN_DIR}/config.gen.json"
 
 mkdir -p "${RUN_DIR}" logs
 
-# Write this task's config: override lam_et + savenames, fresh wandb run, optional epoch cap.
+# Write this task's config: override et_weight + savenames, fresh wandb run, optional epoch cap.
 python - "${BASE_CONFIG}" "${GEN_CONFIG}" "${LAM}" "${RUN_DIR}" "${SWEEP_NAME}_${TAG}" "${SWEEP_EPOCHS}" <<'PY'
 import json, sys
 from training.common import write_config      # yaml-safe writer; see note below
@@ -93,10 +95,10 @@ if cfg.get("task") != "synthesis":
 if not tr.get("residual_mode", False):
     raise SystemExit("[sweep] BASE_CONFIG has residual_mode=false; this sweep is the RESIDUAL task.")
 
-tr["lam_et"] = float(lam)
+tr["et_weight"] = float(lam)
 
-# lam_et is a no-op unless the loader actually returns an ET mask. Required even for the
-# lam_et=0 control, so that arm still logs et_psnr and stays comparable with the others.
+# et_weight is a no-op unless the loader actually returns an ET mask. Required even for the
+# et_weight=1 control, so that arm stays comparable with the others.
 for split in ("train", "val"):
     if not cfg["data"][split].get("et_mask", False):
         raise SystemExit(f"[sweep] data.{split}.et_mask is not true; the ET term would be a no-op.")
@@ -126,11 +128,11 @@ if epochs:
 # which yaml returns as the STRING '1e-06' and CosineAnnealingLR then dies on. write_config
 # canonicalizes and verifies with the same loader train.py uses.
 write_config(cfg, out)
-print(f"[sweep] lam_et={lam} -> {out}  (save_dir={save_dir}, "
+print(f"[sweep] et_weight={lam} -> {out}  (save_dir={save_dir}, "
       f"num_epochs={tr.get('num_epochs')}, T_max={cfg.get('scheduler',{}).get('params',{}).get('T_max')}, "
       f"residual_src_idx={src_idx})")
 PY
 
-echo "[sweep] array task ${SLURM_ARRAY_TASK_ID}: lam_et=${LAM}  ->  ${RUN_DIR}"
+echo "[sweep] array task ${SLURM_ARRAY_TASK_ID}: et_weight=${LAM}  ->  ${RUN_DIR}"
 python train.py "${GEN_CONFIG}"
 

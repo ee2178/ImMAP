@@ -244,6 +244,14 @@ def apply_loss_mask(image, recon, organ_mask, use_mask):
 
 
 ### Region-restricted supervision (enhancing-tumor / ET masks)
+#
+# NOTE: the training loops NO LONGER use region_loss. ET supervision is now a per-pixel
+# weight inside the ordinary loss (`et_weight` -> training.losses.weighted_loss), because
+# the 1/|region| factor below makes the per-pixel gradient scale as 1/area -- measured at a
+# ~6500x swing across realistic ET areas, which let a handful of pixels set the update
+# direction for every parameter. Both functions are kept for the analysis notebooks
+# (lam_et_sweep, synthesis_testbench), which use them as METRICS, where per-batch area
+# normalization is exactly what you want.
 def region_loss(loss_fn, pred, target, region, eps=1e-8):
     """`loss_fn` restricted to a binary `region`, normalized by that region's AREA.
 
@@ -270,7 +278,7 @@ def region_loss(loss_fn, pred, target, region, eps=1e-8):
 def region_psnr(gt, pred, region, eps=1e-12):
     """PSNR with the MSE taken over `region` pixels only (0 if the region is empty).
 
-    This is the number to watch when tuning lam_et. Global PSNR does respond to ET-only
+    This is the number to watch when tuning et_weight. Global PSNR does respond to ET-only
     error, but weakly -- it averages over the ~99.7% of the slice that is not tumor, so a
     change that costs it a few hundredths of a dB costs et_psnr several dB (measured at
     roughly 20-250x more movement, the ratio growing as the error gets smaller).

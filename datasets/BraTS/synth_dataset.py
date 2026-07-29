@@ -25,7 +25,7 @@ channel and not by position within input_idx.
 ET mask
 -------
 `et_mask=True` reads the 'et' dataset written by preprocessing/cmap.py and returns it as a
-fourth item, for ET-weighted supervision (`lam_et` in the training loops). It raises if the
+fourth item, for ET-weighted supervision (`et_weight` in the training loops). It raises if the
 h5 predates that change rather than substituting zeros, which would silently turn the ET
 loss term into a no-op. Backfill an existing dataset with:
     python preprocessing/cmap.py --config config/BraTS/cmap.yaml --add-seg-only

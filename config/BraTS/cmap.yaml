@@ -45,7 +45,7 @@ save_raw_image:    true     # also store an UNNORMALIZED, UNCLIPPED 'img_raw' da
 save_seg:          true     # also store the BraTS segmentation ('seg', raw labels) and the
                             #   derived enhancing-tumor mask ('et') in <case>_img.h5, put
                             #   through the SAME crop + slice selection as the images.
-                            #   Needed for ET-weighted synthesis training (lam_et > 0).
+                            #   Needed for ET-weighted synthesis training (et_weight != 1).
                             #   Subjects without a *_seg.nii.gz are written without them.
 et_labels:         [4]      # seg labels counted as ENHANCING TUMOR. BraTS2021: 1=necrotic
                             #   core, 2=edema, 4=ET (3 unused). Later BraTS releases

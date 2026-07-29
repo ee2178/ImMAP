@@ -29,7 +29,7 @@ cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
 #   model          Unet2D, 3 -> 1
 #   residual_mode  true, residual_src_idx 1 -> supervised on T1ce - X[:,1] = T1ce - T1
 #                  (input_idx [0,1,3] is flair,t1,t2, so position 1 is T1)
-#   lam_et         1.0    -> loss = L(pred, T1ce-T1) + 1.0 * L_ET(pred, T1ce-T1)
+#   et_weight      330    -> ET pixels count 330x in L(pred, T1ce-T1) (per-pixel weight)
 #   scales         [2,2,2,2]
 #
 # The architecture-free control: whatever the residual reparameterization and ET weighting

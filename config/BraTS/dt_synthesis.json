@@ -64,7 +64,7 @@
         "use_mask": true,
         "psnr_only": false,
         "lam_src": 0.0,
-        "lam_et": 1.0
+        "et_weight": 330.0
     },
     "optimizer": {
         "type": "Adam",

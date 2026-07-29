@@ -112,9 +112,67 @@ def mag_nl1_nl2(x, y, sigma, eps=1e-8):
 LOSS_REGISTRY = {
     "complex-mse": complex_mse,
     "magnitude-mse": magnitude_mse,
-    "magnitude-l1":magnitude_l1, 
+    "magnitude-l1":magnitude_l1,
     "sigma-scaled-complex-mse": sigma_scaled_complex_mse,
     "complex-nl1-nl2": complex_nl1_nl2,
     "magnitude-nl1-nl2": mag_nl1_nl2,
     "vgg-feature": vgg_feature_loss,
 }
+
+
+# ---------------------------------------------------------------------------
+# Per-pixel region weighting (enhancing-tumor upweighting)
+# ---------------------------------------------------------------------------
+# The elementwise error each mean-reduced loss above averages. Only losses that ARE a
+# per-pixel mean can be weighted per pixel; the ratio and perceptual entries in
+# LOSS_REGISTRY are not, and weighted_loss refuses them rather than approximating.
+POINTWISE_REGISTRY = {
+    "complex-mse":   lambda x, y: (x - y).abs() ** 2,
+    "magnitude-mse": lambda x, y: (x.abs() - y.abs()) ** 2,
+    "magnitude-l1":  lambda x, y: (x - y).abs(),
+}
+
+
+def weighted_loss(loss_type, pred, target, region, weight):
+    """`loss_type` with pixels inside `region` counted `weight` times as heavily:
+
+        L = mean_i( w_i * err_i ) ,      w_i = 1 + (weight - 1) * region_i
+
+    i.e. `mean(err) over non-region  +  weight * mean(err) over region`, both divided by
+    the SAME total pixel count. `weight = 1` is exactly the unweighted loss -- the term is
+    a no-op by construction rather than by a branch, and an empty region needs no special
+    case.
+
+    Replaces the area-normalized `training.common.region_loss`, which computed a MEAN OVER
+    THE REGION (`sum_region(err) / |region|`). That form's gradient inside the region
+    scales as 1/|region|, and enhancing tumor is well under 1% of a slice and absent from
+    many, so the per-pixel gradient swung ~2 orders of magnitude batch to batch (measured:
+    the ET term's gradient norm ran 2x the whole-brain term's on a large tumor and 190x on
+    a 1-pixel one). `clip_grad_norm_` cannot undo that -- it rescales the sum, preserving
+    the ratio -- so the update DIRECTION was set by a handful of pixels, at full Adam step
+    size. Here the per-pixel gradient is `w_i * d(err_i)/d(pred_i) / N`: bounded, and
+    independent of how much tumor the batch happens to contain.
+
+    It also makes every batch minimize the SAME objective. The old version returned 0 on
+    ET-free batches, so those steps descended a different function -- the estimator was not
+    just noisy but inconsistent.
+
+    Scale note: `weight` is PER PIXEL, so the region's share of the objective is
+    approximately `f*weight / (1 - f + f*weight)` for a region area fraction `f`. ET runs
+    around f = 0.003, so weight = 330 puts ~50% of the objective on the tumor (what the old
+    `lam_et = 1.0` did, via the 1/|region| normalization), weight = 50 puts ~13% there, and
+    weight = 1 is off. Expect to tune in the tens-to-hundreds, not around 1.
+
+    `region` broadcasts against `pred` (a (B, 1, H, W) mask over a (B, C, H, W) prediction
+    is the intended use). Both `pred` and `target` are expected to be brain-masked already,
+    exactly as with the unweighted loss.
+    """
+    if weight == 1:
+        return LOSS_REGISTRY[loss_type](pred, target, None)
+    if loss_type not in POINTWISE_REGISTRY:
+        raise ValueError(
+            f"loss_type {loss_type!r} is not a per-pixel mean, so it cannot be weighted "
+            f"per pixel; got weight={weight}. Use one of "
+            f"{sorted(POINTWISE_REGISTRY)}, or set the region weight to 1.")
+    w = 1.0 + (weight - 1.0) * region.expand_as(pred)
+    return torch.mean(w * POINTWISE_REGISTRY[loss_type](pred, target))

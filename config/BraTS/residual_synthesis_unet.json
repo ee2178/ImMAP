@@ -61,7 +61,7 @@
         "psnr_only": false,
         "residual_mode": true,
         "residual_src_idx": 1,
-        "lam_et": 1.0,
+        "et_weight": 330.0,
         "pretrained": null
     },
     "optimizer": {

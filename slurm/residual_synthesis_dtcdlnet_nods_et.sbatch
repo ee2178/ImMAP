@@ -33,7 +33,7 @@ cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
 #                  this file differs from residual_synthesis_dtcdlnet.json in exactly ONE
 #                  key, so the pair is a clean dS ablation.
 #   residual_mode  true, residual_src_idx 1 -> supervised on T1ce - T1
-#   lam_et         1.0
+#   et_weight      330    -> ET pixels count 330x in the loss (per-pixel weight)
 #   scales         [2,2,2,2]
 #
 # The premise worth testing here: dS exists to add enhancement on top of a base decode, but

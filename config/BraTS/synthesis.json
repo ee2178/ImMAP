@@ -57,7 +57,7 @@
         "loss_type": "magnitude-l1",
         "use_mask": true,
         "psnr_only": false,
-        "lam_et": 0.0,
+        "et_weight": 1.0,
         "pretrained": "trained_nets/brats/CCL_Pretrain_K20/ccl_encoder.pt"
     },
     "optimizer": {
