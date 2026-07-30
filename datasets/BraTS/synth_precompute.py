@@ -12,6 +12,18 @@ stored yhat is z-scored either way. The I2SB dataset (x1_source="synth") then di
 scales[x0_idx] exactly as it divides x0, so x1 lands on x0's scale automatically -- no scale
 bookkeeping downstream.
 
+RESIDUAL RUNS (`training.residual_mode: true`) are supported: those nets predict
+target - X[:, residual_src_idx] (e.g. T1ce - T1), so the anchor channel is added back here,
+exactly as training/synthesis.py lifts its metrics into the T1ce domain:
+
+    yhat = net(X) + X[:, residual_src_idx]
+
+`residual_src_idx` indexes the INPUT STACK X = img[..., input_idx] (not the stored contrasts),
+matching training.synthesis.anchor_channel -- so with input_idx [0,1,3] and residual_src_idx 1
+the anchor is stored channel 1 (T1). The addition happens in the SCALED space the net trained
+in, before the scales[target_idx] multiply back to z-scored, which reproduces the training-time
+T1ce-domain estimate term for term.
+
 In-place: this ADDS one dataset ('yhat') per h5; it does not touch 'img'/'mask'. Existing 'yhat'
 is skipped unless --overwrite.
 
@@ -41,7 +53,8 @@ from datasets.BraTS.i2sb_dataset import index_img_from_root  # noqa: E402
 
 
 @torch.no_grad()
-def infer_volume(net, img, input_idx, mult, device, batch, scales=None, target_idx=2):
+def infer_volume(net, img, input_idx, mult, device, batch, scales=None, target_idx=2,
+                 residual_src_idx=None):
     """img: (n, H, W, C) z-scored. Returns yhat (n, H, W) float32 in the same z-scored space.
     Pads H, W up to a multiple of `mult` (= 2**num_pool_layers) for the Unet2D pooling, then crops
     back, so full (non-32-divisible) slices work.
@@ -50,7 +63,12 @@ def infer_volume(net, img, input_idx, mult, device, batch, scales=None, target_i
     img/scales, so it has to be fed img/scales; the output is then multiplied back by
     scales[target_idx] so yhat stays stored in the unscaled z-scored space this file
     documents (and that I2SBDataset expects, since it divides yhat by scales[x0_idx]
-    itself). Feeding unscaled data to a scale-trained net is a silent domain shift."""
+    itself). Feeding unscaled data to a scale-trained net is a silent domain shift.
+
+    `residual_src_idx` (None = plain run) turns on residual lifting: the net's output is the
+    residual target - X[:, residual_src_idx], so the anchor channel is added back before the
+    crop. The anchor is taken from the SAME padded batch the net saw, so pad/crop stays
+    consistent between the two terms."""
     n, H, W, _ = img.shape
     if scales is not None:
         img = img / np.asarray(scales, dtype=np.float32)[None, None, :]
@@ -65,6 +83,8 @@ def infer_volume(net, img, input_idx, mult, device, batch, scales=None, target_i
         yb = net(xb)                                                  # (b, 1, Hpad, Wpad)
         if isinstance(yb, (tuple, list)):        # CDLNet-family: (x_hat, ...)
             yb = yb[0]
+        if residual_src_idx is not None:         # residual run: net predicts target - anchor
+            yb = yb + xb[:, residual_src_idx:residual_src_idx + 1]
         out[i:i + batch] = yb[..., :H, :W][:, 0].float().cpu()        # crop back, drop channel
     out = out.numpy()
     if scales is not None:
@@ -90,14 +110,25 @@ def main():
     scales = train_cfg.get("scales", None)                           # EXACT training intensity scaling
     target_idx = int(train_cfg.get("target_idx", [2])[0])
     mult = 2 ** int(cfg["model"]["params"].get("num_pool_layers", 5))
+
+    # residual runs predict target - X[:, residual_src_idx]; infer_volume adds the anchor back.
+    # The index addresses the INPUT STACK (len == len(input_idx)), as in synthesis.anchor_channel:
+    # an out-of-range slice would silently return an EMPTY tensor, so check it here.
+    residual_src_idx = None
     if cfg["training"].get("residual_mode"):
-        raise SystemExit(
-            "This run was trained in residual_mode: net(X) predicts T1ce - T1, not T1ce, so "
-            "yhat would be a residual map. Add the anchor channel back before writing yhat.")
+        residual_src_idx = int(cfg["training"].get("residual_src_idx", 0))
+        if not 0 <= residual_src_idx < len(input_idx):
+            raise SystemExit(
+                f"residual_src_idx={residual_src_idx} is out of range for input_idx={input_idx} "
+                f"({len(input_idx)} channels). It indexes the input stack, not the stored contrasts.")
+
     net = load_model(args.config, device=device)                    # build_model + load ckpt + eval()
     net.eval()
+    residual_note = ("off" if residual_src_idx is None else
+                     f"on (anchor = input ch {residual_src_idx} = stored ch {input_idx[residual_src_idx]})")
     print(f"[precompute] net={cfg['model']['type']} input_idx={input_idx} scales={scales} "
-          f"pad_mult={mult} key={args.key!r} device={device}\n[precompute] root={args.root}")
+          f"pad_mult={mult} key={args.key!r} residual={residual_note} device={device}\n"
+          f"[precompute] root={args.root}")
 
     img_paths, _ = index_img_from_root(args.root)
     n_done = n_skip = 0
@@ -111,7 +142,8 @@ def main():
                 del h[args.key]
             img = np.asarray(h["img"])                              # (n, H, W, C) z-scored
             yhat = infer_volume(net, img, input_idx, mult, device, args.batch,
-                                scales=scales, target_idx=target_idx)
+                                scales=scales, target_idx=target_idx,
+                                residual_src_idx=residual_src_idx)
             h.create_dataset(args.key, data=yhat.astype(np.float32))
             n_done += 1
             print(f"  wrote {args.key} {yhat.shape} -> {os.path.basename(p)}")

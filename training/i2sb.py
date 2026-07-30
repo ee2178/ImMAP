@@ -15,6 +15,10 @@ drives them. The network always predicts x0 directly (the only parameterization)
 Conditioning is a single toggle: set the data loader's `cond_idx` and the model's `C` together
 (C == 1 + len(cond_idx)). We assert they agree so a mismatch fails loudly rather than silently
 mis-slicing channels.
+
+Two optional loss weightings compose on top of the plain objective (see `_bridge_loss`):
+`et_weight` upweights enhancing-tumor pixels (needs the loader's `et_mask: true`), and
+`loss_weight` reweights each sample by its noise level. Both default to off.
 """
 
 import os
@@ -29,7 +33,7 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, snr_loss_weight
-from training.losses import LOSS_REGISTRY
+from training.losses import LOSS_REGISTRY, POINTWISE_REGISTRY, weighted_loss
 from training.metrics import compute_metrics
 from sb.base import build_schedule, n_steps, forward_sample, forward_std, predict_x0
 from sb.i2sb import i2sb_sample
@@ -43,34 +47,59 @@ def masked_mse(pred, target, organ_mask, use_mask):
     return F.mse_loss(pred, target)
 
 
-def _apply_loss(loss_fn, target, pred, organ_mask, use_mask, sigma):
-    """Mask (optionally) then evaluate a training.losses registry loss. Registry convention is
-    loss_fn(target, pred, sigma) (see train_denoiser); masked complex-mse reproduces masked_mse.
-    The network predicts x0 directly, so the loss always sees IMAGES (pred_x0 vs x0) and a
-    perceptual loss (e.g. vgg-feature) is meaningful."""
-    target, pred = apply_loss_mask(target, pred, organ_mask, use_mask)
-    return loss_fn(target, pred, sigma)
+def _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
+                 std_fwd, loss_weight):
+    """The x0-regression objective, with two INDEPENDENT weightings composed on top of it:
 
+        per-pixel   w_pix = 1 + (et_weight - 1) * et      enhancing-tumor upweighting
+        per-sample  w_t   = snr_loss_weight(sigma_t)      the t-weighting ("snr" / "t1")
 
-def _x0_weighted_mse(x0, pred_x0, mask, use_mask, std_fwd, loss_weight):
-    """Per-sample masked x0-MSE reweighted by snr_loss_weight(sigma_t) -- the item-3 t-weighting.
-    'snr' reproduces the I2SB eps objective as an x0 loss (toward t=0); 't1' biases toward t=1. This
-    is MSE-based, so it bypasses loss_type (VGG etc.)."""
+        loss = mean_i( w_t[i] * mean_j( w_pix[i,j] * err[i,j] ) )
+
+    With both off this is just the masked registry loss `loss_fn(target, pred, sigma)`, so existing
+    runs are bit-identical. With et_weight != 1 and loss_weight == "uniform" it is exactly
+    losses.weighted_loss (same
+    mean-over-all-pixels-of-w*err form), so the et_weight SCALE carries over from train_synthesis
+    unchanged -- tune it in the tens-to-hundreds, not around 1 (see weighted_loss's docstring: ET
+    covers ~0.3% of a slice, so weight 50 puts ~13% of the objective on the tumor and 330 ~50%).
+
+    Note what each weighting costs: the full LOSS_REGISTRY (vgg-feature, sigma-scaled, the ratio
+    losses) is only available when BOTH are off, because neither a perceptual loss nor a ratio loss
+    is a per-pixel mean. Any weighting therefore drops to the pointwise error, and `loss_type` must
+    name a POINTWISE_REGISTRY entry."""
     tgt, prd = apply_loss_mask(x0, pred_x0, mask, use_mask)
-    per_sample = ((prd - tgt).abs() ** 2).flatten(1).mean(dim=1)          # (B,) per-sample MSE
+
+    if loss_weight == "uniform":
+        if et_weight == 1:
+            return loss_fn(tgt, prd, std_fwd)            # untouched path: whole registry available
+        return weighted_loss(loss_type, prd, tgt, et, et_weight)
+
+    # per-sample t-weighting: reduce per sample FIRST, then weight, so w_t is a per-sample scalar
+    if loss_type not in POINTWISE_REGISTRY:
+        raise ValueError(
+            f"loss_weight={loss_weight!r} needs a per-pixel loss, but loss_type {loss_type!r} is "
+            f"not one. Use one of {sorted(POINTWISE_REGISTRY)}, or loss_weight='uniform'.")
+    err = POINTWISE_REGISTRY[loss_type](prd, tgt)
+    if et_weight != 1:
+        err = (1.0 + (et_weight - 1.0) * et.expand_as(err)) * err
+    per_sample = err.flatten(1).mean(dim=1)                                # (B,)
     return (snr_loss_weight(std_fwd, loss_weight) * per_sample).mean()
 
 
 def _split_batch(batch, device):
-    """Batch is (x0, x1, cond, mask). cond may have 0 channels (conditioning off) -> None."""
-    x0, x1, cond, mask = batch
+    """Batch is (x0, x1, cond, mask) or (x0, x1, cond, mask, et) when the loader has et_mask=True.
+    cond may have 0 channels (conditioning off) -> None; et is None when absent."""
+    x0, x1, cond, mask = batch[:4]
+    et = batch[4] if len(batch) > 4 else None
     x0 = x0.to(device, non_blocking=True)
     x1 = x1.to(device, non_blocking=True)
     mask = mask.to(device, non_blocking=True)
     cond = cond.to(device, non_blocking=True)
     if cond.shape[1] == 0:
         cond = None
-    return x0, x1, cond, mask
+    if et is not None:
+        et = et.to(device, non_blocking=True)
+    return x0, x1, cond, mask, et
 
 
 def train_i2sb(
@@ -89,6 +118,8 @@ def train_i2sb(
     use_mask=True,
     loss_type="complex-mse",         # any key in training.losses.LOSS_REGISTRY (e.g. "vgg-feature")
     loss_weight="uniform",           # per-sample t-weighting: "uniform" | "snr" (~t=0) | "t1" (~t=1)
+    et_weight=1.0,                   # per-pixel enhancing-tumor weight; 1 = off. Needs the loader's
+                                     # et_mask: true. Tune in the tens-to-hundreds (see _bridge_loss).
     psnr_only=False,
     # ---- I2SB method (cfg["i2sb"]) ----
     kind="brownian",                 # schedule: "brownian" (tau-parameterized) or "i2sb" (paper)
@@ -124,8 +155,8 @@ def train_i2sb(
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
 
-    # sanity: conditioning channels must match the network's input width (C = 1 + n_cond)
-    _assert_cond_matches_model(net, train_loader, device, target_channels)
+    # sanity: conditioning width vs the model, and that an ET run actually has ET masks
+    _assert_batch_matches_config(net, train_loader, device, target_channels, et_weight, loss_type)
 
     best_loss = float("inf")
     train_iter = iter(train_loader)
@@ -143,7 +174,7 @@ def train_i2sb(
             except StopIteration:
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
-            x0, x1, cond, mask = _split_batch(batch, device)
+            x0, x1, cond, mask, et = _split_batch(batch, device)
 
             # ----- sample a bridge point and regress the clean endpoint x0 -----
             b = x0.shape[0]
@@ -153,9 +184,8 @@ def train_i2sb(
 
             opt.zero_grad()
             pred_x0 = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
-            loss = (_apply_loss(loss_fn, x0, pred_x0, mask, use_mask, std_fwd)
-                    if loss_weight == "uniform"
-                    else _x0_weighted_mse(x0, pred_x0, mask, use_mask, std_fwd, loss_weight))
+            loss = _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
+                                std_fwd, loss_weight)
 
             loss.backward()
             if clip_grad is not None:
@@ -213,7 +243,8 @@ def train_i2sb(
                 val_seed=val_seed, use_mask=use_mask, deterministic=deterministic,
                 posterior=posterior, clip_denoise=clip_denoise, val_nfe=val_nfe,
                 target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
-                loss_weight=loss_weight, wandb=wandb, global_step=global_step,
+                loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
+                wandb=wandb, global_step=global_step,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -222,14 +253,18 @@ def train_i2sb(
     return net
 
 
-def _assert_cond_matches_model(net, loader, device, target_channels):
-    """Peek one batch: the network's input width self.C must equal target_channels + n_cond."""
+def _assert_batch_matches_config(net, loader, device, target_channels, et_weight, loss_type):
+    """Peek one batch and fail loudly on the two config mismatches that would otherwise be silent:
+    the network's input width (C = target_channels + n_cond), and an ET-weighted run whose loader
+    is not returning ET masks (which would train the ordinary objective under an ET config)."""
+    batch = None
     n_cond = 0
     try:
-        cond = next(iter(loader))[2]
-        n_cond = int(cond.shape[1])
+        batch = next(iter(loader))
+        n_cond = int(batch[2].shape[1])
     except Exception:
         pass
+
     expected_C = target_channels + n_cond
     model_C = getattr(net, "C", None)
     if model_C is not None and model_C != expected_C:
@@ -239,11 +274,27 @@ def _assert_cond_matches_model(net, loader, device, target_channels):
             f"(or cond_idx=[] and C=1 to disable conditioning)."
         )
 
+    if et_weight == 1:
+        return
+    if loss_type not in POINTWISE_REGISTRY:
+        raise ValueError(
+            f"et_weight={et_weight} needs a per-pixel loss, but loss_type {loss_type!r} is not "
+            f"one. Use one of {sorted(POINTWISE_REGISTRY)}, or set et_weight: 1.")
+    if batch is not None and len(batch) < 5:
+        raise ValueError(
+            f"et_weight={et_weight} but the loader returned a {len(batch)}-tuple (no ET mask). "
+            f"Set et_mask: true in BOTH data.train and data.val, or set et_weight: 1.")
+    if batch is not None and float(batch[4].sum()) == 0:
+        print(f"[i2sb] WARNING: et_weight={et_weight} but the first batch's ET mask is entirely "
+              f"zero. That is normal for a batch of tumor-free slices, but if it persists check "
+              f"the h5 'et' dataset.")
+
 
 @torch.no_grad()
 def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
-              target_channels, psnr_only, loss_fn, loss_weight, wandb, global_step):
+              target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
+              wandb, global_step):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -254,13 +305,16 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
     net.eval()
     agg = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "nrmse": 0.0}
     n_samples = 0
+    et_sse, et_n = 0.0, 0.0      # pooled over the whole split, not averaged per batch: most
+                                 # batches contain little or no tumor, so a mean of per-batch
+                                 # ET-PSNRs would be dominated by the emptiest ones
     last = None
     if val_seed is not None:
         gen = torch.Generator(device=device).manual_seed(val_seed)   # fixed val steps -> comparable
     else:
         gen = None
     for batch in val_loader:
-        x0, x1, cond, mask = _split_batch(batch, device)
+        x0, x1, cond, mask, et = _split_batch(batch, device)
         bs = x0.shape[0]
 
         if val_mode == "full_recon":
@@ -269,17 +323,19 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
                 posterior=posterior, clip_denoise=clip_denoise,
                 target_channels=target_channels, log_count=1, verbose=False,
             )
-            sigma_v = torch.zeros(bs, 1, 1, 1, device=device)   # end-to-end: no single step
-            loss = _apply_loss(loss_fn, x0, pred, mask, use_mask, sigma_v)
+            # end-to-end: there is no single step, so no t-weighting either (sigma is 0 and the
+            # per-sample weight would be meaningless) -- but ET weighting still applies.
+            sigma_v = torch.zeros(bs, 1, 1, 1, device=device)
+            loss = _bridge_loss(loss_fn, loss_type, x0, pred, mask, use_mask, et, et_weight,
+                                sigma_v, "uniform")
             xt, step = x1, None
         else:  # single_pass: one random step, one forward (same as a training step)
             step = torch.randint(0, interval, (bs,), generator=gen, device=device)
             xt = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
             pred = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
-            loss = (_apply_loss(loss_fn, x0, pred, mask, use_mask, std_fwd)
-                    if loss_weight == "uniform"
-                    else _x0_weighted_mse(x0, pred, mask, use_mask, std_fwd, loss_weight))
+            loss = _bridge_loss(loss_fn, loss_type, x0, pred, mask, use_mask, et, et_weight,
+                                std_fwd, loss_weight)
 
         x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
         mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only)
@@ -287,10 +343,18 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         for k in ("psnr", "ssim", "nrmse"):
             if k in mets:
                 agg[k] += float(mets[k].detach()) * bs
+        if et is not None:
+            et_sse += float((et * (x0_m - pred_m).abs() ** 2).sum())
+            et_n += float(et.sum())
         n_samples += bs
         last = (x1, xt, x0_m, pred_m, mask, step)
 
     mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
+    # ET PSNR, area-normalized over the split (matches metrics.psnr's implicit data_range of 1).
+    # This is the number et_weight is meant to move; whole-brain psnr barely registers a change
+    # confined to ~0.3% of the voxels.
+    if et_n > 0:
+        mean_metrics["et_psnr"] = -10.0 * math.log10(et_sse / et_n + 1e-12)
 
     if wandb and last is not None:
         x1, xt, x0_m, pred_m, mask, step = last

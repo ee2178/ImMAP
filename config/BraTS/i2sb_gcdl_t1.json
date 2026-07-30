@@ -1,0 +1,98 @@
+{
+    "task": "i2sb",
+    "experiment": {
+        "name": "I2SB_GCDL_T1ce_from_T1_PaperSchedule"
+    },
+    "model": {
+        "type": "GroupCDL",
+        "params": {
+            "K": 30,
+            "M": 169,
+            "Mh": 32,
+            "W": 35,
+            "dK": 5,
+            "C": 1,
+            "sc": 2,
+            "P": 7,
+            "flex_block_size": 128,
+            "attn_backend": "flex",
+            "sim_fun": "distance",
+            "fenchel": false,
+            "is_complex": false,
+            "init": true
+        }
+    },
+    "i2sb": {
+        "kind": "i2sb",
+        "n_points": 1000,
+        "beta_max": 0.3,
+        "deterministic": false,
+        "posterior": "ddpm",
+        "clip_denoise": false,
+        "val_mode": "single_pass",
+        "val_seed": 0,
+        "val_nfe": 20,
+        "target_channels": 1
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/I2SB_GCDL_T1ce_from_T1",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "i2sb",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [],
+            "scales": [1.0, 1.0, 1.0, 1.0],
+            "image_key": "img",
+            "crop_size": 192,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "i2sb",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [],
+            "scales": [1.0, 1.0, 1.0, 1.0],
+            "image_key": "img",
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 6000,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 100,
+        "clip_grad": 1.0,
+        "backtrack_thresh": 100,
+        "backtrack_factor": 0.9,
+        "use_mask": true,
+        "loss_type": "complex-mse",
+        "loss_weight": "uniform",
+        "et_weight": 1.0,
+        "psnr_only": false
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 5.0e-4
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "schrodinger-bridge",
+        "id": null
+    }
+}

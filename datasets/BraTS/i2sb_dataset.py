@@ -9,6 +9,13 @@ normalization.
     x1   : (1, H, W)          prior / bridge start (default T1,  stored idx 1)
     cond : (n_cond, H, W)     conditioning stack   (default FLAIR,T1,T2 = [0,1,3]); () if off
     mask : (1, H, W)          brain mask
+    et   : (1, H, W)          enhancing-tumor mask -- ONLY when et_mask=True (see below)
+
+ET MASK. `et_mask=True` appends a FIFTH item, the enhancing-tumor mask, for `et_weight` in
+train_i2sb. It is appended rather than always returned (unlike SynthesisDataset, which always
+returns 4) because this dataset's 4-tuple is already unpacked positionally in several places --
+datasets/BraTS/stack_dataset.py and the i2sb notebooks -- so an unconditional fifth element would
+break them. Default False keeps every existing config and notebook on the old 4-tuple.
 
 Stored channel order follows cmap_config.contrasts: [flair, t1, t1ce, t2] -> flair=0, t1=1,
 t1ce=2, t2=3.
@@ -30,6 +37,8 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset
 
 import h5py
+
+from datasets.BraTS.synth_dataset import filter_by_key
 
 
 def index_img_from_root(root):
@@ -73,6 +82,8 @@ class I2SBDataset(Dataset):
                                 None -> all ones. NO other normalization is applied.
             image_key (str)     h5 dataset to read: "img" (normalized) or "img_raw"
                                 (unnormalized; requires the generator's save_raw_image: true).
+            et_mask   (bool)    also return the enhancing-tumor mask as a 5th item (needs 'et'
+                                in the h5); subjects without it are dropped up front.
             center_crop, crop_size, random_flips   (optional geometric augmentation)
         """
         self.x0_idx = int(getattr(cfg, "x0_idx", 2))     # T1ce
@@ -90,6 +101,9 @@ class I2SBDataset(Dataset):
         self.yhat_key = str(getattr(cfg, "yhat_key", "yhat"))
         if self.x1_source not in ("contrast", "synth"):
             raise ValueError(f"x1_source must be 'contrast' or 'synth', got {self.x1_source!r}")
+
+        # enhancing-tumor mask, for train_i2sb's et_weight. Off by default (keeps the 4-tuple).
+        self.et_mask = bool(getattr(cfg, "et_mask", False))
 
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
@@ -112,6 +126,21 @@ class I2SBDataset(Dataset):
             self.img_paths, n_slices = index_img_from_manifest(manifest)
         else:
             raise ValueError("I2SBDataset needs cfg.root or cfg.manifest")
+
+        # BraTS ships subjects with no segmentation nifti, so they have no 'et' and never will.
+        # Drop them up front (as SynthesisDataset does) -- otherwise et_weight silently degrades
+        # to 1 on those slices, i.e. a different objective on an unknown fraction of the data.
+        if self.et_mask:
+            n_before = len(self.img_paths)
+            self.img_paths, n_slices, dropped = filter_by_key(self.img_paths, n_slices, "et")
+            if not self.img_paths:
+                raise RuntimeError(
+                    f"et_mask=True but NONE of the {n_before} subjects under "
+                    f"{root or manifest} have an 'et' dataset. Backfill them in place with: "
+                    f"python preprocessing/cmap.py --config config/BraTS/cmap.yaml --add-seg-only")
+            if dropped:
+                print(f"[I2SBDataset] et_mask: excluded {len(dropped)}/{n_before} subject(s) "
+                      f"({len(dropped) / n_before:.1%}) with no 'et' in their h5")
 
         file_id, local = [], []
         for fi, n in enumerate(n_slices):
@@ -165,14 +194,26 @@ class I2SBDataset(Dataset):
         cond = chw(img[..., self.cond_idx]) if self.cond_idx else torch.zeros(0, *img.shape[:2])
         mask = chw(mask)                                  # (1, H, W)
 
+        if self.et_mask:
+            if "et" not in h:
+                raise KeyError(
+                    f"'et' not in {self.img_paths[fi]} (keys={list(h.keys())}). This h5 "
+                    f"predates ET-mask storage. Backfill it in place with: python "
+                    f"preprocessing/cmap.py --config config/BraTS/cmap.yaml --add-seg-only")
+            et = chw(np.asarray(h["et"][li]))             # (1, H, W) 0/1
+        else:
+            et = None
+
         # joint geometric transform: stack -> transform -> split (keeps alignment)
         if self.transform is not None:
             n0, n1, ncond = x0.shape[0], x1.shape[0], cond.shape[0]
-            stacked = torch.cat([x0, x1, cond, mask], dim=0)
-            stacked = self.transform(stacked)
+            parts = [x0, x1, cond, mask] + ([et] if et is not None else [])
+            stacked = self.transform(torch.cat(parts, dim=0))
             x0 = stacked[:n0]
             x1 = stacked[n0:n0 + n1]
             cond = stacked[n0 + n1:n0 + n1 + ncond]
-            mask = stacked[n0 + n1 + ncond:]
+            mask = stacked[n0 + n1 + ncond:n0 + n1 + ncond + 1]
+            if et is not None:
+                et = stacked[n0 + n1 + ncond + 1:]
 
-        return x0, x1, cond, mask
+        return (x0, x1, cond, mask) if et is None else (x0, x1, cond, mask, et)

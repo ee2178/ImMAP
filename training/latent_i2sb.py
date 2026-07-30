@@ -93,8 +93,11 @@ def _combine_loss(loss_fn, loss_mode, latent_weight, image_weight, loss_weight, 
 
 def _split_batch(batch, device):
     """Batch is (x0, x1, cond, mask). cond must be non-empty (the joint dictionary is
-    conditioned on FLAIR/T1/T2), so unlike train_i2sb we keep it as a tensor."""
-    x0, x1, cond, mask = batch
+    conditioned on FLAIR/T1/T2), so unlike train_i2sb we keep it as a tensor.
+
+    A loader with et_mask=True appends a 5th item; it is dropped here rather than left to blow up
+    on the unpack, since ET weighting is a train_i2sb feature and has no latent counterpart yet."""
+    x0, x1, cond, mask = batch[:4]
     x0 = x0.to(device, non_blocking=True)
     x1 = x1.to(device, non_blocking=True)
     mask = mask.to(device, non_blocking=True)

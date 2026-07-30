@@ -26,6 +26,7 @@ def build_i2sb_loader(root=None,
                       yhat_key="yhat",          # h5 dataset holding the e2e synth output
                       scales=None,              # per-stored-channel multipliers; None = ones
                       image_key="img",          # "img" (normalized) or "img_raw" (unnormalized)
+                      et_mask=False,            # append the enhancing-tumor mask (train_i2sb et_weight)
                       center_crop=None,
                       crop_size=None,
                       random_flips=False,
@@ -40,7 +41,7 @@ def build_i2sb_loader(root=None,
         root=root, manifest=manifest,
         x0_idx=x0_idx, x1_idx=x1_idx, cond_idx=list(cond_idx),
         x1_source=x1_source, yhat_key=yhat_key,
-        scales=scales, image_key=image_key,
+        scales=scales, image_key=image_key, et_mask=et_mask,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
     )
     dataset = I2SBDataset(ds_cfg)
