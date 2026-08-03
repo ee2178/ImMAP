@@ -22,5 +22,5 @@ conda activate gcdl      # Replace with your actual env name
 # Navigate to the directory containing train.py
 
 cd ~/scratch/ee2178/ImMAP       # Replace with the actual path
-python train.py config/BraTS/i2sb.json         # start here: t(1-t) bridge, x0 target
-# python train.py config/BraTS/i2sb_paper.json   # faithful I2SB baseline (symmetric + eps)
+# python train.py config/BraTS/i2sb.json         # start here: t(1-t) bridge, x0 target
+python train.py config/BraTS/i2sb_paper.json   # faithful I2SB baseline (symmetric + eps)

@@ -7,7 +7,7 @@
 #SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
-#SBATCH --time=48:00:00
+#SBATCH --time=5:00:00
 #SBATCH --job-name=ResUNet-lamET-sweep
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
@@ -53,9 +53,9 @@
 # ---- sweep knobs (edit these) ------------------------------------------------------------------
 BASE_CONFIG="config/BraTS/residual_synthesis_unet.json"   # task=synthesis, residual_mode=true
 SWEEP_NAME="Residual_Unet_et_weight_sweep"                   # subfolder under trained_nets/brats/
-LAMS=(1 1.3 2.1 4.3 11.6 34.4)                            # 1 = control (unweighted), then log-spaced
+LAMS=(1 1.3 2.1 4.3 11.6)                            # 1 = control (unweighted), then log-spaced
                                                           # LEN MUST MATCH --array
-SWEEP_EPOCHS=""                                           # empty = use the config's num_epochs
+SWEEP_EPOCHS="50"                                           # empty = use the config's num_epochs
 # ------------------------------------------------------------------------------------------------
 
 # Environment (mirrors slurm/residual_synthesis_unet_et.sbatch)

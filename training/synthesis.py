@@ -385,6 +385,8 @@ def train_synthesis(
                     # prediction is missing the tumor or the tumor is simply not in view.
                     d_gt, d_pred = target_vm[:1], pv_m[:1]
                     vmax = torch.maximum(d_gt.abs().amax(), d_pred.abs().amax())
+                    vmin = torch.minimum(d_gt.abs().amin(), d_pred.abs().amin())
+
                     delta = torch.cat([diverging_rgb(d_gt, vmax),
                                        diverging_rgb(d_pred, vmax),
                                        diverging_rgb(etv[:1], 1.0)], dim=0)
