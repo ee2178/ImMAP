@@ -9,6 +9,7 @@ from .groupcdl import GroupCDL
 from .cclnet import CCLNet, Unet2D
 from .multigrid import MGCDLNet, VCycle
 from .ladmm import AltSplitCDLNet
+from .sb_cdlnet import SBCDLNet
 
 
 def build_model(cfg):
@@ -44,6 +45,11 @@ def build_model(cfg):
         return CCLNet(**params)
     elif model_type == "Unet2D":
         return Unet2D(**params)
+
+    # Schrodinger-bridge CDLNet: two-fidelity unrolled ISTA over a shared sparse code
+    # (target-domain + prior-domain dictionaries). Its schedule params must match cfg["i2sb"].
+    elif model_type == "SBCDLNet":
+        return SBCDLNet(**params)
 
     # Multigrid family, all one class:
     #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations
