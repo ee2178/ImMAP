@@ -7,6 +7,8 @@ from .normunet import NormUnet
 from .ipalmnet import IPALMNet
 from .groupcdl import GroupCDL
 from .cclnet import CCLNet, Unet2D
+from .multigrid import MGCDLNet, VCycle
+from .ladmm import AltSplitCDLNet
 
 
 def build_model(cfg):
@@ -42,4 +44,31 @@ def build_model(cfg):
         return CCLNet(**params)
     elif model_type == "Unet2D":
         return Unet2D(**params)
+
+    # Multigrid family, all one class:
+    #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations
+    #   K = int                              -> ordinary CDLNet, same blocks
+    #   Mh + W > 1                           -> group (nonlocal) prox
+    #   dual=True                            -> LPDS: z <- u - prox(u)
+    # The four names differ only in the flags they pin, and exist so that a
+    # config states its intent (and fails loudly if it contradicts it).
+    elif model_type in ("MGCDLNet", "MGGroupCDL", "MGLPDS", "MGGroupLPDS"):
+        params = dict(params)
+        if model_type in ("MGLPDS", "MGGroupLPDS"):
+            # Moreau's identity: the Fenchel prox of the same threshold, i.e. a
+            # residual connection around it (clipping instead of shrinkage),
+            # with the read-out becoming y~ - D z.
+            params["dual"] = True
+        if model_type in ("MGGroupCDL", "MGGroupLPDS"):
+            if params.get("W", 1) <= 1 or params.get("Mh") is None:
+                raise ValueError(
+                    f"{model_type} needs a group prox: set W > 1 (attention "
+                    f"window side, odd) and Mh (attention channels). "
+                    f"Got W={params.get('W', 1)}, Mh={params.get('Mh')}.")
+        return MGCDLNet(**params)
+
+    # unrolled linearized ADMM with a learned CDL prox (+ optional joint coils)
+    elif model_type == "AltSplitCDLNet":
+        return AltSplitCDLNet(**params)
+
     raise ValueError

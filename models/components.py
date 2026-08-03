@@ -92,7 +92,11 @@ class ConvTranspose2d(_GaussConvNd):
     def __init__(self, M, C, P, stride=1, bias=False, complex=True):
         super().__init__(complex=complex)
         self.padding = (P - 1) // 2
-        self.output_padding = 1
+        # torch requires output_padding < stride; stride - 1 is the value that
+        # makes this the exact transpose of Conv2d(C, M, P, stride=stride) for
+        # any stride (it was hard-coded to 1, which crashed for stride=1 and is
+        # unchanged for the common stride=2 case).
+        self.output_padding = max(stride - 1, 0)
         self.stride = stride
         self.conv_real = nn.ConvTranspose2d(M, C, P, stride=stride,
             padding=self.padding, output_padding=self.output_padding, bias=bias)
@@ -134,6 +138,21 @@ class ComplexConvTranspose2d(nn.Module):
             output_padding=self.output_padding,
             bias=bias
         )
+
+    # Same unified single-tensor view as _GaussConvNd, so the shared
+    # init / projection helpers in models/base.py can write these filters.
+    # Without it `self.B[k].weight = W` just parks a plain attribute on the
+    # module and the filters are never initialised.
+    @property
+    def weight(self):
+        return torch.complex(self.conv_real.weight.data,
+                             self.conv_imag.weight.data)
+
+    @weight.setter
+    def weight(self, W):
+        Wc = W if W.is_complex() else torch.complex(W, torch.zeros_like(W))
+        self.conv_real.weight.data.copy_(Wc.real)
+        self.conv_imag.weight.data.copy_(Wc.imag)
 
     def forward(self, x):
         x_r, x_i = x.real, x.imag
