@@ -42,7 +42,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.circulant_attention import Circulant, circ_adjacency, _abs2
-from models.circulant_flex import FlexAdjacency, get_block_mask
+from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
+                                   get_block_mask)
+from models.circulant_triton import HAVE_TRITON, TritonAdjacency
+
+TRITON_SIMS = ("pidistance", "pidot")
 
 EPS = 1e-8
 
@@ -229,13 +233,30 @@ class GroupThreshold(nn.Module):
         self.subgrad_mode = subgrad_mode
         assert self.window % 2 == 1, "window side must be odd"
 
-        assert attn_backend in ("gather", "flex")
+        assert attn_backend in ("gather", "flex", "triton")
         self.attn_backend = attn_backend
         self.flex_block_size = int(flex_block_size)
         self.flex_compile_mask = flex_compile_mask
         self._flex_fn = None          # set by compile_flex()
-        if attn_backend == "flex" and sim_fun not in ("distance", "dot", "realdot"):
-            raise ValueError(f"FlexAttention cannot fuse sim_fun={sim_fun!r}")
+        if attn_backend == "flex" and sim_fun not in FLEX_SIMS:
+            raise ValueError(
+                f"FlexAttention cannot fuse sim_fun={sim_fun!r}; expected one "
+                f"of {FLEX_SIMS}")
+        if attn_backend == "triton":
+            # The triton kernel exists FOR the phase-invariant similarities --
+            # the ones flex cannot carry on complex features. Anything else is
+            # cheaper on flex, so point the config there rather than running a
+            # hand-written kernel for no reason.
+            if sim_fun not in TRITON_SIMS:
+                raise ValueError(
+                    f"attn_backend='triton' implements {TRITON_SIMS}; "
+                    f"sim_fun={sim_fun!r} is faster on attn_backend='flex'")
+            if not HAVE_TRITON:
+                raise RuntimeError(
+                    "attn_backend='triton' but triton is not importable. It "
+                    "ships with PyTorch's Linux CUDA wheels; on this machine "
+                    "use 'gather' (exact, slow) or 'flex' with "
+                    "sim_fun='distance'.")
 
         self.grouped = self.Mh is not None
         if self.grouped:
@@ -305,10 +326,11 @@ class GroupThreshold(nn.Module):
 
     def apply_gamma(self, Gamma, x, transpose=False):
         """`(I (x) Gamma) x` channel-wise, complex-safe, head-aware."""
-        if isinstance(Gamma, FlexAdjacency):
+        if isinstance(Gamma, (FlexAdjacency, TritonAdjacency)):
             if torch.is_complex(x):
-                raise TypeError("the flex backend applies Gamma to real values "
-                                "only; use attn_backend='gather'")
+                raise TypeError(
+                    f"the {self.attn_backend} backend applies Gamma to real "
+                    f"values only; use attn_backend='gather'")
             return Gamma.apply(x, transpose=transpose)     # heads handled inside
         B = x.shape[0]
         xh = self._to_heads(x)
@@ -365,7 +387,28 @@ class GroupThreshold(nn.Module):
 
     def _build_gamma(self, z, sigma):
         q, k = self._scaled_qk(z, sigma)
+        if self.attn_backend == "triton":
+            # Complex q/k are the point of this backend: it accumulates BOTH
+            # Re<q,k> and Im<q,k> so |<q,k>| is available, which no score_mod
+            # can reach. Real q/k work too (im is compiled out).
+            return TritonAdjacency(q, k, self.window, sim=self.sim_fun,
+                                   heads=self.nheads, eps=self.eps)
         if self.attn_backend == "flex":
+            # The pi- (phase-invariant) similarities need |<q,k>|. For REAL
+            # features that is |q.k|, a pointwise function of the score, so the
+            # fusion is exact. For COMPLEX ones the stacked score is only
+            # Re<q,k>; recovering the modulus needs Im<q,k> as well, a second
+            # bilinear form that a score_mod cannot see. Fail here rather than
+            # silently attending on the wrong similarity.
+            if self.sim_fun in SIM_ABS and q.is_complex():
+                raise ValueError(
+                    f"sim_fun={self.sim_fun!r} needs |<q,k>|, which "
+                    f"FlexAttention cannot form for COMPLEX features: its "
+                    f"score is one bilinear form (Re<q,k>) and the modulus "
+                    f"needs two. Options: attn_backend='gather' (exact, "
+                    f"materialises the window), or sim_fun='distance' with "
+                    f"flex (fused, drops phase invariance). Real-valued "
+                    f"models can use {self.sim_fun!r} with flex directly.")
             q, k = self._stack_ri(q), self._stack_ri(k)
             return FlexAdjacency(q, k, self.window, sim=self.sim_fun,
                                  heads=self.nheads,
@@ -390,7 +433,10 @@ class GroupThreshold(nn.Module):
             cache["Gamma"], cache["dupdate"] = self._build_gamma(z, sigma), 1
         elif cache.get("dupdate", 0) % self.dK == 0:
             G_new = self._build_gamma(z, sigma)
-            if isinstance(G_new, FlexAdjacency):
+            if isinstance(G_new, (FlexAdjacency, TritonAdjacency)):
+                # No materialised values to blend (Alg. 4's convex combination),
+                # so the query/key pair is re-cached outright instead -- the
+                # same trade the flex backend makes.
                 cache["Gamma"] = G_new
             else:
                 g = self.gamma(sigma, ref=z).reshape(-1)          # (nheads,)

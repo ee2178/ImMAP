@@ -15,6 +15,11 @@ materialised), and the similarity choice is a `score_mod`:
          softmax_j(-1/2||q_i-k_j||^2) = softmax_j(q_i.k_j - 1/2||k_j||^2),
        i.e. ordinary QK attention with a per-key bias -1/2||k_j||^2. That bias is
        a captured tensor indexed by kv_idx in the score_mod. scale = 1 (no 1/sqrt d).
+  * pidot          : S_ij = |<q_i, k_j>|                   -> score_mod = |score|
+  * pidistance     : S_ij = -1/2||q_i||^2 + |<q_i,k_j>| - 1/2||k_j||^2
+       -> |score| plus the same per-key bias as distance. For REAL features
+       <q,k> = q.k, so |<q,k>| is |score| and this is exact. See SIM_ABS below
+       for why the complex case is not expressible.
 
 FlexAttention returns the *fused* softmax(S)·V, i.e. row-sm(CircSim)·V in one
 kernel -- it never forms the (B, N, K) window tensor. This is the big win on
@@ -23,8 +28,10 @@ matrix; see notes on the GroupCDL convex blend at the bottom.)
 
 Layout: images are (B, C, H, W). We flatten spatial row-major to a sequence of
 length S = H*W (seq index s = r*W + c) and run heads over the channel dim.
-Real-valued only (FlexAttention has no complex support) -> denoising / real
-features; complex CS-MRI must use the gather/sparse path instead.
+Real-valued only (FlexAttention has no complex support). Complex features are
+stacked as [Re; Im] by the caller, which leaves dot/realdot/distance unchanged
+because q.k over the stacked vectors IS Re<q,k>; the phase-invariant pi- family
+is exact for genuinely real features only.
 """
 
 from __future__ import annotations
@@ -110,13 +117,72 @@ def get_block_mask(H, W, win, device, circular=True, BLOCK_SIZE=128, compile=Non
 
 
 # ---------------------------------------------------------------------------
-# score_mod for distance similarity (per-key bias -1/2 ||k_j||^2)
+# score_mods
 # ---------------------------------------------------------------------------
-def _distance_score_mod(k_sqnorm):
-    """k_sqnorm : (B, heads, S) = sum over head_dim of k^2."""
-    def score_mod(score, b, h, q_idx, kv_idx):
-        return score - 0.5 * k_sqnorm[b, h, kv_idx]
+# A score_mod sees ONE number per (q, k) pair -- the raw dot product -- plus
+# anything indexable by b / h / q_idx / kv_idx. So a similarity is fusible iff
+# it is a pointwise function of `q . k` plus per-query and per-key terms:
+#
+#   dot / realdot : q . k                                      identity
+#   distance      : -1/2||q-k||^2 = q.k - 1/2||k||^2 (+ const) per-key bias
+#   pidot         : |<q,k>|                                    |score|
+#   pidistance    : -1/2||q||^2 + |<q,k>| - 1/2||k||^2         |score| + per-key bias
+#
+# The -1/2||q||^2 term is constant across k, so it cancels inside the row
+# softmax and never has to be formed.
+#
+# REAL FEATURES ONLY for the pi- family: with real q, k the inner product is
+# real, so |<q,k>| is |score| and the fusion is exact. With COMPLEX features
+# (stacked here as [Re; Im]) the raw score is Re<q,k>, and recovering
+# |<q,k>| = sqrt(Re^2 + Im^2) needs a SECOND bilinear form, Im<q,k> = [b;-a].[c;d].
+# One flex_attention call produces one score, and score_mods cannot see across
+# heads or calls, so complex pidistance is not expressible here -- it needs a
+# bespoke kernel that accumulates both parts, which is what the Julia flash
+# path is. `GroupThreshold` rejects that combination up front.
+SIM_ABS = ("pidot", "pidistance")            # need |score|
+SIM_KNORM = ("distance", "pidistance")       # need the -1/2||k||^2 per-key bias
+FLEX_SIMS = ("distance", "dot", "realdot", "pidot", "pidistance")
+
+
+def _score_mod(sim, k_sqnorm=None, bias=None):
+    """Build the score_mod for `sim`, optionally with an extra per-key `bias`.
+
+    `k_sqnorm` / `bias` : (B, heads, S), indexed by kv_idx.
+    `bias` is what the transposed apply adds (-log Z_j); it composes with the
+    similarity's own per-key term rather than replacing it.
+    """
+    use_abs = sim in SIM_ABS
+    knorm = k_sqnorm if sim in SIM_KNORM else None
+
+    if knorm is None and bias is None and not use_abs:
+        return None                                   # plain QK attention
+
+    if knorm is not None and bias is not None:
+        total = bias - 0.5 * knorm
+    elif knorm is not None:
+        total = -0.5 * knorm
+    else:
+        total = bias
+
+    if total is None:
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return torch.abs(score)
+    elif use_abs:
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return torch.abs(score) + total[b, h, kv_idx]
+    else:
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score + total[b, h, kv_idx]
+
     return score_mod
+
+
+def _distance_score_mod(k_sqnorm):
+    """`distance` similarity: per-key bias -1/2 ||k_j||^2.
+
+    k_sqnorm : (B, heads, S) = sum over head_dim of k^2.
+    """
+    return _score_mod("distance", k_sqnorm=k_sqnorm)
 
 
 # ---------------------------------------------------------------------------
@@ -136,12 +202,12 @@ def circulant_flex_attention(q, k, v, H, W, win, sim="distance",
     if block_mask is None:
         block_mask = build_block_mask(H, W, win, q.device, circular=circular)
 
-    if sim == "distance":
-        score_mod = _distance_score_mod((k * k).sum(dim=-1))
-    elif sim in ("dot", "realdot"):
-        score_mod = None
-    else:
-        raise ValueError(f"unsupported sim {sim!r} for FlexAttention (real-valued)")
+    if sim not in FLEX_SIMS:
+        raise ValueError(
+            f"unsupported sim {sim!r} for FlexAttention; expected one of "
+            f"{FLEX_SIMS} (all real-valued)")
+
+    score_mod = _score_mod(sim, k_sqnorm=(k * k).sum(dim=-1))
 
     fa = compiled if compiled is not None else flex_attention
     return fa(q, k, v, score_mod=score_mod, block_mask=block_mask, scale=1.0)
@@ -217,8 +283,14 @@ class FlexAdjacency:
     def __init__(self, q_img, k_img, win, sim="distance", heads=1,
                  block_mask=None, circular=True, compiled=None,
                  block_size=128, compile_mask=None):
-        if sim not in ("distance", "dot", "realdot"):
-            raise ValueError(f"unsupported sim {sim!r} for FlexAttention")
+        if sim not in FLEX_SIMS:
+            raise ValueError(
+                f"unsupported sim {sim!r} for FlexAttention; expected one of "
+                f"{FLEX_SIMS}")
+        if q_img.is_complex() or k_img.is_complex():
+            raise ValueError(
+                "FlexAdjacency needs real query/key tensors; stack complex "
+                "features as [Re; Im] first (GroupThreshold._stack_ri)")
         B, C, H, W = q_img.shape
         self.H, self.W, self.win, self.sim, self.heads = H, W, win, sim, heads
         self.q = image_to_seq(q_img, heads)
@@ -233,12 +305,30 @@ class FlexAdjacency:
 
     # -- score_mods ---------------------------------------------------------
     def _fwd_mod(self):
-        # distance: softmax_k(-1/2||q_j - k_k||^2) == softmax_k(q.k - 1/2||k||^2)
-        return _distance_score_mod(self.ksq) if self.sim == "distance" else None
+        # distance:   softmax_k(-1/2||q_j-k_k||^2) == softmax_k(q.k - 1/2||k||^2)
+        # pidistance: the same with |q.k| in place of q.k
+        return _score_mod(self.sim, k_sqnorm=self.ksq)
+
+    def _rev_mod(self):
+        """Transposed apply: the SAME nonlinearity, per-key bias -log Z_j.
+
+        The transposed call swaps the roles of q and k, so its raw score at
+        (row k, col j) is still `q_j . k_k` -- which is why `|.|` has to be
+        applied here too, and why forgetting it would silently give the
+        transpose of a DIFFERENT matrix.  The similarity's own -1/2||k_k||^2
+        term is now indexed by the query, so it moves to `_query_bias`.
+        """
+        use_abs = self.sim in SIM_ABS
+        bias = -self._lse
+        if use_abs:
+            def score_mod(score, b, h, q_idx, kv_idx):
+                return torch.abs(score) + bias[b, h, kv_idx]
+            return score_mod
+        return _per_key_bias(bias)
 
     def _query_bias(self):
         # the -1/2||k||^2 term becomes a per-QUERY constant in the transpose
-        return -0.5 * self.ksq if self.sim == "distance" else 0.0
+        return -0.5 * self.ksq if self.sim in SIM_KNORM else 0.0
 
     # -- application --------------------------------------------------------
     def apply(self, x, transpose=False):
@@ -253,7 +343,7 @@ class FlexAdjacency:
         if self._lse is None:                             # forward not seen yet
             _, self._lse = _flex_with_lse(
                 self.q, self.k, v, self._fwd_mod(), self.block_mask, self.compiled)
-        out, lseT = _flex_with_lse(self.k, self.q, v, _per_key_bias(-self._lse),
+        out, lseT = _flex_with_lse(self.k, self.q, v, self._rev_mod(),
                                    self.block_mask, self.compiled)
         colsum = torch.exp(lseT + self._query_bias())     # = sum_j Gamma_jk, O(1)
         return seq_to_image(out * colsum.unsqueeze(-1), self.H, self.W, self.heads)

@@ -179,6 +179,25 @@ def test_flex_backend():
         check(f"flex dg[{mode}] matches gather", rel(gb, ga) < 1e-4,
               f"rel={rel(gb, ga):.2e}")
 
+    # -- the phase-invariant similarities, REAL features ---------------------
+    # pidistance = -1/2||q||^2 + |<q,k>| - 1/2||k||^2. With real q, k that is
+    # |q.k| plus distance's per-key bias, i.e. a pointwise function of the score
+    # -- so flex fuses it exactly. `rigorous` exercises the TRANSPOSED apply,
+    # which has to carry the same |.| or it transposes a different matrix.
+    for sim in ("pidistance", "pidot"):
+        kw_s = dict(kw, sim_fun=sim)
+        gat_s = GroupThreshold(attn_backend="gather", **kw_s)
+        flx_s = GroupThreshold(attn_backend="flex", flex_compile_mask=False, **kw_s)
+        flx_s.load_state_dict(gat_s.state_dict())
+        with torch.no_grad():
+            a, _ = gat_s(z, 0.02, {})
+            b, _ = flx_s(z, 0.02, {})
+            ga, _ = gat_s.subgradient(z, 0.02, {}, mode="rigorous")
+            gb, _ = flx_s.subgradient(z, 0.02, {}, mode="rigorous")
+        check(f"flex[{sim}] matches gather", rel(b, a) < 1e-4, f"rel={rel(b, a):.2e}")
+        check(f"flex[{sim}] transpose matches gather", rel(gb, ga) < 1e-4,
+              f"rel={rel(gb, ga):.2e}")
+
     # complex latents: q/k get [Re; Im] stacked, Gamma still acts on real values
     zc = torch.randn(1, 8, 8, 8, dtype=torch.complex64)
     with torch.no_grad():
@@ -186,6 +205,17 @@ def test_flex_backend():
         gc, _ = flx.subgradient(zc, 0.02, {}, mode="rigorous")
     check("flex handles complex latents",
           oc.is_complex() and torch.isfinite(gc.abs()).all().item())
+
+    # ... but NOT with a pi- similarity: the stacked score is Re<q,k> and the
+    # modulus needs Im<q,k> too, so this must raise rather than attend on the
+    # wrong similarity.
+    flx_pi = GroupThreshold(attn_backend="flex", flex_compile_mask=False,
+                            **dict(kw, sim_fun="pidistance"))
+    try:
+        flx_pi(zc, 0.02, {})
+        check("flex rejects complex pidistance", False)
+    except ValueError as e:
+        check("flex rejects complex pidistance", "gather" in str(e))
 
     # whole network on the flex backend
     net = MGCDLNet(K=[1, [2, 2]], M=8, Mh=4, C=1, P=5, s=2, W=5,

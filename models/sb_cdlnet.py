@@ -168,9 +168,18 @@ class SBCDLNet(BaseUnrolledModel):
         self.register_buffer("mu0_tab", mu0.clone())
         self.register_buffer("mu1_tab", mu1.clone())
         self.register_buffer("sigma_eff_tab", (std_sb / mu0).clone())
-        # sigma_eff spans ~3 decades; normalize the threshold's polynomial variable to [0,1] and
-        # take logs for the steps, so neither monomial basis is badly conditioned.
+        # sigma_eff spans ~3 decades (0.01 -> 14), so neither polynomial gets it raw:
+        #   steps     log(sigma_eff), then affinely mapped to [-1, 1] over the schedule's own
+        #             range. Without the remap log spans [-4.6, 2.65], so s^2 reaches ~21 and the
+        #             degree-2 coefficient sees a ~21x larger effective learning rate than the
+        #             constant -- harmless at degree <= 1, bad conditioning at the degree 2+ this
+        #             is meant to support. On [-1, 1] every monomial is bounded by 1.
+        #   threshold sigma_eff / max(sigma_eff) in [0, 1]; it carries noise UNITS, so it must
+        #             scale with sigma_eff rather than its log (see the module docstring).
         self.register_buffer("sigma_ref", self.sigma_eff_tab.max().clone())
+        _s = torch.log(self.sigma_eff_tab.clamp_min(1e-12))
+        self.register_buffer("s_mid", 0.5 * (_s.max() + _s.min()))
+        self.register_buffer("s_half", (0.5 * (_s.max() - _s.min())).clamp_min(1e-12))
 
         self.init_filters()
         if init:
@@ -318,14 +327,19 @@ class SBCDLNet(BaseUnrolledModel):
         c = F.pad(c, pad, mode="reflect")
 
         # ---- learned coefficients for this step ----
-        s_log = torch.log(sig_eff.clamp_min(1e-12))         # bounded variable for the steps
-        s_hat = sig_eff / self.sigma_ref.clamp_min(1e-12)   # normalized variable for tau
+        s_log = (torch.log(sig_eff.clamp_min(1e-12)) - self.s_mid) / self.s_half   # -> [-1, 1]
+        s_hat = sig_eff / self.sigma_ref.clamp_min(1e-12)                          # -> [0, 1]
 
         z = torch.zeros_like(self.A_D[0](r))
         for k in range(self.K):
             eta = torch.sigmoid(_horner(self.a_eta[k], s_log))     # (B,1,1,1) in (0,1)
             nu = torch.sigmoid(_horner(self.a_nu[k], s_log))
-            tau = F.relu(_horner(self.t[k], s_hat))                # (B,M,1,1) >= 0
+            # NO relu here. Nonnegativity is enforced by project() clamping the COEFFICIENTS
+            # after every optimizer step (train_i2sb calls it each iteration), exactly as CDLNet
+            # does with t.clamp_(0.). Clamping the OUTPUT instead would put the common t0 = 0
+            # start right on relu's kink, where the subgradient is 0 -- the threshold would then
+            # receive no gradient at any degree and stay pinned at zero for the whole run.
+            tau = _horner(self.t[k], s_hat)                        # (B,M,1,1)
 
             g_D = mu0 * self.A_D[k](mu0 * self.B_D[k](z) - r)      # target fidelity
             g_P = self.A_P[k](self.B_P[k](z) - c)                  # prior fidelity

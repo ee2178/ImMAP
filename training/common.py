@@ -8,6 +8,7 @@ import torch
 import yaml
 from physics.nle import whiten
 from operators.fourier import ifftc
+from operators.noise import mri_awgn
 from models import build_model
 
 def grad_norm(params):
@@ -320,11 +321,28 @@ def prepare_measurement(
     noise_std,
     noise_dist,
     whiten_kspace,
+    generator=None,
 ):
+    """Build (y, sigma, extra) for one reconstruction batch.
+
+    `extra["smaps"]` is ALWAYS the set of maps `y` is consistent with, and the
+    caller must build its encoding operator from those -- the simulated branch
+    RSS-normalizes them (so sigma is the image-domain noise std) and the
+    whitening branch replaces them outright.
+
+    `generator` seeds the noise draw; pass one during validation so the same
+    realization is seen every epoch.
+    """
     extra = {}
 
     if kspace_type == "simulated":
-        y, sigma_n = mri_awgn(image, mask, smaps, noise_std, noise_dist)
+        # Fully synthetic measurement: the clean coil-combined image pushed
+        # through Sense -> Fourier -> mask, with AWGN in the coil-image domain.
+        # The measured `kspace` argument is deliberately unused.
+        y, sigma_n, smaps_n = mri_awgn(
+            image, mask, smaps, noise_std, noise_dist, generator=generator,
+        )
+        extra["smaps"] = smaps_n
 
     elif kspace_type == "measurement":
 
@@ -349,5 +367,8 @@ def prepare_measurement(
     else:
         raise ValueError(f"Unknown kspace_type: {kspace_type}")
 
+    # Always (B, 1, 1, 1): that is the shape a Polynomial threshold broadcasts
+    # against and the only one `MGCDLNet(resize_noise=True)` will resize.
     sigma_n = torch.as_tensor(sigma_n, device=image.device, dtype=torch.float32)
+    sigma_n = sigma_n.reshape(-1, 1, 1, 1).expand(image.shape[0], 1, 1, 1).contiguous()
     return y, sigma_n, extra

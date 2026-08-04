@@ -1,60 +1,141 @@
-import torch
+"""
+Noise models.
+
+`awgn` noises an image directly (the denoising task).  `mri_awgn` builds a
+*synthetic* MRI measurement from a coil-combined ground-truth image and a set of
+coil sensitivities -- the PyTorch counterpart of
+`genobs(clo::SyntheticMRIReco, ...)` in Sljiva's `src/closures/mrireco.jl`.
+
+Both draw sigma through `sample_sigma`, so a noise level means the same thing in
+the denoising and reconstruction paths and a config can be moved between them.
+"""
+
 import math
 
+import torch
+
 from operators.fourier import fftc
-from math import log
 
-def mri_awgn(x_coils, acceleration_map, smaps, noise_std, noise_dist):
-    ### TO DO (not so important). Implement noise distributions
 
-    # Assume we take in a multicoil image
-    if not isinstance(noise_std, (list, tuple)):
-        sigma = noise_std
-    elif isinstance(noise_std, (list, tuple)): # uniform sampling of sigma
-        sigma = noise_std[0] + \
-               (noise_std[1] - noise_std[0])*torch.rand(1, device=x.device)
-    x_coils_noisy = x_coils + sigma*torch.randn_like(x_coils)
-    y_coils = fftc(x_coils_noisy)
-    y_mask = y_coils * acceleration_map
-    # Always return masked kspace
-    return y_mask, sigma
+def _randn_like(x, generator=None):
+    """`torch.randn_like` that accepts a generator (which `randn_like` does not).
 
-def awgn(input, noise_std, dist = 'uniform', k = 1, eps = 1e-8):
-    """ Additive White Gaussian Noise
-    y: clean input image
-    noise_std: (tuple) noise_std of batch size N is uniformly sampled
-                between noise_std[0] and noise_std[1]. Expected to be in interval
-                [0,1]
+    For a complex dtype torch draws the real and imaginary parts at variance 1/2
+    each, so `E|z|^2 = 1` and `sigma * randn` has total variance `sigma^2` --
+    the same convention `awgn` has always used.  `tests/test_synthetic_kspace.py`
+    pins it rather than trusting it.
     """
-    # one sigma per batch element, singleton elsewhere -> broadcasts against
-    # input whether it's (B, C, H, W), (B, H, W), etc.
-    shape = (input.shape[0],) + (1,) * (input.dim() - 1)
+    if generator is None:
+        return torch.randn_like(x)
+    return torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
 
+
+def sample_sigma(n, noise_std, dist="uniform", ndim=4, device=None, k=1,
+                 eps=1e-8, generator=None):
+    """One noise level per batch element, singleton elsewhere.
+
+    Returns a scalar tensor-free float when `noise_std` is a bare number, and a
+    `(n, 1, ..., 1)` tensor with `ndim` axes otherwise, so the result broadcasts
+    against `(B, C, H, W)` and against `(B, H, W)` alike.
+
+    `dist`:
+      * `uniform` -- U[a, b]
+      * `log`     -- log-uniform on [a, b], warped by `k` (k > 1 pushes mass
+                     toward a, k < 1 toward b; endpoints unchanged)
+      * `cosine`  -- sigma = ((cos X + 1)/2)^2 with X uniform on the arccos
+                     preimage of [a, b]
+    """
     if not isinstance(noise_std, (list, tuple)):
-        sigma = noise_std
-    elif isinstance(noise_std, (list, tuple)) and dist == 'uniform': # uniform sampling of sigma
-        sigma = noise_std[0] + \
-               (noise_std[1] - noise_std[0])*torch.rand(len(input),1,1,1, device=input.device)
-    
-    # Implement a power warp on the log distribution. 
-    elif isinstance(noise_std, (list, tuple)) and dist == 'log':
+        return noise_std
+
+    shape = (int(n),) + (1,) * (int(ndim) - 1)
+    a, b = float(noise_std[0]), float(noise_std[1])
+
+    def _rand():
+        return torch.rand(shape, device=device, generator=generator)
+
+    if dist == "uniform":
+        return a + (b - a) * _rand()
+
+    if dist == "log":
         # log-uniform on [a, b] with a shape/"temperature" knob k
         #   k = 1 -> plain log-uniform
         #   k > 1 -> mass pushed toward low sigma (a)
         #   k < 1 -> mass pushed toward high sigma (b)
-        a = noise_std[0] + eps
-        b = noise_std[1]
-        w = torch.rand(shape, device=input.device) ** k   # endpoints unchanged
-        sigma = a * (b / a) ** w
+        lo = a + eps
+        return lo * (b / lo) ** (_rand() ** k)
 
-    elif isinstance(noise_std, (list, tuple)) and dist == 'cosine':
-        # \sigma = ((cos(X)+1)/2)^2, X ~ U([cos^-1(2*a^0.5-1), cos^-1(2*b^0.5-1)])
-        # Draw uniform number [0, 1], map to our desired data range
+    if dist == "cosine":
+        # The lower bound comes from b, not a: arccos is monotonically decreasing.
+        hi, lo_x = math.acos(2 * a ** 0.5 - 1), math.acos(2 * b ** 0.5 - 1)
+        x = lo_x + (hi - lo_x) * _rand()
+        return ((torch.cos(x) + 1) / 2) ** 2
 
-        # The lower bound actually comes from b, not a, since arccos is monotonically decreasing
+    raise ValueError(
+        f"noise_dist must be 'uniform', 'log' or 'cosine'; got {dist!r}")
 
-        x = math.acos(2*noise_std[1]**0.5-1) + \
-        (math.acos(2*noise_std[0]**0.5-1)-math.acos(2*noise_std[1]**0.5-1))*torch.rand(len(input),1,1,1, device=input.device)
 
-        sigma = ((torch.cos(x)+1)/2)**2
-    return input + torch.randn_like(input) * (sigma), sigma
+def awgn(input, noise_std, dist="uniform", k=1, eps=1e-8, generator=None):
+    """Additive white Gaussian noise.
+
+    input: clean image, any shape with the batch on dim 0.
+    noise_std: a number, or a (lo, hi) range sampled per batch element.
+    Returns (noisy, sigma).
+    """
+    sigma = sample_sigma(input.shape[0], noise_std, dist=dist, ndim=input.dim(),
+                         device=input.device, k=k, eps=eps, generator=generator)
+    return input + _randn_like(input, generator) * sigma, sigma
+
+
+def rss(smaps, dim=1, eps=1e-8):
+    """Root-sum-of-squares over the coil axis, keeping the axis."""
+    return smaps.abs().pow(2).sum(dim=dim, keepdim=True).sqrt() + eps
+
+
+def mri_awgn(image, acceleration_map, smaps, noise_std, noise_dist="uniform",
+             normalize_smaps=False, generator=None, k=1, eps=1e-8):
+    """Simulate an accelerated, noisy multicoil measurement from a clean image.
+
+        x_mc  <- s . x                           Sense forward, (B, C, H, W)
+        y     <- mask . F (x_mc + sigma . n)
+
+    Noise is added in the COIL-IMAGE domain before the transform, matching
+    `acgn(slice_rng, xmc, L)` in the Julia closure.  `fftc` is `norm="ortho"`,
+    so that is distributionally the same as adding it in k-space.
+
+    ASSUMES UNIT-RSS MAPS, which is what this repo's preprocessing produces.
+    That is what makes `sigma` the noise std of the coil-combined adjoint:
+
+        E^H y = sum_c conj(s_c)(s_c x + n_c) = x (sum_c |s_c|^2) + sum_c conj(s_c) n_c
+
+    is `x + noise` with variance `sigma^2 sum_c |s_c|^2 = sigma^2` exactly when
+    `sum_c |s_c|^2 = 1`.  That is the quantity the noise-adaptive thresholds are
+    calibrated against.  `mrireco.jl:220` renormalizes because its maps come
+    straight off a downsample; ours do not need it, and `normalize_smaps=True`
+    is left as an escape hatch for maps of unknown provenance.
+
+    Parameters
+    ----------
+    image : (B, 1, H, W) complex   coil-combined ground truth
+    acceleration_map : (B, 1, H, W) or (1, 1, H, W)   sampling mask
+    smaps : (B, C, H, W) complex   coil sensitivities, assumed unit-RSS
+    noise_std : number or (lo, hi)  sampled per batch element
+
+    Returns
+    -------
+    (y, sigma, smaps) -- masked k-space (B, C, H, W), sigma (B, 1, 1, 1), and
+    the maps the simulation used.  The maps come back so the caller builds its
+    encoding operator from exactly what `y` is consistent with; that matters
+    when `normalize_smaps` is on and is a pass-through otherwise.
+    """
+    if normalize_smaps:
+        smaps = smaps / rss(smaps, eps=eps)
+
+    x_coils = smaps * image                      # Sense(smaps) applied to x
+
+    sigma = sample_sigma(x_coils.shape[0], noise_std, dist=noise_dist,
+                         ndim=x_coils.dim(), device=x_coils.device, k=k,
+                         eps=eps, generator=generator)
+
+    y_coils = fftc(x_coils + _randn_like(x_coils, generator) * sigma)
+    return acceleration_map * y_coils, sigma, smaps

@@ -152,6 +152,15 @@ def train_i2sb(
     bridge = build_schedule(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max, device=device)
     interval = n_steps(bridge)
 
+    # Some regressors carry their OWN copy of the schedule because they need more than sigma:
+    # SBCDLNet inverts std_fwd to recover (mu_0, mu_1, sigma_eff) for its two-fidelity step. Its
+    # model.params therefore duplicate cfg["i2sb"], and a disagreement would look up the wrong
+    # bridge coefficients at every step -- silently, training happily to convergence on nonsense.
+    # This is the sweep failure mode in particular: overriding cfg["i2sb"]["beta_max"] without
+    # also overriding model.params.beta_max. Fail at startup instead.
+    if hasattr(net, "assert_schedule_matches"):
+        net.assert_schedule_matches(bridge)
+
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
 

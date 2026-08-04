@@ -38,18 +38,10 @@ def mri_decoding(y, mask, smaps):
     x = torch.sum(smaps.conj()*x_coils, dim = 1, keepdim = True) # B x 1 x H x W
     return x
 
-def mri_awgn(x_coils, acceleration_map, smaps, noise_std):
-    # Assume we take in a multicoil image
-    if not isinstance(noise_std, (list, tuple)):
-        sigma = noise_std
-    elif isinstance(noise_std, (list, tuple)): # uniform sampling of sigma
-        sigma = noise_std[0] + \
-               (noise_std[1] - noise_std[0])*torch.rand(1, device=x.device)
-    x_coils_noisy = x_coils + sigma*torch.randn_like(x_coils)
-    y_coils = fftc(x_coils_noisy)
-    y_mask = y_coils * acceleration_map
-    # Always return masked kspace
-    return y_mask, sigma
+# NOTE: `mri_awgn` lives in operators/noise.py. A stale 4-argument copy used to
+# sit here; it never applied the sensitivity maps and referenced an undefined
+# name, and having two functions of the same name in sibling modules made the
+# wrong one easy to import.
 
 ### Creating Operator Classes for Fourier and MRI Ops
 

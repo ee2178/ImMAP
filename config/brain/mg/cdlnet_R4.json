@@ -1,0 +1,100 @@
+{
+    "task": "recon",
+    "experiment": {
+        "name": "MGCDLNet_brain_R4_synth"
+    },
+    "model": {
+        "type": "MGCDLNet",
+        "params": {
+            "M": 169,
+            "C": 1,
+            "P": 7,
+            "s": 2,
+            "widen": 1,
+            "degrees": 1,
+            "is_complex": true,
+            "preproc": "kspace",
+            "resize_noise": true,
+            "tau0": 0.001,
+            "alpha0": 0.1,
+            "alpha_conv": false,
+            "K": 30
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/mg_recon/brain/cdlnet_R4",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "fastmri",
+            "task": "recon",
+            "anatomy": "brain",
+            "batch_size": 1,
+            "crop_size": null,
+            "center_crop": null,
+            "random_flips": false,
+            "start_slice": 0,
+            "end_slice": 8,
+            "scale_fac": 2000.0,
+            "kspace_root": "../datasets/fastmri/brain/multicoil_train",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/train"
+        },
+        "val": {
+            "name": "fastmri",
+            "task": "recon",
+            "anatomy": "brain",
+            "batch_size": 1,
+            "crop_size": null,
+            "center_crop": null,
+            "random_flips": false,
+            "start_slice": 0,
+            "end_slice": 1,
+            "scale_fac": 2000.0,
+            "kspace_root": "../datasets/fastmri/brain/multicoil_val",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/val"
+        }
+    },
+    "training": {
+        "num_epochs": 500,
+        "steps_per_epoch": 200,
+        "val_every_epochs": 10,
+        "noise_std": [
+            0.0,
+            0.05
+        ],
+        "noise_dist": "uniform",
+        "val_noise_std": 0.025,
+        "val_seed": 1234,
+        "loss_type": "magnitude-nl1-nl2",
+        "clip_grad": 1.0,
+        "use_organ_mask": false,
+        "backtrack_thresh": null,
+        "backtrack_factor": 0.9
+    },
+    "mri": {
+        "R": 4,
+        "acs_lines": 20,
+        "mask_dist": "uniform",
+        "mask_offset": 0,
+        "kspace_type": "simulated",
+        "whiten_kspace": false
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0005
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 100000
+        }
+    },
+    "wandb": {
+        "project": "mg_recon",
+        "id": null
+    }
+}

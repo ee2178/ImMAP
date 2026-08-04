@@ -13,11 +13,17 @@ def make_acc_mask(
     dim=1,
     mode="uniform",          # "uniform" or "random"
     variable_density=False,
+    offset=0,                # "uniform" only: int phase, or "random"
     seed=None,
     device="cpu",
 ):
     """
     Generate either a Uniform or Random vertical subsampling mask
+
+    `offset` shifts which residue class of lines a uniform mask keeps -- the
+    counterpart of `uniform_offset` in Sljiva's `synthmri_closure.yaml`. Pass
+    "random" to draw it in [0, accel) per call; the default 0 reproduces the
+    original fixed pattern.
     """
     Ny, Nx = shape
     N = shape[dim]
@@ -35,7 +41,11 @@ def make_acc_mask(
     # Uniform Cartesian
     # ---------------------------------------------------------
     if mode == "uniform":
-        outer_idx = torch.arange(0, N, accel, device=device)
+        if offset == "random":
+            off = int(torch.randint(0, int(accel), (1,)).item())
+        else:
+            off = int(offset) % int(accel)
+        outer_idx = torch.arange(off, N, accel, device=device)
         # Remove overlap with ACS
         outer_idx = outer_idx[
             (outer_idx < acs_start) | (outer_idx >= acs_end)
@@ -306,16 +316,32 @@ def gen_ssdu_mask(shape, base_acs, ssdu_base_accel, ssdu_acs, ssdu_rho, device =
 ### Mask Caching (Useful in training)
 _mask_cache = {}
 
-def get_mask_cached(smaps, R, acs_lines, mode):
-    Ny, Nx = smaps.shape[-2], smaps.shape[-1]
-    key = (Ny, Nx, R, acs_lines, smaps.device)
+def get_mask_cached(smaps, R, acs_lines, mode, offset=0):
+    """Memoised `make_acc_mask`, keyed on everything that changes the pattern.
 
-    if key not in _mask_cache:
-        _mask_cache[key] = make_acc_mask(
+    The cache is what makes a per-step mask cheap, but it also means a cached
+    mask is reused for the WHOLE run. That is exactly right for a uniform mask
+    at a fixed offset (the pattern is deterministic anyway) and wrong for any
+    mode that is supposed to vary -- so `mode="random"` and `offset="random"`
+    bypass it and draw a fresh pattern each call.
+    """
+    Ny, Nx = smaps.shape[-2], smaps.shape[-1]
+
+    def build():
+        return make_acc_mask(
             shape=(Ny, Nx),
             accel=R,
             acs_lines=acs_lines,
-            mode = mode,
+            mode=mode,
+            offset=offset,
         ).to(smaps.device, non_blocking=True)
+
+    if mode == "random" or offset == "random":
+        return build()
+
+    key = (Ny, Nx, R, acs_lines, mode, offset, smaps.device)
+
+    if key not in _mask_cache:
+        _mask_cache[key] = build()
 
     return _mask_cache[key]

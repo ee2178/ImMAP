@@ -34,8 +34,16 @@ def train_recon(
     kspace_type="measurement",
     whiten_kspace=False,
     mask_dist="uniform",
+    mask_offset=0,
     noise_std=(0.0, 0.01),
     noise_dist="uniform",
+    # Validation noise. `val_noise_std=None` redraws from `noise_std` like
+    # training does; a number pins it (use the midpoint of the training range,
+    # as Sljiva's closure does -- `genobs(clo, Val{true}(), s)` evaluates at
+    # `mean(clo.noise_level)`). `val_seed` fixes the realization, so val curves
+    # move because the model moved, not because the noise did.
+    val_noise_std=None,
+    val_seed=None,
     ### Loss
     loss_type="complex-mse",
     use_organ_mask=False,
@@ -95,10 +103,13 @@ def train_recon(
             image = image.to(device, non_blocking=True)
             organ_mask = organ_mask.to(device, non_blocking=True)
 
-            mask = get_mask(image, R=R, acs_lines=acs_lines, mode=mask_dist)
+            mask = get_mask(image, R=R, acs_lines=acs_lines, mode=mask_dist,
+                            offset=mask_offset)
 
-            E = Mask(mask) @ FFT2D() @ Sense(smaps)
-
+            # prepare_measurement FIRST, then E from the maps it hands back:
+            # the simulated branch RSS-normalizes them and the whitening branch
+            # replaces them, so building E from the raw `smaps` would leave the
+            # encoding operator inconsistent with y.
             y, sigma_n, extra = prepare_measurement(
                 image=image,
                 kspace=kspace,
@@ -110,8 +121,8 @@ def train_recon(
                 whiten_kspace=whiten_kspace,
             )
 
-            if whiten_kspace:
-                smaps = extra["smaps"]
+            smaps = extra["smaps"]
+            E = Mask(mask) @ FFT2D() @ Sense(smaps)
 
             opt.zero_grad(set_to_none=True)
 
@@ -227,6 +238,14 @@ def train_recon(
             }
             num_val_batches = 0
 
+            # Re-seeded every validation pass, so epoch N and epoch N+1 see the
+            # SAME noise and (for a random mask_dist) the same sampling pattern.
+            val_gen = None
+            if val_seed is not None:
+                val_gen = torch.Generator(device=device).manual_seed(int(val_seed))
+
+            val_std = noise_std if val_noise_std is None else val_noise_std
+
             with torch.no_grad():
 
                 for kspace_v, smaps_v, image_v, organ_mask_v in val_loader:
@@ -236,9 +255,8 @@ def train_recon(
                     image_v = image_v.to(device, non_blocking=True)
                     organ_mask_v = organ_mask_v.to(device, non_blocking=True)
 
-                    mask_v = get_mask(image_v, R=R, acs_lines=acs_lines, mode=mask_dist)
-
-                    E_v = Mask(mask_v) @ FFT2D() @ Sense(smaps_v)
+                    mask_v = get_mask(image_v, R=R, acs_lines=acs_lines,
+                                      mode=mask_dist, offset=mask_offset)
 
                     y_v, sigma_v, extra_v = prepare_measurement(
                         image=image_v,
@@ -246,13 +264,14 @@ def train_recon(
                         mask=mask_v,
                         smaps=smaps_v,
                         kspace_type=kspace_type,
-                        noise_std=noise_std,
+                        noise_std=val_std,
                         noise_dist=noise_dist,
                         whiten_kspace=whiten_kspace,
+                        generator=val_gen,
                     )
 
-                    if whiten_kspace:
-                        smaps_v = extra_v["smaps"]
+                    smaps_v = extra_v["smaps"]
+                    E_v = Mask(mask_v) @ FFT2D() @ Sense(smaps_v)
 
                     recon_v, _ = net(y_v, E=E_v, sigma=sigma_v)
 

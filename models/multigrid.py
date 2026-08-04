@@ -59,6 +59,7 @@ from operators.identity import Identity
 from operators.projections import uball_project
 from operators.resample import galerkin, prolong, restrict, restrict_noise
 from preprocessing.image import post_process, pre_process
+from preprocessing.kspace import kspace_post_process, kspace_pre_process
 
 
 def make_layer(C, M, Mh=None, spectral_init=True, **kws):
@@ -398,8 +399,17 @@ class MGCDLNet(nn.Module):
         self.K, self.iters = K_outer, iters
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)
         self.is_complex, self.dual = bool(is_complex), bool(dual)
+        if preproc not in ("image", "kspace", "identity"):
+            raise ValueError(
+                f"preproc must be 'image' (denoising), 'kspace' "
+                f"(reconstruction) or 'identity'; got {preproc!r}")
         self.preproc, self.resize_noise = preproc, bool(resize_noise)
         self.levels = 1 if iters is None else len(iters)
+        # train.py compiles the fused FlexAttention kernel via
+        # `getattr(model, "attn_backend", None) == "flex"`, the same hook
+        # GroupCDL exposes. Without this attribute the compile silently never
+        # happens and MGGroupCDL runs the uncompiled kernel.
+        self.attn_backend = attn_backend
 
         # Inputs are padded up to a multiple of this so every level halves
         # exactly, in both the image grid and the strided latent grid.
@@ -430,12 +440,22 @@ class MGCDLNet(nn.Module):
     def forward(self, y, E=None, sigma=None, z0=None):
         if E is None:
             E = Identity()
-        x_adj = E.adjoint(y) if not isinstance(E, Identity) else y
 
-        if self.preproc == "identity":
-            y_tilde, params = x_adj, None
+        if self.preproc == "kspace":
+            # Pads the OPERATOR alongside y~, and removes DC through E^H E --
+            # see preprocessing/kspace.py for why plain mean subtraction is
+            # wrong once E is not the identity.
+            y_tilde, E, params = kspace_pre_process(y, E, self.pad_stride)
+            post = kspace_post_process
         else:
-            y_tilde, params = pre_process(x_adj, self.pad_stride)
+            x_adj = E.adjoint(y) if not isinstance(E, Identity) else y
+            if self.preproc == "identity":
+                y_tilde, params, post = x_adj, None, None
+                self._check_grid(x_adj.shape[-2:])
+            else:
+                self._check_padding(x_adj.shape[-2:], E)
+                y_tilde, params = pre_process(x_adj, self.pad_stride)
+                post = lambda x, p: post_process(x, list(p))    # noqa: E731
 
         sig = sigma
         if self.resize_noise and torch.is_tensor(sigma) and sigma.dim() == 4:
@@ -445,8 +465,44 @@ class MGCDLNet(nn.Module):
         z, _ = self.lista(z0, y_tilde, E=E, sigma=sig, cache={})
         Dz = self.D(z)
         x = (y_tilde - Dz) if self.dual else Dz
-        x_hat = x if params is None else post_process(x, list(params))
+        x_hat = x if params is None else post(x, params)
         return x_hat, z
+
+    # -- input-size preconditions -------------------------------------------
+    def _check_grid(self, hw):
+        """Every level must halve exactly, on the image AND the latent grid."""
+        H, W = int(hw[0]), int(hw[1])
+        if H % self.pad_stride or W % self.pad_stride:
+            raise ValueError(
+                f"{type(self).__name__} got a {H}x{W} input, which is not a "
+                f"multiple of pad_stride={self.pad_stride} "
+                f"(= s={self.s} x 2^(levels-1={self.levels - 1})). With "
+                f"preproc='identity' nothing pads it for you, so the V-cycle's "
+                f"restrict/prolong round-trip would not land back on the input "
+                f"grid. Crop or pad the data, or reduce the level count.")
+
+    def _check_padding(self, hw, E):
+        """`preproc='image'` pads y~ but NOT the operator -- so E must not care.
+
+        pre_process pads the adjoint image up to `pad_stride`; the mask and the
+        sensitivity maps inside E stay at the original size, so as soon as the
+        pad is non-zero `gram(E, B z)` multiplies tensors of different spatial
+        extent. Denoising (E = Identity) is unaffected, which is why the BSD432
+        configs never hit this. `preproc='kspace'` is the reconstruction mode:
+        it pads the operator too, and removes DC through E^H E rather than
+        subtracting a plain mean (see preprocessing/kspace.py).
+        """
+        if isinstance(E, Identity):
+            return
+        H, W = int(hw[0]), int(hw[1])
+        if H % self.pad_stride or W % self.pad_stride:
+            raise ValueError(
+                f"{type(self).__name__}(preproc={self.preproc!r}) would pad a "
+                f"{H}x{W} input up to a multiple of pad_stride="
+                f"{self.pad_stride}, but the encoding operator {E!r} still "
+                f"holds {H}x{W} masks/maps. Use preproc='kspace' for "
+                f"reconstruction -- it pads the operator alongside y~ and "
+                f"applies the E^H E DC correction.")
 
     # ----------------------------------------------------------------------
     def compile_flex(self):

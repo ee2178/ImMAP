@@ -134,13 +134,43 @@ def test_ladmm_trains():
 
 
 def test_configs_build():
+    """Every checked-in multigrid config must build, and be shaped for its task.
+
+    The generated fastMRI grid (`scripts/make_mg_recon_configs.py`) is globbed
+    rather than listed: a new cell is covered the moment it is generated.
+    """
+    import glob
     import json
-    for path in ("config/bsd432/mg_denoiser.json", "config/knee/ladmm.json"):
+
+    paths = (["config/bsd432/mg_denoiser.json", "config/knee/ladmm.json"]
+             + sorted(glob.glob("config/*/mg/*.json")))
+
+    for path in paths:
         cfg = json.load(open(path))
-        net = build_model(cfg)
+        try:
+            net = build_model(cfg)
+        except Exception as exc:                                  # noqa: BLE001
+            check(f"build {path}", False, f"{type(exc).__name__}: {exc}")
+            continue
+
         n = sum(p.numel() for p in net.parameters())
-        check(f"build_model({cfg['model']['type']})", n > 0,
+        check(f"build {path} -> {cfg['model']['type']}", n > 0,
               f"{n / 1e6:.2f}M params")
+
+        # preproc='image' pads y~ while E's mask and maps stay put, and its
+        # plain mean subtraction is the wrong DC model once E is not identity.
+        if cfg.get("task") == "recon" and cfg["model"]["type"] != "AltSplitCDLNet":
+            check(f"{path} uses preproc='kspace' or 'identity'",
+                  cfg["model"]["params"].get("preproc") in ("kspace", "identity"),
+                  str(cfg["model"]["params"].get("preproc")))
+
+        # train.py indexes these blocks unconditionally per task.
+        required = {"recon": ("data", "training", "mri", "optimizer",
+                              "scheduler", "paths", "wandb"),
+                    "denoiser": ("data", "training", "optimizer", "scheduler",
+                                 "paths", "wandb")}.get(cfg.get("task"), ())
+        missing = [k for k in required if k not in cfg]
+        check(f"{path} has every block train.py reads", not missing, str(missing))
 
 
 if __name__ == "__main__":
