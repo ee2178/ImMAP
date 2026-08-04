@@ -593,6 +593,67 @@ def test_adjacency_accuracy_vs_fp64(device):
                       f"triton={e_tri:.2e} gather={e_gat:.2e}")
 
 
+def test_bisect_prox_stages(device):
+    """WHERE does the gather-vs-triton gap enter `GroupThreshold.forward`?
+
+    `test_adjacency_accuracy_vs_fp64` says Gamma itself is fine and
+    `test_accuracy_vs_fp64` says the prox output is not, so the error enters
+    between them. This walks the intermediates -- Gamma(|za|^2), xi_a, xi, and
+    the clamped output -- scoring each against fp64. The stage where triton's
+    error jumps is the answer; guessing at it from the endpoints is how this
+    got mis-diagnosed twice.
+    """
+    import torch.nn.functional as F
+
+    from models.prox import GroupThreshold, _abs2
+
+    torch.manual_seed(9)
+    kw = dict(M=8, Mh=4, window=5, tau0=0.05, nheads=1, sim_fun="pidistance")
+    gat = GroupThreshold(attn_backend="gather", **kw).to(device)
+    tri = GroupThreshold(attn_backend="triton", **kw).to(device)
+    ref = GroupThreshold(attn_backend="gather", **kw).to(device)
+    tri.load_state_dict(gat.state_dict())
+    ref.load_state_dict(gat.state_dict())
+    ref = ref.double()
+
+    z = torch.randn(2, 8, 12, 12, dtype=torch.complex64, device=device)
+
+    def stages(m, x):
+        with torch.no_grad():
+            tau = m.tau(0.02, ref=x)
+            G, _ = m.gamma_of(x, 0.02, {})
+            za = m.Walpha(x)
+            gz = m.apply_gamma(G, _abs2(za))
+            xi_a = torch.sqrt(gz + m.eps)
+            xi = m.beta_apply(xi_a)
+            factor = F.relu(1.0 - tau / (xi + m.eps))
+            return {"Gamma(|za|^2)": gz, "xi_a": xi_a, "xi": xi,
+                    "relu factor": factor, "out": x * factor}
+
+    s_ref = stages(ref, z.to(torch.complex128))
+    s_gat, s_tri = stages(gat, z), stages(tri, z)
+
+    for name in s_ref:
+        truth = s_ref[name]
+        e_gat = rel(s_gat[name].to(truth.dtype), truth)
+        e_tri = rel(s_tri[name].to(truth.dtype), truth)
+        print(f"       {name:<16} gather {e_gat:.2e}   triton {e_tri:.2e}   "
+              f"ratio {e_tri / max(e_gat, 1e-12):8.1f}x")
+
+    # How much of the clamped output's error is the clamp itself? If the factor
+    # is far worse than xi that ratio is the amplification, and it is structural
+    # (a relu kink), not a kernel defect.
+    amp_t = (rel(s_tri["relu factor"].to(torch.float64), s_ref["relu factor"])
+             / max(rel(s_tri["xi"].to(torch.float64), s_ref["xi"]), 1e-12))
+    amp_g = (rel(s_gat["relu factor"].to(torch.float64), s_ref["relu factor"])
+             / max(rel(s_gat["xi"].to(torch.float64), s_ref["xi"]), 1e-12))
+    print(f"       clamp amplification: gather {amp_g:.1f}x   triton {amp_t:.1f}x")
+
+    check("xi (pre-clamp) is as accurate on triton as on gather",
+          rel(s_tri["xi"].to(torch.float64), s_ref["xi"])
+          < max(5 * rel(s_gat["xi"].to(torch.float64), s_ref["xi"]), 1e-6))
+
+
 def test_accuracy_vs_fp64(device):
     """Is the kernel as accurate as the gather path, or merely close to it?
 
@@ -777,7 +838,8 @@ if __name__ == "__main__":
         for fn in (test_forward, test_transpose, test_heads, test_wraparound,
                    test_shapes, test_gradients, test_transpose_gradients,
                    test_group_threshold_end_to_end,
-                   test_adjacency_accuracy_vs_fp64, test_accuracy_vs_fp64):
+                   test_adjacency_accuracy_vs_fp64,
+                   test_bisect_prox_stages, test_accuracy_vs_fp64):
             print(f"\n--- {fn.__name__} ---")
             try:
                 fn(device)
