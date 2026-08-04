@@ -78,7 +78,15 @@ except ImportError:                                          # pragma: no cover
 
 # Finite sentinel rather than -inf: a fully masked block would otherwise hit
 # (-inf) - (-inf) = NaN in the streaming-softmax rescale.
-NEG = -1.0e30
+#
+# It has to be a `tl.constexpr` to be readable from inside @triton.jit -- a
+# plain module-level float raises "Cannot access global variable ... from within
+# @jit'ed function". Annotating it (`NEG: tl.constexpr = ...`) does NOT work;
+# it must be constructed as one.
+if HAVE_TRITON:
+    NEG = tl.constexpr(-1.0e30)
+else:                                                        # pragma: no cover
+    NEG = -1.0e30
 
 
 def _jit(fn):

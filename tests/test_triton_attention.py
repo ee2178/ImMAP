@@ -663,6 +663,23 @@ if __name__ == "__main__":
     device = "cuda"
     print(f"\n=== PART B: compiled kernel on {torch.cuda.get_device_name(0)} ===")
 
+    # Smoke the kernel once before the suite. A compile error is the same error
+    # in all eight tests, and eight identical stack traces help nobody.
+    try:
+        from models.circulant_triton import TritonAdjacency
+        _q = torch.randn(1, 4, 8, 8, dtype=torch.complex64, device=device)
+        TritonAdjacency(_q, _q, win=3, heads=1, block_m=16).apply(
+            torch.randn(1, 4, 8, 8, device=device))
+        print("smoke: kernel compiles and runs")
+    except Exception as exc:                                      # noqa: BLE001
+        print(f"\nsmoke FAILED -- the kernel does not compile/run, so the "
+              f"suite below would report the same error eight times.\n")
+        import traceback
+        traceback.print_exc()
+        print(f"\n{len(PASS)} passed (Part A), Part B blocked: "
+              f"{type(exc).__name__}")
+        sys.exit(1)
+
     if not args.bench_only:
         for fn in (test_forward, test_transpose, test_heads, test_wraparound,
                    test_shapes, test_gradients, test_transpose_gradients,
