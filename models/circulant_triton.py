@@ -629,9 +629,25 @@ def _img_to_seq(x, heads):
 
 
 def _seq_to_img(s, B, heads, H, W):
-    """(B*heads, H*W, D) -> (B, heads*D, H, W). Inverse of `_img_to_seq`."""
+    """(B*heads, H*W, D) -> (B, heads*D, H, W). Inverse of `_img_to_seq`.
+
+    The `.contiguous()` is load-bearing, not tidiness. `transpose(1, 2)` then
+    `reshape` is expressible as a VIEW here, so without it this returns strides
+    like (576, 1, 48, 4) where the gather backend returns (576, 144, 12, 1).
+    The values are identical -- but `GroupThreshold` feeds this straight into
+    `F.conv_transpose2d` (`beta_apply`), and cuDNN selects a different algorithm
+    for a non-contiguous input, on Ada a TF32 one with 10 mantissa bits. That
+    silently cost ~1e-4 of relative accuracy in `xi` while `Gamma` itself
+    matched fp64 to 4e-7, because elementwise ops in between do not care about
+    layout and only the convolution did.
+
+    Caught by scoring both backends against an fp64 reference
+    (tests/test_triton_attention.py); invisible when comparing them to each
+    other, and invisible in `subgrad_mode="rigorous"`, whose convolution takes
+    an elementwise product and is therefore contiguous anyway.
+    """
     D = s.shape[-1]
-    return s.transpose(1, 2).reshape(B, heads * D, H, W)
+    return s.transpose(1, 2).reshape(B, heads * D, H, W).contiguous()
 
 
 class TritonAdjacency:

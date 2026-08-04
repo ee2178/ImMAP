@@ -354,8 +354,13 @@ def test_layout_roundtrip():
         check(f"seq shape heads={heads}",
               tuple(s.shape) == (B * heads, H * W, C // heads),
               str(tuple(s.shape)))
-        check(f"roundtrip heads={heads}",
-              torch.equal(_seq_to_img(s, B, heads, H, W), x))
+        img = _seq_to_img(s, B, heads, H, W)
+        check(f"roundtrip heads={heads}", torch.equal(img, x))
+        # Not tidiness: a non-contiguous result reaches F.conv_transpose2d in
+        # GroupThreshold.beta_apply, where cuDNN picks a different (TF32)
+        # algorithm and quietly loses ~1e-4 of accuracy. See _seq_to_img.
+        check(f"seq_to_img output is contiguous heads={heads}",
+              img.is_contiguous(), str(img.stride()))
         check(f"head split matches _to_heads heads={heads}",
               torch.equal(s.transpose(1, 2).reshape(B * heads, C // heads, H, W),
                           x.reshape(B * heads, C // heads, H, W)))

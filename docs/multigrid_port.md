@@ -215,6 +215,45 @@ transpose, heads, wraparound, odd shapes, gradients, and end-to-end through
 Part B that Part A passed is a Triton problem** -- indexing, masking, or the
 API -- not a derivation problem.
 
+### A non-contiguous tensor changed the numerics
+
+The bug that took longest to find, and the one most likely to recur.
+
+`_seq_to_img` converted the kernel's `(B*heads, HW, D)` output back to
+`(B, C, H, W)` with `transpose(1, 2).reshape(...)`. That combination is
+expressible as a **view**, so it returned strides `(576, 1, 48, 4)` where the
+gather backend returns `(576, 144, 12, 1)`. Same values, different layout.
+
+`GroupThreshold.beta_apply` feeds that straight into `F.conv_transpose2d`, and
+cuDNN selects a different algorithm for a non-contiguous input — on Ada, a TF32
+one with 10 mantissa bits. Measured against an fp64 reference:
+
+| stage | abs err (gather) | abs err (triton) |
+|---|---|---|
+| `Gamma(\|za\|²)` | 8.1e-08 | 1.5e-07 |
+| `xi_a` | 9.9e-08 | 1.2e-07 |
+| **`xi = beta_apply(xi_a)`** | **8.4e-08** | **2.7e-04** |
+
+A 2388x gain through a map whose weights are non-negative with `max = 0.35` and
+four input channels — a maximum possible gain of 1.4x. That impossibility is
+what identified it: the error could not be coming from the values, so it had to
+be coming from the layout. The fix is one `.contiguous()`.
+
+Three things made it hard to see, all worth remembering:
+
+* **Comparing the two backends to each other cannot find it.** Both are fp32 and
+  the gap looked like roundoff. Only scoring both against fp64 separated "as
+  accurate as the reference" from "close to the reference".
+* **Elementwise ops hide it.** `Gamma`, `|za|²` and `sqrt` do not care about
+  strides, so every stage before the convolution looked clean.
+* **`subgrad_mode="rigorous"` never shows it** — its convolution takes
+  `c * u * gt`, an elementwise product, which is contiguous regardless. That is
+  the mode the configs use, so a full training run would have looked fine while
+  `forward`, `moreau` and `simple` silently ran at ~1e-4.
+
+`tests/test_triton_attention.py::test_layout_roundtrip` now asserts contiguity
+directly.
+
 ### The epsilon that was not roundoff
 
 Comparing the two backends *against each other* cannot distinguish "fp32 noise"
