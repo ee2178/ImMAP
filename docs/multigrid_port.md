@@ -181,6 +181,15 @@ Constraints: fp32, CUDA, `C` and `DV` each ≤ 128 after rounding up (`Mh` is
 site already satisfies, since `PixelConv` has real weights and both sites pass
 `_abs2(...)` or `1/xi_a`.
 
+**Measured** on an L40S at `B=1, Mh=64, 160x160, W=9` (forward apply):
+
+| backend | time | peak memory |
+|---|---|---|
+| gather | 11.27 ms | 1074 MiB |
+| triton | 0.29 ms | 69 MiB |
+
+39x faster, 15x less memory -- and it keeps `pidistance`, which flex cannot.
+
 ### Verifying it
 
 `tests/test_triton_attention.py` is deliberately two layers, because they fail
@@ -202,12 +211,21 @@ python -m tests.test_triton_attention                  # Part A + B + benchmark
 
 Part B runs the compiled kernel against the gather path (forward, lse,
 transpose, heads, wraparound, odd shapes, gradients, and end-to-end through
-`GroupThreshold` in every subgradient mode), then benchmarks against gather at
-`Mh=64, W=9, 160x160`. **A failure in Part B that Part A passed is a Triton
-problem** -- indexing, masking, or the API -- not a derivation problem.
+`GroupThreshold` in every subgradient mode), then benchmarks. **A failure in
+Part B that Part A passed is a Triton problem** -- indexing, masking, or the
+API -- not a derivation problem.
 
-Until Part B has been run on a GPU, the generated configs stay on `--attn flex`.
-Regenerate with `--attn triton` once it is green.
+`test_numerical_floor` deserves a note. The prox modes that clamp
+(`relu(1 - tau/xi)`) or divide by `xi` amplify a ~1e-7 difference in `Gamma`
+into ~1e-4 in their output, so a backend-vs-backend gap at that scale is
+expected rather than alarming. Rather than assert that, the test measures it:
+`triton_block_m` changes only the tiling and the softmax reduction order, never
+the result in exact arithmetic, so running the same kernel at two block sizes
+gives the fp32 noise floor. A gather-vs-triton gap of the same order as that
+floor carries no information about correctness; one far above it does.
+
+Until Part B is fully green the generated configs stay on `--attn flex`.
+Regenerate with `--attn triton` once it is.
 
 The non-obvious part is the TRANSPOSED apply, which the rigorous subgradient
 needs and which a plain attention call cannot express. Writing the masked,

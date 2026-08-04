@@ -225,7 +225,7 @@ class GroupThreshold(nn.Module):
                  rho_inv=True, sim_fun="distance", dK=1,
                  init_strategy="spectral_norm", subgrad_mode="rigorous",
                  attn_backend="gather", flex_block_size=128, flex_compile_mask=None,
-                 eps=EPS, **_ignored):
+                 triton_block_m=64, eps=EPS, **_ignored):
         super().__init__()
         self.M, self.Mh = int(M), (None if Mh is None else int(Mh))
         self.nheads, self.window, self.dK = int(nheads), int(window), max(int(dK), 1)
@@ -237,6 +237,11 @@ class GroupThreshold(nn.Module):
         self.attn_backend = attn_backend
         self.flex_block_size = int(flex_block_size)
         self.flex_compile_mask = flex_compile_mask
+        # Query-block size for the triton kernel. Changes only the tiling and
+        # the order of the softmax reduction, never the result in exact
+        # arithmetic -- which makes it the handle for measuring how much of a
+        # backend-vs-backend gap is just fp32 non-associativity.
+        self.triton_block_m = int(triton_block_m)
         self._flex_fn = None          # set by compile_flex()
         if attn_backend == "flex" and sim_fun not in FLEX_SIMS:
             raise ValueError(
@@ -392,7 +397,8 @@ class GroupThreshold(nn.Module):
             # Re<q,k> and Im<q,k> so |<q,k>| is available, which no score_mod
             # can reach. Real q/k work too (im is compiled out).
             return TritonAdjacency(q, k, self.window, sim=self.sim_fun,
-                                   heads=self.nheads, eps=self.eps)
+                                   heads=self.nheads, eps=self.eps,
+                                   block_m=self.triton_block_m)
         if self.attn_backend == "flex":
             # The pi- (phase-invariant) similarities need |<q,k>|. For REAL
             # features that is |q.k|, a pointwise function of the score, so the
