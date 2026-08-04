@@ -633,12 +633,25 @@ def test_bisect_prox_stages(device):
     s_ref = stages(ref, z.to(torch.complex128))
     s_gat, s_tri = stages(gat, z), stages(tri, z)
 
+    # ABSOLUTE errors and the scale of each stage. `rel` divides by max|ref|,
+    # so a stage whose output is much smaller than its input reports a larger
+    # relative error for the same absolute one -- which looks exactly like
+    # amplification and is not. Print both so the two cannot be confused.
+    print(f"       {'stage':<16} {'max|ref|':>10} {'abs err gat':>12} "
+          f"{'abs err tri':>12} {'rel gat':>10} {'rel tri':>10}")
     for name in s_ref:
         truth = s_ref[name]
-        e_gat = rel(s_gat[name].to(truth.dtype), truth)
-        e_tri = rel(s_tri[name].to(truth.dtype), truth)
-        print(f"       {name:<16} gather {e_gat:.2e}   triton {e_tri:.2e}   "
-              f"ratio {e_tri / max(e_gat, 1e-12):8.1f}x")
+        g = s_gat[name].to(truth.dtype)
+        t = s_tri[name].to(truth.dtype)
+        scale = truth.abs().max().item()
+        a_gat = (g - truth).abs().max().item()
+        a_tri = (t - truth).abs().max().item()
+        print(f"       {name:<16} {scale:10.3e} {a_gat:12.3e} {a_tri:12.3e} "
+              f"{rel(g, truth):10.2e} {rel(t, truth):10.2e}")
+
+    wb = tri.Wbeta.weight
+    print(f"       Wbeta: min {wb.min().item():.3e}  max {wb.max().item():.3e}  "
+          f"(non-negative => beta_apply cannot cancel)")
 
     # How much of the clamped output's error is the clamp itself? If the factor
     # is far worse than xi that ratio is the amplification, and it is structural
