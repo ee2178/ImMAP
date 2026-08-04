@@ -653,6 +653,26 @@ def test_bisect_prox_stages(device):
     print(f"       Wbeta: min {wb.min().item():.3e}  max {wb.max().item():.3e}  "
           f"(non-negative => beta_apply cannot cancel)")
 
+    # `xi = beta_apply(xi_a)` is a pure, non-negative, bounded linear map, so an
+    # error jump there is impossible for a fixed operator and the operand shown.
+    # Separate the two: run TRITON's xi_a through GATHER's module.
+    #   small  -> the operator differs (the modules' weights are not identical)
+    #   large  -> the operand differs in a way max-abs-diff on xi_a did not show
+    diffs = [(n, a, b) for (n, a), (_, b)
+             in zip(tri.named_parameters(), gat.named_parameters())
+             if not torch.equal(a, b)]
+    print(f"       tri/gat parameters bit-identical: {not diffs}")
+    for n, a, b in diffs:
+        print(f"         DIFFERS: {n:<16} max|d| {(a - b).abs().max().item():.3e}")
+
+    cross = gat.beta_apply(s_tri["xi_a"]).to(torch.float64)
+    print(f"       beta_apply(triton xi_a):  via gather module rel "
+          f"{rel(cross, s_ref['xi']):.2e}   via triton module rel "
+          f"{rel(s_tri['xi'].to(torch.float64), s_ref['xi']):.2e}")
+
+    check("tri and gat share identical parameters", not diffs,
+          f"{len(diffs)} differ" if diffs else "")
+
     # How much of the clamped output's error is the clamp itself? If the factor
     # is far worse than xi that ratio is the amplification, and it is structural
     # (a relu kink), not a kernel defect.
