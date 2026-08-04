@@ -555,48 +555,55 @@ def test_group_threshold_end_to_end(device):
           f"{len(grads)} parameter grads")
 
 
-def test_numerical_floor(device):
-    """How much of the gather-vs-triton gap is just fp32 reduction order?
+def test_accuracy_vs_fp64(device):
+    """Is the kernel as accurate as the gather path, or merely close to it?
 
-    `block_m` changes only the tiling and the order of the softmax reduction --
-    never the result in exact arithmetic. So running the SAME kernel at two
-    block sizes measures the floor. A gather-vs-triton difference of the same
-    magnitude carries no information about correctness; one far above it does.
+    The prox modes that clamp (`relu(1 - tau/xi)`) or divide by `xi` turn a
+    ~1e-7 difference in `Gamma` into ~1e-4 in their output, so gather-vs-triton
+    alone cannot say whether the kernel is fine or subtly wrong.
 
-    This exists because the prox modes that clamp (`relu(1 - tau/xi)`) or
-    divide by `xi` amplify a ~1e-7 difference in Gamma, and it is worth knowing
-    that rather than assuming it.
+    The discriminating comparison is against fp64. The gather path is pure
+    PyTorch, so it runs in double; both fp32 backends are then scored against
+    that same ground truth. If the kernel's error is comparable to the fp32
+    gather path's, both are simply at fp32 roundoff. If it is far larger, the
+    kernel has a real error that the direct comparison was hiding.
+
+    (An earlier version of this test varied `triton_block_m` instead, on the
+    theory that it would perturb the reduction order. It does not -- block_m
+    only sets how many QUERIES a program handles, and each query reduces over
+    offsets in a fixed order, so the two block sizes agree bit for bit and the
+    measurement was vacuous.)
     """
     from models.prox import GroupThreshold
     torch.manual_seed(9)
     kw = dict(M=8, Mh=4, window=5, tau0=0.05, nheads=1, sim_fun="pidistance")
+
     gat = GroupThreshold(attn_backend="gather", **kw).to(device)
-    t32 = GroupThreshold(attn_backend="triton", triton_block_m=32, **kw).to(device)
-    t64 = GroupThreshold(attn_backend="triton", triton_block_m=64, **kw).to(device)
-    t32.load_state_dict(gat.state_dict())
-    t64.load_state_dict(gat.state_dict())
+    tri = GroupThreshold(attn_backend="triton", **kw).to(device)
+    tri.load_state_dict(gat.state_dict())
+    ref = GroupThreshold(attn_backend="gather", **kw).to(device)
+    ref.load_state_dict(gat.state_dict())
+    ref = ref.double()                                   # fp64 ground truth
 
     z = torch.randn(2, 8, 12, 12, dtype=torch.complex64, device=device)
+    z64 = z.to(torch.complex128)
 
-    def three(fn):
-        with torch.no_grad():
-            return fn(gat), fn(t32), fn(t64)
-
-    cases = {"forward": lambda m: m(z, 0.02, {})[0]}
+    cases = {"forward": (lambda m, x: m(x, 0.02, {})[0])}
     for mode in ("moreau", "simple", "rigorous"):
         cases[f"dg[{mode}]"] = (
-            lambda m, _mode=mode: m.subgradient(z, 0.02, {}, mode=_mode)[0])
+            lambda m, x, _m=mode: m.subgradient(x, 0.02, {}, mode=_m)[0])
 
     for name, fn in cases.items():
-        a, b32, b64 = three(fn)
-        floor = rel(b32, b64)
-        gap = rel(b32, a)
-        print(f"       {name:<14} tiling floor {floor:.2e}   "
-              f"gather gap {gap:.2e}   ratio {gap / max(floor, 1e-12):6.1f}x")
-        # Loose: catches a broken kernel (gap would be O(1)) without asserting
-        # a relationship between two noisy measurements.
-        check(f"{name} gap is numerical, not structural",
-              gap < max(50 * floor, 1e-3), f"gap={gap:.2e} floor={floor:.2e}")
+        with torch.no_grad():
+            truth = fn(ref, z64).to(torch.complex64)
+            e_gat = rel(fn(gat, z), truth)
+            e_tri = rel(fn(tri, z), truth)
+        ratio = e_tri / max(e_gat, 1e-12)
+        print(f"       {name:<14} vs fp64:  gather {e_gat:.2e}   "
+              f"triton {e_tri:.2e}   ratio {ratio:5.2f}x")
+        check(f"{name}: triton is as accurate as gather",
+              e_tri < max(5 * e_gat, 1e-6),
+              f"triton={e_tri:.2e} gather={e_gat:.2e}")
 
 
 def test_wraparound(device):
@@ -731,7 +738,7 @@ if __name__ == "__main__":
     if not args.bench_only:
         for fn in (test_forward, test_transpose, test_heads, test_wraparound,
                    test_shapes, test_gradients, test_transpose_gradients,
-                   test_group_threshold_end_to_end, test_numerical_floor):
+                   test_group_threshold_end_to_end, test_accuracy_vs_fp64):
             print(f"\n--- {fn.__name__} ---")
             try:
                 fn(device)

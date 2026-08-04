@@ -23,14 +23,13 @@
             "dK": 2,
             "nheads": 1,
             "gamma0": 0.8,
-            "sim_fun": "distance",
+            "sim_fun": "pidistance",
             "init_strategy": "semi_orthogonal",
             "subgrad_mode": "rigorous",
-            "attn_backend": "flex",
-            "K": 30,
-            "flex_block_size": 128
+            "attn_backend": "triton",
+            "K": 30
         },
-        "_comment": "attn_backend='flex' cannot fuse sim_fun='pidistance' for complex features (the score is Re<q,k>; the modulus needs Im<q,k> too), so the similarity is 'distance' here. Regenerate with --attn gather for the reference's exact pidistance at much lower throughput."
+        "_comment": "attn_backend='triton' -- the fused kernel in models/circulant_triton.py, carrying the reference's exact complex pidistance (which FlexAttention cannot express). Re-verify with `python -m tests.test_triton_attention` on a GPU node after any change to that file."
     },
     "paths": {
         "save_dir": "trained_nets/mg_recon/brain/groupcdl_R8",

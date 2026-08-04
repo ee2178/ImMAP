@@ -7,7 +7,7 @@ config per (anatomy, acceleration, model) cell to
 
     config/<anatomy>/mg/<model>_R<r>.json
 
-7 models x 2 anatomies x 2 accelerations = 28 runs. `slurm/mg_recon_grid.sbatch`
+5 models x 2 anatomies x 2 accelerations = 20 runs. `slurm/mg_recon_grid.sbatch`
 indexes the same cell list, so the two must stay in sync -- both derive it from
 `MODELS`, `ANATOMIES` and `ACCELS` below via `--list-cells`.
 
@@ -82,22 +82,23 @@ MG_COMMON = dict(
 # second bilinear form no score_mod can reach. Julia gets away with it because
 # its flash path is a bespoke kernel that accumulates both.
 #
-# So the choice here is real:
-#   --attn flex   (default) fused kernel, sim_fun drops to "distance"
-#   --attn gather            exact pidistance, materialises (B, Mh, Q, W^2)
-#   --attn triton            exact pidistance, fused (models/circulant_triton.py)
-# Defaulting to flex because gather is far slower and this is a 20-cell grid;
-# the swap is written into the emitted config so no run is ambiguous about it.
+# `triton` (the DEFAULT) is the one that gets both: models/circulant_triton.py
+# accumulates Re<q,k> AND Im<q,k>, so the modulus is available -- exactly what a
+# score_mod cannot reach. Verified against the gather path on an L40S
+# (tests/test_triton_attention.py, 115/115) at 0.29 ms / 69 MiB per apply versus
+# gather's 11.2 ms / 1074 MiB, so there is no longer a reason to deviate.
 #
-# `triton` is the one that gets BOTH -- it accumulates Re<q,k> and Im<q,k> so
-# the modulus is available, which is exactly what a score_mod cannot do. Its
-# algebra is verified (tests/test_triton_attention.py Part A) but the compiled
-# kernel needs a GPU pass before 20 trainings ride on it; run Part B first, then
-# regenerate with --attn triton.
+#   --attn triton  (default) exact pidistance, fused
+#   --attn flex              fused, but sim_fun drops to "distance"
+#   --attn gather            exact pidistance, materialises (B, Mh, Q, W^2)
+#
+# flex remains useful as a fallback on a box where triton is unavailable; the
+# similarity swap it forces is written into the emitted config so no run is
+# ambiguous about which similarity it trained on.
 GROUP = dict(
     Mh=64, W=9, dK=2, nheads=1, gamma0=0.8,
     sim_fun="pidistance", init_strategy="semi_orthogonal",
-    subgrad_mode="rigorous", attn_backend="gather",
+    subgrad_mode="rigorous", attn_backend="triton",
 )
 
 # One outer V-cycle over three levels, 8 smoothing sweeps each.
@@ -189,7 +190,7 @@ def make_config(anatomy, r, model, args):
 
     params = dict(spec["params"])
     note = None
-    attn = getattr(args, "attn", "flex")
+    attn = getattr(args, "attn", "triton")
 
     if "attn_backend" in params:
         params["attn_backend"] = attn
@@ -208,11 +209,11 @@ def make_config(anatomy, r, model, args):
                         f"--attn gather keeps it and materialises the window.")
                 params["sim_fun"] = "distance"
         elif attn == "triton":
-            note = ("attn_backend='triton' -- the hand-written kernel in "
-                    "models/circulant_triton.py, which carries the reference's "
-                    "exact complex pidistance. Verify with "
-                    "`python -m tests.test_triton_attention` on a GPU node "
-                    "before trusting a full training run.")
+            note = ("attn_backend='triton' -- the fused kernel in "
+                    "models/circulant_triton.py, carrying the reference's exact "
+                    "complex pidistance (which FlexAttention cannot express). "
+                    "Re-verify with `python -m tests.test_triton_attention` on a "
+                    "GPU node after any change to that file.")
 
     def data(split, shuffle_slices):
         return {
@@ -301,13 +302,13 @@ def main():
     p.add_argument("--lr", type=float, default=5.0e-4)
     p.add_argument("--only", nargs="*", default=None,
                    help="restrict to these model tags")
-    p.add_argument("--attn", choices=("flex", "gather", "triton"), default="flex",
-                   help="attention backend for the group models. 'flex' (default) "
-                        "fuses the kernel but cannot carry pidistance for complex "
-                        "features, so the similarity drops to 'distance'. "
-                        "'triton' keeps the reference's exact pidistance AND stays "
-                        "fused (verify with tests/test_triton_attention.py first). "
-                        "'gather' keeps pidistance and materialises the window.")
+    p.add_argument("--attn", choices=("triton", "flex", "gather"), default="triton",
+                   help="attention backend for the group models. 'triton' (default) "
+                        "keeps the reference's exact pidistance and stays fused. "
+                        "'flex' also fuses but cannot carry pidistance for complex "
+                        "features, so the similarity drops to 'distance'; use it "
+                        "where triton is unavailable. 'gather' keeps pidistance and "
+                        "materialises the window (~39x slower, ~15x the memory).")
     p.add_argument("--dry-run", action="store_true",
                    help="print the configs instead of writing them (no torch needed)")
     p.add_argument("--list-cells", action="store_true",
