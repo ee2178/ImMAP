@@ -396,8 +396,13 @@ class GroupThreshold(nn.Module):
             # Complex q/k are the point of this backend: it accumulates BOTH
             # Re<q,k> and Im<q,k> so |<q,k>| is available, which no score_mod
             # can reach. Real q/k work too (im is compiled out).
+            # NOTE: deliberately NOT eps=self.eps. `self.eps` (1e-8) guards
+            # `xi_a + eps` and `1/(xi_a + eps)`; inside the similarity's modulus
+            # it is a systematic bias on every score, worth ~1e-6 of relative
+            # error in Gamma. The kernel's own SIM_EPS is 1e-30 -- see the
+            # comment on it in models/circulant_triton.py.
             return TritonAdjacency(q, k, self.window, sim=self.sim_fun,
-                                   heads=self.nheads, eps=self.eps,
+                                   heads=self.nheads,
                                    block_m=self.triton_block_m)
         if self.attn_backend == "flex":
             # The pi- (phase-invariant) similarities need |<q,k>|. For REAL

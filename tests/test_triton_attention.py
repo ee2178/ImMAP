@@ -555,6 +555,44 @@ def test_group_threshold_end_to_end(device):
           f"{len(grads)} parameter grads")
 
 
+def test_adjacency_accuracy_vs_fp64(device):
+    """The Gamma apply ITSELF against fp64 -- no prox on top to amplify.
+
+    `test_accuracy_vs_fp64` measures the kernel through `GroupThreshold`, where
+    a clamp and a division sit between Gamma and the number compared, so a
+    failure there does not say whether the kernel or the amplification is at
+    fault. This isolates it: gather and triton, both fp32, both scored against
+    the same fp64 gather reference. Debug this one first.
+    """
+    from models.circulant_attention import circ_adjacency
+    from models.circulant_triton import TritonAdjacency
+
+    for sim in ("pidistance", "pidot"):
+        for complex_q in (True, False):
+            tag = f"{sim}/{'complex' if complex_q else 'real'}"
+            d = make_inputs(B=2, C=8, DV=8, H=12, W=12, device=device, seed=11,
+                            complex_q=complex_q)
+            q, k, v = d["q_img"], d["k_img"], d["v"]
+            hi = torch.complex128 if complex_q else torch.float64
+            q64, k64, v64 = q.to(hi), k.to(hi), v.to(torch.float64)
+
+            for transpose in (False, True):
+                truth = circ_adjacency(sim, q64, k64, 5).apply(v64, transpose=transpose)
+                e_gat = rel(circ_adjacency(sim, q, k, 5)
+                            .apply(v, transpose=transpose).to(torch.float64), truth)
+                adj = TritonAdjacency(q, k, 5, sim=sim, heads=1)
+                if transpose:
+                    adj.apply(v)                              # populate lse
+                e_tri = rel(adj.apply(v, transpose=transpose).to(torch.float64), truth)
+
+                what = "Gamma^T" if transpose else "Gamma"
+                print(f"       {what:<8} {tag:<20} gather {e_gat:.2e}  "
+                      f"triton {e_tri:.2e}  ratio {e_tri / max(e_gat, 1e-12):5.2f}x")
+                check(f"{what} {tag}: triton is as accurate as gather",
+                      e_tri < max(5 * e_gat, 1e-6),
+                      f"triton={e_tri:.2e} gather={e_gat:.2e}")
+
+
 def test_accuracy_vs_fp64(device):
     """Is the kernel as accurate as the gather path, or merely close to it?
 
@@ -738,7 +776,8 @@ if __name__ == "__main__":
     if not args.bench_only:
         for fn in (test_forward, test_transpose, test_heads, test_wraparound,
                    test_shapes, test_gradients, test_transpose_gradients,
-                   test_group_threshold_end_to_end, test_accuracy_vs_fp64):
+                   test_group_threshold_end_to_end,
+                   test_adjacency_accuracy_vs_fp64, test_accuracy_vs_fp64):
             print(f"\n--- {fn.__name__} ---")
             try:
                 fn(device)

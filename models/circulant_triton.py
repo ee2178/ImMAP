@@ -76,6 +76,23 @@ except ImportError:                                          # pragma: no cover
     tl = _TLStub()
 
 
+# Regulariser inside `sqrt(re^2 + im^2 + eps)`. It exists ONLY to stop 0/0 in
+# the backward's `re/A`; it must not perturb the score.
+#
+# It has to be this small. The reference similarity computes an EXACT modulus
+# (`(x * y.conj()).sum(1).abs()` in circulant_similarity.py -- no epsilon), so
+# any eps here is a systematic BIAS, not roundoff:
+#
+#     sqrt(x^2 + eps) - x  ~  eps / (2x)
+#
+# At eps=1e-8 (the value `GroupThreshold.eps` carries, for the unrelated
+# `xi_a + eps` guards) a score of magnitude 5e-3 is inflated by ~1e-6, which
+# softmax turns into ~1e-6 of relative error in Gamma -- ~1000x worse than the
+# gather path against an fp64 reference. Measured, in test_accuracy_vs_fp64.
+# At 1e-30 the bias is ~1e-21 and A stays >= 1e-15, which is all the division
+# needs: |re/A| <= 1 by construction, so there is no blow-up to guard against.
+SIM_EPS = 1e-30
+
 # Finite sentinel rather than -inf: a fully masked block would otherwise hit
 # (-inf) - (-inf) = NaN in the streaming-softmax rescale.
 #
@@ -574,7 +591,7 @@ class _CircPIAttention(torch.autograd.Function):
 
 
 def circulant_pi_attention(qr, kr, v, H, W, win, qi=None, ki=None, bias=None,
-                           use_knorm=True, eps=1e-8, block_m=64, num_warps=4,
+                           use_knorm=True, eps=SIM_EPS, block_m=64, num_warps=4,
                            num_stages=2):
     """Fused windowed attention with the phase-invariant similarity.
 
@@ -583,6 +600,9 @@ def circulant_pi_attention(qr, kr, v, H, W, win, qi=None, ki=None, bias=None,
     v      : (B, HW, DV)  real
     bias   : (B, HW) per-KEY additive term, or None
     use_knorm : include `-1/2 ||k||^2` (pidistance); False gives pidot
+    eps    : regulariser inside the modulus. Leave at SIM_EPS -- see its
+             comment; a larger value biases the score, it does not stabilise
+             anything.
 
     Returns (out, lse): out (B, HW, DV), lse (B, HW).
     """
@@ -637,8 +657,8 @@ class TritonAdjacency:
     __slots__ = ("qr", "qi", "kr", "ki", "ksq", "win", "sim", "heads",
                  "H", "W", "B", "eps", "block_m", "num_warps", "num_stages", "_lse")
 
-    def __init__(self, q_img, k_img, win, sim="pidistance", heads=1, eps=1e-8,
-                 block_m=64, num_warps=4, num_stages=2):
+    def __init__(self, q_img, k_img, win, sim="pidistance", heads=1,
+                 eps=SIM_EPS, block_m=64, num_warps=4, num_stages=2):
         if sim not in ("pidistance", "pidot"):
             raise ValueError(
                 f"TritonAdjacency implements the phase-invariant similarities "

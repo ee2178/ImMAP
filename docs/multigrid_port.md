@@ -215,14 +215,44 @@ transpose, heads, wraparound, odd shapes, gradients, and end-to-end through
 Part B that Part A passed is a Triton problem** -- indexing, masking, or the
 API -- not a derivation problem.
 
-`test_numerical_floor` deserves a note. The prox modes that clamp
-(`relu(1 - tau/xi)`) or divide by `xi` amplify a ~1e-7 difference in `Gamma`
-into ~1e-4 in their output, so a backend-vs-backend gap at that scale is
-expected rather than alarming. Rather than assert that, the test measures it:
-`triton_block_m` changes only the tiling and the softmax reduction order, never
-the result in exact arithmetic, so running the same kernel at two block sizes
-gives the fp32 noise floor. A gather-vs-triton gap of the same order as that
-floor carries no information about correctness; one far above it does.
+### The epsilon that was not roundoff
+
+Comparing the two backends *against each other* cannot distinguish "fp32 noise"
+from "small systematic error", and the modes that clamp (`relu(1 - tau/xi)`) or
+divide by `xi` amplify either one. So `test_accuracy_vs_fp64` scores both fp32
+backends against an **fp64** gather reference instead. That is what caught this:
+
+| | gather vs fp64 | triton vs fp64 |
+|---|---|---|
+| forward | 5.13e-08 | 6.87e-05 |
+| `dg[rigorous]` | 1.67e-07 | 2.30e-07 |
+
+If the clamp were merely amplifying roundoff, gather would show it too. It does
+not — so the kernel had a real error, and `rigorous` (smooth in `Gamma`, no
+clamp) was hiding it.
+
+The cause: the kernel computed `sqrt(re² + im² + eps)` with `eps` inherited
+from `GroupThreshold.eps = 1e-8`, while the reference similarity takes an
+**exact** modulus (`(x * y.conj()).sum(1).abs()`, no epsilon). Any epsilon
+there is a systematic bias, not roundoff:
+
+    sqrt(x² + eps) - x  ≈  eps / 2x       →  1.0e-6 at |⟨q,k⟩| = 5e-3, eps = 1e-8
+
+which softmax carries straight into `Gamma`. The epsilon was not earning it
+either: `|re/A| ≤ 1` by construction, so it only ever had to prevent `0/0`.
+`SIM_EPS = 1e-30` does that with a bias of ~1e-21, and `models/prox.py`
+deliberately does **not** pass `self.eps` down — that value guards `xi_a + eps`,
+a different job.
+
+The lesson worth keeping: a shared `eps` constant is not automatically the right
+one for a new expression. Check what it is guarding.
+
+An earlier version of this test varied `triton_block_m` instead, on the theory
+that it perturbs the reduction order. It does not — `block_m` only sets how many
+*queries* a program handles, and each query reduces over offsets in a fixed
+order, so two block sizes agree bit for bit and the measurement was vacuous.
+`test_adjacency_accuracy_vs_fp64` is the one to debug first: it scores `Gamma`
+and `Gammaᵀ` against fp64 directly, with no prox in between to amplify.
 
 Until Part B is fully green the generated configs stay on `--attn flex`.
 Regenerate with `--attn triton` once it is.
