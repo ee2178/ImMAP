@@ -589,18 +589,21 @@ def circulant_pi_attention(qr, kr, v, H, W, win, qi=None, ki=None, bias=None,
 #  Circulant-compatible adjacency
 # ===========================================================================
 def _img_to_seq(x, heads):
-    """(B, C, H, W) -> (B*heads, H*W, C//heads), channel-last and contiguous."""
+    """(B, C, H, W) -> (B*heads, H*W, C//heads), channel-last and contiguous.
+
+    Heads fold into the batch axis exactly as `GroupThreshold._to_heads` does,
+    so head h of batch b lands at flat index `b*heads + h`.
+    """
     B, C, H, W = x.shape
     if C % heads:
         raise ValueError(f"channels {C} must divide heads {heads}")
-    return x.reshape(B * heads, C // heads, H, W).permute(0, 2, 3, 1).contiguous()
+    return x.reshape(B * heads, C // heads, H * W).transpose(1, 2).contiguous()
 
 
 def _seq_to_img(s, B, heads, H, W):
-    """(B*heads, H*W, D) -> (B, heads*D, H, W)."""
+    """(B*heads, H*W, D) -> (B, heads*D, H, W). Inverse of `_img_to_seq`."""
     D = s.shape[-1]
-    return (s.reshape(B * heads, H, W, D).permute(0, 3, 1, 2)
-             .reshape(B, heads * D, H, W))
+    return s.transpose(1, 2).reshape(B, heads * D, H, W)
 
 
 class TritonAdjacency:

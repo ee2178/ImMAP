@@ -242,6 +242,125 @@ def test_kernel_algebra():
             close(f"[{tag}] backward {nm}", a, b, tol=2e-4)
 
 
+def _dense_gamma(qr, qi, kr, ki, win, use_knorm):
+    """The explicit (B, N, N) adjacency -- ground truth for the transpose."""
+    B, _, H, W = qr.shape
+    N = H * W
+    knorm = ((kr * kr).sum(1) + ((ki * ki).sum(1) if ki is not None else 0)
+             ).reshape(B, N)
+    S = torch.full((B, N, N), -1e30)
+    p = (win - 1) // 2
+    for jr, jc in itertools.product(range(H), range(W)):
+        for dr, dc in itertools.product(range(-p, p + 1), repeat=2):
+            r2, c2 = (jr + dr) % H, (jc + dc) % W
+            qv, kv = qr[:, :, jr, jc], kr[:, :, r2, c2]
+            re = (qv * kv).sum(1)
+            if ki is not None:
+                qvi, kvi = qi[:, :, jr, jc], ki[:, :, r2, c2]
+                re = re + (qvi * kvi).sum(1)
+                im = (qvi * kv).sum(1) - (qv * kvi).sum(1)
+                s = torch.sqrt(re * re + im * im + EPS)
+            else:
+                s = torch.sqrt(re * re + EPS)
+            if use_knorm:
+                s = s - 0.5 * knorm[:, r2 * W + c2]
+            S[:, jr * W + jc, r2 * W + c2] = s
+    return torch.softmax(S, dim=2)
+
+
+def test_transpose_recipe():
+    """`TritonAdjacency`'s transpose bookkeeping, against a dense Gamma.
+
+    The kernel is stubbed out by `_ref_forward` here; what is under test is
+
+        (Gamma^T h)_k = colsum_k * fwd(q<->k, bias=-lse)_k,
+        colsum_k      = exp(lse_t - 1/2||k||^2) = sum_j Gamma_jk
+
+    A sign error or a dropped term would surface only in the transposed apply,
+    i.e. only in the rigorous subgradient -- late, and hard to attribute.
+    """
+    torch.manual_seed(1)
+    B, C, DV, H, W = 2, 4, 3, 5, 6
+
+    for use_knorm, complex_q in [(True, True), (False, True), (True, False)]:
+        tag = f"knorm={int(use_knorm)} cplx={int(complex_q)}"
+        qr, kr = torch.randn(B, C, H, W), torch.randn(B, C, H, W)
+        qi = torch.randn(B, C, H, W) if complex_q else None
+        ki = torch.randn(B, C, H, W) if complex_q else None
+        v = torch.randn(B, DV, H, W)
+        vflat = v.reshape(B, DV, H * W)
+
+        for win in (3, 5):
+            G = _dense_gamma(qr, qi, kr, ki, win, use_knorm)
+            ksq = (kr * kr).sum(1, keepdim=True)
+            if ki is not None:
+                ksq = ksq + (ki * ki).sum(1, keepdim=True)
+
+            got_f, lse = _ref_forward(qr, qi, kr, ki, v, win, use_knorm, None)
+            want_f = torch.einsum("bjk,bck->bcj", G, vflat).reshape(B, DV, H, W)
+            close(f"[{tag} win={win}] forward == dense Gamma v", got_f, want_f)
+
+            out, lse_t = _ref_forward(kr, ki, qr, qi, v, win, use_knorm=False,
+                                      bias=-lse)
+            colsum = torch.exp(lse_t + (-0.5 * ksq if use_knorm else 0.0))
+            close(f"[{tag} win={win}] colsum == column sums of Gamma",
+                  colsum.reshape(B, -1), G.sum(dim=1), tol=1e-4)
+
+            want_t = torch.einsum("bjk,bcj->bck", G, vflat).reshape(B, DV, H, W)
+            close(f"[{tag} win={win}] transpose recipe == dense Gamma^T v",
+                  out * colsum, want_t, tol=1e-4)
+
+
+def _load_circulant_triton():
+    """Import `models.circulant_triton` without running `models/__init__`.
+
+    That `__init__` pulls in FlexAttention, which needs torch 2.x. This module
+    needs neither it nor triton to be *imported*, and Part A is supposed to run
+    on any box -- including the one where these layout helpers get edited.
+    """
+    try:
+        import models.circulant_triton as m
+        return m
+    except ImportError:
+        import importlib.util
+        import os
+        import types
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if "models" not in sys.modules:
+            pkg = types.ModuleType("models")
+            pkg.__path__ = [os.path.join(root, "models")]
+            sys.modules["models"] = pkg
+        spec = importlib.util.spec_from_file_location(
+            "models.circulant_triton",
+            os.path.join(root, "models", "circulant_triton.py"))
+        m = importlib.util.module_from_spec(spec)
+        sys.modules["models.circulant_triton"] = m
+        spec.loader.exec_module(m)
+        return m
+
+
+def test_layout_roundtrip():
+    """img -> seq -> img must be exact, and match GroupThreshold._to_heads.
+
+    This is where the first GPU run died: a permute without the matching
+    flatten left a 4-D tensor, so `B, HW, C = qr.shape` unpacked four values.
+    """
+    ct = _load_circulant_triton()
+    _img_to_seq, _seq_to_img = ct._img_to_seq, ct._seq_to_img
+    B, C, H, W = 3, 12, 5, 7
+    x = torch.randn(B, C, H, W)
+    for heads in (1, 2, 3, 4):
+        s = _img_to_seq(x, heads)
+        check(f"seq shape heads={heads}",
+              tuple(s.shape) == (B * heads, H * W, C // heads),
+              str(tuple(s.shape)))
+        check(f"roundtrip heads={heads}",
+              torch.equal(_seq_to_img(s, B, heads, H, W), x))
+        check(f"head split matches _to_heads heads={heads}",
+              torch.equal(s.transpose(1, 2).reshape(B * heads, C // heads, H, W),
+                          x.reshape(B * heads, C // heads, H, W)))
+
+
 # ---------------------------------------------------------------------------
 #  reference: the gather path, in the kernel's layout
 # ---------------------------------------------------------------------------
@@ -460,6 +579,8 @@ def test_shapes(device):
 # ---------------------------------------------------------------------------
 def benchmark(device, H=160, W=160, Mh=64, win=9, B=1):
     """The number that decides whether any of this was worth it."""
+    from models.circulant_attention import circ_adjacency
+    from models.circulant_triton import TritonAdjacency
     print(f"\n--- benchmark: {B}x{Mh}x{H}x{W}, window {win} ---")
     q = torch.randn(B, Mh, H, W, dtype=torch.complex64, device=device)
     k = torch.randn(B, Mh, H, W, dtype=torch.complex64, device=device)
@@ -512,14 +633,16 @@ if __name__ == "__main__":
 
     # ---- PART A: the algebra. Runs anywhere. --------------------------------
     if not args.bench_only:
-        print("\n=== PART A: kernel algebra (CPU) ===")
-        print("--- test_kernel_algebra ---")
-        try:
-            test_kernel_algebra()
-        except Exception as exc:                                  # noqa: BLE001
-            check("test_kernel_algebra", False, f"{type(exc).__name__}: {exc}")
-            import traceback
-            traceback.print_exc()
+        print("\n=== PART A: kernel algebra + bookkeeping (CPU) ===")
+        for fn in (test_kernel_algebra, test_transpose_recipe,
+                   test_layout_roundtrip):
+            print(f"--- {fn.__name__} ---")
+            try:
+                fn()
+            except Exception as exc:                              # noqa: BLE001
+                check(fn.__name__, False, f"{type(exc).__name__}: {exc}")
+                import traceback
+                traceback.print_exc()
 
     if args.algebra_only:
         print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
