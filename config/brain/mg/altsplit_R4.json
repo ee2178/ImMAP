@@ -1,28 +1,46 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "MGCDLNet_brain_R8_synth"
+        "name": "AltSplitCDLNet_brain_R4_synth"
     },
     "model": {
-        "type": "MGCDLNet",
+        "type": "AltSplitCDLNet",
         "params": {
-            "M": 169,
-            "C": 1,
-            "P": 7,
-            "s": 2,
-            "widen": 1,
-            "degrees": 1,
-            "is_complex": true,
-            "preproc": "kspace",
-            "resize_noise": true,
-            "tau0": 0.001,
-            "alpha0": 0.1,
-            "alpha_conv": false,
-            "K": 30
+            "admm_iters": 6,
+            "reuse_latent": true,
+            "smap_update": true,
+            "rho0": 1.0,
+            "cg_maxit": 10,
+            "cg_tol": 0.0001,
+            "implicit_cg": true,
+            "preproc": "identity",
+            "denoiser_type": "mgcdlnet",
+            "denoiser_kws": {
+                "K": 6,
+                "M": 169,
+                "C": 1,
+                "P": 7,
+                "s": 2,
+                "degrees": 1,
+                "tau0": 0.001,
+                "is_complex": true,
+                "dual": false,
+                "widen": 1,
+                "alpha0": 1.0,
+                "alpha_conv": false,
+                "resize_noise": true
+            },
+            "smap_kws": {
+                "sigma_g": 1.5,
+                "sigma_max": 3.0,
+                "sigma_min": 0.3,
+                "mu0": 1.0,
+                "gamma0": 0.01
+            }
         }
     },
     "paths": {
-        "save_dir": "trained_nets/mg_recon/brain/cdlnet_R8",
+        "save_dir": "trained_nets/mg_recon/brain/altsplit_R4",
         "ckpt": null
     },
     "data": {
@@ -61,10 +79,10 @@
         "val_every_epochs": 10,
         "noise_std": [
             0.0,
-            0.05
+            0.01
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.025,
+        "val_noise_std": 0.005,
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
@@ -73,7 +91,7 @@
         "backtrack_factor": 0.9
     },
     "mri": {
-        "R": 8,
+        "R": 4,
         "acs_lines": 20,
         "mask_dist": "uniform",
         "mask_offset": 0,
@@ -83,7 +101,7 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 0.0005
+            "lr": 0.0002
         }
     },
     "scheduler": {

@@ -22,7 +22,7 @@ the comparison needs both numbers to be read honestly.
 Usage
 -----
     python scripts/eval_mg_recon.py --runs trained_nets/mg_recon --out results/mg_recon.csv
-    python scripts/eval_mg_recon.py --runs trained_nets/mg_recon --sigmas 0 0.025 0.05
+    python scripts/eval_mg_recon.py --runs trained_nets/mg_recon --sigmas 0 0.005 0.01
 """
 
 from __future__ import annotations
@@ -119,7 +119,7 @@ def main():
                    help="root of the trained-run tree")
     p.add_argument("--out", default="results/mg_recon.csv")
     p.add_argument("--sigmas", type=float, nargs="*",
-                   default=[0.0, 0.01, 0.025, 0.05],
+                   default=[0.0, 0.0025, 0.005, 0.01],
                    help="noise levels to evaluate at (pinned, not sampled)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

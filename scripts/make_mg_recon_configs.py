@@ -7,13 +7,13 @@ config per (anatomy, acceleration, model) cell to
 
     config/<anatomy>/mg/<model>_R<r>.json
 
-5 models x 2 anatomies x 2 accelerations = 20 runs. `slurm/mg_recon_grid.sbatch`
-indexes the same cell list, so the two must stay in sync -- both derive it from
-`MODELS`, `ANATOMIES` and `ACCELS` below via `--list-cells`.
+4 models x 2 accelerations = 8 runs PER ANATOMY. knee and brain have separate
+sbatch files (`slurm/mg_recon_{knee,brain}.sbatch`); each asks this script for
+its own cell list via `--list-cells --anatomy <a>`, so the two stay in sync.
 
 Every cell trains on SYNTHETIC k-space (`kspace_type: "simulated"`): the clean
 coil-combined image is pushed through Sense -> Fourier -> mask with complex AWGN
-at sigma ~ U[0, 0.05] added in the coil-image domain. See
+at sigma ~ U[0, 0.01] added in the coil-image domain. See
 `operators/noise.py::mri_awgn`, the port of `genobs(clo::SyntheticMRIReco, ...)`
 in `Sljiva/src/closures/mrireco.jl`.
 
@@ -21,7 +21,7 @@ Usage
 -----
     python scripts/make_mg_recon_configs.py                  # write config/
     python scripts/make_mg_recon_configs.py --dry-run        # print, don't write
-    python scripts/make_mg_recon_configs.py --list-cells     # the sbatch index map
+    python scripts/make_mg_recon_configs.py --list-cells --anatomy knee
 
 Writing needs `training.common.write_config` (and therefore torch); `--dry-run`
 and `--list-cells` are pure stdlib and run anywhere.
@@ -110,39 +110,71 @@ VCYCLE_K = [1, [8, 8, 8]]
 # asymmetry is visible rather than papered over.
 BASELINE_K = 30
 
-# NOTE: MGLPDS / MGGroupLPDS are deliberately NOT in this grid.
-# ImMAP's MGLPDS is `MGCDLNet(dual=True)` -- the Fenchel/Moreau dual of the CDL
-# prox (clipping instead of shrinkage, read-out y~ - Dz). The reference's
-# multigrid MRI model called LPDS is `mg_lpdsnet` (Sljiva/src/networks/mg_lpds.jl),
-# a primal-dual splitting network with a sensenet, which is NOT ported. Same
-# name, different architecture -- so running the dual cells here would produce
-# numbers that look like an MGLPDS comparison and are not one. The model types
-# still exist and are still tested; they are just out of this experiment.
-MODELS = {
-    "mgcdlnet":    dict(type="MGCDLNet",    params=dict(MG_COMMON, K=VCYCLE_K)),
-    "mggroupcdl":  dict(type="MGGroupCDL",  params=dict(MG_COMMON, **GROUP, K=VCYCLE_K)),
-    "cdlnet":      dict(type="MGCDLNet",    params=dict(MG_COMMON, K=BASELINE_K)),
-    "groupcdl":    dict(type="MGGroupCDL",  params=dict(MG_COMMON, **GROUP, K=BASELINE_K)),
-    # altsplit.yaml verbatim: 6 ADMM iterations, joint coil-map refinement on,
-    # a 3-level V-cycle CDLNet prox. preproc stays "identity" here -- with
-    # smap_update the unroll needs raw k-space and re-forms E^H y per layer,
-    # so there is nothing for kspace preprocessing to act on.
-    "ladmm": dict(
+# READ THIS BEFORE COMPARING THE `mglpds` CELLS TO ANYTHING PUBLISHED.
+#
+# ImMAP's MGLPDS is `MGCDLNet(dual=True)`: the Fenchel/Moreau dual of the CDL
+# prox -- clipping instead of shrinkage, read-out `y~ - Dz`. It is a one-flag
+# variant of the same V-cycle CDLNet, sharing every other hyperparameter.
+#
+# The reference's multigrid MRI model *called* LPDS is `mg_lpdsnet`
+# (Sljiva/src/networks/mg_lpds.jl): a primal-dual splitting network with its own
+# sensenet, dual-channel widening, and separate lambda/theta step parameters. It
+# is NOT ported. Same name, different architecture.
+#
+# So these two cells answer "does the dual read-out help OUR V-cycle CDLNet",
+# which is a real question. They do not reproduce Sljiva's MGLPDS, and their
+# numbers are not comparable to anything reported for it. The caveat rides along
+# in each emitted config's `_comment` so it survives into the run directory.
+_LPDS_NOTE = (
+    "MGLPDS here is MGCDLNet(dual=True) -- the Fenchel/Moreau dual of the CDL "
+    "prox (clipping instead of shrinkage, read-out y~ - Dz). It is NOT Sljiva's "
+    "mg_lpdsnet (src/networks/mg_lpds.jl), a primal-dual splitting network with "
+    "a sensenet, which is not ported to ImMAP. Same name, different "
+    "architecture: these numbers measure the dual read-out on our V-cycle "
+    "CDLNet and are not comparable to published MGLPDS results.")
+
+# AltSplitCDLNet, from altsplit.yaml. `denoiser_kws.K` is the ONLY difference
+# between the two LADMM cells: altsplit.yaml ships `K: [1, [4,4,8]]` with
+# `# K: 6` commented directly above it, so both come from the reference.
+# preproc stays "identity" -- with smap_update the unroll keeps raw k-space and
+# re-forms E^H y per layer, so there is nothing for kspace preprocessing to act on.
+def _altsplit(denoiser_K):
+    return dict(
         type="AltSplitCDLNet",
-        lr=2.0e-4,      # the CG solves make this one touchier than the rest
+        lr=2.0e-4,          # the CG solves make this one touchier than the rest
         params=dict(
             admm_iters=6, reuse_latent=True, smap_update=True, rho0=1.0,
             cg_maxit=10, cg_tol=1.0e-4, implicit_cg=True, preproc="identity",
             denoiser_type="mgcdlnet",
             denoiser_kws=dict(
-                K=[1, [4, 4, 8]], M=169, C=1, P=7, s=2, degrees=1,
+                K=denoiser_K, M=169, C=1, P=7, s=2, degrees=1,
                 tau0=1.0e-3, is_complex=True, dual=False, widen=1,
                 alpha0=1.0, alpha_conv=False, resize_noise=True,
             ),
             smap_kws=dict(sigma_g=1.5, sigma_max=3.0, sigma_min=0.3,
                           mu0=1.0, gamma0=0.01),
         ),
+    )
+
+
+MODELS = {
+    # models/lpdsnet.py::LPDSNet -- its own class, not a CDLNet variant. Its
+    # l0 / eta_0 / theta_0 defaults already equal Sljiva lpdsnet.yaml's
+    # lambda0 / tau0 / theta0. M / P / s / K are held at the grid's values
+    # rather than lpdsnet.yaml's (M=225, p=9, K=40) so the only thing separating
+    # it from mglpds is architecture, not capacity.
+    "lpdsnet": dict(
+        type="LPDSNet",
+        params=dict(K=BASELINE_K, M=169, P=7, s=2, C=1,
+                    l0=1.0e-3, eta_0=0.5, theta_0=0.0,
+                    adaptive=True, init=True, preproc="kspace"),
     ),
+    # dual=True is what build_model forces for this type anyway; stated here so
+    # the config shows the flag that makes it the Fenchel/clipping read-out.
+    "mglpds": dict(type="MGLPDS", note=_LPDS_NOTE,
+                   params=dict(MG_COMMON, K=VCYCLE_K, dual=True)),
+    "altsplit":   _altsplit(6),
+    "mgaltsplit": _altsplit([1, [4, 4, 8]]),
 }
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
@@ -166,18 +198,23 @@ ANATOMIES = {
     ),
 }
 
-NOISE_STD = [0.0, 0.05]        # sigma ~ U[0, 0.05], the experiment's whole point
-VAL_NOISE_STD = 0.025          # mean(NOISE_STD): mrireco.jl:277 evaluates there
+NOISE_STD = [0.0, 0.01]        # sigma ~ U[0, 0.01], the experiment's whole point
+VAL_NOISE_STD = 0.005          # mean(NOISE_STD): mrireco.jl:277 evaluates there
 VAL_SEED = 1234
 
 
-def cells():
-    """The canonical cell order. `slurm/mg_recon_grid.sbatch` indexes this."""
+def cells(anatomy=None):
+    """The canonical cell order, optionally for one anatomy.
+
+    knee and brain have SEPARATE sbatch files, so each indexes its own list and
+    the array bound is per-anatomy. Passing no anatomy gives every cell, which
+    is what the generator uses when writing configs.
+    """
     out = []
-    for anatomy in ANATOMIES:
+    for a in ([anatomy] if anatomy else ANATOMIES):
         for r in ACCELS:
             for model in MODELS:
-                out.append((anatomy, r, model))
+                out.append((a, r, model))
     return out
 
 
@@ -189,7 +226,10 @@ def make_config(anatomy, r, model, args):
     spec = MODELS[model]
 
     params = dict(spec["params"])
-    note = None
+    # Notes accumulate: a cell can be both an LPDS variant and on a backend
+    # that swapped its similarity, and losing either one in the run directory
+    # is how a caveat stops travelling with its numbers.
+    notes = [spec["note"]] if spec.get("note") else []
     attn = getattr(args, "attn", "triton")
 
     if "attn_backend" in params:
@@ -201,19 +241,22 @@ def make_config(anatomy, r, model, args):
             # letting the model raise on the first forward.
             if params.get("sim_fun") in ("pidistance", "pidot") \
                     and params.get("is_complex", True):
-                note = (f"attn_backend='flex' cannot fuse "
-                        f"sim_fun='{params['sim_fun']}' for complex features "
-                        f"(the score is Re<q,k>; the modulus needs Im<q,k> "
-                        f"too), so the similarity is 'distance' here. "
-                        f"--attn triton keeps pidistance and stays fused; "
-                        f"--attn gather keeps it and materialises the window.")
+                notes.append(
+                    f"attn_backend='flex' cannot fuse "
+                    f"sim_fun='{params['sim_fun']}' for complex features "
+                    f"(the score is Re<q,k>; the modulus needs Im<q,k> too), "
+                    f"so the similarity is 'distance' here. --attn triton "
+                    f"keeps pidistance and stays fused; --attn gather keeps it "
+                    f"and materialises the window.")
                 params["sim_fun"] = "distance"
         elif attn == "triton":
-            note = ("attn_backend='triton' -- the fused kernel in "
-                    "models/circulant_triton.py, carrying the reference's exact "
-                    "complex pidistance (which FlexAttention cannot express). "
-                    "Re-verify with `python -m tests.test_triton_attention` on a "
-                    "GPU node after any change to that file.")
+            notes.append(
+                "attn_backend='triton' -- the fused kernel in "
+                "models/circulant_triton.py, carrying the reference's exact "
+                "complex pidistance (which FlexAttention cannot express). "
+                "Re-verify with `python -m tests.test_triton_attention` on a "
+                "GPU node after any change to that file.")
+    note = " ".join(notes) if notes else None
 
     def data(split, shuffle_slices):
         return {
@@ -302,6 +345,9 @@ def main():
     p.add_argument("--lr", type=float, default=5.0e-4)
     p.add_argument("--only", nargs="*", default=None,
                    help="restrict to these model tags")
+    p.add_argument("--anatomy", choices=("knee", "brain"), default=None,
+                   help="restrict to one anatomy. The sbatch files pass this so "
+                        "each indexes its own cell list.")
     p.add_argument("--attn", choices=("triton", "flex", "gather"), default="triton",
                    help="attention backend for the group models. 'triton' (default) "
                         "keeps the reference's exact pidistance and stays fused. "
@@ -316,7 +362,7 @@ def main():
     args = p.parse_args()
 
     if args.list_cells:
-        for i, (anatomy, r, model) in enumerate(cells()):
+        for i, (anatomy, r, model) in enumerate(cells(args.anatomy)):
             print(f"{i}\t{anatomy}\tR{r}\t{model}")
         return
 
@@ -334,7 +380,7 @@ def main():
                 f"--dry-run to inspect the configs without writing.")
 
     written = []
-    for anatomy, r, model in cells():
+    for anatomy, r, model in cells(args.anatomy):
         if args.only and model not in args.only:
             continue
 

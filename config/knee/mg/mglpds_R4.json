@@ -1,10 +1,10 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "MGGroupCDL_knee_R8_synth"
+        "name": "MGLPDS_knee_R4_synth"
     },
     "model": {
-        "type": "MGGroupCDL",
+        "type": "MGLPDS",
         "params": {
             "M": 169,
             "C": 1,
@@ -18,21 +18,20 @@
             "tau0": 0.001,
             "alpha0": 0.1,
             "alpha_conv": false,
-            "Mh": 64,
-            "W": 9,
-            "dK": 2,
-            "nheads": 1,
-            "gamma0": 0.8,
-            "sim_fun": "pidistance",
-            "init_strategy": "semi_orthogonal",
-            "subgrad_mode": "rigorous",
-            "attn_backend": "triton",
-            "K": 30
+            "K": [
+                1,
+                [
+                    8,
+                    8,
+                    8
+                ]
+            ],
+            "dual": true
         },
-        "_comment": "attn_backend='triton' -- the fused kernel in models/circulant_triton.py, carrying the reference's exact complex pidistance (which FlexAttention cannot express). Re-verify with `python -m tests.test_triton_attention` on a GPU node after any change to that file."
+        "_comment": "MGLPDS here is MGCDLNet(dual=True) -- the Fenchel/Moreau dual of the CDL prox (clipping instead of shrinkage, read-out y~ - Dz). It is NOT Sljiva's mg_lpdsnet (src/networks/mg_lpds.jl), a primal-dual splitting network with a sensenet, which is not ported to ImMAP. Same name, different architecture: these numbers measure the dual read-out on our V-cycle CDLNet and are not comparable to published MGLPDS results."
     },
     "paths": {
-        "save_dir": "trained_nets/mg_recon/knee/groupcdl_R8",
+        "save_dir": "trained_nets/mg_recon/knee/mglpds_R4",
         "ckpt": null
     },
     "data": {
@@ -71,10 +70,10 @@
         "val_every_epochs": 10,
         "noise_std": [
             0.0,
-            0.05
+            0.01
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.025,
+        "val_noise_std": 0.005,
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
@@ -83,7 +82,7 @@
         "backtrack_factor": 0.9
     },
     "mri": {
-        "R": 8,
+        "R": 4,
         "acs_lines": 20,
         "mask_dist": "uniform",
         "mask_offset": 0,

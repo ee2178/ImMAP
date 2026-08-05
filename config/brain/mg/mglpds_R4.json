@@ -1,10 +1,10 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "MGCDLNet_brain_R4_synth"
+        "name": "MGLPDS_brain_R4_synth"
     },
     "model": {
-        "type": "MGCDLNet",
+        "type": "MGLPDS",
         "params": {
             "M": 169,
             "C": 1,
@@ -18,11 +18,20 @@
             "tau0": 0.001,
             "alpha0": 0.1,
             "alpha_conv": false,
-            "K": 30
-        }
+            "K": [
+                1,
+                [
+                    8,
+                    8,
+                    8
+                ]
+            ],
+            "dual": true
+        },
+        "_comment": "MGLPDS here is MGCDLNet(dual=True) -- the Fenchel/Moreau dual of the CDL prox (clipping instead of shrinkage, read-out y~ - Dz). It is NOT Sljiva's mg_lpdsnet (src/networks/mg_lpds.jl), a primal-dual splitting network with a sensenet, which is not ported to ImMAP. Same name, different architecture: these numbers measure the dual read-out on our V-cycle CDLNet and are not comparable to published MGLPDS results."
     },
     "paths": {
-        "save_dir": "trained_nets/mg_recon/brain/cdlnet_R4",
+        "save_dir": "trained_nets/mg_recon/brain/mglpds_R4",
         "ckpt": null
     },
     "data": {
@@ -61,10 +70,10 @@
         "val_every_epochs": 10,
         "noise_std": [
             0.0,
-            0.05
+            0.01
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.025,
+        "val_noise_std": 0.005,
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,

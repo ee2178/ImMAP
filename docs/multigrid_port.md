@@ -185,10 +185,12 @@ site already satisfies, since `PixelConv` has real weights and both sites pass
 
 | backend | time | peak memory |
 |---|---|---|
-| gather | 11.27 ms | 1074 MiB |
-| triton | 0.29 ms | 69 MiB |
+| gather | 11.6 ms | 1074 MiB |
+| triton | 0.32 ms | 75 MiB |
 
-39x faster, 15x less memory -- and it keeps `pidistance`, which flex cannot.
+~36x faster, ~14x less memory -- and it keeps `pidistance`, which flex cannot.
+Accuracy against an fp64 reference is indistinguishable from the gather path
+(ratios 1.0-1.5x across the prox forward and all three subgradient modes).
 
 ### Verifying it
 
@@ -493,58 +495,65 @@ meant to vary, so `mode="random"` and `offset="random"` now bypass the cache.
 
 ### The experiment grid
 
-`scripts/make_mg_recon_configs.py` generates 20 cells --
-5 models x {knee PD, brain T2} x {R=8, R=4}, both at 20 ACS lines, uniform mask,
-`sigma ~ U[0, 0.05]`, full FOV at `batch_size=1`.
+`scripts/make_mg_recon_configs.py` generates **8 cells per anatomy** --
+4 models x {R=8, R=4} at 20 ACS lines, uniform mask, `sigma ~ U[0, 0.01]`, full
+FOV at `batch_size=1`. knee and brain have separate launchers, so each indexes
+its own cell list and its own array bound.
 
-Network hyperparameters are matched to the Julia reference, so a deviation is
-traceable: `Sljiva/config/groupcdl.yaml` supplies `M=169, p=7, s=2, d=1,
-tau0=1e-3, Mh=64, gamma0=0.8, similarity=pidistance,
-init_strategy=semi_orthogonal` and the `K=30` baseline;
-`Sljiva/scripts/makeconfigs_multigrid.jl` supplies the multigrid sweep proper --
-its `K888s2` cell (`K=[1,[8,8,8]]`, `s=2`, `widen=1`, `alpha0=0.1`,
-`alpha_conv=false`, `dK=2`) crossed with `dual` in `{false,true}` and
-`windowsize` in `{1,9}`. Those four corners **are** the four model types below.
-`Sljiva/config/altsplit.yaml` supplies the LADMM cell.
-
-| tag | type | K | group |
+| tag | type | K | preproc |
 |---|---|---|---|
-| `mgcdlnet` | `MGCDLNet` | `[1, [8, 8, 8]]` | `W=1` |
-| `mggroupcdl` | `MGGroupCDL` | `[1, [8, 8, 8]]` | `W=9`, `Mh=64`, `dK=2` |
-| `cdlnet` / `groupcdl` | same classes, plain int `K` | `30` | as above |
-| `ladmm` | `AltSplitCDLNet` | `admm_iters=6`, `smap_update`, `[1,[4,4,8]]` prox | -- |
+| `lpdsnet` | `LPDSNet` (`models/lpdsnet.py`) | `30` | `kspace` |
+| `mglpds` | `MGLPDS` = `MGCDLNet(dual=True)` | `[1, [8, 8, 8]]` | `kspace` |
+| `altsplit` | `AltSplitCDLNet`, `smap_update` | denoiser `K=6` | `identity` |
+| `mgaltsplit` | `AltSplitCDLNet`, `smap_update` | denoiser `K=[1, [4, 4, 8]]` | `identity` |
 
-**`MGLPDS` / `MGGroupLPDS` are not in this grid.** ImMAP's `MGLPDS` is
-`MGCDLNet(dual=True)`, the Fenchel/Moreau dual of the CDL prox. The reference's
-multigrid MRI model called LPDS is `mg_lpdsnet` (`Sljiva/src/networks/mg_lpds.jl`),
-a primal-dual splitting network with a sensenet, which is **not ported**. Same
-name, different architecture -- so running the dual cells here would produce
-numbers that read as an MGLPDS comparison without being one. The model types
-still build and are still covered by `tests/test_integration.py`.
+**What each pair does and does not isolate.** `altsplit` / `mgaltsplit` are the
+same class with the same `admm_iters`, CG settings and denoiser width; the
+V-cycle in `denoiser_kws.K` is the only variable, and `altsplit.yaml` ships both
+values (`K: [1, [4,4,8]]` with `# K: 6` commented above it). That pair is a clean
+multigrid ablation.
 
-Two more things about this grid that are the reference's choices rather than
-ours, and should not be read as controlled comparisons:
+`lpdsnet` / `mglpds` is not. `LPDSNet` is its own class (`BaseUnrolledModel`,
+plain int `K`, no V-cycle path) and ImMAP has no multigrid version of it, so the
+comparison crosses an architecture boundary as well as the V-cycle. `M`, `P`,
+`s` and `K` are held at the grid's values rather than `lpdsnet.yaml`'s
+(`M=225, p=9, K=40`) so capacity is at least not a third variable, and both now
+use the `E^H E` DC correction so preprocessing is not a fourth. A difference
+between them still cannot be attributed to multigrid alone.
 
-* `K=30` is **not** iteration-matched to the V-cycle (30 sweeps vs 8 on the fine
-  grid) and none of the cells are parameter-matched -- a V-cycle also carries its
-  coarse levels, the `dF` copies and `alpha`. `scripts/eval_mg_recon.py` reports
-  `n_params` next to PSNR so the asymmetry stays visible.
-* The group cells use the multigrid sweep's `W=9 / dK=2`, held identical across
-  V-cycle and baseline cells, rather than `groupcdl.yaml`'s `W=35 / dK=5` (which
-  belongs to its standalone denoising experiment). That keeps the
-  multigrid-vs-baseline contrast from being confounded by the attention config.
+**The `mglpds` cells are not Sljiva's MGLPDS.** ImMAP's `MGLPDS` is
+`MGCDLNet(dual=True)`: the Fenchel/Moreau dual of the CDL prox -- clipping
+instead of shrinkage, read-out `y~ - Dz`. The reference's multigrid MRI model
+*called* LPDS is `mg_lpdsnet` (`Sljiva/src/networks/mg_lpds.jl`): a primal-dual
+splitting network with its own sensenet, dual-channel widening and separate
+lambda/theta steps, which is **not ported**. Same name, different architecture,
+and the numbers are not comparable to anything published for it. The caveat is
+written into each generated config's `_comment` so it travels into the run
+directory rather than living only here.
 
-**Attention backend.** This is the one place the grid cannot match the reference,
-and it is worth understanding rather than working around. See the section below.
+No group (nonlocal) models are in this grid, so the attention backend does not
+apply to any cell. `MGGroupCDL` / `MGGroupLPDS` and the triton kernel are
+unchanged and still tested; they are simply not exercised here.
+
+`LPDSNet` gained a `preproc` option for this grid. It previously subtracted a
+plain `mean(E^H y)` unconditionally, which is the wrong DC model under a real
+operator (see below), and allocated its iterate at the UNPADDED size while `y~`
+was padded -- correct only because `s=2` on 320x320 pads by zero. `preproc="image"`
+remains the default, so `config/knee/recon.json` is unaffected.
 
 ```bash
-python scripts/make_mg_recon_configs.py --list-cells   # index -> cell, as the array job sees it
+python scripts/make_mg_recon_configs.py --list-cells --anatomy knee
 python scripts/make_mg_recon_configs.py                # write config/{knee,brain}/mg/*.json
-sbatch slurm/mg_recon_grid.sbatch                      # all 28; --array=0 for one
+sbatch slurm/mg_recon_knee.sbatch                      # 8 cells; --array=0 for one
+sbatch slurm/mg_recon_brain.sbatch                     # 8 cells (paths unverified)
 python scripts/eval_mg_recon.py --runs trained_nets/mg_recon --out results/mg_recon.csv
 ```
 
-Validation is pinned: `val_noise_std: 0.025` (the midpoint of the training range,
+Both launchers source `slurm/_mg_recon_body.sh`, which holds the logic they
+share; only `ANATOMY` differs. Two launchers that drift apart is how a grid ends
+up half-comparable.
+
+Validation is pinned: `val_noise_std: 0.005` (the midpoint of the training range,
 where `genobs(clo, Val{true}(), s)` evaluates), `val_seed: 1234`, and a single
 fixed slice per validation volume. Val curves therefore move because the model
 moved.
