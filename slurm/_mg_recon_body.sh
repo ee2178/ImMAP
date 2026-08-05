@@ -4,19 +4,24 @@
 # identical between the two, so it lives here rather than being copied: two
 # launchers that drift apart is exactly how a grid ends up half-comparable.
 #
+# The caller must also set IMMAP_ROOT (the repo checkout) -- it cannot be derived
+# here, because sbatch runs a COPY of the launcher from the node's spool dir and
+# $BASH_SOURCE points there rather than at the repo.
+#
 # The caller may also override, before sourcing:
 #   CONFIG_ROOT     default "config"
 #   SWEEP_EPOCHS    "" = the config's num_epochs; e.g. 20 to probe first
 #   REGENERATE      1 = regenerate configs from the generator before running
 
 : "${ANATOMY:?the calling sbatch must set ANATOMY=knee|brain}"
+: "${IMMAP_ROOT:?the calling sbatch must set IMMAP_ROOT=/path/to/ImMAP}"
 CONFIG_ROOT="${CONFIG_ROOT:-config}"
 SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"
 REGENERATE="${REGENERATE:-1}"
 
 source ~/.bashrc
 conda activate gcdl
-cd ~/scratch/ee2178/ImMAP
+cd "${IMMAP_ROOT}"
 
 set -eo pipefail
 : "${SLURM_ARRAY_TASK_ID:?must be run as an array job (sbatch sets SLURM_ARRAY_TASK_ID)}"
