@@ -3,7 +3,6 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.utils as vutils
 
 from tqdm import tqdm
 from training.losses import LOSS_REGISTRY
@@ -17,6 +16,7 @@ from training.common import (
     prepare_measurement,
 )
 from visualization.filters import get_filter_grids
+from visualization.image import recon_panel, residual_kspace
 from physics.mask import get_mask_cached as get_mask
 from operators import Mask, FFT2D, Sense
 
@@ -53,6 +53,11 @@ def train_recon(
     clip_grad=1.0,
     ### Logging
     val_every_epochs=10,      # validate every N epochs (was: val_every steps)
+    # Fixed amplification for the residual panel. Fixed, NOT auto-scaled: an
+    # auto-scaled residual always fills the dynamic range, so an artifact that
+    # is shrinking over training looks identical to one that is not. Raise it
+    # to inspect a residual that has become faint.
+    residual_gain=4.0,
     start_epoch=0,            # was: start_step
     save_dir=None,
     ckpt=None,
@@ -295,18 +300,58 @@ def train_recon(
 
                 ### Sample Image Logging for Wandb
                 if wandb:
-                    gt_img = image_v[:1].abs()
-                    recon_img = recon_v[:1].abs()
+                    # The zero-filled adjoint is the reference the network has
+                    # to beat: it is what the undersampling artifact looks like
+                    # BEFORE reconstruction, so "did the net remove it or move
+                    # it around" is answerable at a glance.
+                    zf_v = E_v.adjoint(y_v)
+                    if whiten_kspace and "Zinv" in extra_v:
+                        zf_v = extra_v["Zinv"] * zf_v
 
-                    grid = torch.cat([gt_img, recon_img], dim=0)
-                    grid = grid - grid.min()
-                    grid = grid / grid.max()
+                    panel, pstats = recon_panel(
+                        image_v, recon_v, zero_filled=zf_v, gain=residual_gain,
+                    )
+
+                    # metrics of the DISPLAYED slice, not the val-set mean --
+                    # a caption quoting the set mean next to one image is a
+                    # standing invitation to misread the picture.
+                    m1 = compute_metrics(image_v[:1].abs(), recon_v[:1].abs())
+                    sig = float(torch.as_tensor(sigma_v).reshape(-1)[0])
+
+                    caption = (
+                        f"epoch {epoch} | zero-filled | recon | ground truth | "
+                        f"|residual| x{pstats['gain']:g}\n"
+                        f"R={R} acs={acs_lines} mask={mask_dist} sigma={sig:.4f} "
+                        f"| this slice: PSNR {float(m1['psnr']):.2f} dB, "
+                        f"SSIM {float(m1['ssim']):.4f}, "
+                        f"NRMSE {float(m1['nrmse']):.4f}\n"
+                        f"residual: peak {100 * pstats['res_max']:.1f}%, "
+                        f"rms {100 * pstats['res_rms']:.2f}% of peak signal "
+                        f"(panel saturates at {100 / pstats['gain']:.0f}%)"
+                    )
 
                     wandb.log(
                         {
-                            "val/recon_example": wandb.Image(
-                                vutils.make_grid(grid, nrow=2)
-                            )
+                            "val/recon_example": wandb.Image(panel, caption=caption),
+                            "val/residual_kspace": wandb.Image(
+                                residual_kspace(image_v, recon_v),
+                                caption=(
+                                    f"epoch {epoch}: log|FFT(recon - gt)|. "
+                                    f"Energy laid out along the UNSAMPLED "
+                                    f"phase-encode lines (a comb of period R={R} "
+                                    f"for an equispaced mask, scattered for a "
+                                    f"random one) = unrecovered undersampling: a "
+                                    f"data-consistency / capacity problem. Energy "
+                                    f"piled at the band edges and corners = "
+                                    f"grid-locked structure at a coarse level's "
+                                    f"Nyquist, i.e. the multigrid transfer pair or "
+                                    f"a strided-ConvTranspose checkerboard -- more "
+                                    f"depth will NOT remove that one. Flat floor = "
+                                    f"noise."
+                                ),
+                            ),
+                            "val/residual_rms_frac": pstats["res_rms"],
+                            "val/residual_peak_frac": pstats["res_max"],
                         },
                         step=global_step,
                     )
