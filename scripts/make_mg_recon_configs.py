@@ -100,20 +100,38 @@ def _altsplit(denoiser_K):
     )
 
 
-# The LPDS family, from the reference's own LPDS configs rather than the CDL
-# ones: `Sljiva/config/lpdsnet.yaml` (M=225, p=7, stride=2, degrees=1,
-# lambda0=1e-3, tau0=0.5, theta0=0.0, K=40) and `mglpds.yaml` (alpha0=1.0,
-# widen=1, preproc kspace). The V-cycle shape is `makeconfigs_mglpds.jl`'s MRI
-# RECONSTRUCTION sweep -- iters=[12,12,12] -- not the denoising sweep's.
+# The LPDS family. M and K are THIS repo's long-standing defaults (config/knee/
+# recon.json, models/lpdsnet.py), not `Sljiva/config/lpdsnet.yaml`'s M=225 / K=40
+# -- an earlier revision of this file used the Julia values and it was wrong to
+# switch them. The step-size parameters need no such choice: ImMAP's LPDSNet
+# defaults (l0=1e-3, eta_0=0.5, theta_0=0.0) already equal lpdsnet.yaml's
+# lambda0 / tau0 / theta0. `alpha0=1.0` is the coarse-correction init from
+# mglpds.yaml, which has no LPDSNet counterpart.
 #
 # windowsize stays 1: no group models in this grid, so no Mh / attention.
 LPDS_COMMON = dict(
-    M=225, C=1, P=7, s=2, widen=1, degrees=1,
+    M=169, C=1, P=7, s=2, widen=1, degrees=1,
     lam0=1.0e-3, tau0=5.0e-1, theta0=0.0, alpha0=1.0,
     is_complex=True, preproc="kspace", resize_noise=True,
 )
-LPDS_VCYCLE_K = [1, [12, 12, 12]]
-LPDS_BASELINE_K = 40                       # lpdsnet.yaml's K
+
+# "6 V-cycles with [4, 4, 6] LISTA iterations: 4 at depth 0, 4 at depth 1, 6 at
+# depth 2" translates directly, because `iters[l]` IS the per-depth count --
+# the V-cycle halves it into pre/post smoothing itself:
+#
+#   depth 0   iters[0] = 4   ->  lpdsA 2 + lpdsB 2
+#   depth 1   iters[1] = 4   ->  lpdsA 2 + lpdsB 2
+#   depth 2   iters[2] = 6   ->  one stack of 6 (coarsest: no split)
+#
+# `PDVCycle.iters_per_level` reports [4, 4, 6] back, and `tests/test_mg_lpds.py`
+# pins that round-trip. 6 x (4+4+6) = 84 layers, 6 x 4 = 24 on the fine grid.
+#
+# NOT a checked-in Sljiva configuration: every V-cycle config there uses
+# K_outer = 1 with large per-level iters (mglpds.yaml `[16,16,16]`,
+# makeconfigs_mglpds.jl `[12,12,12]`). Many-outer-cycles-few-sweeps matches
+# `MGLPDSNet`'s constructor default (`K=8, iters=[4,4,4]`) instead.
+LPDS_VCYCLE_K = [6, [4, 4, 6]]
+LPDS_BASELINE_K = 30                       # this repo's LPDSNet default
 
 MODELS = {
     # SAME CLASS, differing only in K -- so this pair is a clean multigrid

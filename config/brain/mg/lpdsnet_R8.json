@@ -6,7 +6,7 @@
     "model": {
         "type": "MGLPDSNet",
         "params": {
-            "M": 225,
+            "M": 169,
             "C": 1,
             "P": 7,
             "s": 2,
@@ -19,7 +19,7 @@
             "is_complex": true,
             "preproc": "kspace",
             "resize_noise": true,
-            "K": 40
+            "K": 30
         }
     },
     "paths": {

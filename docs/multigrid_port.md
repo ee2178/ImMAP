@@ -549,19 +549,32 @@ its own cell list and its own array bound.
 
 | tag | type | K | preproc |
 |---|---|---|---|
-| `lpdsnet` | `MGLPDSNet` | `40` | `kspace` |
-| `mglpds` | `MGLPDSNet` | `[1, [12, 12, 12]]` | `kspace` |
+| `lpdsnet` | `MGLPDSNet` | `30` | `kspace` |
+| `mglpds` | `MGLPDSNet` | `[6, [4, 4, 6]]` | `kspace` |
 | `altsplit` | `AltSplitCDLNet`, `smap_update` | denoiser `K=6` | `identity` |
 | `mgaltsplit` | `AltSplitCDLNet`, `smap_update` | denoiser `K=[1, [4, 4, 8]]` | `identity` |
 
 **Both pairs are now clean multigrid ablations** -- same class, `K` the only
 variable. `lpdsnet` / `mglpds` used to cross an architecture boundary as well
 (`models/lpdsnet.py::LPDSNet` versus `MGCDLNet(dual=True)`); porting
-`mg_lpds.jl` removed that confound. LPDS hyperparameters come from the
-reference's own LPDS configs -- `lpdsnet.yaml` for `M=225, p=7, stride=2,
-degrees=1, lambda0=1e-3, tau0=0.5, theta0=0.0, K=40` and `mglpds.yaml` for
-`alpha0=1.0, widen=1` -- with the V-cycle shape taken from
-`makeconfigs_mglpds.jl`'s MRI **reconstruction** sweep, `iters=[12,12,12]`.
+`mg_lpds.jl` removed that confound.
+
+`M=169` and the baseline `K=30` are this repo's own LPDSNet defaults
+(`config/knee/recon.json`), not `Sljiva/config/lpdsnet.yaml`'s `M=225 / K=40`.
+The step sizes need no such choice -- ImMAP's `l0 / eta_0 / theta_0` defaults
+already equal `lpdsnet.yaml`'s `lambda0 / tau0 / theta0`.
+
+The V-cycle shape is `K = [6, [4, 4, 6]]`: 6 outer V-cycles with 4 LISTA
+iterations at depth 0, 4 at depth 1, 6 at depth 2. `iters[l]` is the per-depth
+count and the V-cycle halves it into pre/post smoothing itself, so depths 0 and
+1 run 2 + 2 and the coarsest runs one stack of 6. That is 84 layers, 24 of them
+on the fine grid.
+
+This is what the Sljiva author reports running, and it is **not** a checked-in
+configuration there: every V-cycle config in that repo uses `K_outer = 1` with
+large per-level iters (`mglpds.yaml` `[16,16,16]`, `makeconfigs_mglpds.jl`
+`[12,12,12]`). The many-outer-cycles-few-sweeps shape matches `MGLPDSNet`'s
+constructor default (`K=8, iters=[4,4,4]`) instead.
 
 No group (nonlocal) models are in this grid, so the attention backend does not
 apply to any cell. `MGGroupCDL` / `MGGroupLPDS` and the triton kernel are

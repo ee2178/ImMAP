@@ -6,7 +6,7 @@
     "model": {
         "type": "MGLPDSNet",
         "params": {
-            "M": 225,
+            "M": 169,
             "C": 1,
             "P": 7,
             "s": 2,
@@ -20,11 +20,11 @@
             "preproc": "kspace",
             "resize_noise": true,
             "K": [
-                1,
+                6,
                 [
-                    12,
-                    12,
-                    12
+                    4,
+                    4,
+                    6
                 ]
             ]
         }

@@ -184,9 +184,16 @@ def test_vcycle_and_stack_are_interchangeable():
         (x2, _), _ = net((x, z), y, E=Identity(), sigma=0.02)
         check(f"{name} continues from a pair", x2.shape == x.shape)
 
-    check("PDVCycle reports its iters per level",
-          V.iters_per_level == [4, 2], str(V.iters_per_level))
-    check("PDVCycle reports its depth", V.depth == 2, str(V.depth))
+    # `iters_per_level` sums lpdsA + lpdsB per level, so it must reproduce the
+    # `iters` the V-cycle was built from -- a stronger and less error-prone
+    # assertion than a hardcoded pair (the first version of this test hardcoded
+    # the wrong one). Matches Julia's `iters_per_level` exactly.
+    for iters in ([2, 2], [4, 4, 2]):
+        Vi = PDVCycle(iters, widen=1, **kws)
+        check(f"iters_per_level round-trips {iters}",
+              Vi.iters_per_level == iters, str(Vi.iters_per_level))
+        check(f"depth equals the level count for {iters}",
+              Vi.depth == len(iters), str(Vi.depth))
 
 
 def test_K_parsing():
