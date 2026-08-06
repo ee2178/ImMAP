@@ -1,22 +1,25 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "LPDSNet_knee_R8_synth"
+        "name": "MGLPDSNet_knee_R8_synth"
     },
     "model": {
-        "type": "LPDSNet",
+        "type": "MGLPDSNet",
         "params": {
-            "K": 30,
-            "M": 169,
+            "M": 225,
+            "C": 1,
             "P": 7,
             "s": 2,
-            "C": 1,
-            "l0": 0.001,
-            "eta_0": 0.5,
-            "theta_0": 0.0,
-            "adaptive": true,
-            "init": true,
-            "preproc": "kspace"
+            "widen": 1,
+            "degrees": 1,
+            "lam0": 0.001,
+            "tau0": 0.5,
+            "theta0": 0.0,
+            "alpha0": 1.0,
+            "is_complex": true,
+            "preproc": "kspace",
+            "resize_noise": true,
+            "K": 40
         }
     },
     "paths": {

@@ -1,8 +1,8 @@
 # Sljiva (Julia/Lux) -> ImMAP (PyTorch): multigrid + LADMM port
 
 Source files ported: `src/networks/mg_lista.jl`, `mg_group.jl`, `cdlnet.jl`,
-`ladmm.jl` (plus the `lista.jl` / `layers.jl` / `group.jl` / `operators.jl`
-pieces they depend on).
+`ladmm.jl`, `lpds.jl`, `mg_lpds.jl` (plus the `lista.jl` / `layers.jl` /
+`group.jl` / `operators.jl` pieces they depend on).
 
 ## File map
 
@@ -15,6 +15,8 @@ pieces they depend on).
 | `networks/mg_lista.jl` (`mgVCycleLayer`, `mgObjectiveDownsampleLayer`, widening) | `models/multigrid.py` |
 | `networks/cdlnet.jl` (`CDLNet`) | `models/multigrid.py` (`MGCDLNet`) |
 | `networks/ladmm.jl` | `models/ladmm.py` |
+| `networks/lpds.jl` (`LPDSLayer`) | `models/lpds.py` |
+| `networks/mg_lpds.jl` (`mgPDVCycleLayer`, `MGLPDSNet`) | `models/mg_lpds.py` |
 | `operators.jl` `Resample` / `galerkin` / `meanpool` / `upsample` | `operators/resample.py` |
 | `operators.jl` accessors / functional updaters | `operators/accessors.py` |
 | `solver.jl` `cg` / `tcg` + its `rrule` | `solvers/cg.py` (`batched_cg`, `tcg`) |
@@ -90,6 +92,51 @@ threshold -- Moreau's identity, `prox_{g*}(u) = u - prox_g(u)`, implemented once
 in `FenchelProx` and verified in `tests/test_init.py`. `K` as a plain int drops
 the V-cycle and leaves an ordinary (Group)CDLNet built from the same blocks, so
 the non-multigrid baselines come from the same code path.
+
+**`MGLPDS` is not `MGLPDSNet`.** The table above is the CDL family: `MGLPDS` is
+a LISTA layer with a clipping prox -- ONE iterate, no extrapolation, one `pi`,
+one `alpha`. Sljiva's `mg_lpds.jl` is a primal-dual splitting network that
+propagates a PAIR with over-relaxation and a two-field FAS correction; that is
+`MGLPDSNet` (`models/mg_lpds.py`), described below. Both names are registered in
+`build_model` and their numbers are not interchangeable.
+
+## Multigrid LPDS (`models/lpds.py`, `models/mg_lpds.py`)
+
+The port of `lpds.jl` + `mg_lpds.jl`. LPDS is a different classical algorithm
+from ISTA, not a different prox on the same iteration, so it gets its own
+smoother and its own V-cycle:
+
+    min_x max_z  f(x) + <A x, z> - g*(z),        f(x) = 1/2 ||E x - y||^2
+
+    x+ = x - tau (grad f(x) + A^T z - pi_x)
+    xt = x+ + theta (x+ - x)                     primal over-relaxation
+    z+ = prox_{g*}(z + A xt - pi_z)
+
+The state is a pair whose halves live on **different grids** -- `x` primal on the
+image grid (`C` channels, never widened), `z` dual on the latent grid (`M`
+channels, widened U-Net style) -- so `PDVCycle` restricts both, forms two
+corrections, and applies two coarse-correction steps (`alpha_x`, a per-channel
+scale on `C`; `alpha_z`, an `M*widen -> M` conv). That is why it cannot be
+`VCycle` with a different smoother.
+
+The two corrections are not symmetric: `pi_x` is a residual of the primal
+GRADIENT, `pi_z` a FIXED-POINT residual of the dual map (`z - prox_{g*}(...)`).
+A saddle-point problem has no single objective whose subgradient serves as both,
+which is precisely why `ObjectiveDownsample` does not generalise.
+
+`K` follows the `MGCDLNet` convention (`int` -> plain `LPDSStack`,
+`[K_outer, iters]` -> V-cycle), so the multigrid ablation is one config key.
+
+Not ported: the group/guided prox variants (the slot is pluggable but nothing
+exercises it), and `SensitivityNet` -- `mg_lpds.jl` makes it a no-op whenever
+`use_smaps=true`, which every reference config and this pipeline use. The seam
+for adding it is marked in `MGLPDSNet.forward`.
+
+`tests/test_mg_lpds.py` covers it. The one that matters is
+`test_fas_consistency`: if `(x, z)` is a fixed point of the fine iteration then
+`(Rx, Rz)` must be a fixed point of the coarse one once the corrections are
+added. A sign error or a swapped residual in `pi` passes every shape and
+gradient check and fails only that.
 
 ## Attention backends (MG-GroupCDL)
 
@@ -502,34 +549,19 @@ its own cell list and its own array bound.
 
 | tag | type | K | preproc |
 |---|---|---|---|
-| `lpdsnet` | `LPDSNet` (`models/lpdsnet.py`) | `30` | `kspace` |
-| `mglpds` | `MGLPDS` = `MGCDLNet(dual=True)` | `[1, [8, 8, 8]]` | `kspace` |
+| `lpdsnet` | `MGLPDSNet` | `40` | `kspace` |
+| `mglpds` | `MGLPDSNet` | `[1, [12, 12, 12]]` | `kspace` |
 | `altsplit` | `AltSplitCDLNet`, `smap_update` | denoiser `K=6` | `identity` |
 | `mgaltsplit` | `AltSplitCDLNet`, `smap_update` | denoiser `K=[1, [4, 4, 8]]` | `identity` |
 
-**What each pair does and does not isolate.** `altsplit` / `mgaltsplit` are the
-same class with the same `admm_iters`, CG settings and denoiser width; the
-V-cycle in `denoiser_kws.K` is the only variable, and `altsplit.yaml` ships both
-values (`K: [1, [4,4,8]]` with `# K: 6` commented above it). That pair is a clean
-multigrid ablation.
-
-`lpdsnet` / `mglpds` is not. `LPDSNet` is its own class (`BaseUnrolledModel`,
-plain int `K`, no V-cycle path) and ImMAP has no multigrid version of it, so the
-comparison crosses an architecture boundary as well as the V-cycle. `M`, `P`,
-`s` and `K` are held at the grid's values rather than `lpdsnet.yaml`'s
-(`M=225, p=9, K=40`) so capacity is at least not a third variable, and both now
-use the `E^H E` DC correction so preprocessing is not a fourth. A difference
-between them still cannot be attributed to multigrid alone.
-
-**The `mglpds` cells are not Sljiva's MGLPDS.** ImMAP's `MGLPDS` is
-`MGCDLNet(dual=True)`: the Fenchel/Moreau dual of the CDL prox -- clipping
-instead of shrinkage, read-out `y~ - Dz`. The reference's multigrid MRI model
-*called* LPDS is `mg_lpdsnet` (`Sljiva/src/networks/mg_lpds.jl`): a primal-dual
-splitting network with its own sensenet, dual-channel widening and separate
-lambda/theta steps, which is **not ported**. Same name, different architecture,
-and the numbers are not comparable to anything published for it. The caveat is
-written into each generated config's `_comment` so it travels into the run
-directory rather than living only here.
+**Both pairs are now clean multigrid ablations** -- same class, `K` the only
+variable. `lpdsnet` / `mglpds` used to cross an architecture boundary as well
+(`models/lpdsnet.py::LPDSNet` versus `MGCDLNet(dual=True)`); porting
+`mg_lpds.jl` removed that confound. LPDS hyperparameters come from the
+reference's own LPDS configs -- `lpdsnet.yaml` for `M=225, p=7, stride=2,
+degrees=1, lambda0=1e-3, tau0=0.5, theta0=0.0, K=40` and `mglpds.yaml` for
+`alpha0=1.0, widen=1` -- with the V-cycle shape taken from
+`makeconfigs_mglpds.jl`'s MRI **reconstruction** sweep, `iters=[12,12,12]`.
 
 No group (nonlocal) models are in this grid, so the attention backend does not
 apply to any cell. `MGGroupCDL` / `MGGroupLPDS` and the triton kernel are

@@ -8,6 +8,8 @@ from .ipalmnet import IPALMNet
 from .groupcdl import GroupCDL
 from .cclnet import CCLNet, Unet2D
 from .multigrid import MGCDLNet, VCycle
+from .lpds import LPDSLayer, LPDSStack
+from .mg_lpds import MGLPDSNet, PDVCycle
 from .ladmm import AltSplitCDLNet
 from .sb_cdlnet import SBCDLNet
 
@@ -72,6 +74,15 @@ def build_model(cfg):
                     f"window side, odd) and Mh (attention channels). "
                     f"Got W={params.get('W', 1)}, Mh={params.get('Mh')}.")
         return MGCDLNet(**params)
+
+    # Multigrid Learned Primal-Dual Splitting -- the port of mg_lpds.jl. NOT the
+    # same thing as `MGLPDS` above: that is MGCDLNet(dual=True), a LISTA layer
+    # with a clipping prox (one iterate, no extrapolation). This propagates a
+    # primal-dual PAIR with over-relaxation and a two-field FAS correction.
+    # `K` follows the MGCDLNet convention, so K as a plain int gives an ordinary
+    # LPDS stack from the same blocks and the multigrid ablation is one key.
+    elif model_type == "MGLPDSNet":
+        return MGLPDSNet(**params)
 
     # unrolled linearized ADMM with a learned CDL prox (+ optional joint coils)
     elif model_type == "AltSplitCDLNet":

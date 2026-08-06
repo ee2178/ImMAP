@@ -60,78 +60,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # preproc="kspace" is the reconstruction mode (Sljiva's lpdsnet.yaml /
 # mglpds.yaml use it too): it pads the OPERATOR alongside y~, and removes DC
 # through E^H E instead of subtracting a plain mean. See preprocessing/kspace.py.
-MG_COMMON = dict(
-    M=169, C=1, P=7, s=2, widen=1, degrees=1,
-    is_complex=True, preproc="kspace", resize_noise=True,
-    tau0=1.0e-3, alpha0=1.0e-1, alpha_conv=False,
-)
+#
+# The CDL-family constants (MG_COMMON / GROUP / VCYCLE_K / BASELINE_K) and the
+# attention-backend discussion that used to live here were dropped when the grid
+# lost its MGCDLNet and group cells. `docs/multigrid_port.md` still carries both,
+# and `models/circulant_{flex,triton}.py` are unchanged -- adding a group cell
+# back means reinstating a GROUP dict, not rebuilding anything.
 
-# Group (nonlocal) prox. windowsize=9 / dK=2 come from the multigrid sweep;
-# groupcdl.yaml's W=35 / dK=5 belong to the standalone denoising experiment.
-# Held identical across V-cycle and baseline cells so the comparison isolates
-# the V-cycle rather than the attention configuration.
+# NOTE ON `mglpds`: this is now the real port of Sljiva's mg_lpds.jl
+# (models/mg_lpds.py::MGLPDSNet) -- a primal-dual splitting network propagating
+# a pair (x, z) with over-relaxation and a two-field FAS correction.
 #
-# ATTENTION BACKEND -- the one place this grid cannot match the reference.
-#
-# The reference uses similarity=pidistance, the phase-invariant distance
-#     -1/2||q||^2 + |<q,k>| - 1/2||k||^2.
-# FlexAttention's score_mod sees ONE number per pair (the raw dot product). For
-# REAL features <q,k> = q.k, so |<q,k>| is |score| and the fusion is exact --
-# models/circulant_flex.py now does it. For COMPLEX features (these configs)
-# the stacked score is only Re<q,k>, and the modulus needs Im<q,k> too: a
-# second bilinear form no score_mod can reach. Julia gets away with it because
-# its flash path is a bespoke kernel that accumulates both.
-#
-# `triton` (the DEFAULT) is the one that gets both: models/circulant_triton.py
-# accumulates Re<q,k> AND Im<q,k>, so the modulus is available -- exactly what a
-# score_mod cannot reach. Verified against the gather path on an L40S
-# (tests/test_triton_attention.py, 115/115) at 0.29 ms / 69 MiB per apply versus
-# gather's 11.2 ms / 1074 MiB, so there is no longer a reason to deviate.
-#
-#   --attn triton  (default) exact pidistance, fused
-#   --attn flex              fused, but sim_fun drops to "distance"
-#   --attn gather            exact pidistance, materialises (B, Mh, Q, W^2)
-#
-# flex remains useful as a fallback on a box where triton is unavailable; the
-# similarity swap it forces is written into the emitted config so no run is
-# ambiguous about which similarity it trained on.
-GROUP = dict(
-    Mh=64, W=9, dK=2, nheads=1, gamma0=0.8,
-    sim_fun="pidistance", init_strategy="semi_orthogonal",
-    subgrad_mode="rigorous", attn_backend="triton",
-)
-
-# One outer V-cycle over three levels, 8 smoothing sweeps each.
-VCYCLE_K = [1, [8, 8, 8]]
-# groupcdl.yaml's K: 30. NOTE this is the reference's own baseline and it is
-# NOT iteration-matched to the V-cycle (30 sweeps vs 8 on the fine grid) nor
-# parameter-matched (a V-cycle also carries its coarse levels, the dF copies
-# and alpha). scripts/eval_mg_recon.py reports n_params next to PSNR so the
-# asymmetry is visible rather than papered over.
-BASELINE_K = 30
-
-# READ THIS BEFORE COMPARING THE `mglpds` CELLS TO ANYTHING PUBLISHED.
-#
-# ImMAP's MGLPDS is `MGCDLNet(dual=True)`: the Fenchel/Moreau dual of the CDL
-# prox -- clipping instead of shrinkage, read-out `y~ - Dz`. It is a one-flag
-# variant of the same V-cycle CDLNet, sharing every other hyperparameter.
-#
-# The reference's multigrid MRI model *called* LPDS is `mg_lpdsnet`
-# (Sljiva/src/networks/mg_lpds.jl): a primal-dual splitting network with its own
-# sensenet, dual-channel widening, and separate lambda/theta step parameters. It
-# is NOT ported. Same name, different architecture.
-#
-# So these two cells answer "does the dual read-out help OUR V-cycle CDLNet",
-# which is a real question. They do not reproduce Sljiva's MGLPDS, and their
-# numbers are not comparable to anything reported for it. The caveat rides along
-# in each emitted config's `_comment` so it survives into the run directory.
-_LPDS_NOTE = (
-    "MGLPDS here is MGCDLNet(dual=True) -- the Fenchel/Moreau dual of the CDL "
-    "prox (clipping instead of shrinkage, read-out y~ - Dz). It is NOT Sljiva's "
-    "mg_lpdsnet (src/networks/mg_lpds.jl), a primal-dual splitting network with "
-    "a sensenet, which is not ported to ImMAP. Same name, different "
-    "architecture: these numbers measure the dual read-out on our V-cycle "
-    "CDLNet and are not comparable to published MGLPDS results.")
+# It is NOT `MGLPDS` / `MGCDLNet(dual=True)`, which this grid used to run: that
+# is a LISTA layer with a clipping prox -- one iterate, no extrapolation, one
+# coarse correction. Both names still exist in build_model; they are different
+# networks and their numbers are not interchangeable.
 
 # AltSplitCDLNet, from altsplit.yaml. `denoiser_kws.K` is the ONLY difference
 # between the two LADMM cells: altsplit.yaml ships `K: [1, [4,4,8]]` with
@@ -157,22 +100,31 @@ def _altsplit(denoiser_K):
     )
 
 
+# The LPDS family, from the reference's own LPDS configs rather than the CDL
+# ones: `Sljiva/config/lpdsnet.yaml` (M=225, p=7, stride=2, degrees=1,
+# lambda0=1e-3, tau0=0.5, theta0=0.0, K=40) and `mglpds.yaml` (alpha0=1.0,
+# widen=1, preproc kspace). The V-cycle shape is `makeconfigs_mglpds.jl`'s MRI
+# RECONSTRUCTION sweep -- iters=[12,12,12] -- not the denoising sweep's.
+#
+# windowsize stays 1: no group models in this grid, so no Mh / attention.
+LPDS_COMMON = dict(
+    M=225, C=1, P=7, s=2, widen=1, degrees=1,
+    lam0=1.0e-3, tau0=5.0e-1, theta0=0.0, alpha0=1.0,
+    is_complex=True, preproc="kspace", resize_noise=True,
+)
+LPDS_VCYCLE_K = [1, [12, 12, 12]]
+LPDS_BASELINE_K = 40                       # lpdsnet.yaml's K
+
 MODELS = {
-    # models/lpdsnet.py::LPDSNet -- its own class, not a CDLNet variant. Its
-    # l0 / eta_0 / theta_0 defaults already equal Sljiva lpdsnet.yaml's
-    # lambda0 / tau0 / theta0. M / P / s / K are held at the grid's values
-    # rather than lpdsnet.yaml's (M=225, p=9, K=40) so the only thing separating
-    # it from mglpds is architecture, not capacity.
-    "lpdsnet": dict(
-        type="LPDSNet",
-        params=dict(K=BASELINE_K, M=169, P=7, s=2, C=1,
-                    l0=1.0e-3, eta_0=0.5, theta_0=0.0,
-                    adaptive=True, init=True, preproc="kspace"),
-    ),
-    # dual=True is what build_model forces for this type anyway; stated here so
-    # the config shows the flag that makes it the Fenchel/clipping read-out.
-    "mglpds": dict(type="MGLPDS", note=_LPDS_NOTE,
-                   params=dict(MG_COMMON, K=VCYCLE_K, dual=True)),
+    # SAME CLASS, differing only in K -- so this pair is a clean multigrid
+    # ablation. It did not used to be: `lpdsnet` was models/lpdsnet.py::LPDSNet
+    # and `mglpds` was MGCDLNet(dual=True), which crossed an architecture
+    # boundary as well as the V-cycle. models/mg_lpds.py is the real port, so
+    # both cells are now MGLPDSNet.
+    "lpdsnet": dict(type="MGLPDSNet",
+                    params=dict(LPDS_COMMON, K=LPDS_BASELINE_K)),
+    "mglpds":  dict(type="MGLPDSNet",
+                    params=dict(LPDS_COMMON, K=LPDS_VCYCLE_K)),
     "altsplit":   _altsplit(6),
     "mgaltsplit": _altsplit([1, [4, 4, 8]]),
 }
