@@ -64,9 +64,9 @@
         }
     },
     "training": {
-        "num_epochs": 500,
-        "steps_per_epoch": 200,
-        "val_every_epochs": 10,
+        "num_epochs": 6000,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 100,
         "noise_std": [
             0.0,
             0.01
@@ -98,7 +98,7 @@
         "type": "CosineAnnealingLR",
         "params": {
             "eta_min": 1.0e-6,
-            "T_max": 100000
+            "T_max": 300000
         }
     },
     "wandb": {

@@ -79,14 +79,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # AltSplitCDLNet, from altsplit.yaml. `denoiser_kws.K` is the ONLY difference
 # between the two LADMM cells: altsplit.yaml ships `K: [1, [4,4,8]]` with
 # `# K: 6` commented directly above it, so both come from the reference.
-# preproc stays "identity" -- with smap_update the unroll keeps raw k-space and
-# re-forms E^H y per layer, so there is nothing for kspace preprocessing to act on.
+# smap_update is OFF. Profiling put the coil-map CG solve at 72.9% of the
+# forward pass -- and the learned highpass inside it at 57.4% of the whole
+# forward, 11 applies per solve -- for a 3.46x increase in step time. The maps
+# come from the dataset and are already good; re-estimating them is not where
+# this grid's accuracy is coming from. `smap_kws` is left in place so flipping
+# the flag back is a one-key change.
+#
+# preproc stays "identity": the LADMM x-solve is (E^H E + rho I) x = E^H y,
+# which is well posed on the raw adjoint -- there is no dictionary here whose
+# atoms would be spent representing DC.
 def _altsplit(denoiser_K):
     return dict(
         type="AltSplitCDLNet",
         lr=2.0e-4,          # the CG solves make this one touchier than the rest
         params=dict(
-            admm_iters=6, reuse_latent=True, smap_update=True, rho0=1.0,
+            admm_iters=6, reuse_latent=True, smap_update=False, rho0=1.0,
             cg_maxit=10, cg_tol=1.0e-4, implicit_cg=True, preproc="identity",
             denoiser_type="mgcdlnet",
             denoiser_kws=dict(
@@ -191,6 +199,41 @@ def cells(anatomy=None):
 # ===========================================================================
 #  Config assembly
 # ===========================================================================
+def _variant(params):
+    """"mg" or "flat", read off the actual K -- not off the cell's name.
+
+    The flat and multigrid arms of a pair share a MODEL CLASS: `MGLPDSNet` with
+    `K=30` is the flat LPDS stack and with `K=[6,[4,4,6]]` is the V-cycle, and
+    likewise for AltSplitCDLNet's `denoiser_kws.K`. That is the point of the
+    design -- one key is the whole ablation -- but it means `spec["type"]` alone
+    cannot name a run, and two cells would land on the SAME wandb name.
+
+    Derived from K rather than from the cell key so the tag cannot drift if
+    someone edits a K by hand.
+    """
+    K = params.get("K", params.get("denoiser_kws", {}).get("K"))
+    return "flat" if isinstance(K, int) else "mg"
+
+
+# What a run is CALLED, which is not what its class is called. `MGLPDSNet` with
+# K=30 is the plain LPDS baseline and labelling it "MGLPDSNet" in wandb would be
+# actively misleading; AltSplitCDLNet is named for its denoiser, which is a
+# multigrid CDLNet only in the mg arm.
+_DISPLAY_NAME = {
+    ("MGLPDSNet",      "flat"): "LPDSNet",
+    ("MGLPDSNet",      "mg"):   "MGLPDSNet",
+    ("AltSplitCDLNet", "flat"): "AltSplitCDLNet",
+    ("AltSplitCDLNet", "mg"):   "AltSplitMGCDLNet",
+}
+
+
+def _display_name(spec_type, params):
+    """The run's name. Falls back to `<class>_<variant>` for an unmapped model
+    so a new cell stays distinguishable instead of silently colliding."""
+    variant = _variant(params)
+    return _DISPLAY_NAME.get((spec_type, variant), f"{spec_type}_{variant}")
+
+
 def make_config(anatomy, r, model, args):
     a = ANATOMIES[anatomy]
     spec = MODELS[model]
@@ -249,7 +292,9 @@ def make_config(anatomy, r, model, args):
     return {
         "task": "recon",
         "experiment": {
-            "name": f"{spec['type']}_{anatomy}_R{r}_synth",
+            # Load-bearing, not decoration: the flat and multigrid arms share a
+            # model class, so `spec["type"]` alone collides on one wandb run.
+            "name": f"{_display_name(spec['type'], params)}_{anatomy}_R{r}_synth",
         },
         "model": dict(
             {"type": spec["type"], "params": params},
@@ -309,9 +354,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", default="config", help="config root (default: config)")
-    p.add_argument("--num-epochs", type=int, default=500)
-    p.add_argument("--steps-per-epoch", type=int, default=200)
-    p.add_argument("--val-every-epochs", type=int, default=10)
+    # 6000 x 50 = 300000 steps; the cosine schedule's T_max is derived from
+    # these two, so the annealing always spans exactly one full run.
+    p.add_argument("--num-epochs", type=int, default=6000)
+    p.add_argument("--steps-per-epoch", type=int, default=50)
+    p.add_argument("--val-every-epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=5.0e-4)
     p.add_argument("--only", nargs="*", default=None,
                    help="restrict to these model tags")
@@ -350,12 +397,25 @@ def main():
                 f"--dry-run to inspect the configs without writing.")
 
     written = []
+    seen_names = {}
     for anatomy, r, model in cells(args.anatomy):
         if args.only and model not in args.only:
             continue
 
         cfg = make_config(anatomy, r, model, args)
         path = os.path.join(args.out, anatomy, "mg", f"{model}_R{r}.json")
+
+        # Two cells sharing a wandb name interleave their curves into one run,
+        # and the loss is silent -- nothing errors, the plot is just wrong. The
+        # flat/mg pairs share a model class, so this is one edit away at all
+        # times. Fail here instead.
+        name = cfg["experiment"]["name"]
+        if name in seen_names:
+            raise SystemExit(
+                f"duplicate experiment name {name!r}: cells {seen_names[name]} "
+                f"and {(anatomy, r, model)} would log into the same wandb run. "
+                f"Add an entry to _DISPLAY_NAME.")
+        seen_names[name] = (anatomy, r, model)
 
         if args.dry_run:
             print(f"--- {path} ---")

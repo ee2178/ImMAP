@@ -81,8 +81,23 @@ class LearnedHighpass(nn.Module):
 
     The kernel *size* is fixed at construction from `sigma_max` (the 5-sigma
     rule), not from the current sigma, so the shape never changes under
-    autograd as the width trains; only the values are rebuilt each call.
+    autograd as the width trains; only the values are rebuilt when sigma moves.
     `||I - G|| <= 1` always, since a normalised Gaussian's DFT lies in (0, 1].
+
+    Separable application
+    ---------------------
+    An isotropic Gaussian is an outer product of two 1-D Gaussians, so each blur
+    is two 1-D passes rather than one `ks x ks` pass: 2*(2*ks) multiplies per
+    pixel instead of `ks^2`, i.e. 60 vs 225 at ks=15 -- 3.75x fewer.  The
+    `delta` term needs no convolution at all; it is the input.
+
+    This is EXACT, not an approximation.  With zero padding, convolving rows
+    then columns equals one 2-D convolution with the outer-product kernel: the
+    intermediate is zero wherever it would be padded, because the input already
+    was.  `tests/test_ladmm.py` checks it against the explicit 2-D kernel.
+
+    Profiling motivated it: this layer was 57% of AltSplitCDLNet's forward pass,
+    running 11 times per coil-map CG solve.
     """
 
     def __init__(self, sigma_g=1.5, sigma_max=3.0, sigma_min=0.3):
@@ -96,36 +111,77 @@ class LearnedHighpass(nn.Module):
 
         m = (self.ks - 1) // 2
         grid = torch.arange(-m, m + 1, dtype=torch.float32)
+        # gx / gy are kept (rather than replaced by a 1-D buffer) so the
+        # state_dict is unchanged; the separable path reads `gx[0]`.
         self.register_buffer("gy", grid.view(-1, 1).expand(self.ks, self.ks).clone())
         self.register_buffer("gx", grid.view(1, -1).expand(self.ks, self.ks).clone())
         delta = torch.zeros(1, 1, self.ks, self.ks)
         delta[0, 0, m, m] = 1.0
         self.register_buffer("impulse", delta)
 
+        self._k_key = None                     # cache: (sigma version, grad mode)
+        self._k_val = None
+
     @property
     def sigma_g(self):
         return clamp_sigma(self.sigma_raw, self.sigma_min)
 
-    def gaussian(self, sigma):
-        r2 = self.gx ** 2 + self.gy ** 2
-        k = torch.exp(-r2 / (2.0 * sigma * sigma))
-        return (k / k.sum()).reshape(1, 1, self.ks, self.ks)
+    # -- kernels ------------------------------------------------------------
+    def _gauss_1d(self, sigma):
+        g = torch.exp(-(self.gx[0] ** 2) / (2.0 * sigma * sigma))
+        return g / g.sum()
+
+    def kernels_1d(self):
+        """The two 1-D Gaussians, rebuilt only when sigma_g actually moves.
+
+        Cached across the ~11 applies of a CG solve.  The key carries the
+        parameter's version counter (bumped in place by `optimizer.step()`) AND
+        the grad mode: a kernel built under `no_grad` has no graph, so handing
+        it back inside an `enable_grad` region would silently drop sigma_g's
+        gradient.
+        """
+        key = (int(self.sigma_raw._version), torch.is_grad_enabled())
+        if self._k_key != key:
+            s = self.sigma_g
+            self._k_val = (self._gauss_1d(s), self._gauss_1d(s * math.sqrt(2.0)))
+            self._k_key = key
+        return self._k_val
 
     def kernel(self):
-        s = self.sigma_g
-        return self.impulse - 2.0 * self.gaussian(s) + self.gaussian(s * math.sqrt(2.0))
+        """The explicit 2-D kernel. Not used by `forward` -- kept for
+        inspection and as the reference the separability test compares to."""
+        g1, g2 = self.kernels_1d()
+        k = (self.impulse
+             - 2.0 * torch.outer(g1, g1).reshape(1, 1, self.ks, self.ks)
+             + torch.outer(g2, g2).reshape(1, 1, self.ks, self.ks))
+        return k
+
+    def gaussian(self, sigma):
+        """The 2-D isotropic Gaussian, normalised. Outer product of the 1-D one,
+        which is already unit-sum, so the 2-D one is too."""
+        g = self._gauss_1d(sigma)
+        return torch.outer(g, g).reshape(1, 1, self.ks, self.ks)
+
+    # -- application --------------------------------------------------------
+    def _blur(self, x, g):
+        """Separable Gaussian blur: columns then rows, both zero-padded."""
+        pad = (self.ks - 1) // 2
+        x = F.conv2d(x, g.reshape(1, 1, -1, 1), padding=(pad, 0))
+        return F.conv2d(x, g.reshape(1, 1, 1, -1), padding=(0, pad))
+
+    def _apply_real(self, x, g1, g2):
+        return x - 2.0 * self._blur(x, g1) + self._blur(x, g2)
 
     def forward(self, x):
         """Apply W channel-wise; coils are folded into the batch axis."""
         shape = x.shape
         xr = x.reshape(-1, 1, shape[-2], shape[-1])
-        k = self.kernel()
-        pad = (self.ks - 1) // 2
+        g1, g2 = self.kernels_1d()
         if torch.is_complex(xr):
-            out = torch.complex(F.conv2d(xr.real, k, padding=pad),
-                                F.conv2d(xr.imag, k, padding=pad))
+            out = torch.complex(self._apply_real(xr.real, g1, g2),
+                                self._apply_real(xr.imag, g1, g2))
         else:
-            out = F.conv2d(xr, k, padding=pad)
+            out = self._apply_real(xr, g1, g2)
         return out.reshape(shape)
 
     @torch.no_grad()

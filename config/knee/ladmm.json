@@ -5,25 +5,32 @@
     },
     "model": {
         "type": "AltSplitCDLNet",
-        "_comment": "Unrolled linearized ADMM, matched to Sljiva/config/altsplit.yaml: 6 layers, each an (E^H E + rho I) CG solve, a 3-level V-cycle CDLNet prox, and a dual ascent step. smap_update refines the coil maps each layer, which is why preproc stays 'identity' -- that path re-forms E^H y per layer from raw k-space. implicit_cg trades one extra CG solve in the backward for O(1) memory in the CG depth.",
+        "_comment": "Unrolled linearized ADMM: 5 layers, each an (E^H E + rho I) CG solve, a multigrid CDL denoiser as the prox, and a dual ascent step. smap_update is off: profiling put the coil-map CG solve at ~58-73% of the forward pass for a 2.5-3.5x increase in step time, and the dataset maps are already good. smap_kws is kept so flipping it back is one key. implicit_cg trades one extra CG solve in the backward for O(1) memory in the CG depth.",
         "params": {
             "admm_iters": 6,
             "reuse_latent": true,
-            "smap_update": true,
+            "smap_update": false,
             "rho0": 1.0,
             "cg_maxit": 10,
-            "cg_tol": 1.0e-4,
+            "cg_tol": 0.0001,
             "implicit_cg": true,
             "preproc": "identity",
             "denoiser_type": "mgcdlnet",
             "denoiser_kws": {
-                "K": [1, [4, 4, 8]],
+                "K": [
+                    1,
+                    [
+                        4,
+                        4,
+                        8
+                    ]
+                ],
                 "M": 169,
                 "C": 1,
                 "P": 7,
                 "s": 2,
                 "degrees": 1,
-                "tau0": 1.0e-3,
+                "tau0": 0.001,
                 "widen": 1,
                 "alpha0": 1.0,
                 "alpha_conv": false,
@@ -75,10 +82,13 @@
         }
     },
     "training": {
-        "num_epochs": 200,
-        "steps_per_epoch": 200,
-        "val_every_epochs": 5,
-        "noise_std": [0.0, 0.02],
+        "num_epochs": 6000,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 100,
+        "noise_std": [
+            0.0,
+            0.02
+        ],
         "noise_dist": "uniform",
         "val_noise_std": 0.01,
         "val_seed": 1234,
@@ -96,14 +106,14 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 2.0e-4
+            "lr": 0.0002
         }
     },
     "scheduler": {
         "type": "CosineAnnealingLR",
         "params": {
             "eta_min": 1.0e-6,
-            "T_max": 40000
+            "T_max": 300000
         }
     },
     "wandb": {

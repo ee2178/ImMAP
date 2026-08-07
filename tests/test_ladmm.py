@@ -130,6 +130,58 @@ def test_highpass():
           f"max={hp(const)[..., m:-m, m:-m].abs().max().item():.2e}")
 
 
+def test_highpass_separability():
+    """The separable path must be EXACTLY the 2-D kernel, not an approximation."""
+    import torch.nn.functional as Fn
+    hp = LearnedHighpass(sigma_g=1.5, sigma_max=3.0)
+
+    def two_d(t):
+        return Fn.conv2d(t, hp.kernel(), padding=(hp.ks - 1) // 2)
+
+    x = torch.randn(8, 1, 48, 48)
+    with torch.no_grad():
+        check("separable == explicit 2-D kernel", rel(hp(x), two_d(x)) < 1e-5,
+              f"rel={rel(hp(x), two_d(x)):.2e}")
+
+    # the complex path the coil solve actually takes
+    xc = torch.randn(1, 4, 48, 48, dtype=torch.complex64)
+    with torch.no_grad():
+        ref = torch.complex(two_d(xc.real.reshape(-1, 1, 48, 48)),
+                            two_d(xc.imag.reshape(-1, 1, 48, 48))).reshape(xc.shape)
+        check("separable == 2-D on complex input", rel(hp(xc), ref) < 1e-5)
+
+    # sigma_g must still get the same gradient through the separable path
+    grads = []
+    for fn in (hp, two_d):
+        hp.zero_grad(); hp._k_key = None
+        fn(x).pow(2).sum().backward()
+        grads.append(hp.sigma_raw.grad.item())
+    check("d/dsigma_g matches the 2-D path",
+          abs(grads[0] - grads[1]) / abs(grads[1]) < 1e-5,
+          f"{grads[0]:.4f} vs {grads[1]:.4f}")
+
+
+def test_highpass_kernel_cache():
+    """Cached across a CG solve, invalidated on a step and on entering grad."""
+    hp = LearnedHighpass()
+    x = torch.randn(2, 1, 32, 32)
+    hp._k_key = None
+    with torch.no_grad():
+        hp(x); first = hp._k_val
+        hp(x)
+        check("kernel reused across applies", hp._k_val is first)
+        hp.sigma_raw.add_(0.1)              # what optimizer.step() does
+        hp(x)
+        check("kernel rebuilt after an in-place param update",
+              hp._k_val is not first)
+        hp(x); nograd = hp._k_val
+    withgrad = hp.kernels_1d()
+    # a kernel built under no_grad carries no graph -- reusing it inside an
+    # enable_grad region would silently drop sigma_g's gradient
+    check("kernel rebuilt when entering grad mode",
+          withgrad is not nograd and withgrad[0].requires_grad)
+
+
 def test_smap_update():
     E, x, y, smaps, mask = make_mri(B=1, C=4, N=16)
     upd = LSmapUpdate(cg_maxit=300, cg_tol=1e-12)
@@ -206,7 +258,8 @@ def test_denoiser_factory():
 
 if __name__ == "__main__":
     for fn in (test_cg, test_implicit_gradient, test_accessors_and_mask,
-               test_highpass, test_smap_update, test_ladmm_forward_backward,
+               test_highpass, test_highpass_separability,
+               test_highpass_kernel_cache, test_smap_update, test_ladmm_forward_backward,
                test_ladmm_joint_smaps, test_denoiser_factory):
         print(f"\n--- {fn.__name__} ---")
         fn()
