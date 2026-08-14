@@ -186,13 +186,19 @@ class Patcher:
         self._saved.clear()
 
 
-# The four leaf families. They never nest inside one another, so their times
-# add up and "elementwise / overhead" is an honest remainder.
+# The leaf families. They never nest inside one another, so their times add up
+# and "elementwise / overhead" is an honest remainder. Analysis and synthesis
+# are kept apart: with `--by-level` the key is the INPUT grid, and a level's
+# analysis reads the image grid while its synthesis reads the latent grid --
+# so at stride 2 they would otherwise collide with the next level down.
 LEAF_OPS = [
     ("fft", torch.fft, ["fftn", "ifftn", "fft2", "ifft2"]),
     ("fftshift", torch.fft, ["fftshift", "ifftshift"]),
-    ("conv", F, ["conv2d", "conv_transpose2d"]),
-    ("resample", F, ["interpolate", "avg_pool2d", "pad"]),
+    ("conv (analysis)", F, ["conv2d"]),
+    ("convT (synthesis)", F, ["conv_transpose2d"]),
+    ("prolong", F, ["interpolate"]),
+    ("restrict", F, ["avg_pool2d"]),
+    ("pad", F, ["pad"]),
 ]
 
 
@@ -233,33 +239,49 @@ def count_run(model, y, E, sigma):
     return counts, grids
 
 
-def breakdown_run(model, y, E, sigma, device):
+def breakdown_run(model, y, E, sigma, device, by_level=False):
     """Per-family GPU time, via CUDA events (one sync at the end).
 
     Individually timing a few thousand kernels inflates the total; the split is
     what this is for.
+
+    `by_level` additionally keys each family by the spatial size of its input,
+    which is what separates a multigrid level from its parent. A family whose
+    time does NOT fall as the grid shrinks is not doing the work you think it
+    is -- either the physics is not being coarsened, or the kernel picked for
+    that shape is a bad one.
     """
     spans = defaultdict(list)
     totals = defaultdict(float)
+    counts = Counter()
     cuda = device.type == "cuda"
     p = Patcher()
+
+    def key_for(bucket, a):
+        if by_level and a and torch.is_tensor(a[0]) and a[0].dim() >= 2:
+            return f"{bucket} @{a[0].shape[-2]}x{a[0].shape[-1]}"
+        return bucket
 
     def timer(bucket):
         def factory(orig, name):
             if cuda:
                 def inner(*a, **k):
+                    key = key_for(bucket, a)
                     s = torch.cuda.Event(enable_timing=True)
                     e = torch.cuda.Event(enable_timing=True)
                     s.record()
                     out = orig(*a, **k)
                     e.record()
-                    spans[bucket].append((s, e))
+                    spans[key].append((s, e))
+                    counts[key] += 1
                     return out
             else:
                 def inner(*a, **k):
+                    key = key_for(bucket, a)
                     t0 = time.perf_counter()
                     out = orig(*a, **k)
-                    totals[bucket] += (time.perf_counter() - t0) * 1e3
+                    totals[key] += (time.perf_counter() - t0) * 1e3
+                    counts[key] += 1
                     return out
             return inner
         return factory
@@ -282,10 +304,10 @@ def breakdown_run(model, y, E, sigma, device):
         p.restore()
 
     if cuda:
-        for bucket, evts in spans.items():
-            totals[bucket] = sum(s.elapsed_time(e) for s, e in evts)
+        for key, evts in spans.items():
+            totals[key] = sum(s.elapsed_time(e) for s, e in evts)
     totals["elementwise / overhead"] = wall - sum(totals.values())
-    return dict(totals), wall
+    return dict(totals), dict(counts), wall
 
 
 def time_run(model, y, E, sigma, reps, warmup, device):
@@ -335,12 +357,19 @@ def main():
                     help="exact op counts and the grid each ran at")
     ap.add_argument("--breakdown", action="store_true",
                     help="split GPU time into fft / conv / resample / other")
+    ap.add_argument("--by-level", action="store_true",
+                    help="with --breakdown, key each family by its input grid "
+                         "size, separating the multigrid levels")
+    ap.add_argument("--cudnn-benchmark", action="store_true",
+                    help="enable cuDNN autotuning (off by default everywhere in "
+                         "this repo); shapes are fixed, so warmup pays for it")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     device = torch.device(args.device)
     size = (args.size[0], args.size[-1])
+    torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
     if device.type == "cpu":
         print("WARNING: profiling on CPU. The FFT/conv balance and the launch "
               "overhead that drive GPU timings do not transfer -- use a GPU.\n")
@@ -349,7 +378,8 @@ def main():
           + (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     print(f"torch    : {torch.__version__}")
     print(f"problem  : {args.batch}x{args.coils} coils, {size[0]}x{size[1]}, "
-          f"sigma={args.sigma}, {args.reps} reps after {args.warmup} warmup\n")
+          f"sigma={args.sigma}, {args.reps} reps after {args.warmup} warmup")
+    print(f"cudnn.benchmark : {torch.backends.cudnn.benchmark}\n")
 
     rows, first_median, outputs = [], {}, {}
     for cfg_path in args.configs:
@@ -392,10 +422,19 @@ def main():
                       "physics)\n")
 
             if args.breakdown and mode == "optimised":
-                totals, wall = breakdown_run(model, y, E, sigma, device)
-                print(f"--- breakdown: {name}  (instrumented total {wall:.1f} ms) ---")
+                totals, ncalls, wall = breakdown_run(model, y, E, sigma, device,
+                                                     by_level=args.by_level)
+                clean = stats["median"]
+                print(f"--- breakdown: {name}  (instrumented {wall:.1f} ms vs "
+                      f"clean {clean:.1f} ms; the {wall - clean:.1f} ms of wrapper "
+                      f"overhead lands in the remainder) ---")
+                head = f"    {'family':<28}{'ms':>9}{'%':>7}{'calls':>8}{'us/call':>10}"
+                print(head)
                 for k, v in sorted(totals.items(), key=lambda kv: -kv[1]):
-                    print(f"    {k:<24} {v:8.2f} ms   {100 * v / wall:5.1f}%")
+                    n = ncalls.get(k, 0)
+                    per = f"{1e3 * v / n:>10.1f}" if n else " " * 10
+                    print(f"    {k:<28}{v:>9.2f}{100 * v / wall:>7.1f}"
+                          f"{n if n else '':>8}{per}")
                 print()
 
     print(f"{'config':<16}{'model':<28}{'params':>10}  {'mode':<11}"
