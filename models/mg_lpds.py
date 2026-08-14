@@ -305,7 +305,11 @@ class MGLPDSNet(nn.Module):
         K = [K_outer, [i0, i1, ...]]   -> K_outer primal-dual V-cycles
         K = int                        -> a plain LPDS stack, no V-cycle
 
-    Returns `(x_hat, z)` to match the repo's model interface.
+    Returns `(x_hat, (x, z))`. The second element is the repo's usual "latent",
+    but for a primal-dual method the state is the PAIR, not the code alone --
+    and `models/ladmm.py` threads exactly this back in as `state` when
+    `reuse_latent=True`, so handing back `z` only would make the warm start half
+    a warm start (`x` would cold-restart from `y~` every ADMM layer).
     """
 
     def __init__(self, K=(1, (8, 8, 8)), M=169, C=1, P=7, s=2, widen=1,
@@ -369,7 +373,7 @@ class MGLPDSNet(nn.Module):
 
         (x, z), _ = self.net(state, y_tilde, E=E, sigma=sigma, cache={})
         x_hat = x if params is None else post(x, params)
-        return x_hat, z
+        return x_hat, (x, z)
 
     def _check_grid(self, hw):
         H, W = int(hw[0]), int(hw[1])

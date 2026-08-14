@@ -230,17 +230,25 @@ class LSmapUpdate(nn.Module):
 # ===========================================================================
 #  denoiser plumbing
 # ===========================================================================
-def _accepts_z0(net):
+def _warm_start_kwarg(net):
+    """Name of the denoiser's warm-start argument, or None.
+
+    `z0` for the CDL family (a sparse code); `state` for `MGLPDSNet`, whose
+    latent is a primal-dual PAIR. Checking only for `z0` silently disabled
+    `reuse_latent` for LPDS denoisers -- a no-op that looked like it worked.
+    """
     try:
-        return "z0" in inspect.signature(net.forward).parameters
+        params = inspect.signature(net.forward).parameters
     except (TypeError, ValueError):
-        return False
+        return None
+    return next((n for n in ("z0", "state") if n in params), None)
 
 
 def denoise(net, x, sigma, z0=None):
     """Call any of this repo's denoisers uniformly; returns (x_hat, latent)."""
-    if z0 is not None and _accepts_z0(net):
-        out = net(x, E=Identity(), sigma=sigma, z0=z0)
+    kw = _warm_start_kwarg(net) if z0 is not None else None
+    if kw is not None:
+        out = net(x, E=Identity(), sigma=sigma, **{kw: z0})
     else:
         out = net(x, E=Identity(), sigma=sigma)
     if isinstance(out, tuple):
@@ -405,4 +413,15 @@ def build_denoiser(name, **kws):
     if name == "groupcdl":
         from models.groupcdl import GroupCDL
         return GroupCDL(**kws)
+    # The LPDS family. Both names build MGLPDSNet; `K` decides -- an int gives a
+    # plain LPDS stack, `[K_outer, iters]` a primal-dual V-cycle -- so the
+    # multigrid ablation inside the LADMM prox is the same one-key change it is
+    # for the standalone cells.
+    if name in ("lpdsnet", "mglpdsnet", "mglpds", "lpds"):
+        from models.mg_lpds import MGLPDSNet
+        # E = Identity inside the prox, so plain mean subtraction IS the right
+        # DC model here (`E^H E 1 = 1` makes the kspace correction degenerate to
+        # it); no operator to fall behind a pad either.
+        kws.setdefault("preproc", "image")
+        return MGLPDSNet(**kws)
     raise ValueError(f"unknown denoiser type '{name}'")

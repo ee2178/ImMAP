@@ -14,21 +14,21 @@
             "cg_tol": 0.0001,
             "implicit_cg": true,
             "preproc": "identity",
-            "denoiser_type": "mgcdlnet",
+            "denoiser_type": "mglpdsnet",
             "denoiser_kws": {
-                "K": 6,
                 "M": 169,
                 "C": 1,
                 "P": 7,
                 "s": 2,
-                "degrees": 1,
-                "tau0": 0.001,
-                "is_complex": true,
-                "dual": false,
                 "widen": 1,
+                "degrees": 1,
+                "lam0": 0.001,
+                "tau0": 0.5,
+                "theta0": 0.0,
                 "alpha0": 1.0,
-                "alpha_conv": false,
-                "resize_noise": true
+                "is_complex": true,
+                "resize_noise": true,
+                "K": 6
             },
             "smap_kws": {
                 "sigma_g": 1.5,
@@ -101,7 +101,7 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 0.0002
+            "lr": 0.0005
         }
     },
     "scheduler": {

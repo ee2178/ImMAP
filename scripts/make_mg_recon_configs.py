@@ -89,19 +89,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # preproc stays "identity": the LADMM x-solve is (E^H E + rho I) x = E^H y,
 # which is well posed on the raw adjoint -- there is no dictionary here whose
 # atoms would be spent representing DC.
+#
+# The prox is an MGLPDSNet, matching the standalone `lpdsnet` / `mglpds` cells,
+# so all four models in the grid are built from the same primal-dual smoother
+# and only the OUTER algorithm (unrolled LPDS vs linearized ADMM) and the
+# V-cycle differ. `denoiser_kws` is `LPDS_COMMON` verbatim apart from `preproc`,
+# which `build_denoiser` sets to "image": inside the prox `E = Identity`, so
+# `E^H E 1 = 1` and the kspace DC correction degenerates to a plain mean anyway.
+#
+# `reuse_latent=True` genuinely works here now -- `MGLPDSNet` returns its
+# primal-dual pair as the latent and `denoise()` threads it back in as `state`.
+# Before that it silently no-op'd, because `denoise` only looked for `z0`.
 def _altsplit(denoiser_K):
     return dict(
         type="AltSplitCDLNet",
-        lr=2.0e-4,          # the CG solves make this one touchier than the rest
         params=dict(
             admm_iters=6, reuse_latent=True, smap_update=False, rho0=1.0,
             cg_maxit=10, cg_tol=1.0e-4, implicit_cg=True, preproc="identity",
-            denoiser_type="mgcdlnet",
-            denoiser_kws=dict(
-                K=denoiser_K, M=169, C=1, P=7, s=2, degrees=1,
-                tau0=1.0e-3, is_complex=True, dual=False, widen=1,
-                alpha0=1.0, alpha_conv=False, resize_noise=True,
-            ),
+            denoiser_type="mglpdsnet",
+            denoiser_kws=dict(LPDS_DENOISER, K=denoiser_K),
             smap_kws=dict(sigma_g=1.5, sigma_max=3.0, sigma_min=0.3,
                           mu0=1.0, gamma0=0.01),
         ),
@@ -141,6 +147,10 @@ LPDS_COMMON = dict(
 LPDS_VCYCLE_K = [6, [4, 4, 6]]
 LPDS_BASELINE_K = 30                       # this repo's LPDSNet default
 
+# What the LADMM prox slot gets: the same smoother as the standalone cells,
+# minus `preproc` (build_denoiser pins it to "image" for the E = Identity prox).
+LPDS_DENOISER = {k: v for k, v in LPDS_COMMON.items() if k != "preproc"}
+
 MODELS = {
     # SAME CLASS, differing only in K -- so this pair is a clean multigrid
     # ablation. It did not used to be: `lpdsnet` was models/lpdsnet.py::LPDSNet
@@ -152,7 +162,7 @@ MODELS = {
     "mglpds":  dict(type="MGLPDSNet",
                     params=dict(LPDS_COMMON, K=LPDS_VCYCLE_K)),
     "altsplit":   _altsplit(6),
-    "mgaltsplit": _altsplit([1, [4, 4, 8]]),
+    "mgaltsplit": _altsplit([1, [4, 4, 6]]),
 }
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
@@ -364,7 +374,7 @@ def make_config(anatomy, r, model, args):
         },
         "optimizer": {
             "type": "Adam",
-            "params": {"lr": spec.get("lr", args.lr)},
+            "params": {"lr": args.lr},
         },
         "scheduler": {
             "type": "CosineAnnealingLR",
