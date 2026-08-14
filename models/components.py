@@ -31,6 +31,12 @@ class _GaussConvNd(nn.Module):
     Learnable params live in conv_real.weight / conv_imag.weight.
     Subclasses set up self.conv_real / self.conv_imag and define _op().
     """
+    # Combine the Gauss trick's three convolutions in place when no autograd
+    # graph is being built. Class-level so it can be flipped globally -- a kill
+    # switch if it ever misbehaves, and what `scripts/profile_mg.py` toggles to
+    # measure what it is worth.
+    INPLACE_COMBINE = True
+
     def __init__(self, complex=True):
         super().__init__()
         self.complex = complex
@@ -71,7 +77,7 @@ class _GaussConvNd(nn.Module):
         t1 = self._op(x_r, wr, br)
         t2 = self._op(x_i, wi, bi)
         t3 = self._op(x_r + x_i, wr + wi, None if br is None else br + bi)
-        if torch.is_grad_enabled():
+        if torch.is_grad_enabled() or not self.INPLACE_COMBINE:
             return torch.complex(t1 - t2, t3 - t1 - t2)
         # Inference: t1/t2/t3 are fresh conv outputs, unaliased and dead after
         # this, so the two combining subtractions can land in place. At M=169
