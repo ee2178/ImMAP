@@ -6,6 +6,10 @@ from operators.base import Operator
 class Mask(Operator):
     """Elementwise multiplication by `mask`, i.e. diag(mask)."""
 
+    # Lets `CompositeOperator` recognise a SENSE encoding and fuse its Gram
+    # without importing this module.  See `operators/base.py::_match_sense_gram`.
+    OP_KIND = "kspace_diag"
+
     def __init__(self, mask):
         self.mask = mask
 

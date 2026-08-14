@@ -96,6 +96,13 @@ class LPDSLayer(nn.Module):
         if cache is None:
             cache = {}
 
+        # A parent V-cycle forms E^H E x at the restricted iterate while
+        # building its FAS correction, and the coarse level's first sweep wants
+        # exactly that -- same operator, same tensor. The Gram carries no
+        # learned weights, so the value is reusable verbatim. Popped on sight:
+        # every later sweep has moved x, and a stale hit would be silent.
+        hint = cache.pop("_gram_x", None)
+
         if state is None:
             # Cold start (`lpds.jl` third method): x = y~, z = prox_{g*}(A y~).
             x = y_tilde
@@ -108,7 +115,8 @@ class LPDSLayer(nn.Module):
         tau = self.tau(sigma, ref=x)
         theta = self.theta(sigma, ref=x)
 
-        residual = gram(E, x) - y_tilde + self.synthesis(z)
+        Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x)
+        residual = Ex - y_tilde + self.synthesis(z)
         if pi_x is not None:
             residual = residual - pi_x
         x_new = x - tau * residual

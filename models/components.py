@@ -71,7 +71,16 @@ class _GaussConvNd(nn.Module):
         t1 = self._op(x_r, wr, br)
         t2 = self._op(x_i, wi, bi)
         t3 = self._op(x_r + x_i, wr + wi, None if br is None else br + bi)
-        return torch.complex(t1 - t2, t3 - t1 - t2)
+        if torch.is_grad_enabled():
+            return torch.complex(t1 - t2, t3 - t1 - t2)
+        # Inference: t1/t2/t3 are fresh conv outputs, unaliased and dead after
+        # this, so the two combining subtractions can land in place. At M=169
+        # on a 160x160 latent each avoided temporary is ~17 MB of traffic, and
+        # an unrolled V-cycle runs this ~100 times. Order matters -- the
+        # imaginary part still needs an unmodified t1.
+        imag = t3.sub_(t1).sub_(t2)
+        real = t1.sub_(t2)
+        return torch.complex(real, imag)
 
 class Conv2d(_GaussConvNd):
     def __init__(self, C, M, P, stride=1, bias=False, complex=True):

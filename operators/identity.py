@@ -8,3 +8,6 @@ class Identity(Operator):
 
     def adjoint(self, x):
         return x
+
+    def gram(self, x):
+        return x

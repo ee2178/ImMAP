@@ -142,8 +142,10 @@ def test_fas_consistency():
         # y~ chosen so grad f(x) + A^T z = 0, i.e. the fine primal residual is 0
         y = x + fine.synthesis(z)                      # E = Identity => gram = I
         cache = {}
-        x_c, z_c, pi_x, pi_z, y_c, E_c, sigma_c = dF(x, z, y, Identity(),
-                                                     torch.tensor(0.01), cache)
+        # dF also hands back the coarse Gram it formed, so the coarse level's
+        # first sweep does not recompute it; unused here.
+        (x_c, z_c, pi_x, pi_z, y_c, E_c, sigma_c,
+         _gram_x_c) = dF(x, z, y, Identity(), torch.tensor(0.01), cache)
 
         # the fine primal residual really is zero at this (x, z, y)
         r_fine = x - y + fine.synthesis(z)

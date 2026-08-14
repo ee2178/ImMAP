@@ -142,7 +142,7 @@ class PDObjectiveDownsample(nn.Module):
                 self.widen_z.weight.copy_(
                     identity_widen_weight(M_coarse, M_fine, self.widen))
 
-    def forward(self, x, z, y, E, sigma, cache):
+    def forward(self, x, z, y, E, sigma, cache, static=None):
         R = dict(julia_compat=self.julia_compat)
 
         # ---- fine-level primal-dual residual --------------------------------
@@ -155,22 +155,23 @@ class PDObjectiveDownsample(nn.Module):
 
         # ---- restriction: x and y on the image grid, z on the latent grid ----
         x_c = restrict(x, **R)
-        y_c = restrict(y, **R)
         Rrx = restrict(rx_fine, **R)
         z_c = self.widen_z(restrict(z, **R))
         Rrz = self.widen_z(restrict(rz_fine, **R))
 
-        sigma_c = restrict_noise(sigma, **R)
-        E_c = galerkin(E)
+        y_c, E_c, sigma_c = _restrict_measurement(y, E, sigma, R, static)
 
         # ---- coarse-level primal-dual residual ------------------------------
-        rx_coarse = gram_or_x(E_c, x_c) - y_c + self.synthesis_coarse(z_c)
+        # Handed on to the coarse level, whose first sweep needs the same Gram.
+        gram_x_c = gram_or_x(E_c, x_c)
+        rx_coarse = gram_x_c - y_c + self.synthesis_coarse(z_c)
         zhat_c, cache["_dF_coarse"] = self.prox_coarse(
             z_c + self.analysis_coarse(x_c), sigma_c,
             cache.setdefault("_dF_coarse", {}))
         rz_coarse = z_c - zhat_c
 
-        return x_c, z_c, rx_coarse - Rrx, rz_coarse - Rrz, y_c, E_c, sigma_c
+        return (x_c, z_c, rx_coarse - Rrx, rz_coarse - Rrz, y_c, E_c, sigma_c,
+                gram_x_c)
 
     @torch.no_grad()
     def project_(self):
@@ -181,6 +182,29 @@ class PDObjectiveDownsample(nn.Module):
 
 def gram_or_x(E, x):
     return x if (E is None or isinstance(E, Identity)) else E.gram(x)
+
+
+def _restrict_measurement(y, E, sigma, R, static):
+    """Coarsen `(y, E, sigma)` -- the parts of the level that never move.
+
+    These depend on the measurement alone, not on the iterate, so the `K_outer`
+    V-cycles at a level all want the same three objects and were each building
+    their own.  `static` is a per-forward-pass slot threaded down the cache
+    tree; the memo is guarded by object identity, so a miss costs exactly the
+    recomputation it was trying to avoid and can never return the wrong grid.
+    """
+    key = (id(y), id(E), id(sigma))
+    if static is not None:
+        hit = static.get("_measurement")
+        if hit is not None and hit[0] == key:
+            return hit[1]
+
+    val = (restrict(y, **R), galerkin(E), restrict_noise(sigma, **R))
+    if static is not None:
+        # The memo holds `val` alive, which is what keeps the ids in the next
+        # level's key valid for the rest of the pass.
+        static["_measurement"] = (key, val)
+    return val
 
 
 # ===========================================================================
@@ -252,6 +276,7 @@ class PDVCycle(nn.Module):
     def forward(self, state, y_tilde, E=None, sigma=None, pi=None, cache=None):
         if cache is None:
             cache = {}
+        static = cache.setdefault("_static", {})
 
         # pre-smooth (pi from the parent level, if any)
         state, cache = self.lpdsA(state, y_tilde, E=E, sigma=sigma, pi=pi,
@@ -259,13 +284,18 @@ class PDVCycle(nn.Module):
         x, z = state
 
         # restrict + the two FAS corrections
-        x_c, z_c, pi_x, pi_z, y_c, E_c, sigma_c = self.dF(x, z, y_tilde, E,
-                                                          sigma, cache)
+        (x_c, z_c, pi_x, pi_z, y_c, E_c, sigma_c,
+         gram_x_c) = self.dF(x, z, y_tilde, E, sigma, cache, static)
 
-        # recurse -- the coarse level keeps its own adjacency cache
+        # recurse -- the coarse level keeps its own adjacency cache, and
+        # inherits both the shared static slot and the Gram dF just formed at
+        # (E_c, x_c), which its first sweep would otherwise recompute verbatim.
+        coarse = cache.setdefault("_coarse", {})
+        coarse.setdefault("_static", static.setdefault("_coarse", {}))
+        coarse["_gram_x"] = (x_c, gram_x_c)
         (wx_c, wz_c), cache["_coarse"] = self.mglayer(
             (x_c, z_c), y_c, E=E_c, sigma=sigma_c, pi=(pi_x, pi_z),
-            cache=cache.setdefault("_coarse", {}))
+            cache=coarse)
 
         # prolongate and apply the two coarse-correction steps separately
         x = x + self.alpha_x(prolong(wx_c - x_c))
@@ -412,9 +442,18 @@ class _OuterStack(nn.Module):
     def forward(self, state, y_tilde, E=None, sigma=None, pi=None, cache=None):
         if cache is None:
             cache = {}
+        # One static slot for the whole stack: every outer V-cycle coarsens the
+        # same (y~, E, sigma), so the restrictions are built once per pass.
+        static = cache.setdefault("_static", {})
         for k, layer in enumerate(self.layers):
-            state, cache = layer(state, y_tilde, E=E, sigma=sigma, pi=pi,
-                                 cache=cache.setdefault(f"_outer{k}", {}))
+            # `cache` was previously rebound to the layer's own sub-dict, so
+            # `_outer1` was created inside `_outer0` rather than beside it. The
+            # sub-dicts start empty either way, so nothing read the difference,
+            # but the shared static slot below needs them to be siblings.
+            sub = cache.setdefault(f"_outer{k}", {})
+            sub.setdefault("_static", static)
+            state, cache[f"_outer{k}"] = layer(
+                state, y_tilde, E=E, sigma=sigma, pi=pi, cache=sub)
         return state, cache
 
     def extra_repr(self):

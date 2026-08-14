@@ -554,9 +554,11 @@ class FenchelProx(nn.Module):
         return z - zt, cache
 
     def subgradient(self, z, sigma=None, cache=None):
-        # dg* of the conjugate: fall back to the Moreau envelope of *this* map.
-        zt, cache = self.forward(z, sigma, cache)
-        return z - zt, cache
+        # dg* of the conjugate: the Moreau envelope of *this* map, which
+        # telescopes.  z - prox_{g*}(z) = z - (z - prox_g(z)) = prox_g(z), so
+        # the inner prox IS the answer -- forming it via two subtractions cost
+        # two full M-channel temporaries and bought nothing.
+        return self.prox(z, sigma, cache)
 
     @torch.no_grad()
     def project_(self):

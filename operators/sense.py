@@ -3,6 +3,11 @@ from operators.base import Operator
 
 class Sense(Operator):
 
+    # See `operators/base.py::_match_sense_gram`.  `SoftSense` below is
+    # deliberately left untagged -- it reduces over a different axis, so the
+    # fused Gram in `FFT2D.sense_gram` does not describe it.
+    OP_KIND = "sense"
+
     def __init__(self, smaps):
         self.smaps = smaps
 
