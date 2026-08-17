@@ -26,19 +26,34 @@
 # `--list` always reports runs excluded BY THE ANATOMY FILTER, so switching to
 # the other anatomy later cannot silently leave work behind.
 #
-# ALWAYS LIST FIRST. The array bound above has to match the number of runs that
-# actually need resuming, and that changes as runs finish:
+# SUBMIT FROM THE REPO ROOT, or make sure `logs/` exists relative to wherever
+# you do run sbatch. `#SBATCH --output=logs/...` is resolved against the SUBMIT
+# directory -- not this file's location, and not the `cd "${IMMAP_ROOT}"` below.
+# Submitting from slurm/ makes slurmd try to open slurm/logs/..., fail, and kill
+# the job BEFORE the script runs, so there is no log to explain what happened.
+# `#SBATCH` directives cannot expand variables, so this cannot be fixed here.
+#
+# LISTING IS MANDATORY, NOT ADVISORY. `--list` writes a MANIFEST, and the array
+# reads that instead of re-enumerating:
 #
 #     conda activate gcdl
 #     bash slurm/mg_recon_resume.sbatch --list
-#
-# It prints the eligible runs, their progress, and the exact --array to pass.
-# Then:
-#
 #     sbatch --array=0-<N-1> slurm/mg_recon_resume.sbatch
+#
+# The manifest exists because the run list SHRINKS as runs finish. When each
+# array task enumerated for itself, a task starting after another had completed
+# a run saw a shorter list, and its index pointed at a different run than
+# `--list` had shown -- silently resuming some runs twice and skipping others.
+# That is only visible when tasks queue behind each other, i.e. exactly when the
+# cluster is busy. Now the index is frozen at list time.
+#
+# A manifest going stale is safe in the one direction that matters: a run that
+# finished after listing is still in the file, gets resumed, and train.py exits
+# immediately because start_epoch >= num_epochs.
 #
 # knee and brain are separate arrays, as with the two original launchers -- an
 # index means something different in each, so do not mix them in one submission.
+# They also get separate manifests (logs/resume_<anatomy>.manifest).
 #
 # WHICH CONFIG THIS USES, AND WHY IT MATTERS
 # ------------------------------------------
@@ -115,18 +130,36 @@ fi
 cd "${IMMAP_ROOT}"
 mkdir -p logs
 
-# --- enumerate the runs that need resuming ---------------------------------
-# One source of truth for --list and for the array path, so the index the array
-# resolves is the index --list printed.
-RUNS="$(python - "${LIST_ONLY}" <<'PY'
-import glob, json, os, sys
+MANIFEST="logs/resume_${ANATOMY}.manifest"
 
-list_only = sys.argv[1] == "1"
+# --- enumerate the runs that need resuming ---------------------------------
+# ONLY --list enumerates. It writes MANIFEST; the array path below reads that
+# file and never re-derives the list, so an index cannot shift under a task.
+if [ "${LIST_ONLY}" = "1" ]; then
+    # Drop any previous manifest FIRST. If this enumeration dies (no conda env,
+    # unreadable checkpoint, ...) the array must find nothing rather than an
+    # older, longer list whose indices no longer mean what --list just printed.
+    rm -f "${MANIFEST}"
+    # The heredoc body has to start at column 0; the `then`/`fi` around it do not.
+    if ! python - "${MANIFEST}" <<'PY'
+import datetime, glob, json, os, sys
+
+manifest = sys.argv[1]
 anatomy = os.environ.get("ANATOMY", "knee")
 only = [t for t in os.environ.get("RESUME_ONLY", "").split() if t]
 skip = [t for t in os.environ.get("RESUME_SKIP", "").split() if t]
 force = os.environ.get("FORCE_ALL") == "1"
 include_unstarted = os.environ.get("INCLUDE_UNSTARTED") == "1"
+
+# Reading a checkpoint needs torch. Without it every run would come back at
+# "epoch 0" and the listing would look plausible while being uniformly wrong, so
+# fail loudly instead -- `--list` deliberately does not activate the env.
+try:
+    import torch
+except ImportError:
+    sys.exit("[resume] torch is not importable -- `conda activate gcdl` first. "
+             "Without it every run would be reported at epoch 0.")
+
 
 def progress(run_dir):
     """(done, start_epoch, num_epochs) for a run, from its ckpt + config.
@@ -142,7 +175,6 @@ def progress(run_dir):
     if not os.path.exists(ckpt):
         return None, 0, nep
     try:
-        import torch
         step = torch.load(ckpt, map_location="cpu", weights_only=False).get("step") or 0
     except Exception as e:                                        # noqa: BLE001
         print(f"# unreadable ckpt in {run_dir}: {e}", file=sys.stderr)
@@ -188,63 +220,86 @@ if include_unstarted:
         eligible.append((run, 0, 0))
     unstarted = []
 
-if list_only:
-    w = max([len(r) for r, *_ in eligible + done] + [30])
-    print(f"\nANATOMY={anatomy}")
-    print("RESUMABLE")
-    print(f"{'idx':<6}{'run':<{w+2}}{'epoch':>8} / total")
-    for i, (run, ep, nep) in enumerate(eligible):
-        print(f"{i:<6}{run:<{w+2}}{ep:>8} / {nep}")
-    if done:
-        print("\nCOMPLETE (skipped; FORCE_ALL=1 to include):")
-        for run, ep, nep in done:
-            print(f"      {run:<{w+2}}{ep:>8} / {nep}")
-    if unstarted:
-        print("\nNO CHECKPOINT (skipped; INCLUDE_UNSTARTED=1 restarts them fresh):")
-        for run, why in unstarted:
-            print(f"      {run:<{w+2}}  {why}")
-    if broken:
-        print("\nUNREADABLE:")
-        for run, why in broken:
-            print(f"      {run:<{w+2}}  {why}")
-    if other_anatomy:
-        others = sorted({r.split("/")[2] for r in other_anatomy})
-        print(f"\nEXCLUDED BY ANATOMY={anatomy}: {len(other_anatomy)} run(s) under "
-              f"{', '.join(others)}")
-        print(f"      see them with: ANATOMY={others[0]} (or all)")
-    n = len(eligible)
-    print(f"\n{n} run(s) to resume.")
-    if n:
-        env = "" if anatomy == "knee" else f"ANATOMY={anatomy} "
-        print(f"submit with:  {env}sbatch --array=0-{n - 1} "
-              f"slurm/mg_recon_resume.sbatch")
-    else:
-        print("nothing to resume.")
-else:
-    for run, _, _ in eligible:
-        print(run)
-PY
-)"
+w = max([len(r) for r, *_ in eligible + done] + [30])
+print(f"\nANATOMY={anatomy}")
+print("RESUMABLE")
+print(f"{'idx':<6}{'run':<{w+2}}{'epoch':>8} / total")
+for i, (run, ep, nep) in enumerate(eligible):
+    print(f"{i:<6}{run:<{w+2}}{ep:>8} / {nep}")
+if done:
+    print("\nCOMPLETE (skipped; FORCE_ALL=1 to include):")
+    for run, ep, nep in done:
+        print(f"      {run:<{w+2}}{ep:>8} / {nep}")
+if unstarted:
+    print("\nNO CHECKPOINT (skipped; INCLUDE_UNSTARTED=1 restarts them fresh):")
+    for run, why in unstarted:
+        print(f"      {run:<{w+2}}  {why}")
+if broken:
+    print("\nUNREADABLE:")
+    for run, why in broken:
+        print(f"      {run:<{w+2}}  {why}")
+if other_anatomy:
+    others = sorted({r.split("/")[2] for r in other_anatomy})
+    print(f"\nEXCLUDED BY ANATOMY={anatomy}: {len(other_anatomy)} run(s) under "
+          f"{', '.join(others)}")
+    print(f"      see them with: ANATOMY={others[0]} (or all)")
 
-if [ "${LIST_ONLY}" = "1" ]; then
-    echo "${RUNS}"
+# The manifest FREEZES the index the array will resolve. Written even when
+# empty, so a later submit against a stale file cannot silently reuse an older,
+# longer list.
+os.makedirs(os.path.dirname(manifest) or ".", exist_ok=True)
+with open(manifest, "w") as f:
+    f.write(f"# mg_recon resume manifest -- anatomy={anatomy}\n")
+    f.write(f"# written {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+    f.write(f"# {len(eligible)} run(s); array index = line order below\n")
+    for run, ep, nep in eligible:
+        f.write(f"{run}\n")
+
+n = len(eligible)
+print(f"\n{n} run(s) to resume.  manifest: {manifest}")
+if n:
+    env = "" if anatomy == "knee" else f"ANATOMY={anatomy} "
+    print(f"submit with:  {env}sbatch --array=0-{n - 1} "
+          f"slurm/mg_recon_resume.sbatch")
+else:
+    print("nothing to resume.")
+PY
+    then
+        echo "[resume] enumeration FAILED -- the manifest was NOT written, so a" >&2
+        echo "         submission cannot silently pick up a stale list." >&2
+        echo "         (the error is above; usually a missing conda env)" >&2
+        exit 1
+    fi
     exit 0
 fi
 
+# --- array mode: read the frozen manifest, never re-enumerate --------------
 set -eo pipefail
 : "${SLURM_ARRAY_TASK_ID:?must be run as an array job (sbatch sets SLURM_ARRAY_TASK_ID)}"
 
+if [ ! -f "${MANIFEST}" ]; then
+    echo "[resume] no ${MANIFEST}." >&2
+    echo "         The list step writes it, and the array indexes it. Run:" >&2
+    echo "           bash $0 --list ${ANATOMY}" >&2
+    exit 1
+fi
+
+RUNS="$(grep -v '^[[:space:]]*\(#.*\)\?$' "${MANIFEST}" || true)"
 if [ -z "${RUNS}" ]; then
-    echo "[resume] nothing to resume. Check with: bash $0 --list"
-    exit 0
+    echo "[resume] ${MANIFEST} lists no runs -- nothing to resume." >&2
+    echo "         Re-check with: bash $0 --list ${ANATOMY}" >&2
+    exit 1
 fi
 
 N_TOTAL="$(echo "${RUNS}" | wc -l)"
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TOTAL}" ]; then
-    echo "[resume] task ${SLURM_ARRAY_TASK_ID} >= ${N_TOTAL} resumable runs -- fix --array"
-    echo "         (should be 0-$(( N_TOTAL - 1 )); re-check with: bash $0 --list)"
+    echo "[resume] task ${SLURM_ARRAY_TASK_ID} >= ${N_TOTAL} runs in ${MANIFEST}" >&2
+    echo "         -- fix --array (should be 0-$(( N_TOTAL - 1 )))" >&2
     exit 1
 fi
+
+echo "[resume] manifest ${MANIFEST}:"
+sed -n '1,3p' "${MANIFEST}" | sed 's/^/         /'
 
 RUN_DIR="$(echo "${RUNS}" | sed -n "$(( SLURM_ARRAY_TASK_ID + 1 ))p")"
 CONFIG="${RUN_DIR}/config.json"

@@ -15,6 +15,7 @@ operands (`A @ A.conj().mT` comes back non-Hermitian), so run this on the cluste
 torch, not that one.
 """
 
+import math
 import sys
 
 import torch
@@ -23,8 +24,11 @@ from operators.fourier import fftc
 from physics.gfactor import gfactor_uniform, sigma_full_map
 from physics.mask import make_acc_mask
 from physics.sense_noise import (
-    _alias_gram,
+    _alias_bracket,
+    _alias_lags,
+    _alias_stack,
     _fold_alias,
+    _kernel_taps,
     block_sense,
     coil_combined_noise_level,
     effective_acceleration,
@@ -78,8 +82,52 @@ def rand_cov(C, seed=1, dtype=torch.complex128):
 
 
 # ---------------------------------------------------------------------------
+def test_alias_lags_and_stack():
+    """`_alias_stack` must gather each pixel's partners, lag 0 first.
+
+    This is the general path `sense_noise_level` now uses for every accel. The
+    indivisible case is the point: where j*n/A is not an integer the aliasing peak
+    straddles two pixels, so BOTH bracketing integers must appear -- rounding to the
+    nearer one throws away up to 36% of that fold's tap. Divisible cases must be
+    untouched (floor == ceil), which is the backward-compatibility guard.
+    """
+    for n, accel, want in [
+        (8, 4, (0, 2, 4, 6)),                                  # divisible
+        (12, 3, (0, 4, 8)),                                    # divisible
+        (48, 4, (0, 12, 24, 36)),                              # divisible
+        (10, 4, (0, 2, 3, 5, 7, 8)),                           # 2.5 and 7.5 bracketed
+        (46, 6, (0, 7, 8, 15, 16, 23, 30, 31, 38, 39)),
+        (368, 6, (0, 61, 62, 122, 123, 184, 245, 246, 306, 307)),   # the house case
+    ]:
+        got = _alias_lags(n, accel)
+        check(f"lags(n={n}, A={accel})", got == want, f"{got} vs {want}")
+    check("lag 0 is always first", all(_alias_lags(n, a)[0] == 0
+                                      for n in (16, 17, 368) for a in (2, 3, 5, 6)))
+
+    # Values encode the PE index, so the gather is directly readable.
+    n, accel, H = 12, 3, 2
+    x = torch.arange(n, dtype=torch.float64).to(torch.complex128)
+    x = x.reshape(1, 1, 1, n).expand(1, 1, H, n).contiguous()
+    P = _alias_stack(x, _alias_lags(n, accel), 3)          # (H*n, 1, accel)
+    got = P.reshape(H, n, accel)[0].real
+    want = (torch.arange(n)[:, None] + torch.tensor([0, 4, 8])[None, :]) % n
+    check("alias_stack gathers n + l_a", close(got, want.to(torch.float64)))
+
+    # Divisible accel must yield exactly A lags; indivisible at most 2A - 1.
+    for n, accel in [(48, 4), (96, 6), (368, 4)]:
+        check(f"divisible ({n}, {accel}) keeps exactly A lags",
+              len(_alias_lags(n, accel)) == accel)
+    for n, accel in [(368, 6), (46, 6), (50, 4)]:
+        k = len(_alias_lags(n, accel))
+        check(f"indivisible ({n}, {accel}) keeps <= 2A-1 lags",
+              accel < k <= 2 * accel - 1, f"{k} lags for accel={accel}")
+
+
 def test_folding_indices():
-    """`_fold_alias` must gather PE indices {jj, jj+step, ...} per block."""
+    """`_fold_alias` must gather PE indices {jj, jj+step, ...} per block.
+
+    Still used by `block_sense`, which needs the reduced-FOV image.
+    """
     B, C, H, W, accel = 1, 1, 3, 8, 4
     step = W // accel
     # Encode the PE index in the value so the gather is directly readable.
@@ -97,6 +145,143 @@ def test_folding_indices():
     d = S[:, 0, :].real                                          # (nblk, accel)
     back = _unfold_alias(d, B, lead, n, accel, ax)
     check("unfold inverts fold", close(back[0, 0, 0], torch.arange(W, dtype=torch.float64)))
+
+
+def test_mask_driven_taps_match_the_analytic_bracket():
+    """The kernel read off the mask must reproduce the note's taps in both limits.
+
+    p = 0: m[j n/A] = 1/A exactly, so T = ones/A.
+    p = 1: m[0] = 1, m[l != 0] = 0, so T = I.
+    In between the mask taps keep the ACS sinc's sidelobes, so they differ from
+    (1-p)/A by a little -- that is the improvement, not an error.
+    """
+    n, accel = 48, 4
+    lags = _alias_lags(n, accel)
+    kw = dict(ax=3, dtype=torch.complex128, device=torch.device('cpu'))
+
+    for acs, note in ((0, 'p=0 -> ones/A'), (n, 'p=1 -> I')):
+        m = make_acc_mask((16, n), accel, acs_lines=acs, dim=1).to(torch.complex128)
+        T_mask = _kernel_taps(lags, n, accel, acs, m, **kw)
+        T_anal = _kernel_taps(lags, n, accel, acs, None, **kw)
+        check(f"mask taps == analytic taps, {note}", close(T_mask, T_anal, atol=1e-12),
+              f"max |diff| {(T_mask - T_anal).abs().max():.2e}")
+
+    # Structural guarantees the Hadamard form buys: T Hermitian PSD, m[0] = 1/A_eff.
+    for acs in (0, 8, 20, 48):
+        m = make_acc_mask((16, n), accel, acs_lines=acs, dim=1).to(torch.complex128)
+        T = _kernel_taps(lags, n, accel, acs, m, **kw)
+        w = torch.linalg.eigvalsh(T).real
+        check(f"mask taps give PSD T (acs={acs})", bool((w > -1e-12).all()),
+              f"min eig {w.min():.2e}")
+        check(f"T[0,0] == 1/A_eff (acs={acs})",
+              abs(T[0, 0].real.item() - 1.0 / effective_acceleration(mask=m)) < 1e-12,
+              f"{T[0, 0].real.item():.6f} vs {1 / effective_acceleration(mask=m):.6f}")
+
+    # Intermediate p is where it gets interesting. The ACS band of width `acs`
+    # contributes sum_{k in ACS} exp(2*pi*i*k*l/n) at lag l; on the lattice
+    # l = j*n/A that phase advances by j/A per line, so `acs` consecutive lines sum
+    # to EXACTLY zero whenever A | acs. The note's (1-p)/A off-diagonal is then not
+    # an approximation at all -- it is exact. It only misses when A does not divide
+    # acs, and then only by a sidelobe.
+    for acs in (8, 12, 20):                       # all divisible by accel=4
+        m = make_acc_mask((16, n), accel, acs_lines=acs, dim=1).to(torch.complex128)
+        d = (_kernel_taps(lags, n, accel, acs, m, **kw)
+             - _kernel_taps(lags, n, accel, acs, None, **kw)).abs().max().item()
+        check(f"accel | acs_size ({accel} | {acs}): analytic taps are EXACT", d < 1e-13,
+              f"max |diff| {d:.2e}")
+    for acs in (6, 10, 14):                       # not divisible by accel=4
+        m = make_acc_mask((16, n), accel, acs_lines=acs, dim=1).to(torch.complex128)
+        d = (_kernel_taps(lags, n, accel, acs, m, **kw)
+             - _kernel_taps(lags, n, accel, acs, None, **kw)).abs().max().item()
+        check(f"accel not | acs_size ({accel}, {acs}): taps differ by a sidelobe",
+              1e-6 < d < 0.05, f"max |diff| {d:.4f}")
+
+
+def test_mask_and_analytic_agree_when_divisible():
+    """Passing the mask must not change the answer where the note is already exact."""
+    s = phantom(C=6, H=24, W=48, dc=0.0)
+    Sig = rand_cov(6)
+    m = make_acc_mask((24, 48), 4, acs_lines=0, dim=1).to(torch.complex128)
+    for weighted in (True, False):
+        a = sense_noise_level(s, Sig, 4, acs_size=0, weighted=weighted)
+        b = sense_noise_level(s, Sig, 4, mask=m, weighted=weighted)
+        check(f"mask == analytic at acs=0 (weighted={weighted})", close(a, b, rtol=1e-6),
+              f"max rel {(a - b).abs().max() / a.max():.2e}")
+
+
+def test_indivisible_accel_is_rejected_without_a_mask():
+    """accel not dividing n: analytic taps are wrong, so demand the mask."""
+    s = phantom(C=6, H=16, W=50, dc=0.0)
+    try:
+        sense_noise_level(s, None, 4, acs_size=0)
+        check("indivisible accel without mask raises", False, "no error raised")
+    except ValueError as e:
+        check("indivisible accel without mask raises", "does not divide" in str(e),
+              str(e)[:70])
+    m = make_acc_mask((16, 50), 4, acs_lines=0, dim=1).to(torch.complex128)
+    sig = sense_noise_level(s, None, 4, mask=m)
+    check("indivisible accel with mask runs",
+          tuple(sig.shape) == (2, 1, 16, 50) and bool(torch.isfinite(sig).all()))
+
+    # block_sense still needs divisibility, and must say so clearly.
+    try:
+        block_sense(torch.zeros(1, 6, 16, 50, dtype=torch.complex128), s[:1], 4)
+        check("block_sense rejects indivisible accel", False, "no error raised")
+    except ValueError as e:
+        check("block_sense rejects indivisible accel", "cg_sense" in str(e), str(e)[:70])
+
+
+def test_indivisible_accel_against_mc():
+    """accel not dividing n: how much accuracy does the nearest-lattice cost?
+
+    Two numbers, because they behave differently and only one of them matters for
+    ImMAP. The LEVEL error is dominated by a global scale bias (the closed form
+    under-predicts). The SHAPE error -- the mean-1 variance maps, i.e. exactly what
+    `normalize_gmap` hands to a reconstruction -- is much smaller, because that scale
+    bias divides straight out.
+
+    Neither improves with image size: the Dirichlet peak of a length-K comb is
+    ~N/(K A) ~ 1 pixel wide regardless of N, so a half-pixel offset always lands
+    mid-peak. What does drive it is `accel` -- more folds, more smeared peaks, more
+    dropped leakage.
+
+    Replica floors at 256 reps: 1/(2 sqrt(R)) = 3.1% on the level (a std) and
+    1/sqrt(R) = 6.3% on the shape (a variance). The divisible rows sit at those
+    floors; that is the control that says the machinery itself is right.
+    """
+    C, H, NREPS = 8, 8, 256
+    floor_lvl, floor_shp = 1 / (2 * NREPS ** 0.5), NREPS ** -0.5
+    for W, accel in [(48, 4), (46, 3), (46, 6), (184, 6)]:
+        s = phantom(B=1, C=C, H=H, W=W, seed=5, dc=0.0, dtype=torch.complex64)
+        m = make_acc_mask((H, W), accel, acs_lines=0, dim=1).to(torch.complex64)
+        an = sense_noise_level(s, None, accel, mask=m, weighted=True)
+        g = torch.Generator().manual_seed(31)
+        mc = sense_noise_level_mc(s, None, accel, weighted=True, mask=m,
+                                  nreps=NREPS, generator=g, chunk=64,
+                                  cg_kwargs={"max_iter": 400, "tol": 1e-10})
+        k = an > 0.2 * an.max()
+        lvl = ((mc - an).abs() / an.clamp_min(1e-8))[k].mean().item()
+        scale = (mc[k].mean() / an[k].mean()).item()
+        a2, m2 = an.pow(2), mc.pow(2)
+        a2, m2 = a2 / a2[k].mean(), m2 / m2[k].mean()
+        shp = ((m2 - a2).abs() / a2.clamp_min(1e-8))[k].mean().item()
+
+        nl = len(_alias_lags(W, accel))
+        tag = f"n={W}, accel={accel}"
+        detail = (f"level {lvl:.1%} (scale {scale:.3f}), shape {shp:.1%}, {nl} lags, "
+                  f"gcd={math.gcd(accel, W)}, floors {floor_lvl:.1%}/{floor_shp:.1%}")
+        if W % accel == 0:
+            check(f"{tag} [divisible]: level at the replica floor",
+                  lvl < 2 * floor_lvl, detail)
+            check(f"{tag} [divisible]: shape at the replica floor",
+                  shp < 1.5 * floor_shp, detail)
+        else:
+            # Measured envelope: level 4% at A=3 rising to ~25% at A=6; shape 5-11%.
+            check(f"{tag}: level within 30%", lvl < 0.30, detail)
+            check(f"{tag}: SHAPE within 15% -- the number ImMAP actually consumes",
+                  shp < 0.15, detail)
+            check(f"{tag}: closed form under-predicts (scale >= 1)", scale > 0.99,
+                  f"scale {scale:.3f}")
 
 
 def test_a1_is_fully_sampled():
@@ -117,13 +302,12 @@ def test_p0_recovers_the_no_acs_formula():
     accel = 3
     sigma = sense_noise_level(s, Sig, accel, acs_size=0, weighted=True)
 
-    # Brute force, one alias set at a time.
-    S, lead, n, ax = _fold_alias(s, accel, -1)
+    # Brute force, one pixel's block at a time, straight from the definition.
+    S = _alias_stack(s, _alias_lags(24, accel), 3)
     Sinv = torch.linalg.inv(Sig).to(S.dtype)
     M = S.conj().transpose(-2, -1) @ (Sinv @ S)
-    d = accel * torch.diagonal(torch.linalg.inv(M), dim1=-2, dim2=-1).real
-    from physics.sense_noise import _unfold_alias
-    want = _unfold_alias(d, s.shape[0], lead, n, accel, ax).sqrt()
+    d = accel * torch.diagonal(torch.linalg.inv(M), dim1=-2, dim2=-1).real[:, 0]
+    want = d.reshape(s.shape[0], 1, *s.shape[2:]).sqrt()
     check("p=0 == A (S^H Sigma^-1 S)^-1", close(sigma, want, rtol=1e-6),
           f"max rel {(sigma - want).abs().max() / want.max():.2e}")
 
@@ -157,9 +341,11 @@ def test_monotone_in_p():
     check("sigma nonincreasing in acs_size", ok)
 
     # And the Loewner statement itself: dg(G) >= G / A for PSD G.
-    S, *_ = _fold_alias(s, 2, -1)
-    G0 = _alias_gram(S, S, 2, 0.0)
-    G1 = _alias_gram(S, S, 2, 0.5)
+    lags = _alias_lags(48, 2)
+    S = _alias_stack(s, lags, 3)
+    kw = dict(mask=None, ax=3, dtype=s.dtype, device=s.device)
+    G0 = _alias_bracket(S, S, _kernel_taps(lags, 48, 2, 0, **kw))
+    G1 = _alias_bracket(S, S, _kernel_taps(lags, 48, 2, 24, **kw))
     w = torch.linalg.eigvalsh(G1 - G0).real
     check("bracket increases in the Loewner order", bool((w > -1e-10).all()),
           f"min eig {w.min():.2e}")
@@ -410,7 +596,12 @@ def test_grappa_comparison_from_the_note():
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    test_alias_lags_and_stack()
     test_folding_indices()
+    test_mask_driven_taps_match_the_analytic_bracket()
+    test_mask_and_analytic_agree_when_divisible()
+    test_indivisible_accel_is_rejected_without_a_mask()
+    test_indivisible_accel_against_mc()
     test_a1_is_fully_sampled()
     test_p0_recovers_the_no_acs_formula()
     test_p1_recovers_fully_sampled()

@@ -90,15 +90,77 @@ map comes out a factor sqrt(N) below the analytic one.  `block_sense` here uses
 the repo's ortho `fftc`/`ifftc`, under which MC and closed form agree exactly (up
 to replica error) -- which is the point of the check.
 
-Cost: one batched A x A Hermitian eigendecomposition per folded pixel, i.e.
-H * (W / A) * B of them.  For A = 2 that is a small multiple of a single
-coil-combination.  (The Julia uses a truncated SVD; for the Hermitian PSD
-brackets built here `eigh` is the same decomposition, cheaper, and is what
+Beyond the note
+---------------
+Two generalisations the Julia does not have, both needed for real masks.
+
+*The bracket is a Hadamard product with the mask's own kernel.*  Writing
+`m = ifft(mask)` for the image-domain kernel of `M^conv = F^H M F`,
+
+    <X>_n = G (o) T,   G[a,a'] = s[n+l_a]^H X s[n+l_a'],  T[a,a'] = m[l_a - l_a'],
+
+for alias offsets `l_0 = 0, l_1, ...`.  Pass `mask=` and the taps are read off the
+actual pattern by one inverse FFT instead of assumed; the note's
+`(1-p)/A * G + p * dg(G)` is the special case `m[0] = 1/A_eff`,
+`m[j N/A] = (1-p)/A`.  It stops caring whether the ACS is one centred contiguous
+block, and it makes the Hermitian-PSD property structural (`m` is the transform of
+a nonnegative function, so `T` is PSD by Bochner; `G` is PSD; Schur product
+theorem) rather than something to hope for -- which is what the `eigh` path needs.
+
+Doing it this way also shows the note undersells its own bracket.  The ACS band
+contributes `sum_{k in ACS} exp(2 pi i k l / N)` at lag `l`; on the lattice
+`l = j N/A` that phase advances by `j/A` per line, so `acs_size` consecutive lines
+sum to *exactly* zero whenever `A | acs_size`.  The `(1-p)/A` off-diagonal is then
+not an approximation at all, and neither is `m[0] = 1/A_eff`: the whole tap matrix
+is exact.  When `A` does not divide `acs_size` the taps differ by a sidelobe, under
+0.05 in the cases tested.  So the "delta-for-sinc" substitution is *not* where the
+ACS branch's error comes from.  What it actually drops is the coupling at lags off
+the alias lattice, where the sinc also has support -- the covariance is dense and
+only its lattice part is being modelled.  That is the approximation to distrust.
+
+*`accel` need not divide the PE length.*  `arange(off, N, A)` is a coset of a
+subgroup of Z_N only when `A | N`; otherwise the exact deltas sit at multiples of
+`N/gcd(A,N)` and the other folds smear into Dirichlet lobes near `j N/A`.  We take
+the integers *bracketing* each `j N/A` (both, not the nearer one) with the exact
+taps there, so the block grows from `A` to at most `2A - 1` lags.  Rounding to one
+neighbour is not good enough and, importantly, does not get better on bigger
+images: the Dirichlet peak of a length-K comb is `~N/(K A) ~ 1` pixel wide
+*regardless of N*, so a half-pixel offset always lands mid-peak and the single tap
+it keeps is down by `sinc(delta)` -- up to 36%.  Bracketing recovered 27% -> 18%
+(N=46) and 35% -> 24% (N=184) at A=6.
+
+Even bracketed, the alias sets no longer partition the image, so this is a *local*
+inverse -- the submatrix of the normal operator on one pixel's partner list -- and
+leakage onto unmodelled lags is still dropped.  Measured against CG-SENSE replicas,
+8 coils, `acs_size=0` (`test_indivisible_accel_against_mc`):
+
+    N=48, A=4  (A | N)   level  2.8%   shape  5.5%   <- both at the replica floor
+    N=46, A=3            level  4.1%   shape  5.1%   <- also at the floor
+    N=46, A=6            level 18.2%   shape  9.5%
+    N=184, A=6           level 24.5%   shape 11.1%
+
+The level error is mostly a global scale bias (the closed form under-predicts, by
+1.18x and 1.25x on those two rows), and it is driven by `A` -- more folds, more
+smeared peaks -- not by N.  The *shape* error is much smaller because that bias
+divides out, which is the number that matters if the map is going through
+`physics.gfactor.normalize_gmap` into a reconstruction: there only the mean-1 shape
+survives.  If you need the absolute level right at an indivisible `accel`, use
+`physics.gfactor.gfactor_replica`.
+
+`block_sense` still requires `A | N`, since a folded image of `N/A` pixels only
+exists then; use `physics.gfactor.cg_sense` otherwise.
+
+Cost: one batched A x A Hermitian eigendecomposition per *pixel* (not per folded
+pixel), i.e. H * W * B of them -- A times the folded cost, in exchange for handling
+any acceleration.  Still a small multiple of a single coil combination; `chunk`
+caps peak memory.  (The Julia uses a truncated SVD; for the Hermitian PSD brackets
+built here `eigh` is the same decomposition, cheaper, and is what
 `physics.gfactor` already uses.)
 """
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional, Sequence, Tuple
 
 import torch
@@ -125,21 +187,156 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Alias-set folding
+# Alias sets and the sampling kernel
 # ---------------------------------------------------------------------------
+#
+# The note writes the bracket as (1-p)/A * S_n^H X S_n + p * dg(S_n^H X S_n).  That
+# is a special case of something more useful.  For ANY mask,
+#
+#     [S^H (M^conv (x) X) S]_{n,n'} = s[n]^H X s[n'] * m[n - n'],
+#     m = the image-domain kernel of M^conv = F^H M F,
+#
+# so restricting to an alias set with PE offsets l_0 = 0, l_1, ..., l_{A-1} gives
+#
+#     <X>_n = G (o) T,     G[a,a'] = s[n + l_a]^H X s[n + l_a'],
+#                          T[a,a'] = m[l_a - l_a']          (Hadamard product)
+#
+# i.e. the Gram elementwise-multiplied by the Toeplitz matrix of the kernel taps.
+# Two things follow.
+#
+# (1) The taps can be read off the ACTUAL mask by one inverse FFT instead of being
+#     assumed.  Checking it reproduces the note: for A | N with no ACS the taps are
+#     m[j N/A] = 1/A, so T = ones/A and <X> = G/A.  For a centred ACS band,
+#     m[0] = |Omega|/N = 1/A + p - p/A and m[j N/A] = (1-p)/A + O(sinc sidelobe), so
+#     T = (1-p)/A * ones + p * I and the Hadamard form IS the note's bracket -- but
+#     with the sidelobes kept rather than dropped, and with no assumption that the
+#     ACS is one centred contiguous block.
+#
+# (2) It is automatically Hermitian PSD, which is what `eigh` downstream needs.  m is
+#     the inverse transform of a nonnegative function, so it is a positive-definite
+#     sequence and T is PSD (Bochner); G is PSD; the Schur product theorem does the
+#     rest.  The previous hand-built form had no such guarantee.
+#
+# When accel does not divide N the lattice {j N/A} is not integral and, worse, not a
+# subgroup of Z_N -- `arange(off, N, A)` is a coset of a subgroup only when A | N.
+# The exact deltas then sit only at multiples of N/gcd(A, N) and the remaining folds
+# smear into Dirichlet lobes near j N/A.  We take the A nearest-integer offsets
+# round(j N/A) and the exact taps at those offsets.  Two consequences worth being
+# explicit about: the alias sets no longer partition the image, so this is a *local*
+# inverse (the submatrix of the normal operator on one pixel's partner list) rather
+# than an exact block factorisation; and leakage onto unmodelled lags is dropped.
+# `tests/test_sense_noise.py::test_indivisible_accel_against_mc` measures what that
+# costs -- a few percent, not a factor.
+
+def _alias_lags(n: int, accel: int) -> Tuple[int, ...]:
+    """PE offsets of one pixel's alias partners, `l_0 = 0` first.
+
+    Exactly `{j * n // accel}` when `accel | n`; nearest integers otherwise, with
+    collisions dropped (so a very large `accel` yields fewer than `accel` lags).
+    """
+    seen, lags = set(), []
+    for j in range(accel):
+        x = j * n / accel
+        # When x is not an integer the aliasing peak straddles two pixels, so take
+        # BOTH. Rounding to the nearer one is not good enough: the Dirichlet peak of
+        # a length-K comb is ~N/(K A) ~ 1 pixel wide *regardless of N*, so a half-
+        # pixel offset always lands mid-peak and the single tap it keeps is down by
+        # sinc(delta) -- up to 36% -- with the rest of the energy on the neighbour.
+        # That error does not shrink as the image grows (measured: 27% at n=46 and
+        # 35% at n=184, both accel=6). Bracketing recovers it and costs a bigger
+        # block, at most 2A - 1 lags instead of A.
+        for l in (int(math.floor(x)) % n, int(math.ceil(x)) % n):
+            if l not in seen:
+                seen.add(l)
+                lags.append(l)
+    return tuple(lags)
+
+
+def _pe_profile(mask: Tensor, ax: int, n: int) -> Tensor:
+    """Reduce a sampling mask to its 1-D profile along `ax`, as a float in {0, 1}.
+
+    Requires separability -- a mask that varies along the readout is not a 1-D
+    Cartesian pattern and none of this applies to it.
+    """
+    m = (mask != 0)
+    while m.dim() < 4:
+        m = m.unsqueeze(0)
+    m = m.movedim(ax, -1)
+    flat = m.reshape(-1, n)
+    prof = flat.any(dim=0)
+    if not torch.equal(prof, flat.all(dim=0)):
+        raise ValueError(
+            "mask is not separable along the phase-encode axis (it varies along the "
+            "readout), so it is not a 1-D Cartesian pattern; use "
+            "physics.gfactor.gfactor_replica for such masks")
+    # float64 on purpose: the taps are one length-n FFT, so precision here is free,
+    # and in float32 the ACS band's exact cancellation on the alias lattice only
+    # closes to ~1e-8 -- enough to muddy an exactness check.
+    return prof.to(torch.float64)
+
+
+def _kernel_taps(lags: Sequence[int], n: int, accel: int, acs_size: int,
+                 mask: Optional[Tensor], ax: int, dtype, device) -> Tensor:
+    """The `(A, A)` Hermitian tap matrix `T[a,a'] = m[l_a - l_a']`.
+
+    With `mask=None` the analytic delta-for-sinc taps of the note are used, which
+    presume the uniform-plus-centred-ACS pattern *and* `accel | n`.  With a mask they
+    are exact for that mask: `m = ifft(ifftshift(profile))`, matching the repo's
+    ortho `fftc` (which fftshifts), and `m[0] = mean(mask) = 1/A_eff`.
+    """
+    A = len(lags)
+    L = torch.as_tensor(lags, device=device)
+    D = (L[:, None] - L[None, :]) % n                      # (A, A) lag differences
+
+    if mask is None:
+        if n % accel:
+            raise ValueError(
+                f"accel={accel} does not divide the phase-encode length {n}, so the "
+                "analytic taps do not apply. Pass the actual sampling `mask=` and the "
+                "kernel is read from it exactly.")
+        p = float(acs_size) / float(n)
+        off = (1.0 - p) / accel
+        T = torch.full((A, A), off, dtype=dtype, device=device)
+        T += p * torch.eye(A, dtype=dtype, device=device)
+        return T
+
+    prof = _pe_profile(mask, ax, n).to(device)
+    # F = fftc includes an fftshift, so undo it before the transform; then m[l] is
+    # indexed by lag with m[0] = mean(mask).
+    m = torch.fft.ifft(torch.fft.ifftshift(prof))
+    return m[D].to(dtype)
+
+
+def _alias_stack(x: Tensor, lags: Sequence[int], ax: int) -> Tensor:
+    """`(B, C, H, W) -> (B * npix, C, A)` holding `s[n + l_a]` for every pixel `n`.
+
+    A roll per lag rather than the free reshape the divisible case allows: every
+    pixel gets its own block, so this is `A` times the work of the folded version
+    (still a small multiple of one coil combination) and it handles any `accel`.
+    """
+    P = torch.stack([torch.roll(x, shifts=-int(l), dims=ax) for l in lags], dim=-1)
+    C = x.shape[1]
+    P = P.movedim(1, -2)                                   # (B, H, W, C, A)
+    return P.reshape(-1, C, len(lags))
+
+
+def _alias_bracket(P: Tensor, Q: Tensor, T: Tensor) -> Tensor:
+    """`<X>_n = (P^H Q) (o) T`, (npix, A, A) Hermitian PSD."""
+    return (P.conj().transpose(-2, -1) @ Q) * T
+
+
+# The fold/unfold pair below is used only by `block_sense`, which genuinely operates
+# on the folded measurement -- a reduced-FOV image of n/accel pixels, which exists
+# only when accel divides n.  `sense_noise_level` no longer needs it: one block per
+# pixel is both simpler and general.
 
 def _fold_alias(x: Tensor, accel: int, axis: int) -> Tuple[Tensor, Tuple[int, ...], int, int]:
-    """Gather the aliasing sensitivity matrices S_n, no gather needed.
+    """`(B, C, H, W) -> (B * L * step, C, accel)`, alias axis for free.
 
-    (B, C, H, W) -> (B * L * step, C, accel), where `step = n // accel` and `n`
-    is the length of the folded axis.  A row-major reshape of that axis into
-    (accel, step) puts PE index `a * step + jj` at `[a, jj]`, so the alias set
-    {jj, jj + step, ..., jj + (accel-1) step} *is* the `accel` axis -- the same
-    free-folding trick the Julia gets from a column-major
-    `reshape(smaps, Nx, space, accel, C, B)`.
-
-    Returns `(S, lead, n, ax)`; `lead` is the untouched spatial axis, needed to
-    undo the fold.
+    A row-major reshape of the PE axis into `(accel, step)` puts index
+    `a * step + jj` at `[a, jj]`, so the alias set is exactly the `accel` axis --
+    the same trick the Julia gets from a column-major
+    `reshape(smaps, Nx, space, accel, C, B)`.  Returns `(S, lead, n, ax)`.
     """
     if x.dim() != 4:
         raise ValueError(f"expected (B, C, H, W); got {tuple(x.shape)}")
@@ -152,7 +349,10 @@ def _fold_alias(x: Tensor, accel: int, axis: int) -> Tuple[Tensor, Tuple[int, ..
     lead = tuple(s.shape[2:-1])
     n = s.shape[-1]
     if n % accel:
-        raise ValueError(f"accel={accel} does not divide axis length {n}")
+        raise ValueError(
+            f"accel={accel} does not divide axis length {n}; block_sense needs a "
+            "folded image of n/accel pixels. Use physics.gfactor.cg_sense instead "
+            "(sense_noise_level itself has no such restriction).")
     step = n // accel
 
     S = s.reshape(B, C, -1, accel, step)           # (B, C, L, accel, step)
@@ -162,28 +362,10 @@ def _fold_alias(x: Tensor, accel: int, axis: int) -> Tuple[Tensor, Tuple[int, ..
 
 def _unfold_alias(d: Tensor, B: int, lead: Sequence[int], n: int,
                   accel: int, ax: int) -> Tensor:
-    """(B * L * step, accel) -> (B, 1, H, W), undoing `_fold_alias`."""
+    """`(B * L * step, accel) -> (B, 1, H, W)`, undoing `_fold_alias`."""
     step = n // accel
     t = d.reshape(B, -1, step, accel).permute(0, 1, 3, 2)   # (B, L, accel, step)
     return t.reshape(B, 1, *lead, n).movedim(-1, ax)
-
-
-def _alias_gram(S: Tensor, XS: Tensor, accel: int, p: float) -> Tensor:
-    """The sampled bracket `<X>_n`, (nblk, accel, accel).
-
-    `S` holds S_n and `XS` holds X S_n (X applied pixel-wise across coils), both
-    from `_fold_alias`.  The Gram is one batched product and the ACS term is a
-    Hadamard product with the A x A identity:
-
-        <X>_n = (1-p)/A * S_n^H X S_n  +  p * dg(S_n^H X S_n).
-
-    `dg(S_n^H X S_n)` has entries s[n^(a)]^H X s[n^(a)]: the ACS contributes the
-    *same diagonal* as the uniform term with the off-diagonals stripped, which is
-    the mechanism by which it breaks the aliasing degeneracy.
-    """
-    G = S.conj().transpose(-2, -1) @ XS            # G[a, a'] = s[n^(a)]^H X s[n^(a')]
-    eye = torch.eye(accel, device=G.device, dtype=G.dtype)
-    return ((1.0 - p) / accel) * G + p * (G * eye)
 
 
 # ---------------------------------------------------------------------------
@@ -240,15 +422,27 @@ def _apply_cov(X: Optional[Tensor], smaps: Tensor) -> Tensor:
 # Public API
 # ---------------------------------------------------------------------------
 
-def effective_acceleration(accel: int, acs_size: int, n_pe: int) -> float:
-    """`A_eff = A / (1 + p (A - 1))`, `p = acs_size / n_pe`.
+def effective_acceleration(accel: int = 0, acs_size: int = 0, n_pe: int = 1,
+                           mask: Optional[Tensor] = None) -> float:
+    """`A_eff`, the reciprocal of the acquired fraction of k-space.
 
-    The reciprocal of the acquired fraction of k-space once the ACS band is
-    counted as acquired data: the central amplitude of M_Omega^conv is
-    1/A + p - p/A = 1/A_eff.  This is the SNR penalty attributable to *scan
-    time*; what is left in the g-factor is then purely the conditioning penalty,
-    which is why `sense_gfactor` divides by sqrt(A_eff) rather than sqrt(A).
+    With a `mask` this is just `1 / mean(mask)` -- exact for any pattern, and the
+    only form that is right when `accel` does not divide `n_pe` (there
+    `arange(off, n, accel)` keeps `ceil(n / accel)` lines, not `n / accel`).
+
+    Without one it falls back to the note's `A / (1 + p (A - 1))`,
+    `p = acs_size / n_pe`, which is the central amplitude of M_Omega^conv,
+    `1/A + p - p/A`, and presumes `accel | n_pe`.
+
+    This is the SNR penalty attributable to *scan time*; what is left in the
+    g-factor is then purely the conditioning penalty, which is why
+    `sense_gfactor` divides by sqrt(A_eff) rather than sqrt(A).
     """
+    if mask is not None:
+        frac = (mask != 0).to(torch.float64).mean().item()
+        if frac <= 0:
+            raise ValueError("mask is empty")
+        return 1.0 / frac
     p = float(acs_size) / float(n_pe)
     return float(accel) / (1.0 + p * (accel - 1))
 
@@ -289,10 +483,12 @@ def sense_noise_level(
     accel: int = 2,
     axis: int = -1,
     acs_size: int = 0,
+    mask: Optional[Tensor] = None,
     weighted: bool = True,
     rtol: float = 1e-6,
     thresh: float = 0.0,
     eps: float = 1e-12,
+    chunk: int = 1 << 20,
 ) -> Tensor:
     """Spatially varying image-domain noise level of a SENSE reconstruction.
 
@@ -306,14 +502,27 @@ def sense_noise_level(
         k-space coil noise covariance; None means the identity, i.e. the map
         comes back relative to the per-coil noise std.
     accel : int
-        Uniform acceleration A along `axis`; must divide that axis's length.
+        Uniform acceleration A along `axis`.  Need not divide the axis length --
+        see `mask`.
     axis : int
         Image axis the aliasing folds along -- the undersampled (phase-encode)
         k-space axis.  Default -1 matches `physics.mask.make_acc_mask(dim=1)`.
     acs_size : int
-        Number of fully sampled central PE lines *included in the
-        reconstruction*.  0 is the pure uniform case and is exact; > 0 uses the
-        delta-for-sinc bracket (see the module docstring).
+        Number of fully sampled central PE lines included in the reconstruction.
+        Ignored when `mask` is given (the mask says what was acquired).
+    mask : (B, 1, H, W) | (1, 1, H, W) | (H, W), optional
+        The actual sampling pattern.  **Strongly preferred**, and *required* when
+        `accel` does not divide the PE length: the kernel taps are then read off
+        the mask by one inverse FFT rather than assumed, which
+
+        * removes the delta-for-sinc guess for the ACS band (sidelobes kept),
+        * drops the assumption that the ACS is one centred contiguous block,
+        * gets the acquired fraction right when `ceil(n/A) != n/A`.
+
+        Without it the analytic taps of the note are used and `accel | n` is
+        enforced.  Either way the mask must be separable along the PE axis; random
+        or variable-density patterns break the alias-set structure entirely and
+        need `physics.gfactor.gfactor_replica`.
     weighted : bool
         True for the noise-weighted (pre-whitened, ML) pinv, which attains the
         Cramer-Rao bound; False for the plain pinv on un-whitened data, which is
@@ -323,40 +532,63 @@ def sense_noise_level(
         and ill-conditioned blocks return 0 rather than inf.
     thresh : float
         If > 0, zero the output outside `support_mask(smaps, thresh)`.
+    chunk : int
+        Pixels per batch through the A x A solve.  Only a memory knob.
 
     Returns
     -------
     (B, 1, H, W) real.  Square it for the noise *variance* -- the `nvar` that
     `physics.gfactor` returns and that `normalize_gmap` consumes.
     """
+    if smaps.dim() != 4:
+        raise ValueError(f"smaps must be (B, C, H, W); got {tuple(smaps.shape)}")
     accel = int(accel)
-    B = smaps.shape[0]
-    n_pe = smaps.shape[axis % smaps.dim()]
-    p = float(acs_size) / float(n_pe)
-    if not 0.0 <= p <= 1.0:
+    ax = axis % smaps.dim()
+    if ax < 2:
+        raise ValueError("axis must be a spatial axis (2 or 3, or -1/-2)")
+    n_pe = smaps.shape[ax]
+    if not 0 <= acs_size <= n_pe:
         raise ValueError(f"acs_size must be in [0, {n_pe}]; got {acs_size}")
 
+    lags = _alias_lags(n_pe, accel)
+    T = _kernel_taps(lags, n_pe, accel, acs_size, mask, ax,
+                     smaps.dtype, smaps.device)
+
+    # <Sigma^{-1}>_n needs Sigma^{-1/2}-whitened maps and <Sigma>_n needs
+    # Sigma^{+1/2}-coloured ones, since S^H X S = (X^{1/2} S)^H (X^{1/2} S).
     if weighted:
-        # <Sigma^{-1}>_n = <I>_n on Sigma^{-1/2}-whitened maps, since
-        # S_n^H Sigma^{-1} S_n = (Sigma^{-1/2} S_n)^H (Sigma^{-1/2} S_n).
-        Sw, lead, n, ax = _fold_alias(whiten_smaps(smaps, Sigma, eps=eps), accel, axis)
-        M = _alias_gram(Sw, Sw, accel, p)
-        d = _batched_inv_diag(M, rtol=rtol)                       # eq. (26)
+        u = whiten_smaps(smaps, Sigma, eps=eps)
+        v = None
     else:
-        S, lead, n, ax = _fold_alias(smaps, accel, axis)
-        Bm = _alias_gram(S, S, accel, p)                          # <I>
+        u = smaps
         if Sigma is None:
-            Cm = Bm
+            v = None
         else:
             Sig = _as_cov(Sigma, smaps.shape[1], smaps.device, smaps.dtype)
-            # S_n^H Sigma S_n = (Sigma^{1/2} S_n)^H (Sigma^{1/2} S_n)
-            Sc, _, _, _ = _fold_alias(_apply_cov(_herm_pow(Sig, 0.5, eps=eps), smaps),
-                                      accel, axis)
-            Cm = _alias_gram(Sc, Sc, accel, p)                    # <Sigma>
-        Bi = _batched_pinv(Bm, rtol=rtol)
-        d = _batched_diag(Bi @ Cm @ Bi)                            # eq. (27)
+            v = _apply_cov(_herm_pow(Sig, 0.5, eps=eps), smaps)
 
-    sigma = _unfold_alias(d.clamp_min(0.0), B, lead, n, accel, ax).sqrt()
+    P = _alias_stack(u, lags, ax)                             # (npix, C, A)
+    Pv = _alias_stack(v, lags, ax) if v is not None else None
+
+    out = []
+    for i in range(0, P.shape[0], max(int(chunk), 1)):
+        Pi = P[i:i + chunk]
+        if weighted:
+            M = _alias_bracket(Pi, Pi, T)
+            d0 = _batched_inv_diag(M, rtol=rtol)[:, 0]            # eq. (26)
+        else:
+            Bm = _alias_bracket(Pi, Pi, T)                        # <I>
+            Cm = Bm if Pv is None else _alias_bracket(Pv[i:i + chunk],
+                                                      Pv[i:i + chunk], T)
+            Bi = _batched_pinv(Bm, rtol=rtol)
+            d0 = _batched_diag(Bi @ Cm @ Bi)[:, 0]                # eq. (27)
+        out.append(d0)
+
+    # `_alias_stack` keeps the pixel index in the original (B, H, W) order and
+    # `lags[0] == 0`, so entry 0 of each block is the pixel itself: the result drops
+    # straight back into place, with no fold/unfold bookkeeping to get wrong.
+    sigma = torch.cat(out).reshape(smaps.shape[0], 1, *smaps.shape[2:])
+    sigma = sigma.clamp_min(0.0).sqrt()
     if thresh > 0:
         sigma = sigma * support_mask(smaps, thresh).to(sigma.dtype)
     return sigma
@@ -368,6 +600,7 @@ def sense_gfactor(
     accel: int = 2,
     axis: int = -1,
     acs_size: int = 0,
+    mask: Optional[Tensor] = None,
     weighted: bool = True,
     rtol: float = 1e-6,
     thresh: float = 0.0,
@@ -382,13 +615,15 @@ def sense_gfactor(
     `sqrt([(S_n^H Sigma^{-1} S_n)^{-1}]_aa [S_n^H Sigma^{-1} S_n]_aa)`.
 
     Dividing by sqrt(A_eff) rather than sqrt(A) is deliberate -- see
-    `effective_acceleration`.
+    `effective_acceleration`.  Pass `mask` and A_eff comes from `1 / mean(mask)`,
+    which is the only correct normaliser when `accel` does not divide the PE length.
     """
     n_pe = smaps.shape[axis % smaps.dim()]
-    Aeff = effective_acceleration(accel, acs_size, n_pe)
+    Aeff = effective_acceleration(accel, acs_size, n_pe, mask=mask)
 
     sigma = sense_noise_level(smaps, Sigma, accel, axis=axis, acs_size=acs_size,
-                              weighted=weighted, rtol=rtol, thresh=thresh, eps=eps)
+                              mask=mask, weighted=weighted, rtol=rtol,
+                              thresh=thresh, eps=eps)
     sigma0 = coil_combined_noise_level(smaps, Sigma, weighted=weighted, eps=eps)
 
     den = Aeff ** 0.5 * sigma0
