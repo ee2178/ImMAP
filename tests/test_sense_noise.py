@@ -82,6 +82,47 @@ def rand_cov(C, seed=1, dtype=torch.complex128):
 
 
 # ---------------------------------------------------------------------------
+def test_generator_device_mismatch():
+    """A CPU-seeded generator must work against a CUDA target, not raise.
+
+    `torch.Generator()` is CPU-only, so `torch.randn(..., device='cuda',
+    generator=<cpu gen>)` raises "Expected a 'cuda' device type for generator but
+    found 'cpu'". `sample_kspace_noise` absorbs that by drawing on the generator's
+    device and moving the result, which also makes a CPU-seeded run bit-identical on
+    both devices. The CUDA half only runs where there is a GPU; the reproducibility
+    half runs everywhere.
+    """
+    from physics.gfactor import sample_kspace_noise
+
+    shape = (1, 4, 8, 8)
+    g1 = torch.Generator().manual_seed(5)
+    a = sample_kspace_noise(shape, device='cpu', dtype=torch.complex64, generator=g1)
+    g2 = torch.Generator().manual_seed(5)
+    b = sample_kspace_noise(shape, device=None, dtype=torch.complex64, generator=g2)
+    check("same seed, device='cpu' vs device=None agree", close(a, b, atol=0))
+
+    # A generator is honoured at all (i.e. we did not silently fall back to global RNG)
+    g3 = torch.Generator().manual_seed(6)
+    c = sample_kspace_noise(shape, device='cpu', dtype=torch.complex64, generator=g3)
+    check("different seed gives different noise", not close(a, c, atol=1e-6))
+
+    if torch.cuda.is_available():
+        gc_ = torch.Generator().manual_seed(5)
+        d = sample_kspace_noise(shape, device='cuda', dtype=torch.complex64,
+                                generator=gc_)
+        check("cpu generator + cuda target does not raise", d.is_cuda)
+        check("cpu-seeded noise is identical on cpu and cuda",
+              close(a, d.cpu(), atol=0),
+              f"max |diff| {(a - d.cpu()).abs().max():.2e}")
+        gg = torch.Generator(device='cuda').manual_seed(5)
+        e = sample_kspace_noise(shape, device='cuda', dtype=torch.complex64,
+                                generator=gg)
+        check("cuda generator + cuda target works", e.is_cuda and torch.isfinite(e).all())
+    else:
+        check("cuda half skipped (no GPU here)", True,
+              "run on the cluster to exercise the cpu-generator/cuda-target path")
+
+
 def test_alias_lags_and_stack():
     """`_alias_stack` must gather each pixel's partners, lag 0 first.
 
@@ -596,6 +637,7 @@ def test_grappa_comparison_from_the_note():
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    test_generator_device_mismatch()
     test_alias_lags_and_stack()
     test_folding_indices()
     test_mask_driven_taps_match_the_analytic_bracket()

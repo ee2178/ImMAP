@@ -359,12 +359,27 @@ def sample_kspace_noise(
 
     Follows `operators.noise`: a complex `randn` has E|z|^2 = 1 split evenly
     between real and imaginary parts, so Sigma = s * I gives E|xi_c|^2 = s.
+
+    `generator` may live on either device.  `torch.Generator()` is CPU by default,
+    and handing a CPU generator to a CUDA `randn` raises "Expected a 'cuda' device
+    type for generator but found 'cpu'" -- the single most common way to trip over
+    this function.  Rather than propagate that, a mismatched generator draws on its
+    own device and the sample is moved.  That costs one host-to-device copy per
+    draw and buys something worth having: a CPU-seeded generator produces
+    bit-identical noise whether the rest of the run is on CPU or GPU, so replica
+    counts and A/B comparisons are reproducible across devices.
     """
     B, C = shape[0], shape[1]
     if generator is None:
         z = torch.randn(*shape, device=device, dtype=dtype)
     else:
-        z = torch.randn(*shape, device=device, dtype=dtype, generator=generator)
+        gdev = generator.device
+        tgt = torch.device(device) if device is not None else gdev
+        if tgt.type != gdev.type:
+            z = torch.randn(*shape, device=gdev, dtype=dtype,
+                            generator=generator).to(tgt)
+        else:
+            z = torch.randn(*shape, device=tgt, dtype=dtype, generator=generator)
     if Sigma is not None:
         Sig = _as_cov(Sigma, C, z.device, z.dtype)
         L = _herm_pow(Sig, 0.5).expand(B, C, C)

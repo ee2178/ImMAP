@@ -17,6 +17,23 @@ import torch
 from operators.fourier import fftc
 
 
+def _draw(shape, dtype, device, generator, fn=torch.randn):
+    """`fn(shape, ...)` that tolerates a generator on the *other* device.
+
+    `torch.Generator()` is CPU-only, so passing one alongside a CUDA target raises
+    "Expected a 'cuda' device type for generator but found 'cpu'".  Draw on the
+    generator's own device and move instead: never raises, and a CPU-seeded run
+    produces bit-identical noise on CPU and GPU.
+    """
+    if generator is None:
+        return fn(shape, dtype=dtype, device=device)
+    gdev = generator.device
+    tgt = torch.device(device) if device is not None else gdev
+    if tgt.type != gdev.type:
+        return fn(shape, dtype=dtype, device=gdev, generator=generator).to(tgt)
+    return fn(shape, dtype=dtype, device=tgt, generator=generator)
+
+
 def _randn_like(x, generator=None):
     """`torch.randn_like` that accepts a generator (which `randn_like` does not).
 
@@ -27,7 +44,7 @@ def _randn_like(x, generator=None):
     """
     if generator is None:
         return torch.randn_like(x)
-    return torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
+    return _draw(x.shape, x.dtype, x.device, generator)
 
 
 def sample_sigma(n, noise_std, dist="uniform", ndim=4, device=None, k=1,
@@ -52,7 +69,7 @@ def sample_sigma(n, noise_std, dist="uniform", ndim=4, device=None, k=1,
     a, b = float(noise_std[0]), float(noise_std[1])
 
     def _rand():
-        return torch.rand(shape, device=device, generator=generator)
+        return _draw(shape, None, device, generator, fn=torch.rand)
 
     if dist == "uniform":
         return a + (b - a) * _rand()
