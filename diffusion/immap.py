@@ -18,15 +18,21 @@ def immap1(y, noise_level, denoiser, E,
            # Base Diffusion Hyperparameters
            beta = 0.05,    # Noise injection ratio, should belong in [0, 1]
            h_0 = 0.01,      # Initial step size
+           # Optional g-factor
+           g = None,
            save_dir = None, 
            verbose = True):
     # Set initial conditions
-    x_t, t, sigma_t, sigma_t_prev, y = init_diff(y, sigma_max=sigma_max)
+    x_t, t, sigma_t, sigma_t_prev = init_diff(y, sigma_max=sigma_max)
 
     # Refactor to take in a measurement operator E
     # Mean shifting
     EHy = E.H(y)
     x_t = x_t + torch.mean(EHy)
+
+    # If g factor is not given, default to all 1. 
+    if g is None:
+        g = torch.ones_like(EHy)
 
     with torch.no_grad():
         while sigma_t > sigma_min:
@@ -34,17 +40,18 @@ def immap1(y, noise_level, denoiser, E,
                 x_hat, _ = f(x, Identity(), sigma=sigma)
                 return x_hat
             x_hat_t = denoise(x_t, sigma_t)
-            # Get noise level estimate
-            sigma_t_sq = torch.mean((x_hat_t - x_t).abs()**2)
+            # Get noise level estimate (taking g factor into account)
+            sigma_t_sq = torch.mean((x_hat_t - x_t).abs()**2 / g)
             sigma_t = sigma_t_sq**(0.5)
             
             # Tweedie's formula
             grad_prior = x_hat_t - x_t
 
-            # PiGDM Laplace Approx (use * operator because the forward operator E starts with elementwise multiplication
-            def S_t(x, noise_level=noise_level, sigma_t_sq = sigma_t_sq, E = E):
-                # We do not actually want to explicitly compute Sigma_t, but rather have the ability to apply it to a matrix
-                return noise_level**2 * x + sigma_t_sq/(1+sigma_t_sq)*E(E.H(x))
+            # PiGDM Laplace Approx
+            r_t = sigma_t_sq * g / (1 + sigma_t_sq * g)
+            def S_t(x, E=E, r_t=r_t):
+                return noise_level**2 * x + E(r_t * E.H(x))
+
             # We want to solve sigma_t v_t = E x_hat - y
             # We may use CG since sigma_t is a covariance matrix + PSD symmetric matrix
             v_t, tol_reached = cg(S_t, E(x_hat_t) - y, max_iter = 500, tol=1e-3, verbose = False)
@@ -57,8 +64,8 @@ def immap1(y, noise_level, denoiser, E,
             # Update noise injection
             gamma_t = sigma_t_sq**(0.5)*((1-beta*h_t)**2-(1-h_t)**2)**0.5
             noise = torch.randn_like(x_t)
-            # Stochastic gradient ascent
-            x_t = x_t + h_t * (grad_prior+grad_likelihood) + gamma_t*noise
+            # Stochastic gradient ascent taking g factor into account
+            x_t = x_t + h_t * (grad_prior+grad_likelihood) + torch.sqrt(g)*gamma_t*noise
             if t % 5 == 0 and save_dir:
                 fname = os.path.join(save_dir, f"diffusion_sigma_{sigma_t.item():2f}.png")
                 saveimg(x_t, fname)

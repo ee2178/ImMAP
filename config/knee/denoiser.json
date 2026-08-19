@@ -11,7 +11,8 @@
             "C": 1,
             "s": 2,
             "P": 7,
-            "adaptive":true
+            "adaptive":true,
+            "init":true
         }
     },
     "paths": {

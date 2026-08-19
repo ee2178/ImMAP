@@ -47,9 +47,9 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [0, 1, 3],
-            "image_key": "img",
-            "et_mask": true,
-            "scales": [2.0, 2.0, 2.0, 2.0],
+            "image_key": "img_raw",
+            "et_mask": false,
+            "scales": [1750.0, 1200.0, 2700.0, 1000.0],
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 8,
@@ -61,9 +61,9 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [0, 1, 3],
-            "image_key": "img",
-            "et_mask": true,
-            "scales": [2.0, 2.0, 2.0, 2.0],
+            "image_key": "img_raw",
+            "et_mask": false,
+            "scales": [1750.0, 1200.0, 2700.0, 1000.0],
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8
@@ -73,7 +73,7 @@
         "num_epochs": 3000,
         "steps_per_epoch": 100,
         "val_every_epochs": 50,
-        "clip_grad": 1.0,
+        "clip_grad": 5.0e-2,
         "backtrack_thresh": 1000,
         "backtrack_factor": 0.9,
         "use_mask": true,
@@ -85,7 +85,7 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 5.0e-4
+            "lr": 1.0e-4
         }
     },
     "scheduler": {
