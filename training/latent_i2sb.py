@@ -47,6 +47,7 @@ from sb.base import build_schedule, n_steps, forward_sample, forward_std
 from sb.latent_i2sb import (encode, decode, latent_regress, _decode_dc,
                             latent_i2sb_sample, latent_i2sb_sample_imgdomain)
 from visualization.filters import get_filter_grids
+from visualization.params import get_param_logs
 
 
 def _apply_loss(loss_fn, target, pred, mask, use_mask, sigma):
@@ -344,7 +345,8 @@ def train_latent_i2sb(
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss, "train/lr": opt.param_groups[0]["lr"],
                        "train/epoch": epoch,
-                       **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
+                       **{f"train/{k}": v for k, v in train_metrics.items()},
+                       **get_param_logs(R)}, step=global_step)
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 

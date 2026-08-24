@@ -20,7 +20,7 @@ break them. Default False keeps every existing config and notebook on the old 4-
 Stored channel order follows cmap_config.contrasts: [flair, t1, t1ce, t2] -> flair=0, t1=1,
 t1ce=2, t2=3.
 
-Normalization: NONE is applied here. Each stored contrast c is multiplied by scales[c]
+Normalization: NONE is applied here. Each stored contrast c is DIVIDED by scales[c]
 (default 1.0). This lets you dial the relative dynamic range of each contrast directly, which
 matters for I2SB because the bridge endpoints (x0, x1) and the absolute noise-schedule stds
 must live on a compatible scale. If your *_img.h5 was written z-scored, the scales rescale that;
@@ -78,7 +78,8 @@ class I2SBDataset(Dataset):
             x0_idx    (int)     stored channel used as the bridge target   (T1ce=2)
             x1_idx    (int)     stored channel used as the bridge prior     (T1=1)
             cond_idx  (list)    stored channels used as conditioning; [] disables conditioning
-            scales    (list)    per-STORED-channel multipliers (len >= max stored idx + 1);
+            scales    (list)    per-STORED-channel DIVISORS (len >= max stored idx + 1); the
+                                image is divided by these, so 3.0 scales intensities DOWN by 3;
                                 None -> all ones. NO other normalization is applied.
             image_key (str)     h5 dataset to read: "img" (normalized) or "img_raw"
                                 (unnormalized; requires the generator's save_raw_image: true).

@@ -7,6 +7,7 @@ import torchvision.utils as vutils
 from tqdm import tqdm
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
+from visualization.params import get_param_logs
 from training.common import (
     save_ckpt,
     load_ckpt,
@@ -161,6 +162,7 @@ def train_ipalm(
                     f"train/{k}": v.item()
                     for k, v in train_metrics.items()
                 },
+                **get_param_logs(net),
             }
 
             if wandb is not None:

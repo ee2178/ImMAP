@@ -299,6 +299,41 @@ class SBCDLNet(BaseUnrolledModel):
                 f"recovered from sigma will be wrong.")
 
     # -----------------------------------------------------------------
+    # logging hook (visualization/params.py picks this up automatically)
+    # -----------------------------------------------------------------
+    @torch.no_grad()
+    def param_logs(self, probes=(0.0, 0.5, 1.0)):
+        """The step sizes and threshold this net will ACTUALLY use, at a few bridge positions.
+
+        A generic parameter walker can only see the raw polynomial coefficients, which say
+        nothing on their own -- eta is sigmoid(poly(log sigma_eff)), so the coefficient values
+        are not interpretable and the same eta can come from many of them. What you want to watch
+        is the derived curve: is the step pinned at 0 or 1, is the threshold collapsing, do later
+        unrolled layers behave differently from earlier ones. `probes` are positions along the
+        bridge (0 = target end, 1 = prior end)."""
+        out = {}
+        n = self.std_fwd.shape[0]
+        for t in probes:
+            k = min(max(int(round(t * (n - 1))), 0), n - 1)
+            sig = self.sigma_eff_tab[k]
+            s_log = ((sig.clamp_min(1e-12).log() - self.s_mid) / self.s_half).view(1, 1, 1, 1)
+            s_hat = (sig / self.sigma_ref.clamp_min(1e-12)).view(1, 1, 1, 1)
+            tag = f"t{t:.2f}"
+            per_layer = {
+                "eta": [torch.sigmoid(_horner(self.a_eta[j], s_log)).mean() for j in range(self.K)],
+                "nu": [torch.sigmoid(_horner(self.a_nu[j], s_log)).mean() for j in range(self.K)],
+                "tau": [_horner(self.t[j], s_hat).mean() for j in range(self.K)],
+            }
+            for name, vals in per_layer.items():
+                v = torch.stack(vals)
+                out[f"{name}.{tag}.mean"] = float(v.mean())
+                out[f"{name}.{tag}.first"] = float(v[0])       # depth dependence, cheaply
+                out[f"{name}.{tag}.last"] = float(v[-1])
+        out["sigma_eff.min"] = float(self.sigma_eff_tab.min())
+        out["sigma_eff.max"] = float(self.sigma_eff_tab.max())
+        return out
+
+    # -----------------------------------------------------------------
     # forward
     # -----------------------------------------------------------------
     def forward(self, y, E=None, sigma=None, step=None):

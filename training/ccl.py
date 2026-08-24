@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr
+from visualization.params import get_param_logs
 from training.ccl_loss import ConstrainedContrastiveLoss
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -136,7 +137,8 @@ def train_ccl(
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss,
                        "train/lr": opt.param_groups[0]["lr"],
-                       "train/epoch": epoch}, step=global_step)
+                       "train/epoch": epoch,
+                       **get_param_logs(net)}, step=global_step)
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss})
 

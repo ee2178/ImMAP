@@ -8,6 +8,7 @@ import torchvision.utils as vutils
 from tqdm import tqdm
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
+from visualization.params import get_param_logs
 from training.common import (
     save_ckpt,
     load_ckpt,
@@ -297,6 +298,7 @@ def train_joint_denoising_recon(
                 "train/lr": get_lr(opt)[0],
                 "train/epoch": epoch,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
+                **get_param_logs(net),
             }
             wandb.log(log_dict, step=global_step)
         elif wandb is None:

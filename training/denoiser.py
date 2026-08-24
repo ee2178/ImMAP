@@ -12,6 +12,7 @@ from operators.noise import awgn
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics, psnr
+from visualization.params import get_param_logs
 from visualization.filters import get_filter_grids
 
 
@@ -165,6 +166,7 @@ def train_denoiser(
                 "train/lr": opt.param_groups[0]["lr"],
                 "train/epoch": epoch,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
+                **get_param_logs(net),
             }
             wandb.log(log_dict, step=global_step)
         elif not wandb:

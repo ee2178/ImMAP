@@ -38,6 +38,7 @@ from training.metrics import compute_metrics
 from sb.base import build_schedule, n_steps, forward_sample, forward_std, predict_x0
 from sb.i2sb import i2sb_sample
 from visualization.filters import get_filter_grids
+from visualization.params import get_param_logs
 
 
 def masked_mse(pred, target, organ_mask, use_mask):
@@ -121,6 +122,9 @@ def train_i2sb(
     et_weight=1.0,                   # per-pixel enhancing-tumor weight; 1 = off. Needs the loader's
                                      # et_mask: true. Tune in the tens-to-hundreds (see _bridge_loss).
     psnr_only=False,
+    data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
+                                     # data in [-1, 1]. Must match the loader's actual scaling or
+                                     # every reported dB is offset by 20*log10(data_range).
     # ---- I2SB method (cfg["i2sb"]) ----
     kind="brownian",                 # schedule: "brownian" (tau-parameterized) or "i2sb" (paper)
     tau=0.19,                        # brownian: peak bridge-noise std; max forward_std (sigma) = 2*tau
@@ -216,7 +220,7 @@ def train_i2sb(
 
         # one-step denoise metrics (pred_x0 vs x0), masked like the loss
         x0_m, pred_m = apply_loss_mask(x0, pred_x0, mask, use_mask)
-        train_metrics = compute_metrics(x0_m, pred_m, psnr_only=psnr_only)
+        train_metrics = compute_metrics(x0_m, pred_m, psnr_only=psnr_only, data_range=data_range)
         train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
         # ---- averaged-loss backtracking (matches the other loops) ----
@@ -239,9 +243,14 @@ def train_i2sb(
 
         # ---- logging ----
         if wandb and not nonfinite:
+            # get_param_logs is every-epoch (cheap scalars) rather than every-val: thresholds and
+            # step sizes drift on the timescale of training, not of validation. Grads are still
+            # populated here -- zero_grad happens at the top of the NEXT step -- so it also
+            # captures per-tensor grad norms.
             wandb.log({"train/loss": avg_loss, "train/lr": opt.param_groups[0]["lr"],
                        "train/epoch": epoch,
-                       **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
+                       **{f"train/{k}": v for k, v in train_metrics.items()},
+                       **get_param_logs(net)}, step=global_step)
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 
@@ -253,7 +262,7 @@ def train_i2sb(
                 posterior=posterior, clip_denoise=clip_denoise, val_nfe=val_nfe,
                 target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
                 loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
-                wandb=wandb, global_step=global_step,
+                data_range=data_range, wandb=wandb, global_step=global_step,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -303,7 +312,7 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
 def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
-              wandb, global_step):
+              data_range, wandb, global_step):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -347,7 +356,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
                                 std_fwd, loss_weight)
 
         x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
-        mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only)
+        mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only, data_range=data_range)
         agg["loss"] += float(loss) * bs
         for k in ("psnr", "ssim", "nrmse"):
             if k in mets:
@@ -359,11 +368,11 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         last = (x1, xt, x0_m, pred_m, mask, step)
 
     mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
-    # ET PSNR, area-normalized over the split (matches metrics.psnr's implicit data_range of 1).
+    # ET PSNR, area-normalized over the split, on the same data_range as metrics.psnr.
     # This is the number et_weight is meant to move; whole-brain psnr barely registers a change
     # confined to ~0.3% of the voxels.
     if et_n > 0:
-        mean_metrics["et_psnr"] = -10.0 * math.log10(et_sse / et_n + 1e-12)
+        mean_metrics["et_psnr"] = 10.0 * math.log10(data_range ** 2 / (et_sse / et_n + 1e-12))
 
     if wandb and last is not None:
         x1, xt, x0_m, pred_m, mask, step = last

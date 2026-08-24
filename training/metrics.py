@@ -44,10 +44,20 @@ def joint_normalize(x, y):
 def psnr(
     gt,
     pred,
+    data_range=1.0,
     eps=1e-12,
 ):
     """
     Complex-valued PSNR.
+
+    Parameters
+    ----------
+    data_range : float
+        Peak-to-peak range of the signal. 1.0 (the default) reproduces the previous
+        `-10*log10(mse)`. Use 2.0 for data in [-1, 1], and the measured
+        max-min for anything else -- PSNR is only comparable between runs that
+        assume the SAME range, and getting it wrong shifts every number by
+        20*log10(data_range) dB (6.02 dB for 1 -> 2).
 
     Returns
     -------
@@ -59,8 +69,8 @@ def psnr(
         (gt - pred).abs() ** 2
     )
 
-    return -10 * torch.log10(
-        mse + eps
+    return 10 * torch.log10(
+        data_range ** 2 / (mse + eps)
     )
 
 
@@ -75,6 +85,9 @@ def nrmse(
 ):
     """
     Normalized RMSE using joint dynamic range.
+
+    Deliberately takes no `data_range`: it divides by the range MEASURED from
+    (gt, pred), so it is already scale-free and a nominal range would double-count.
 
     Returns
     -------
@@ -109,9 +122,12 @@ def nrmse(
 def ssim(
     gt,
     pred,
+    data_range=1.0,
     window_size=11,
-    C1=(1e-2) ** 2,
-    C2=(3e-2) ** 2,
+    K1=1e-2,
+    K2=3e-2,
+    C1=None,
+    C2=None,
 ):
     """
     Complex-valued SSIM using magnitude images.
@@ -124,11 +140,25 @@ def ssim(
     pred : torch.Tensor
         Shape (B, C, H, W)
 
+    data_range : float
+        Peak-to-peak range of the signal. The stability constants are
+        C1 = (K1*data_range)^2, C2 = (K2*data_range)^2 -- SSIM depends on the
+        range just as PSNR does, and leaving them at their data_range=1 values on
+        [-1, 1] data quietly changes what is being measured (the constants stop
+        being small relative to the local variances they regularize).
+        data_range=1.0 reproduces the previous C1=(1e-2)^2, C2=(3e-2)^2.
+
+    C1, C2 : float, optional
+        Explicit overrides; when given, `data_range` / K1 / K2 are ignored.
+
     Returns
     -------
     torch.Tensor
         Shape (B,)
     """
+
+    C1 = (K1 * data_range) ** 2 if C1 is None else C1
+    C2 = (K2 * data_range) ** 2 if C2 is None else C2
 
     gt_mag = gt.abs()
     pred_mag = pred.abs()
@@ -210,15 +240,18 @@ def ssim(
     )
 
 
-def compute_metrics(gt, recon, psnr_only = False):
+def compute_metrics(gt, recon, psnr_only=False, data_range=1.0):
+    """PSNR / NRMSE / SSIM. `data_range` is the signal's peak-to-peak range and feeds
+    PSNR and SSIM (NRMSE measures its own -- see nrmse). Default 1.0 keeps every
+    existing caller bit-identical; pass 2.0 for data in [-1, 1]."""
     if psnr_only:
         return {
-            "psnr": psnr(gt, recon),
+            "psnr": psnr(gt, recon, data_range=data_range),
         }
     else:
         return {
-            "psnr": psnr(gt, recon),
+            "psnr": psnr(gt, recon, data_range=data_range),
             "nrmse": nrmse(gt, recon),
-            "ssim": ssim(gt, recon).mean(),
+            "ssim": ssim(gt, recon, data_range=data_range).mean(),
         }
 

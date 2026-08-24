@@ -14,12 +14,19 @@ named to match the BraTS file convention:
     <case>/<case>_constraint_map_K<K>.h5   ['param']       (n, H, W, 1)  int16
                                            ['slice_index']  (n,)         int32  -> original z
     <case>/<case>_img.h5  (optional)       ['img']          (n, H, W, C) float  normalized
+                                           ['img_<mode>']   (n, H, W, C) float  extra normalizations
                                            ['img_raw']      (n, H, W, C) float  unnormalized (raw)
                                            ['mask']         (n, H, W, 1) uint8  brain mask
                                            ['seg']          (n, H, W, 1) int16  BraTS tumor labels
                                            ['et']           (n, H, W, 1) uint8  enhancing-tumor mask
                                            ['slice_index']  (n,)         int32
 Plus a manifest CSV at the subdir root listing every subject and its kept-slice count.
+
+`img` holds the `normalize` mode (the primary one -- it is also what the clustering runs on, so
+the constraint maps depend only on it). Every mode listed in `normalize_extra` is normalized from
+the SAME clipped volume and stored beside it as `img_<mode>` ('median-mad' -> 'img_median_mad'),
+so a training run can switch normalization with `image_key` alone, no regeneration. Each costs one
+more full copy of the image data on disk.
 
 `seg` is the raw BraTS segmentation (1 = necrotic core, 2 = edema, 4 = enhancing tumor;
 3 unused), carried through the exact same crop + slice selection as the images so it stays
@@ -78,34 +85,98 @@ def load_seg(case_dir, tag="seg"):
     return np.rint(seg).astype(np.int16)
 
 
-def normalize_masked(img, fg, mode="zscore", eps=1e-8):
+# MAD is scaled so it equals the standard deviation on Gaussian data. Without this constant
+# the median-mad output would sit on a different scale from zscore/median-std, and every
+# downstream absolute quantity (loss thresholds, the bridge tau / beta_max) would silently
+# change meaning when you switch normalize modes.
+_MAD_TO_STD = 1.4826
+
+NORMALIZE_MODES = ("zscore", "median-std", "median-mad", "minmax")
+
+
+def norm_key(mode):
+    """h5 dataset name for a normalization mode: 'median-mad' -> 'img_median_mad'."""
+    return "img_" + str(mode).replace("-", "_")
+
+
+def extra_modes(cfg):
+    """Modes from cfg.normalize_extra to store ALONGSIDE the primary `normalize`, de-duplicated
+    against it -- listing the primary mode again would just write `img` twice under two names."""
+    primary = getattr(cfg, "normalize", "zscore")
+    out = []
+    for m in (getattr(cfg, "normalize_extra", None) or []):
+        m = str(m)
+        if m not in NORMALIZE_MODES:
+            raise ValueError(f"normalize_extra has {m!r}; must be one of {NORMALIZE_MODES}")
+        if m != primary and m not in out:
+            out.append(m)
+    return out
+
+
+def _centre_scale(vals, mode, eps):
+    """(centre, scale) for one channel's in-brain samples.
+
+        zscore      mean   / std        the original; both moments are skewed by a bright tail
+        median-std  median / std        robust CENTRE only
+        median-mad  median / MAD        robust centre AND scale
+        minmax      min    / range      linear stretch (the caller clamps to [0,1])
+
+    A high-intensity tail -- enhancing tumor in T1ce, say -- pulls the mean up AND inflates the
+    std. median-std fixes only the first; median-mad fixes both. Which one you want is an
+    empirical question: notebooks/inspect_percentile_norm.ipynb measures it."""
+    if mode == "zscore":
+        return vals.mean(), vals.std().clamp_min(eps)
+    if mode == "median-std":
+        return vals.median(), vals.std().clamp_min(eps)
+    if mode == "median-mad":
+        med = vals.median()
+        return med, (_MAD_TO_STD * (vals - med).abs().median()).clamp_min(eps)
+    if mode == "minmax":
+        lo = vals.amin()
+        return lo, (vals.amax() - lo).clamp_min(eps)
+    raise ValueError(f"normalize must be one of {NORMALIZE_MODES}, got {mode!r}")
+
+
+def normalize_masked(img, fg, mode="zscore", eps=1e-8, per_slice=False):
     """Per-channel normalization computed ONLY within the brain mask; background -> 0.
-    img (D,C,H,W), fg (D,H,W) bool. Returns (out, stats) where stats[c] = (mean,std) for
-    zscore or (lo,range) for minmax, so the transform is invertible later.
+
+    img (D,C,H,W), fg (D,H,W) bool. Returns (out, stats), where stats holds the (centre, scale)
+    actually applied so the transform stays invertible:
+
+        per_slice=False   stats (C, 2)      one pair per channel, over the whole volume
+        per_slice=True    stats (D, C, 2)   one pair per channel PER SLICE
+
+    `per_slice` normalizes each slice against its own statistics. That removes through-plane
+    intensity drift, but it also means the same tissue can take different values on adjacent
+    slices -- the volume is no longer consistently scaled along z. Off by default; it is a real
+    change to what a 2D network sees, not just a bookkeeping detail.
 
     Note: a linear "contrast stretch" to [0,1] before a z-score is a no-op (z-score is
     affine-invariant), so we offer the stretch as an ALTERNATIVE normalization (minmax),
     not an extra step. The nonlinear clipping that actually matters is done separately."""
+    if mode not in NORMALIZE_MODES:
+        raise ValueError(f"normalize must be one of {NORMALIZE_MODES}, got {mode!r}")
     out = img.clone()
-    C = img.shape[1]
-    stats = np.zeros((C, 2), dtype=np.float32)
+    D, C = img.shape[0], img.shape[1]
+    stats = np.zeros((D, C, 2) if per_slice else (C, 2), dtype=np.float32)
+
+    def _apply(sel, c, vals):
+        """Normalize img[sel, c] by its own in-brain stats; -> the (centre, scale) used."""
+        if vals.numel() == 0:              # slice (or volume) with no brain voxels
+            out[sel, c] = 0.0
+            return (0.0, 1.0)
+        centre, scale = _centre_scale(vals, mode, eps)
+        y = (img[sel, c] - centre) / scale
+        out[sel, c] = y.clamp(0.0, 1.0) if mode == "minmax" else y
+        return (float(centre), float(scale))
+
     for c in range(C):
-        vals = img[:, c][fg]
-        if vals.numel() == 0:
-            out[:, c] = 0.0
-            continue
-        if mode == "zscore":
-            mean = vals.mean()
-            std = vals.std().clamp_min(eps)
-            out[:, c] = (img[:, c] - mean) / std
-            stats[c] = (float(mean), float(std))
-        elif mode == "minmax":
-            lo = vals.amin()
-            rng = (vals.amax() - lo).clamp_min(eps)
-            out[:, c] = ((img[:, c] - lo) / rng).clamp(0.0, 1.0)
-            stats[c] = (float(lo), float(rng))
+        if per_slice:
+            for d in range(D):
+                stats[d, c] = _apply(d, c, img[d, c][fg[d]])
         else:
-            raise ValueError(f"normalize must be 'zscore' or 'minmax', got {mode}")
+            stats[c] = _apply(slice(None), c, img[:, c][fg])
+
     out = out * fg.unsqueeze(1)            # background -> 0 sentinel (consistent across channels)
     return out, stats
 
@@ -142,13 +213,16 @@ def center_crop_spatial(a, size, h_axis, w_axis):
 @torch.no_grad()
 def constraint_map_for_subject(case_dir, cfg, pca_fn, tvd_fn, kmeans_fn):
     """
-    Returns (param, image, image_raw, fg, seg, stats):
+    Returns (param, image, image_raw, fg, seg, stats, extras):
         param     : (D, H, W) int16      constraint map (background = 0 if mask_background)
         image     : (D, C, H, W) float32 NORMALIZED image (within-brain zscore/minmax, bg=0)
         image_raw : (D, C, H, W) float32 UNNORMALIZED, UNCLIPPED raw intensities (bg=0)
         fg        : (D, H, W) bool        brain mask (from raw intensities)
         seg       : (D, H, W) int16       BraTS tumor labels, or None if the case has no seg
-        stats     : (C, 2) float32        per-channel normalization stats (invertible)
+        stats     : (C, 2) float32        per-channel (centre, scale); (D, C, 2) if
+                                         cfg.normalize_per_slice
+        extras    : {mode: (image, stats)} additional normalizations of the same clipped
+                                         volume, same shapes as `image` / `stats`
 
     Clustering (PCA/TVD/kmeans) runs on the NORMALIZED image so the constraint maps are
     unchanged; the unnormalized image is carried alongside for tasks (e.g. I2SB translation)
@@ -172,8 +246,18 @@ def constraint_map_for_subject(case_dir, cfg, pca_fn, tvd_fn, kmeans_fn):
             seg = np.transpose(seg, (2, 0, 1))                  # (H, W, D) -> (D, H, W)
 
     x_raw = (x * fg.unsqueeze(1)).contiguous()                  # UNnormalized, UNclipped, bg -> 0
-    x = channelwise_percentile_clip(x, fg, cfg.clip_lo, cfg.clip_hi)
-    x, stats = normalize_masked(x, fg, mode=getattr(cfg, "normalize", "zscore"))
+    x_clip = channelwise_percentile_clip(x, fg, cfg.clip_lo, cfg.clip_hi)
+    per_slice = bool(getattr(cfg, "normalize_per_slice", False))
+    x, stats = normalize_masked(x_clip, fg, mode=getattr(cfg, "normalize", "zscore"),
+                                per_slice=per_slice)
+
+    # Extra normalizations of the SAME clipped volume, so every stored variant differs ONLY in
+    # its centre/scale. Clustering below still runs on `x` (the primary mode), so adding modes
+    # here cannot change the constraint maps.
+    extras = {}
+    for m in extra_modes(cfg):
+        xm, sm = normalize_masked(x_clip, fg, mode=m, per_slice=per_slice)
+        extras[m] = (xm.cpu().numpy().astype(np.float32), sm)
 
     pca_out = pca_fn(x, n_components=cfg.n_pca)                  # cluster on the NORMALIZED image
     x_pc = pca_out[0] if isinstance(pca_out, (tuple, list)) else pca_out
@@ -202,7 +286,7 @@ def constraint_map_for_subject(case_dir, cfg, pca_fn, tvd_fn, kmeans_fn):
     image = x.cpu().numpy().astype(np.float32)
     image_raw = x_raw.cpu().numpy().astype(np.float32)
     fg = fg.cpu().numpy()
-    return param, image, image_raw, fg, seg, stats
+    return param, image, image_raw, fg, seg, stats, extras
 
 
 # ----------------------------------------------------------------------------
@@ -226,14 +310,17 @@ def _common_attrs(f, case, slice_idx, orig_depth, stats, cfg):
     f.attrs["slice_range"] = [int(getattr(cfg, "start_slice", -1) or -1),
                               int(getattr(cfg, "end_slice", -1) or -1)]
     f.attrs["normalize"] = getattr(cfg, "normalize", "zscore")
-    f.attrs["norm_stats"] = stats                 # (C,2): (mean,std) or (lo,range) per channel
+    f.attrs["normalize_per_slice"] = bool(getattr(cfg, "normalize_per_slice", False))
+    f.attrs["normalize_extra"] = ",".join(extra_modes(cfg))   # stored as img_<mode> each
+    f.attrs["norm_stats"] = stats                 # (C,2) centre/scale per channel, or (n,C,2)
+                                                  # per KEPT slice when normalize_per_slice
     f.attrs["has_raw_image"] = bool(getattr(cfg, "save_raw_image", True))
     f.attrs["et_labels"] = np.asarray(et_labels(cfg), dtype=np.int16)
     f.attrs["axis_order"] = "N,H,W,C ; slice_index maps N back to the original nifti z-axis"
 
 
 def save_subject(out_dir, case, image_hwc, image_raw_hwc, param_hwc, mask_hwc, seg_hwc,
-                 slice_idx, orig_depth, stats, cfg):
+                 slice_idx, orig_depth, stats, cfg, extras_hwc=None):
     os.makedirs(out_dir, exist_ok=True)
     comp = "gzip" if cfg.compress else None
 
@@ -249,6 +336,11 @@ def save_subject(out_dir, case, image_hwc, image_raw_hwc, param_hwc, mask_hwc, s
         with h5py.File(img_path, "w") as f:
             f.create_dataset("img", data=image_hwc.astype(cfg.img_dtype),         # NORMALIZED
                              chunks=(1,) + image_hwc.shape[1:], compression=comp)
+            for m, (arr, st) in (extras_hwc or {}).items():
+                # same pixels, different centre/scale -- pick one at train time with image_key
+                f.create_dataset(norm_key(m), data=arr.astype(cfg.img_dtype),
+                                 chunks=(1,) + arr.shape[1:], compression=comp)
+                f.attrs[f"norm_stats_{m.replace('-', '_')}"] = st
             if getattr(cfg, "save_raw_image", True) and image_raw_hwc is not None:
                 f.create_dataset("img_raw", data=image_raw_hwc.astype(cfg.img_dtype),  # UNNORMALIZED
                                  chunks=(1,) + image_raw_hwc.shape[1:], compression=comp)
@@ -264,9 +356,11 @@ def save_subject(out_dir, case, image_hwc, image_raw_hwc, param_hwc, mask_hwc, s
     return cmap_path, img_path
 
 
-def prepare_arrays(param, image, image_raw, fg, seg, cfg):
+def prepare_arrays(param, image, image_raw, fg, seg, cfg, extras=None):
     """Crop + brain-fraction slice selection; return (img_hwc, img_raw_hwc, param_hwc,
-    mask_hwc, seg_hwc, slice_idx, orig_depth). A slice is kept iff brain covers >=
+    mask_hwc, seg_hwc, slice_idx, orig_depth, extras_hwc). `extras` is the {mode: (image, stats)}
+    dict of additional normalizations and rides the identical crop + selection. A slice is kept
+    iff brain covers >=
     min_brain_frac of the FOV (subsumes the old 'any foreground' rule and drops near-empty
     top/bottom slices). `seg` rides through the identical crop + `keep` selection as the
     images -- that alignment is the whole point of doing it here rather than at load time.
@@ -279,6 +373,9 @@ def prepare_arrays(param, image, image_raw, fg, seg, cfg):
         fg = center_crop_spatial(fg, cfg.crop_size, h_axis=1, w_axis=2)
         if seg is not None:
             seg = center_crop_spatial(seg, cfg.crop_size, h_axis=1, w_axis=2)
+        if extras:
+            extras = {m: (center_crop_spatial(a, cfg.crop_size, h_axis=2, w_axis=3), st)
+                      for m, (a, st) in extras.items()}
 
     D = fg.shape[0]
     z = np.arange(D)
@@ -303,7 +400,12 @@ def prepare_arrays(param, image, image_raw, fg, seg, cfg):
     param_hwc = param[keep][..., np.newaxis]                    # (n, H, W, 1)
     mask_hwc = fg[keep][..., np.newaxis]                        # (n, H, W, 1) bool
     seg_hwc = None if seg is None else seg[keep][..., np.newaxis]   # (n, H, W, 1) int16
-    return img_hwc, img_raw_hwc, param_hwc, mask_hwc, seg_hwc, slice_idx, orig_depth
+    # per-slice stats must ride the same `keep` selection as the pixels they describe
+    extras_hwc = {m: (np.transpose(a[keep], (0, 2, 3, 1)),
+                      st[slice_idx] if st.ndim == 3 else st)
+                  for m, (a, st) in (extras or {}).items()}
+    return (img_hwc, img_raw_hwc, param_hwc, mask_hwc, seg_hwc, slice_idx, orig_depth,
+            extras_hwc)
 
 
 # ----------------------------------------------------------------------------
@@ -338,11 +440,15 @@ def process_split(cases, subdir_path, cfg, fns, manifest_rows):
             continue
 
         try:
-            param, image, image_raw, fg, seg, stats = constraint_map_for_subject(src_dir, cfg, pca_fn, tvd_fn, kmeans_fn)
-            img_hwc, img_raw_hwc, param_hwc, mask_hwc, seg_hwc, slice_idx, orig_depth = prepare_arrays(
-                param, image, image_raw, fg, seg, cfg)
+            param, image, image_raw, fg, seg, stats, extras = constraint_map_for_subject(
+                src_dir, cfg, pca_fn, tvd_fn, kmeans_fn)
+            (img_hwc, img_raw_hwc, param_hwc, mask_hwc, seg_hwc, slice_idx, orig_depth,
+             extras_hwc) = prepare_arrays(param, image, image_raw, fg, seg, cfg, extras=extras)
+            if stats.ndim == 3:            # per-slice stats: drop the slices prepare_arrays dropped,
+                stats = stats[slice_idx]   # so stats[i] still describes img[i]
             cpath, ipath = save_subject(out_dir, case, img_hwc, img_raw_hwc, param_hwc, mask_hwc,
-                                        seg_hwc, slice_idx, orig_depth, stats, cfg)
+                                        seg_hwc, slice_idx, orig_depth, stats, cfg,
+                                        extras_hwc=extras_hwc)
             manifest_rows.append([case, param_hwc.shape[0], cpath, ipath])
             n_ok += 1
             total_slices += param_hwc.shape[0]

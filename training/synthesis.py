@@ -67,6 +67,7 @@ from tqdm import tqdm
 
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask
 from training.metrics import compute_metrics
+from visualization.params import get_param_logs
 from training.losses import LOSS_REGISTRY, weighted_loss
 
 # For reducing LR on plateau
@@ -300,7 +301,8 @@ def train_synthesis(
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss,
                        "train/lr": opt.param_groups[0]["lr"], "train/epoch": epoch,
-                       **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
+                       **{f"train/{k}": v for k, v in train_metrics.items()},
+                       **get_param_logs(net)}, step=global_step)
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 

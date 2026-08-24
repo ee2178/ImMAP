@@ -31,7 +31,29 @@ mask_background: true       # cluster foreground only; background -> reserved la
 # --- preprocessing -----------------------------------------------------------
 clip_lo:       0.01
 clip_hi:       99.9
-normalize:     zscore      # 'zscore' (signed; spec endpoint) or 'minmax' ([0,1]; makes PSNR data_range=1 valid)
+normalize:     zscore      # centre/scale applied per channel within the brain mask:
+                           #   zscore      mean   / std     (signed; spec endpoint)
+                           #   median-std  median / std     robust CENTRE only
+                           #   median-mad  median / MAD     robust centre AND scale (MAD x1.4826,
+                           #                                 so it matches std on Gaussian data)
+                           #   minmax      min    / range    ([0,1]; makes PSNR data_range=1 valid)
+                           # A bright tail (enhancing tumor in T1ce) skews the mean AND inflates
+                           # the std; median-std fixes only the first, median-mad both. Measure
+                           # which you need with notebooks/inspect_percentile_norm.ipynb.
+normalize_extra: [median-mad]
+                           # extra normalizations of the SAME clipped volume, written beside 'img'
+                           # as 'img_<mode>' ('median-mad' -> 'img_median_mad'). Pick one at train
+                           # time with the data block's image_key -- no regeneration needed. 'img'
+                           # always holds `normalize` above, so existing configs are unaffected.
+                           # Each extra costs one more full copy of the image data on disk, and
+                           # clustering always uses `normalize`, so this cannot move constraint maps.
+                           # [] = off.
+normalize_per_slice: false # false = one (centre, scale) per channel per VOLUME (the original
+                           # behaviour). true = per channel per SLICE, which removes through-plane
+                           # drift but leaves the volume inconsistently scaled along z -- the same
+                           # tissue can take different values on adjacent slices. Changing either
+                           # of these knobs changes the absolute intensity scale, so re-derive any
+                           # absolute downstream quantity (i2sb tau / beta_max, loss thresholds).
 crop_size:     null         # e.g. 160 -> center-crop to 160x160; null = keep native (240)
 
 # --- output options ----------------------------------------------------------
