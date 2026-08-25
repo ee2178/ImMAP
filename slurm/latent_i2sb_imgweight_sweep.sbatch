@@ -61,6 +61,7 @@ mkdir -p "${RUN_DIR}" logs
 # Write this task's config: force loss_mode="mixed", override image_weight + savenames, fresh wandb run.
 python - "${BASE_CONFIG}" "${GEN_CONFIG}" "${IW}" "${RUN_DIR}" "${SWEEP_NAME}_${TAG}" "${SWEEP_EPOCHS}" <<'PY'
 import json, sys
+from training.common import write_config      # yaml-safe writer; see note below
 args = sys.argv[1:]
 base, out, iw, save_dir, name = args[:5]
 epochs = args[5] if len(args) > 5 else ""      # optional; robust if the empty arg is dropped
@@ -76,8 +77,11 @@ cfg.setdefault("experiment", {})["name"] = name
 cfg.setdefault("wandb", {})["id"] = None       # new run id per weight
 if epochs:
     tr["num_epochs"] = int(epochs)
-with open(out, "w") as f:
-    json.dump(cfg, f, indent=4)
+# write_config, NOT json.dump: train.py reads configs with yaml.safe_load, where json's
+# `1e-06` for eta_min comes back as the STRING '1e-06' and CosineAnnealingLR then dies on
+# it. write_config writes plain decimal instead and verifies the result with the same
+# loader train.py uses, so a bad config fails here rather than mid-training.
+write_config(cfg, out)
 print(f"[sweep] image_weight={iw}  (latent_weight={tr.get('latent_weight')}, loss_mode={tr['loss_mode']}, "
       f"latent_loss={tr.get('latent_loss')}) -> {out}  (save_dir={save_dir}, num_epochs={tr.get('num_epochs')})")
 PY

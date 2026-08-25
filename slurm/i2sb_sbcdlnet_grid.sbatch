@@ -85,6 +85,7 @@ echo "       et_weight=${ETW} (col ${EI})  ->  ${RUN_DIR}"
 python - "${BASE_CONFIG}" "${GEN_CONFIG}" "${BETA}" "${ETW}" "${RUN_DIR}" \
          "${SWEEP_NAME}_${TAG}" "${SWEEP_EPOCHS}" <<'PY'
 import json, sys
+from training.common import write_config      # yaml-safe writer; see note below
 
 args = sys.argv[1:]
 base, out, beta_max, et_weight, save_dir, name = args[:6]
@@ -148,8 +149,11 @@ cfg.setdefault("wandb", {})["id"] = None        # a new wandb run per cell
 if epochs:
     cfg["training"]["num_epochs"] = int(epochs)
 
-with open(out, "w") as f:
-    json.dump(cfg, f, indent=4)
+# write_config, NOT json.dump: train.py reads configs with yaml.safe_load, where json's
+# `1e-06` for eta_min comes back as the STRING '1e-06' and CosineAnnealingLR then dies on
+# it. write_config writes plain decimal instead and verifies the result with the same
+# loader train.py uses, so a bad config fails here rather than mid-training.
+write_config(cfg, out)
 
 print(f"[grid] beta_max={beta_max} et_weight={et_weight} -> {out}\n"
       f"       model={cfg['model']['type']} C={mparams.get('C')} "

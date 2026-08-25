@@ -54,6 +54,7 @@ mkdir -p "${RUN_DIR}" logs
 # Write this task's config: override beta_max + savenames, fresh wandb run, optional epoch cap.
 python - "${BASE_CONFIG}" "${GEN_CONFIG}" "${BETA_MAX}" "${RUN_DIR}" "${SWEEP_NAME}_${TAG}" "${SWEEP_EPOCHS}" <<'PY'
 import json, sys
+from training.common import write_config      # yaml-safe writer; see note below
 args = sys.argv[1:]
 base, out, beta_max, save_dir, name = args[:5]
 epochs = args[5] if len(args) > 5 else ""     # optional; robust if the empty arg is dropped
@@ -71,8 +72,11 @@ cfg.setdefault("experiment", {})["name"] = name
 cfg.setdefault("wandb", {})["id"] = None          # new run id per beta_max
 if epochs:
     cfg.setdefault("training", {})["num_epochs"] = int(epochs)
-with open(out, "w") as f:
-    json.dump(cfg, f, indent=4)
+# write_config, NOT json.dump: train.py reads configs with yaml.safe_load, where json's
+# `1e-06` for eta_min comes back as the STRING '1e-06' and CosineAnnealingLR then dies on
+# it. write_config writes plain decimal instead and verifies the result with the same
+# loader train.py uses, so a bad config fails here rather than mid-training.
+write_config(cfg, out)
 print(f"[sweep] beta_max={beta_max} -> {out}  (save_dir={save_dir}, "
       f"num_epochs={cfg.get('training', {}).get('num_epochs')})")
 PY
