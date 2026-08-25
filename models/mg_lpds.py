@@ -58,7 +58,8 @@ from models.multigrid import (_ChannelScale, identity_widen_weight,
 from models.prox import PixelConv
 from operators.identity import Identity
 from operators.projections import uball_project
-from operators.resample import galerkin, prolong, restrict, restrict_noise
+from operators.resample import (GridTransfer, _check_filter, galerkin,
+                                prolong, restrict, restrict_noise)
 from preprocessing.image import post_process, pre_process
 from preprocessing.kspace import kspace_post_process, kspace_pre_process
 
@@ -121,10 +122,16 @@ class PDObjectiveDownsample(nn.Module):
     specialise.
     """
 
-    def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False):
+    def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False,
+                 transfer_filter=None, transfer=None):
         super().__init__()
         self.widen = int(widen)
         self.julia_compat = bool(julia_compat)
+        self.transfer_filter = _check_filter(transfer_filter)
+        # LATENT-grid transfer, shared with the enclosing V-cycle. Only the
+        # DUAL variable z lives there; the primal x is on the image grid and
+        # keeps the fixed filter, alongside y / E / sigma.
+        self.transfer = transfer
 
         self.analysis_fine = copy.deepcopy(fine_layer.analysis)
         self.synthesis_fine = copy.deepcopy(fine_layer.synthesis)
@@ -143,7 +150,7 @@ class PDObjectiveDownsample(nn.Module):
                     identity_widen_weight(M_coarse, M_fine, self.widen))
 
     def forward(self, x, z, y, E, sigma, cache, static=None):
-        R = dict(julia_compat=self.julia_compat)
+        R = dict(julia_compat=self.julia_compat, filter=self.transfer_filter)
 
         # ---- fine-level primal-dual residual --------------------------------
         # primal:  grad f(x) + A^T z
@@ -154,10 +161,19 @@ class PDObjectiveDownsample(nn.Module):
         rz_fine = z - zhat
 
         # ---- restriction: x and y on the image grid, z on the latent grid ----
+        # IMAGE path -- the primal variable and its residual sit on the same
+        # grid as y and E, so they coarsen with the fixed filter. Learning here
+        # would be learning the coarse forward model.
         x_c = restrict(x, **R)
         Rrx = restrict(rx_fine, **R)
-        z_c = self.widen_z(restrict(z, **R))
-        Rrz = self.widen_z(restrict(rz_fine, **R))
+
+        # LATENT path -- the dual variable and its residual.
+        if self.transfer is not None:
+            z_c = self.widen_z(self.transfer.restrict(z))
+            Rrz = self.widen_z(self.transfer.restrict(rz_fine))
+        else:
+            z_c = self.widen_z(restrict(z, **R))
+            Rrz = self.widen_z(restrict(rz_fine, **R))
 
         y_c, E_c, sigma_c = _restrict_measurement(y, E, sigma, R, static)
 
@@ -199,7 +215,8 @@ def _restrict_measurement(y, E, sigma, R, static):
         if hit is not None and hit[0] == key:
             return hit[1]
 
-    val = (restrict(y, **R), galerkin(E), restrict_noise(sigma, **R))
+    val = (restrict(y, **R), galerkin(E, filter=R["filter"]),
+           restrict_noise(sigma, **R))
     if static is not None:
         # The memo holds `val` alive, which is what keeps the ids in the next
         # level's key valid for the rest of the pass.
@@ -219,7 +236,8 @@ class PDVCycle(nn.Module):
     """
 
     def __init__(self, iters, C, M, widen=1, alpha0=1e-1, julia_compat=False,
-                 spectral_init=True, **layer_kws):
+                 spectral_init=True, transfer_filter=None,
+                 learn_transfer=False, **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
         assert iters[0] % 2 == 0, \
@@ -227,6 +245,28 @@ class PDVCycle(nn.Module):
         self.widen = int(widen)
         self.C, self.M = int(C), int(M)
         self.julia_compat = bool(julia_compat)
+        # Resolved once, at construction: a V-cycle built inside a
+        # `use_filter` block keeps that filter for the rest of its life, so a
+        # checkpoint records which ablation arm produced it.
+        self.transfer_filter = _check_filter(transfer_filter)
+        self.learn_transfer = bool(learn_transfer)
+
+        # One latent-grid kernel per level, shared between this level's dual
+        # restriction (inside dF) and its dual prolongation (in forward), so
+        # the two stay exact transposes while training moves them. channels=1
+        # because `widen_z` / `alpha_z` change the channel count in between --
+        # see the note in models/multigrid.py::VCycle.
+        self.transfer = None
+        if learn_transfer:
+            if not torch.is_tensor(self.transfer_filter) and \
+                    self.transfer_filter == "legacy":
+                raise ValueError(
+                    "learn_transfer=True is incompatible with "
+                    "transfer_filter='legacy': its restriction and "
+                    "prolongation are not transposes, so there is no single "
+                    "kernel to learn. Pick any other filter to start from.")
+            self.transfer = GridTransfer(channels=1, filter=self.transfer_filter,
+                                         learn=True)
 
         half = iters[0] // 2
         self.lpdsA = LPDSStack(half, lambda: make_lpds_layer(
@@ -238,7 +278,10 @@ class PDVCycle(nn.Module):
         if len(iters) > 2:
             self.mglayer = PDVCycle(iters[1:], C, M_c, widen=self.widen,
                                     alpha0=alpha0, julia_compat=julia_compat,
-                                    spectral_init=False, **layer_kws)
+                                    spectral_init=False,
+                                    transfer_filter=self.transfer_filter,
+                                    learn_transfer=learn_transfer,
+                                    **layer_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
                 C, M_c, spectral_init=False, **layer_kws))
@@ -248,7 +291,9 @@ class PDVCycle(nn.Module):
         self.dF = PDObjectiveDownsample(self.lpdsA.first,
                                         first_pd_layer(self.mglayer),
                                         widen=self.widen,
-                                        julia_compat=julia_compat)
+                                        julia_compat=julia_compat,
+                                        transfer_filter=self.transfer_filter,
+                                        transfer=self.transfer)
 
         # Two coarse-correction steps. Left unclamped by `project_`: they are
         # signed step sizes, unlike tau / theta.
@@ -298,8 +343,14 @@ class PDVCycle(nn.Module):
             cache=coarse)
 
         # prolongate and apply the two coarse-correction steps separately
-        x = x + self.alpha_x(prolong(wx_c - x_c))
-        z = z + self.alpha_z(prolong(wz_c - z_c))
+        # image path stays fixed; latent path follows dF's restriction
+        x = x + self.alpha_x(prolong(wx_c - x_c, filter=self.transfer_filter))
+        corr_z = wz_c - z_c
+        if self.transfer is not None:
+            corr_z = self.transfer.prolong(corr_z)
+        else:
+            corr_z = prolong(corr_z, filter=self.transfer_filter)
+        z = z + self.alpha_z(corr_z)
 
         # post-smooth, inheriting the pre-smoother's cache
         state, cache = self.lpdsB((x, z), y_tilde, E=E, sigma=sigma, pi=pi,
@@ -348,12 +399,15 @@ class MGLPDSNet(nn.Module):
                  nheads=1, rho0=1.0, gamma0=0.8,
                  init_strategy="spectral_norm", subgrad_mode="rigorous",
                  attn_backend="gather", flex_block_size=128,
-                 preproc="kspace", resize_noise=False, julia_compat=False):
+                 preproc="kspace", resize_noise=False, julia_compat=False,
+                 transfer_filter=None, learn_transfer=False):
         super().__init__()
         K_outer, iters = _parse_K(K)
         self.K, self.iters = K_outer, iters
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)
         self.preproc, self.resize_noise = preproc, bool(resize_noise)
+        self.transfer_filter = _check_filter(transfer_filter)
+        self.learn_transfer = bool(learn_transfer)
         self.levels = 1 if iters is None else len(iters)
         self.attn_backend = attn_backend
         if preproc not in ("image", "kspace", "identity"):
@@ -378,7 +432,9 @@ class MGLPDSNet(nn.Module):
         else:
             self.net = _OuterStack(K_outer, lambda: PDVCycle(
                 iters, C, M, widen=widen, alpha0=alpha0,
-                julia_compat=julia_compat, **layer_kws))
+                julia_compat=julia_compat,
+                transfer_filter=self.transfer_filter,
+                learn_transfer=self.learn_transfer, **layer_kws))
 
     # ----------------------------------------------------------------------
     def forward(self, y, E=None, sigma=None, state=None):

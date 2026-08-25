@@ -54,25 +54,84 @@ needs its own slot.
    The same function also uses `c = W_beta^T tau` rather than `W_beta^T 1` with
    `tau` applied afterwards -- identical for a channel-uniform `tau`, correct
    when it varies per subband.
-2. **Restriction padding.** Julia always pads `(1,0,1,0)` before mean-pooling,
-   which shifts an even-sized grid by half a cell and attenuates its first
-   row/column. Since inputs are padded up to a multiple of `s * 2^(L-1)`, every
-   level is even and the padding is only needed for odd sizes. `restrict` pads
-   only when a dimension is odd; `julia_compat=True` restores the old behaviour.
-3. **`align_corners`.** NNlib defaults to vertex-centred (`True`); the 2x2 mean
-   restriction is cell-centred, so `False` is the variationally consistent
-   partner. Exposed on `Resample` / `prolong`.
-4. **Padding stride.** Julia pads to `s * 2^L` for `L` levels; only `L - 1`
+2. **Grid transfer.** Julia mean-pools 2x2 to restrict and bilinearly
+   interpolates to prolong. Those are not a transpose pair: bilinear
+   upsampling by 2 (`align_corners=False`) is *exactly* zero-insertion
+   followed by the separable `[1,3,3,1]/8` filter, so its transpose is that
+   filter and not the 2x2 mean -- they differ by 22%, and the resulting coarse
+   Gram `R E^H E P` came out 14.5% non-Hermitian. `dF_coarse` was then the
+   subgradient of no objective at all, which is precisely what the FAS
+   correction assumes it is.
+
+   Both directions are now built from one Kaiser-windowed sinc kernel `h`
+   (`deepinv`'s `sinc_filter`, the same anti-aliasing filter the Reconstruct
+   Anything Model composes with its forward operator): `R` filters then
+   decimates, `P` zero-inserts then filters. `F.conv_transpose2d` is defined
+   as the transpose of `F.conv2d` and, at `groups=C`, both read the same
+   `(C, 1, L, L)` weight -- so `P == 4 R^T` holds exactly, by layout. Padding
+   is circular with the matching fold on the transpose, so constants survive
+   at the border and the pair stays exactly adjoint.
+
+   A 2x2 mean could not have been fixed by reweighting: minimising
+   `|H(pi/2)| / |H(0)|` over all `[a, b]` gives `1/sqrt(2)`, attained at
+   `a = b = 1/2`. The box is the *optimal* 2-tap anti-aliasing filter and is
+   still only -3 dB at the coarse Nyquist. Overlapping taps are the only way
+   to buy anything.
+
+   `julia_compat` (the old `(1,0,1,0)` pre-pad, which only ever fired on odd
+   inputs -- and every level is even by construction) is accepted and ignored,
+   so existing configs keep loading.
+3. **Selecting a filter (ablation).** The kernel is a knob, at three scopes:
+
+   ```python
+   restrict(x, filter="box")               # one call
+   with use_filter("box"): ...             # a block, construction included
+   MGCDLNet(..., transfer_filter="box")    # a model, and its config JSON
+   ```
+
+   `transfer_filter` is resolved once at construction and stored on every
+   `VCycle` / `ObjectiveDownsample`, so a checkpoint records which arm produced
+   it. An explicit kwarg beats an enclosing `use_filter`. A raw
+   `torch.Tensor` works anywhere a name does.
+
+   `|H(w)|` for the 1-D kernel of each option at factor 2 -- middle columns are
+   passband (want ~1), right columns stopband (want ~0):
+
+   | filter | L | 0.25pi | 0.40pi | 0.50pi | 0.60pi | 0.75pi | `sigma_c/sigma` |
+   |---|---|---|---|---|---|---|---|
+   | `none` | 2 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.0000 |
+   | `box` | 2 | 0.924 | 0.809 | 0.707 | 0.588 | 0.383 | 0.5000 |
+   | `bilinear` | 4 | 0.789 | 0.530 | 0.354 | 0.203 | 0.056 | 0.3125 |
+   | `bicubic` | 8 | 0.936 | 0.709 | 0.486 | 0.272 | 0.067 | 0.4044 |
+   | `gaussian` | 8 | 0.735 | 0.454 | 0.291 | 0.169 | 0.062 | 0.2821 |
+   | `sinc` (default) | 8 | 0.957 | 0.732 | 0.498 | 0.267 | 0.046 | 0.4162 |
+
+   Every one of these is an exact adjoint pair with a Hermitian PSD coarse
+   Gram, so the sweep varies anti-aliasing and nothing else. `legacy` is the
+   exception and is not a kernel: it restores the old mean-pool / bilinear
+   pairing (47% adjointness error, 14.5% non-Hermitian Gram) so an ablation
+   table has a "what we had before" row. `is_adjoint_pair(filter)` reports
+   which case you are in; `noise_scale(filter=...)` gives the matching
+   `sigma_c / sigma`, which must move with the kernel or the coarse prox
+   thresholds are mis-scaled and the ablation blames the filter for it.
+4. **Learned transfers.** `GridTransfer(learn=True)` makes the kernel a
+   parameter while keeping `P == 4 R^T` at every step, since both directions
+   read the same weight. Use it only on the *latent* grid: the image-grid
+   transfers define `E_c` and `y_c = E_c^H y`, so learning those means
+   learning the coarse forward model. RAM draws the same line -- learned
+   strided convs between feature stages, fixed windowed sinc inside the
+   physics.
+5. **Padding stride.** Julia pads to `s * 2^L` for `L` levels; only `L - 1`
    coarsenings actually happen, so `MGCDLNet` pads to `s * 2^(L-1)`.
-5. **Dead parameters.** The outermost V-cycle never receives a `pi` (the outer
+6. **Dead parameters.** The outermost V-cycle never receives a `pi` (the outer
    LISTA calls it with `pi=None`), so its smoothers no longer allocate the
    `eta` polynomial at all. In Julia those weights exist and never get a
    gradient.
-6. **Batched CG.** Julia reduces CG inner products per batch element
+7. **Batched CG.** Julia reduces CG inner products per batch element
    (`dims=1:N-1`); this repo's existing `cg` uses one global scalar. `tcg` uses
    the batched form, so a well-conditioned slice is not throttled by the worst
    one in its batch.
-7. **`project!` recursion.** Replaced by a `project_()` hook discovered via
+8. **`project!` recursion.** Replaced by a `project_()` hook discovered via
    `nn.Module.modules()`, so a new constrained submodule cannot be forgotten.
 
 ## The four multigrid model types

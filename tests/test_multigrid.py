@@ -16,7 +16,10 @@ from models.multigrid import (MGCDLNet, VCycle, identity_widen_weight,
                               widen_filter, widen_pixel)
 from models.prox import GroupThreshold, SoftThreshold, Polynomial
 from operators import FFT2D, Identity, Mask, Sense
-from operators.resample import galerkin, prolong, restrict, restrict_noise
+from operators.resample import (TRANSFER_FILTERS, GridTransfer, default_filter,
+                                filter_length, galerkin, is_adjoint_pair,
+                                noise_scale, prolong, restrict, restrict_noise,
+                                use_filter)
 
 torch.manual_seed(0)
 
@@ -44,17 +47,162 @@ def test_grid_transfer():
     check("restrict is complex-safe",
           rc.is_complex() and rel(rc.real, restrict(xc.real)) < 1e-6)
 
+    # circular padding, so constants survive at the border too -- not just in
+    # the interior the way a zero-padded long kernel would leave them
     const = torch.full((1, 1, 8, 8), 3.0)
     check("restriction of a constant is exact", rel(restrict(const), const[..., :4, :4]) < 1e-6)
+    check("prolongation of a constant is exact",
+          rel(prolong(const), torch.full((1, 1, 16, 16), 3.0)) < 1e-6)
 
-    # noise level: an averaged 2x2 block of iid noise has half the std
+    # THE invariant: P == 4 R^T exactly, not approximately.  This is what makes
+    # the coarse Gram Hermitian, and hence what makes the coarse level a real
+    # optimisation problem for the FAS correction to correct.
+    z = torch.randn(2, 3, 8, 8)
+    lhs = (restrict(x) * z).sum()
+    rhs = (x * prolong(z)).sum() / 4
+    check("prolong is exactly 4 . restrict^T",
+          abs(lhs - rhs).item() / abs(lhs).item() < 1e-5,
+          f"rel={abs(lhs - rhs).item() / abs(lhs).item():.2e}")
+
+    # noise level: filtering by h scales the std by ||h||_2 (decimation does
+    # not), so this tracks the kernel rather than a hardcoded 1/2
     n = torch.randn(1, 1, 256, 256)
-    check("sigma_c = sigma / 2 matches the empirical std",
-          abs(restrict(n).std().item() - 0.5) < 0.02,
-          f"std={restrict(n).std().item():.3f}")
-    check("restrict_noise passes scalars", abs(restrict_noise(0.1) - 0.05) < 1e-9)
+    check("sigma_c / sigma == ||h||_2, matching the empirical std",
+          abs(restrict(n).std().item() - noise_scale()) < 0.02,
+          f"std={restrict(n).std().item():.4f} vs ||h||_2={noise_scale():.4f}")
+    check("restrict_noise passes scalars",
+          abs(restrict_noise(0.1) - 0.1 * noise_scale()) < 1e-9)
     check("restrict_noise passes (B,1,1,1)",
           restrict_noise(torch.full((4, 1, 1, 1), 0.2)).shape == (4, 1, 1, 1))
+    check("restrict passes singleton spatial dims",
+          restrict(torch.randn(2, 3, 1, 1)).shape == (2, 3, 1, 1))
+
+
+def test_grid_transfer_module():
+    """`GridTransfer` must stay a tied pair whether or not it is learned."""
+    x = torch.randn(2, 6, 16, 16)
+    z = torch.randn(2, 6, 8, 8)
+
+    fixed = GridTransfer(channels=6, learn=False)
+    check("GridTransfer(learn=False) == the module-level functions",
+          rel(fixed.restrict(x), restrict(x)) < 1e-6
+          and rel(fixed.prolong(z), prolong(z)) < 1e-6)
+    check("a fixed GridTransfer exposes no parameters",
+          len(list(fixed.parameters())) == 0)
+
+    learned = GridTransfer(channels=6, learn=True)
+    with torch.no_grad():                       # stand in for a few SGD steps
+        learned.weight.add_(0.05 * torch.randn_like(learned.weight))
+    lhs = (learned.restrict(x) * z).sum()
+    rhs = (x * learned.prolong(z)).sum() / 4
+    check("a MOVED learned kernel still satisfies P == 4 R^T",
+          abs(lhs - rhs).item() / abs(lhs).item() < 1e-5,
+          f"rel={abs(lhs - rhs).item() / abs(lhs).item():.2e}")
+    check("sum-normalisation keeps restrict(const) == const after learning",
+          rel(learned.restrict(torch.full((1, 6, 16, 16), 3.0)),
+              torch.full((1, 6, 8, 8), 3.0)) < 1e-4)
+
+    n = torch.randn(1, 6, 256, 256)
+    check("learned noise_scale tracks the moved kernel",
+          abs(learned.restrict(n).std().item() - learned.noise_scale.item()) < 0.02,
+          f"empirical={learned.restrict(n).std():.4f} vs "
+          f"noise_scale={learned.noise_scale:.4f}")
+
+    learned.zero_grad()
+    learned.prolong(learned.restrict(
+        torch.randn(1, 6, 16, 16, dtype=torch.complex64))).abs().sum().backward()
+    check("gradient reaches the learned kernel through a complex round-trip",
+          learned.weight.grad is not None
+          and learned.weight.grad.abs().sum().item() > 0)
+
+
+def test_transfer_filters():
+    """Every selectable filter, swept the way an ablation would sweep them.
+
+    The point of the sweep is that switching filters changes the anti-aliasing
+    and NOTHING else: each one is still an exact adjoint pair, still preserves
+    constants, and still yields a Hermitian PSD coarse Gram. `legacy` is the
+    deliberate exception -- it is the pre-existing mean-pool / bilinear pairing,
+    kept so an ablation table has a "what we had before" row.
+    """
+    x = torch.randn(2, 3, 16, 16)
+    zc = torch.randn(2, 3, 8, 8)
+    n = torch.randn(1, 1, 256, 256)
+
+    smaps = torch.randn(1, 4, 16, 16, dtype=torch.complex64)
+    mask = (torch.rand(1, 1, 16, 16) > 0.5).to(torch.complex64)
+    E = Mask(mask) @ FFT2D() @ Sense(smaps)
+
+    for f in TRANSFER_FILTERS:
+        check(f"[{f}] restrict / prolong round-trip the grid",
+              restrict(x, filter=f).shape == (2, 3, 8, 8)
+              and prolong(zc, filter=f).shape == (2, 3, 16, 16),
+              f"L={filter_length(f)}")
+
+        lhs = (restrict(x, filter=f) * zc).sum()
+        rhs = (x * prolong(zc, filter=f)).sum() / 4
+        adj = abs(lhs - rhs).item() / abs(lhs).item()
+        if is_adjoint_pair(f):
+            check(f"[{f}] prolong == 4 . restrict^T", adj < 1e-5, f"rel={adj:.2e}")
+        else:
+            check(f"[{f}] is NOT an adjoint pair, as documented", adj > 1e-2,
+                  f"rel={adj:.2e}")
+
+        check(f"[{f}] restrict preserves constants",
+              rel(restrict(torch.full((1, 1, 16, 16), 3.0), filter=f),
+                  torch.full((1, 1, 8, 8), 3.0)) < 1e-5)
+
+        emp = restrict(n, filter=f).std().item()
+        check(f"[{f}] noise_scale matches the empirical std",
+              abs(emp - noise_scale(filter=f)) < 0.02,
+              f"{emp:.4f} vs {noise_scale(filter=f):.4f}")
+
+        # the coarse Gram this filter induces
+        Ec = galerkin(E, filter=f)
+        G = torch.zeros(64, 64, dtype=torch.complex64)
+        for i in range(64):
+            e = torch.zeros(1, 1, 8, 8, dtype=torch.complex64)
+            e.view(-1)[i] = 1
+            G[:, i] = Ec.gram(e).reshape(-1)
+        herm = ((G - G.conj().T).norm() / G.norm()).item()
+        if is_adjoint_pair(f):
+            lo = torch.linalg.eigvalsh(
+                ((G + G.conj().T) / 2).to(torch.complex128)).real.min().item()
+            check(f"[{f}] coarse Gram Hermitian PSD",
+                  herm < 1e-5 and lo > -1e-6, f"herm={herm:.2e} lo={lo:.3f}")
+        else:
+            check(f"[{f}] coarse Gram is non-Hermitian, as documented",
+                  herm > 1e-2, f"herm={herm:.2e}")
+
+    # legacy must be BIT-identical to what the module used to do
+    check("legacy restrict == the old avg_pool2d",
+          rel(restrict(x, filter="legacy"), F.avg_pool2d(x, 2)) < 1e-12)
+    check("legacy prolong == the old bilinear interpolate",
+          rel(prolong(zc, filter="legacy"),
+              F.interpolate(zc, scale_factor=2.0, mode="bilinear",
+                            align_corners=False)) < 1e-12)
+    check("legacy noise scale is the old hardcoded 1/2",
+          abs(restrict_noise(0.1, filter="legacy") - 0.05) < 1e-9)
+
+    # a raw kernel works anywhere a name does
+    check("a custom tensor kernel == the equivalent name",
+          rel(restrict(x, filter=torch.tensor([1., 3, 3, 1]) / 8),
+              restrict(x, filter="bilinear")) < 1e-6)
+
+    # scoping
+    check("default filter is sinc", default_filter() == "sinc")
+    with use_filter("box"):
+        check("use_filter redirects an unqualified call",
+              default_filter() == "box"
+              and rel(restrict(x), restrict(x, filter="box")) < 1e-6)
+    check("use_filter restores on exit", default_filter() == "sinc")
+
+    for bad in ("nope", "legacy"):
+        try:
+            GridTransfer(filter=bad)
+            check(f"GridTransfer rejects filter={bad!r}", False)
+        except ValueError:
+            check(f"GridTransfer rejects filter={bad!r}", True)
 
 
 def test_galerkin():
@@ -65,6 +213,23 @@ def test_galerkin():
     Ec = galerkin(E)
     zc = torch.randn(1, 1, 8, 8, dtype=torch.complex64)
     check("coarse Gram maps coarse -> coarse", Ec.gram(zc).shape == zc.shape)
+
+    # E_c = E . P with restrict == P^T / 4, so the coarse Gram is
+    # (1/4) P^H E^H E P -- Hermitian PSD, i.e. the gradient of an actual coarse
+    # least-squares objective.  The bilinear-up / bilinear-down pair this
+    # replaced was 14.5% non-Hermitian, so `dF_coarse` was the subgradient of
+    # no objective at all and the FAS correction had nothing well-posed to
+    # correct.  Built densely: 8x8 coarse grid, 64 columns.
+    n = 8 * 8
+    G = torch.zeros(n, n, dtype=torch.complex64)
+    for i in range(n):
+        e = torch.zeros(1, 1, 8, 8, dtype=torch.complex64)
+        e.view(-1)[i] = 1
+        G[:, i] = Ec.gram(e).reshape(-1)
+    herm = ((G - G.conj().T).norm() / G.norm()).item()
+    check("coarse Gram is Hermitian", herm < 1e-5, f"rel={herm:.2e}")
+    lo = torch.linalg.eigvalsh(((G + G.conj().T) / 2).to(torch.complex128)).real.min()
+    check("coarse Gram is PSD", lo.item() > -1e-6, f"lambda_min={lo:.2e}")
 
 
 def test_widening():
@@ -229,7 +394,8 @@ def test_fixed_point_consistency():
 
 
 if __name__ == "__main__":
-    for fn in (test_grid_transfer, test_galerkin, test_widening,
+    for fn in (test_grid_transfer, test_grid_transfer_module,
+               test_transfer_filters, test_galerkin, test_widening,
                test_prox_subgradients, test_vcycle_shapes_and_grads,
                test_vcycle_mri_and_group, test_plain_lista,
                test_fixed_point_consistency):

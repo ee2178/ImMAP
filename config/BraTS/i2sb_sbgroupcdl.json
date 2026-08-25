@@ -1,0 +1,129 @@
+{
+    "task": "i2sb",
+    "experiment": {
+        "name": "I2SB_SBGroupCDL_T1ce_from_T1_medmad"
+    },
+    "model": {
+        "type": "SBGroupCDL",
+        "params": {
+            "K": 30,
+            "M": 169,
+            "Mh": 32,
+            "C": 4,
+            "P": 7,
+            "sc": 2,
+            "W": 35,
+            "dK": 5,
+            "prior_idx": 1,
+            "t0": 0.001,
+            "deg_eta": 2,
+            "deg_tau": 2,
+            "kind": "i2sb",
+            "tau": 0.19,
+            "n_points": 1000,
+            "beta_max": 0.3,
+            "sim_fun": "distance",
+            "attn_backend": "flex",
+            "flex_block_size": 128,
+            "blend": true,
+            "fenchel": false,
+            "is_complex": false,
+            "init": true
+        }
+    },
+    "i2sb": {
+        "kind": "i2sb",
+        "tau": 0.19,
+        "n_points": 1000,
+        "beta_max": 0.3,
+        "deterministic": false,
+        "posterior": "ddpm",
+        "clip_denoise": false,
+        "val_mode": "single_pass",
+        "val_seed": 0,
+        "val_nfe": 20,
+        "target_channels": 1
+    },
+    "paths": {
+        "save_dir": "trained_nets/brats/I2SB_SBGroupCDL_T1ce_from_T1_medmad",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "i2sb",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                0,
+                1,
+                3
+            ],
+            "image_key": "img_median_mad",
+            "et_mask": false,
+            "scales": [
+                3.0,
+                3.0,
+                3.0,
+                3.0
+            ],
+            "crop_size": 128,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "i2sb",
+            "root": "/home/ee2178/scratch/ee2178/datasets/BraTS/BraTS2021_DataSet_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                0,
+                1,
+                3
+            ],
+            "image_key": "img_median_mad",
+            "et_mask": false,
+            "scales": [
+                3.0,
+                3.0,
+                3.0,
+                3.0
+            ],
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 3000,
+        "steps_per_epoch": 100,
+        "val_every_epochs": 50,
+        "clip_grad": 0.05,
+        "backtrack_thresh": 1000,
+        "backtrack_factor": 0.9,
+        "use_mask": true,
+        "loss_type": "complex-mse",
+        "loss_weight": "uniform",
+        "et_weight": 1.0,
+        "psnr_only": false,
+        "data_range": 2.0
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0001
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1e-06,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "schrodinger-bridge",
+        "id": null
+    }
+}

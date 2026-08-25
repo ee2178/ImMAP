@@ -74,25 +74,13 @@ import torch.nn.functional as F
 
 from models.base import BaseUnrolledModel, set_weight
 from models.components import ST, Conv2d, ConvTranspose2d
-from operators.padding import calc_pad_2d, unpad
+from models.sb_schedule import BridgeScheduleMixin, horner as _horner
+from operators.padding import unpad
 from operators.projections import uball_project
-from sb.base import build_schedule, bridge_coeffs
 from solvers.eigen import power_method
 
 
-def _horner(coef, x):
-    """Evaluate sum_d coef[d] * x**d by Horner's rule.
-
-    `coef` is indexed on its FIRST axis by degree; any trailing axes broadcast against `x`. This
-    serves both the scalar per-layer steps (coef (D+1,) -> scalar) and the per-channel thresholds
-    (coef (D+1, M, 1, 1) -> (B, M, 1, 1))."""
-    y = coef[-1]
-    for d in range(coef.shape[0] - 2, -1, -1):
-        y = y * x + coef[d]
-    return y
-
-
-class SBCDLNet(BaseUnrolledModel):
+class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
     """Unrolled two-fidelity sparse coding for the Schrodinger bridge.
 
     Per layer k, with r the debiased bridge residual and c the (DC-removed) conditioning stack:
@@ -162,24 +150,7 @@ class SBCDLNet(BaseUnrolledModel):
         self.t = nn.Parameter(t)
 
         # ---- schedule tables (buffers: saved with the checkpoint, moved by .to()) ----
-        sched = build_schedule(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max)
-        mu0, mu1, std_sb = bridge_coeffs(sched)
-        self.register_buffer("std_fwd", sched.std_fwd.clone())
-        self.register_buffer("mu0_tab", mu0.clone())
-        self.register_buffer("mu1_tab", mu1.clone())
-        self.register_buffer("sigma_eff_tab", (std_sb / mu0).clone())
-        # sigma_eff spans ~3 decades (0.01 -> 14), so neither polynomial gets it raw:
-        #   steps     log(sigma_eff), then affinely mapped to [-1, 1] over the schedule's own
-        #             range. Without the remap log spans [-4.6, 2.65], so s^2 reaches ~21 and the
-        #             degree-2 coefficient sees a ~21x larger effective learning rate than the
-        #             constant -- harmless at degree <= 1, bad conditioning at the degree 2+ this
-        #             is meant to support. On [-1, 1] every monomial is bounded by 1.
-        #   threshold sigma_eff / max(sigma_eff) in [0, 1]; it carries noise UNITS, so it must
-        #             scale with sigma_eff rather than its log (see the module docstring).
-        self.register_buffer("sigma_ref", self.sigma_eff_tab.max().clone())
-        _s = torch.log(self.sigma_eff_tab.clamp_min(1e-12))
-        self.register_buffer("s_mid", 0.5 * (_s.max() + _s.min()))
-        self.register_buffer("s_half", (0.5 * (_s.max() - _s.min())).clamp_min(1e-12))
+        self._init_bridge_tables(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max)
 
         self.init_filters()
         if init:
@@ -245,93 +216,17 @@ class SBCDLNet(BaseUnrolledModel):
         self.project_filters()
 
     # -----------------------------------------------------------------
-    # bridge coefficient lookup
-    # -----------------------------------------------------------------
-    def _step_from_sigma(self, sigma):
-        """Invert std_fwd -> step index. std_fwd is strictly increasing, and predict_x0 passes
-        values taken FROM this table, so this is exact; the neighbour comparison only guards
-        against float round-trips."""
-        s = torch.as_tensor(sigma, device=self.std_fwd.device,
-                            dtype=self.std_fwd.dtype).reshape(-1).contiguous()
-        n = self.std_fwd.shape[0]
-        hi = torch.searchsorted(self.std_fwd, s).clamp(0, n - 1)
-        lo = (hi - 1).clamp(0, n - 1)
-        take_lo = (self.std_fwd[lo] - s).abs() < (self.std_fwd[hi] - s).abs()
-        return torch.where(take_lo, lo, hi)
-
-    def bridge_coefficients(self, sigma=None, step=None, batch=None):
-        """(mu_0, mu_1, sigma_eff) at this bridge position, each shaped (B, 1, 1, 1).
-
-        Give `step` directly, or `sigma` (the schedule's std_fwd, what predict_x0 passes) to
-        recover it by table lookup. A single value broadcasts over the batch."""
-        if step is None:
-            if sigma is None:
-                raise ValueError(
-                    "SBCDLNet needs the bridge position: pass `sigma` (= the schedule's std_fwd, "
-                    "as sb.base.predict_x0 does) or `step`.")
-            step = self._step_from_sigma(sigma)
-        step = torch.as_tensor(step, device=self.std_fwd.device).reshape(-1).long()
-        if batch is not None:
-            if step.numel() == 1:
-                step = step.expand(batch)
-            elif step.numel() != batch:
-                raise ValueError(f"got {step.numel()} bridge positions for a batch of {batch}")
-        v = lambda tab: tab[step].view(-1, 1, 1, 1)
-        return v(self.mu0_tab), v(self.mu1_tab), v(self.sigma_eff_tab)
-
-    def assert_schedule_matches(self, sched, atol=1e-6):
-        """Fail loudly if this net's schedule differs from the one training is using.
-
-        The bridge coefficients are recovered by inverting std_fwd, so a mismatch between
-        model.params (kind/tau/n_points/beta_max) and cfg["i2sb"] would silently look up the
-        WRONG mu_0/mu_1 at every step -- a bug that trains happily and produces nonsense. Call
-        this once at startup with the schedule the training loop built."""
-        ref = sched.std_fwd.to(self.std_fwd.device)
-        if ref.shape != self.std_fwd.shape:
-            raise ValueError(
-                f"schedule length mismatch: model was built with n_points={self.std_fwd.shape[0]}, "
-                f"training uses {ref.shape[0]}. Keep model.params and cfg['i2sb'] in sync.")
-        d = float((ref - self.std_fwd).abs().max())
-        if d > atol:
-            raise ValueError(
-                f"schedule mismatch: max |std_fwd difference| = {d:.3e} > {atol:g}. The model's "
-                f"kind/tau/beta_max must equal cfg['i2sb']'s, or the bridge coefficients "
-                f"recovered from sigma will be wrong.")
-
-    # -----------------------------------------------------------------
     # logging hook (visualization/params.py picks this up automatically)
     # -----------------------------------------------------------------
     @torch.no_grad()
     def param_logs(self, probes=(0.0, 0.5, 1.0)):
         """The step sizes and threshold this net will ACTUALLY use, at a few bridge positions.
-
-        A generic parameter walker can only see the raw polynomial coefficients, which say
-        nothing on their own -- eta is sigmoid(poly(log sigma_eff)), so the coefficient values
-        are not interpretable and the same eta can come from many of them. What you want to watch
-        is the derived curve: is the step pinned at 0 or 1, is the threshold collapsing, do later
-        unrolled layers behave differently from earlier ones. `probes` are positions along the
-        bridge (0 = target end, 1 = prior end)."""
-        out = {}
-        n = self.std_fwd.shape[0]
-        for t in probes:
-            k = min(max(int(round(t * (n - 1))), 0), n - 1)
-            sig = self.sigma_eff_tab[k]
-            s_log = ((sig.clamp_min(1e-12).log() - self.s_mid) / self.s_half).view(1, 1, 1, 1)
-            s_hat = (sig / self.sigma_ref.clamp_min(1e-12)).view(1, 1, 1, 1)
-            tag = f"t{t:.2f}"
-            per_layer = {
-                "eta": [torch.sigmoid(_horner(self.a_eta[j], s_log)).mean() for j in range(self.K)],
-                "nu": [torch.sigmoid(_horner(self.a_nu[j], s_log)).mean() for j in range(self.K)],
-                "tau": [_horner(self.t[j], s_hat).mean() for j in range(self.K)],
-            }
-            for name, vals in per_layer.items():
-                v = torch.stack(vals)
-                out[f"{name}.{tag}.mean"] = float(v.mean())
-                out[f"{name}.{tag}.first"] = float(v[0])       # depth dependence, cheaply
-                out[f"{name}.{tag}.last"] = float(v[-1])
-        out["sigma_eff.min"] = float(self.sigma_eff_tab.min())
-        out["sigma_eff.max"] = float(self.sigma_eff_tab.max())
-        return out
+        See BridgeScheduleMixin._sb_param_logs for why the raw coefficients are not enough."""
+        return self._sb_param_logs({
+            "eta": lambda sl, sh: [torch.sigmoid(_horner(self.a_eta[j], sl)) for j in range(self.K)],
+            "nu": lambda sl, sh: [torch.sigmoid(_horner(self.a_nu[j], sl)) for j in range(self.K)],
+            "tau": lambda sl, sh: [_horner(self.t[j], sh) for j in range(self.K)],
+        }, probes=probes)
 
     # -----------------------------------------------------------------
     # forward
@@ -339,31 +234,8 @@ class SBCDLNet(BaseUnrolledModel):
     def forward(self, y, E=None, sigma=None, step=None):
         """`y = cat([x_t, cond], dim=1)`, the tensor sb.base.predict_x0 builds. `E` is accepted
         for signature parity with the repo's denoisers and ignored. Returns (x0_hat, z)."""
-        x_t, cond = y[:, :1], y[:, 1:]
-        if cond.shape[1] != self.n_cond:
-            raise ValueError(
-                f"expected {self.n_cond} conditioning channel(s) (C={self.C}), got {cond.shape[1]}")
-        x1 = cond[:, self.prior_idx:self.prior_idx + 1]
-
-        mu0, mu1, sig_eff = self.bridge_coefficients(sigma=sigma, step=step, batch=y.shape[0])
-
-        # ---- DC: one term for both inputs, carried analytically ----
-        # The dictionaries are (near) zero-mean, so the DC has to be handled outside them. Using
-        # mean(x_1) -- available at train AND inference -- keeps the two fidelities consistent:
-        # r - mu_0*dc ~ mu_0 * B_D z  and  x_1 - dc ~ B_P z  are then solved by the SAME code.
-        # (Same trick as decode_dc="x1_mean" in sb/latent_i2sb.py.)
-        dc = x1.mean(dim=(1, 2, 3), keepdim=True)
-        r = x_t - mu1 * x1 - mu0 * dc                       # debiased bridge residual
-        c = cond - cond.mean(dim=(2, 3), keepdim=True)      # per-channel DC removal
-
-        # ---- shared padding to a multiple of the stride ----
-        pad = calc_pad_2d(*r.shape[2:], self.s)
-        r = F.pad(r, pad, mode="reflect")
-        c = F.pad(c, pad, mode="reflect")
-
-        # ---- learned coefficients for this step ----
-        s_log = (torch.log(sig_eff.clamp_min(1e-12)) - self.s_mid) / self.s_half   # -> [-1, 1]
-        s_hat = sig_eff / self.sigma_ref.clamp_min(1e-12)                          # -> [0, 1]
+        # split, debias, DC-correct and pad -- all shared with SBGroupCDL
+        r, c, dc, pad, mu0, s_log, s_hat = self.bridge_inputs(y, sigma=sigma, step=step)
 
         z = torch.zeros_like(self.A_D[0](r))
         for k in range(self.K):

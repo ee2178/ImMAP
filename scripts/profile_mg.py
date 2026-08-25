@@ -196,8 +196,11 @@ LEAF_OPS = [
     ("fftshift", torch.fft, ["fftshift", "ifftshift"]),
     ("conv (analysis)", F, ["conv2d"]),
     ("convT (synthesis)", F, ["conv_transpose2d"]),
-    ("prolong", F, ["interpolate"]),
-    ("restrict", F, ["avg_pool2d"]),
+    # NOTE: restrict / prolong are now conv2d / conv_transpose2d against a
+    # windowed-sinc kernel, so their calls land in the two buckets above and
+    # cannot be split out by op name alone. Use --by-level: a transfer reads
+    # the grid it is leaving, so it shows up one level off from the smoother
+    # convs it sits between.
     ("pad", F, ["pad"]),
 ]
 

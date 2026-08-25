@@ -12,6 +12,7 @@ from .lpds import LPDSLayer, LPDSStack
 from .mg_lpds import MGLPDSNet, PDVCycle
 from .ladmm import AltSplitCDLNet
 from .sb_cdlnet import SBCDLNet
+from .sb_groupcdl import SBGroupCDL
 
 
 def build_model(cfg):
@@ -52,6 +53,11 @@ def build_model(cfg):
     # (target-domain + prior-domain dictionaries). Its schedule params must match cfg["i2sb"].
     elif model_type == "SBCDLNet":
         return SBCDLNet(**params)
+
+    # Same two-fidelity bridge scaffold as SBCDLNet, with GroupCDL's nonlocal group-sparsity
+    # prox in place of the soft threshold. Its schedule params must match cfg["i2sb"] too.
+    elif model_type == "SBGroupCDL":
+        return SBGroupCDL(**params)
 
     # Multigrid family, all one class:
     #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations

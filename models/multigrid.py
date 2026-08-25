@@ -57,7 +57,8 @@ from models.lista import LISTA, LISTALayer, gram
 from models.prox import GroupThreshold, PixelConv, FenchelProx, resize_noise
 from operators.identity import Identity
 from operators.projections import uball_project
-from operators.resample import galerkin, prolong, restrict, restrict_noise
+from operators.resample import (GridTransfer, _check_filter, galerkin,
+                                prolong, restrict, restrict_noise)
 from preprocessing.image import post_process, pre_process
 from preprocessing.kspace import kspace_post_process, kspace_pre_process
 
@@ -193,10 +194,17 @@ class ObjectiveDownsample(nn.Module):
     can afford to specialise away from the smoothers it started as.
     """
 
-    def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False):
+    def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False,
+                 transfer_filter=None, transfer=None):
         super().__init__()
         self.widen = int(widen)
         self.julia_compat = bool(julia_compat)
+        self.transfer_filter = _check_filter(transfer_filter)
+        # The LATENT-grid transfer, shared with the enclosing V-cycle so that
+        # the restriction of dF here and the prolongation of the correction
+        # there are the same kernel -- which is what makes them transposes.
+        # `None` means "use the module-level functions", i.e. the fixed filter.
+        self.transfer = transfer
 
         self.analysis_fine = copy.deepcopy(fine_layer.analysis)
         self.synthesis_fine = copy.deepcopy(fine_layer.synthesis)
@@ -215,7 +223,7 @@ class ObjectiveDownsample(nn.Module):
                     identity_widen_weight(M_coarse, M_fine, self.widen))
 
     def forward(self, z, y, E, sigma, cache):
-        R = dict(julia_compat=self.julia_compat)
+        R = dict(julia_compat=self.julia_compat, filter=self.transfer_filter)
 
         # ---- fine-level subgradient  dF_f(z) = A^H (E^H E B z - y) + dg(z) ----
         Bz = self.synthesis_fine(z)
@@ -225,11 +233,24 @@ class ObjectiveDownsample(nn.Module):
         dF_fine = Ar + gz
 
         # ---- restriction: space first, then channels -------------------------
-        z_c = self.widen_z(restrict(z, **R))
-        RdF = self.widen_z(restrict(dF_fine, **R))
+        # LATENT path (z, and the subgradient dF that is z's dual): the
+        # learnable one, when this V-cycle was built with learn_transfer=True.
+        if self.transfer is not None:
+            z_c = self.widen_z(self.transfer.restrict(z))
+            RdF = self.widen_z(self.transfer.restrict(dF_fine))
+        else:
+            z_c = self.widen_z(restrict(z, **R))
+            RdF = self.widen_z(restrict(dF_fine, **R))
+
+        # IMAGE path: y_c, sigma_c and E_c are the coarse *problem*, not the
+        # coarse iterate. They stay on the fixed filter even when the latent
+        # transfer is learned -- E_c = E . P is the coarse forward model, and a
+        # learned P there would mean learning the physics. sigma_c likewise
+        # describes the measurement noise, so it must not follow a latent
+        # kernel that has learned to alias on purpose.
         y_c = restrict(y, **R)
         sigma_c = restrict_noise(sigma, **R)
-        E_c = galerkin(E)
+        E_c = galerkin(E, filter=self.transfer_filter)
 
         # ---- coarse-level subgradient ---------------------------------------
         Bz_c = self.synthesis_coarse(z_c)
@@ -260,7 +281,8 @@ class VCycle(nn.Module):
 
     def __init__(self, iters, C, M, widen=1, alpha0=1e-1, alpha_conv=True,
                  Mh=None, julia_compat=False, spectral_init=True,
-                 receives_pi=False, **layer_kws):
+                 receives_pi=False, transfer_filter=None, learn_transfer=False,
+                 **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
         assert iters[0] % 2 == 0, \
@@ -268,6 +290,33 @@ class VCycle(nn.Module):
         self.widen = int(widen)
         self.C, self.M, self.Mh = int(C), int(M), Mh
         self.julia_compat = bool(julia_compat)
+        # Resolved once, at construction: a V-cycle built inside a
+        # `use_filter` block keeps that filter for the rest of its life, so a
+        # checkpoint records which ablation arm produced it.
+        self.transfer_filter = _check_filter(transfer_filter)
+        self.learn_transfer = bool(learn_transfer)
+
+        # One LATENT-grid kernel per level, shared between this level's
+        # restriction (inside dF) and its prolongation (in forward), so the two
+        # stay exact transposes even while training moves them.
+        #
+        # channels=1, i.e. one kernel broadcast over the subbands rather than a
+        # depthwise kernel per subband. Not a shortcut: R acts on M channels
+        # and P on M*widen, because `widen_z` and `alpha` do the channel
+        # transfer in between. A per-subband kernel could therefore not be the
+        # SAME kernel on both sides, and the tie is worth more than the extra
+        # expressiveness -- the channel mixing is already learned, twice.
+        self.transfer = None
+        if learn_transfer:
+            if not torch.is_tensor(self.transfer_filter) and \
+                    self.transfer_filter == "legacy":
+                raise ValueError(
+                    "learn_transfer=True is incompatible with "
+                    "transfer_filter='legacy': its restriction and "
+                    "prolongation are not transposes, so there is no single "
+                    "kernel to learn. Pick any other filter to start from.")
+            self.transfer = GridTransfer(channels=1, filter=self.transfer_filter,
+                                         learn=True)
 
         half = iters[0] // 2
         layer_kws = dict(layer_kws)
@@ -290,7 +339,10 @@ class VCycle(nn.Module):
             self.mglayer = VCycle(iters[1:], C, M_c, widen=self.widen,
                                   alpha0=alpha0, alpha_conv=alpha_conv, Mh=Mh_c,
                                   julia_compat=julia_compat, spectral_init=False,
-                                  receives_pi=True, **layer_kws)
+                                  receives_pi=True,
+                                  transfer_filter=self.transfer_filter,
+                                  learn_transfer=learn_transfer,
+                                  **layer_kws)
         else:
             self.mglayer = LISTA(iters[1], lambda: make_layer(
                 C, M_c, Mh=Mh_c, spectral_init=False, multigrid=True, **layer_kws))
@@ -300,7 +352,9 @@ class VCycle(nn.Module):
 
         # ---- restriction + coarse-correction step ---------------------------
         self.dF = ObjectiveDownsample(self.listaA.first, first_layer(self.mglayer),
-                                      widen=self.widen, julia_compat=julia_compat)
+                                      widen=self.widen, julia_compat=julia_compat,
+                                      transfer_filter=self.transfer_filter,
+                                      transfer=self.transfer)
 
         if alpha_conv:
             self.alpha = PixelConv(M_c, M)
@@ -340,7 +394,13 @@ class VCycle(nn.Module):
             cache=cache.setdefault("_coarse", {}))
 
         # prolongate the coarse correction, narrow the channels, step
-        z = z + self.alpha(prolong(w_c - z_c))
+        # latent path -- the transpose of the restriction dF just used
+        corr = w_c - z_c
+        if self.transfer is not None:
+            corr = self.transfer.prolong(corr)
+        else:
+            corr = prolong(corr, filter=self.transfer_filter)
+        z = z + self.alpha(corr)
 
         # post-smooth, inheriting the pre-smoother's adjacency for free
         z, cache = self.listaB(z, y_tilde, E=E, sigma=sigma, pi=pi, cache=cache)
@@ -360,7 +420,9 @@ class VCycle(nn.Module):
 
     def extra_repr(self):
         return (f"depth={self.depth}, iters_per_level={self.iters_per_level}, "
-                f"M={self.M} x widen^l (widen={self.widen})")
+                f"M={self.M} x widen^l (widen={self.widen}), "
+                f"transfer_filter={self.transfer_filter!r}, "
+                f"learn_transfer={self.learn_transfer}")
 
 
 class _ChannelScale(nn.Module):
@@ -393,7 +455,8 @@ class MGCDLNet(nn.Module):
                  dK=1, sim_fun="distance", nheads=1, rho0=1.0, gamma0=0.8,
                  init_strategy="spectral_norm", subgrad_mode="rigorous",
                  attn_backend="gather", flex_block_size=128,
-                 preproc="image", resize_noise=False, julia_compat=False):
+                 preproc="image", resize_noise=False, julia_compat=False,
+                 transfer_filter=None, learn_transfer=False):
         super().__init__()
         K_outer, iters = _parse_K(K)
         self.K, self.iters = K_outer, iters
@@ -404,6 +467,8 @@ class MGCDLNet(nn.Module):
                 f"preproc must be 'image' (denoising), 'kspace' "
                 f"(reconstruction) or 'identity'; got {preproc!r}")
         self.preproc, self.resize_noise = preproc, bool(resize_noise)
+        self.transfer_filter = _check_filter(transfer_filter)
+        self.learn_transfer = bool(learn_transfer)
         self.levels = 1 if iters is None else len(iters)
         # train.py compiles the fused FlexAttention kernel via
         # `getattr(model, "attn_backend", None) == "flex"`, the same hook
@@ -429,7 +494,9 @@ class MGCDLNet(nn.Module):
         else:
             self.lista = LISTA(K_outer, lambda: VCycle(
                 iters, C, M, widen=widen, alpha0=alpha0, alpha_conv=alpha_conv,
-                Mh=Mh, julia_compat=julia_compat, **layer_kws))
+                Mh=Mh, julia_compat=julia_compat,
+                transfer_filter=self.transfer_filter,
+                learn_transfer=self.learn_transfer, **layer_kws))
 
         # Read-out dictionary D, initialised from the first synthesis.
         self.D = ConvTranspose2d(M, C, P, stride=s, bias=False, complex=is_complex)
@@ -530,7 +597,9 @@ class MGCDLNet(nn.Module):
                 m.project_()
 
     def extra_repr(self):
-        return f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}"
+        return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "
+                f"transfer_filter={self.transfer_filter!r}, "
+                f"learn_transfer={self.learn_transfer}")
 
 
 def _parse_K(K):
