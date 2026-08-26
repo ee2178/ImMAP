@@ -13,39 +13,55 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-1
+#SBATCH --array=0-2
 #
-# Is the  P = 4 R^T  scale split the reason the rewritten transfer underperforms?
+# Where did the rewritten grid transfer lose ground against the old one?
 #
-# Two cells, one MGLPDSNet, fastMRI knee recon at R=8, both on the BOX kernel
-# (the same 2x2 mean the pre-rewrite code restricted with):
+# Three cells, one MGLPDSNet, fastMRI knee recon at R=8. All three restrict
+# with the SAME 2x2 mean kernel the pre-rewrite code used, so the anti-aliasing
+# is held fixed and only the pairing and its normalisation move:
 #
-#   0  transfer_filter=box        sum(h)=1, c=4   R(1)=1     P(1)=1
-#   1  transfer_filter=box-unit   sum(h)=2, c=1   R(1)=2     P(1)=0.5
+#   0  legacy     R = 2x2 mean, P = bilinear    NOT a transpose pair
+#   1  box        R = 2x2 mean, P = 4 R^T       sum(h)=1, c=4, R(1)=P(1)=1
+#   2  box-unit   R = 2x2 mean, P = R^T         sum(h)=2, c=1, R(1)=2, P(1)=0.5
 #
-# Both keep  P R (1) = 1, so the round trip is faithful either way. What
-# differs is how the factor^d is split between the two halves:
+# Read as two independent one-step comparisons:
 #
-#   "box"       each operator preserves constants on its own, so a restricted
-#               iterate sits at the same POINTWISE amplitude as the fine one --
-#               which is what preload_with_widening assumes when it copies the
-#               fine prox thresholds down to the coarse level.
-#   "box-unit"  R IS P^T, with no scalar at all, and ||P||_2 ~ 1. Cleaner
-#               operator algebra: galerkin(E).adjoint becomes a true adjoint
-#               rather than 1/4 of one. The coarse iterate lands at 2x the fine
-#               amplitude, and sigma_c/sigma goes 0.5 -> 1.0 to match.
+#   0 -> 1   does making the pair a genuine transpose matter?
+#            `legacy` pairs a mean-pool restriction with bilinear
+#            interpolation, which are not transposes -- they differ by 22%, and
+#            the coarse Gram comes out 14.5% non-Hermitian, so dF_coarse is the
+#            subgradient of no objective at all. `box` fixes exactly that and
+#            changes nothing else: same kernel, same sigma_c/sigma = 0.5, same
+#            FAS-correction strength.
 #
-# WHAT THIS CAN AND CANNOT SHOW. The coarse Gram  R E^H E P  is bit-identical
-# under both (verified: rel diff 0.000e+00) -- the gains cancel in the product.
-# So this is a change of VARIABLES on the coarse grid, not a change to the
-# coarse problem. Any difference between these two arms therefore has to come
-# from something nonlinear in the coarse iterate's scale: the prox thresholds,
-# and eta/alpha. If the arms tie, the c factor is not what is hurting, and the
-# suspects fall back to sigma_c calibration and the circular padding.
+#   1 -> 2   does the SCALE SPLIT matter?
+#            Both keep P R (1) = 1, so the round trip is faithful either way;
+#            they differ in how the factor^d is divided. "box" has each operator
+#            preserve constants on its own, so a restricted iterate sits at the
+#            same POINTWISE amplitude as the fine one -- what
+#            preload_with_widening assumes when it copies the fine prox
+#            thresholds down. "box-unit" makes R literally P^T with ||P||_2 ~ 1
+#            (galerkin(E).adjoint becomes a true adjoint rather than 1/4 of
+#            one), at the cost of putting the coarse iterate at 2x the fine
+#            amplitude; sigma_c/sigma goes 0.5 -> 1.0 to match.
 #
-# Submit both:  sbatch slurm/transfer_window.sbatch
-# Separately:   sbatch --array=0 slurm/transfer_window.sbatch   # box,  c=4
-#               sbatch --array=1 slurm/transfer_window.sbatch   # box,  c=1
+# WHAT ARM 2 CAN AND CANNOT SHOW. The coarse Gram R E^H E P is bit-identical
+# between arms 1 and 2 (verified: rel diff 0.000e+00) -- the gains cancel in the
+# product. So 1 -> 2 is a change of VARIABLES on the coarse grid, not a change
+# to the coarse problem, and any difference has to come from something
+# nonlinear in the coarse iterate's scale: the prox thresholds, eta, alpha. If
+# 1 and 2 tie, c is exonerated.
+#
+# Arm 0 is a BIT-EXACT replica of the pre-rewrite code -- parameters, forward,
+# loss AND gradients all match commit f74a799 to 0.000e+00 (tests/
+# test_multigrid.py pins the operator half of that). So it is a real baseline,
+# not an approximation of one.
+#
+# Submit all:   sbatch slurm/transfer_window.sbatch
+# Separately:   sbatch --array=0 slurm/transfer_window.sbatch   # legacy
+#               sbatch --array=1 slurm/transfer_window.sbatch   # box, c=4
+#               sbatch --array=2 slurm/transfer_window.sbatch   # box, c=1
 # Probe first:  SWEEP_EPOCHS=20 sbatch slurm/transfer_window.sbatch
 
 ANATOMY=knee
@@ -54,7 +70,7 @@ RTAG=R8
 CONFIG_ROOT="${CONFIG_ROOT:-config}"
 SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"
 
-ARMS=(box box-unit)
+ARMS=(legacy box box-unit)
 
 source ~/.bashrc
 conda activate gcdl
@@ -81,7 +97,7 @@ set -eo pipefail
 mkdir -p logs
 
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${#ARMS[@]}" ]; then
-    echo "[norm] task ${SLURM_ARRAY_TASK_ID} >= ${#ARMS[@]} arms -- use --array=0-1"
+    echo "[norm] task ${SLURM_ARRAY_TASK_ID} >= ${#ARMS[@]} arms -- use --array=0-2"
     exit 1
 fi
 FILTER="${ARMS[${SLURM_ARRAY_TASK_ID}]}"
@@ -111,7 +127,8 @@ import json, sys
 # doing arithmetic on it. See training/common.py.
 from training.common import write_config
 from operators.resample import (_check_filter, adjoint_scale, filter_length,
-                                noise_scale, split_normalisation)
+                                is_adjoint_pair, noise_scale,
+                                split_normalisation)
 
 base, out, save_dir, filt = sys.argv[1:5]
 epochs = sys.argv[5] if len(sys.argv) > 5 else ""
@@ -154,8 +171,13 @@ write_config(cfg, out)
 # Log what the arm actually changes, rather than leaving it to be inferred from
 # the filter name.
 base_name, norm = split_normalisation(filt)
+# `adjoint_scale` would happily report 4 for 'legacy', but legacy is not a
+# transpose pair at any scale -- printing a c there would invent a relationship
+# the run does not have.
+pair = (f"norm={norm}, c={adjoint_scale(filt):g}" if is_adjoint_pair(filt)
+        else "NOT an adjoint pair (P is bilinear, not a multiple of R^T)")
 print(f"[norm] {cfg['model']['type']} R={cfg['mri']['R']} filter={filt} "
-      f"(kernel={base_name}, norm={norm}, c={adjoint_scale(filt):g}) "
+      f"(kernel={base_name}, {pair}) "
       f"L={filter_length(filt)} sigma_c/sigma={noise_scale(filter=filt):.4f} "
       f"epochs={cfg['training']['num_epochs']} -> {out}")
 PY
