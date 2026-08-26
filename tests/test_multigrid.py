@@ -16,10 +16,10 @@ from models.multigrid import (MGCDLNet, VCycle, identity_widen_weight,
                               widen_filter, widen_pixel)
 from models.prox import GroupThreshold, SoftThreshold, Polynomial
 from operators import FFT2D, Identity, Mask, Sense
-from operators.resample import (TRANSFER_FILTERS, GridTransfer, default_filter,
-                                filter_length, galerkin, is_adjoint_pair,
-                                noise_scale, prolong, restrict, restrict_noise,
-                                use_filter)
+from operators.resample import (TRANSFER_FILTERS, GridTransfer, adjoint_scale,
+                                default_filter, filter_length, galerkin,
+                                is_adjoint_pair, noise_scale, prolong, restrict,
+                                restrict_noise, split_normalisation, use_filter)
 
 torch.manual_seed(0)
 
@@ -203,6 +203,85 @@ def test_transfer_filters():
             check(f"GridTransfer rejects filter={bad!r}", False)
         except ValueError:
             check(f"GridTransfer rejects filter={bad!r}", True)
+
+
+def test_unit_normalisation():
+    """`"<filter>-unit"` splits factor^d evenly, so `c` becomes 1.
+
+    The point of the option is that `R` becomes literally `P^T`. The point of
+    the TEST is the invariant underneath: whichever way the gain is split, the
+    coarse Gram must not move -- otherwise this is not a change of variables
+    and the ablation it exists for would be confounded.
+    """
+    x = torch.randn(2, 3, 16, 16)
+    z = torch.randn(2, 3, 8, 8)
+
+    check("split_normalisation reads the suffix",
+          split_normalisation("box-unit") == ("box", "unit")
+          and split_normalisation("box") == ("box", "dc"))
+    check("a base name containing '_' is not mistaken for a suffix",
+          split_normalisation("sinc_unwindowed") == ("sinc_unwindowed", "dc"))
+    check("c is 4 by default and 1 under -unit",
+          adjoint_scale("box") == 4.0 and adjoint_scale("box-unit") == 1.0)
+
+    for f in ("box-unit", "sinc-unit"):
+        lhs = (restrict(x, filter=f) * z).sum()
+        rhs = (x * prolong(z, filter=f)).sum()          # no scalar at all
+        check(f"{f}: R is exactly P^T (c = 1)",
+              abs(lhs - rhs).item() / abs(lhs).item() < 1e-4,
+              f"rel={abs(lhs - rhs).item() / abs(lhs).item():.2e}")
+
+    # both halves still reproduce constants through the round trip, which is
+    # what stops this from being a silent rescale of the coarse problem
+    one_f, one_c = torch.full((1, 1, 16, 16), 3.0), torch.full((1, 1, 8, 8), 3.0)
+    check("-unit splits the gain: R(3)=6, P(3)=1.5, but P R (3)=3",
+          abs(restrict(one_f, filter="box-unit").mean() - 6.0) < 1e-5
+          and abs(prolong(one_c, filter="box-unit").mean() - 1.5) < 1e-5
+          and abs(prolong(restrict(one_f, filter="box-unit"),
+                          filter="box-unit").mean() - 3.0) < 1e-5)
+    check("sigma_c tracks the renormalised kernel",
+          abs(noise_scale(filter="box-unit") - 2 * noise_scale(filter="box")) < 1e-6,
+          f"{noise_scale(filter='box-unit'):.4f} vs "
+          f"2 x {noise_scale(filter='box'):.4f}")
+
+    # THE invariant: the coarse Gram is a similarity-invariant of the split
+    smaps = torch.randn(1, 4, 16, 16, dtype=torch.complex64)
+    mask = (torch.rand(1, 1, 16, 16) > 0.5).to(torch.complex64)
+    E = Mask(mask) @ FFT2D() @ Sense(smaps)
+    G = {}
+    for f in ("box", "box-unit"):
+        Ec = galerkin(E, filter=f)
+        M = torch.zeros(64, 64, dtype=torch.complex64)
+        for i in range(64):
+            e = torch.zeros(1, 1, 8, 8, dtype=torch.complex64)
+            e.view(-1)[i] = 1
+            M[:, i] = Ec.gram(e).reshape(-1)
+        G[f] = M
+    d = ((G["box"] - G["box-unit"]).norm() / G["box"].norm()).item()
+    check("the coarse Gram is IDENTICAL under both normalisations",
+          d < 1e-6, f"rel={d:.2e}")
+
+    # a learned kernel must renormalise to gamma, not to 1 -- otherwise the
+    # -unit scaling is quietly undone while adjoint_scale stays at 1
+    T = GridTransfer(channels=3, filter="box-unit", learn=True)
+    with torch.no_grad():
+        T.weight.add_(0.03 * torch.randn_like(T.weight))
+    lhs = (T.restrict(x) * z).sum()
+    rhs = (x * T.prolong(z)).sum() / T.adjoint_scale
+    check("GridTransfer(-unit) keeps c = 1 after the kernel moves",
+          T.adjoint_scale == 1.0
+          and abs(lhs - rhs).item() / abs(lhs).item() < 1e-4,
+          f"c={T.adjoint_scale:g}, rel={abs(lhs - rhs).item() / abs(lhs).item():.2e}")
+    check("GridTransfer(-unit) renormalises to gamma, not to 1",
+          abs(T.restrict(torch.full((1, 3, 16, 16), 3.0)).mean() - 6.0) < 1e-4,
+          f"R(3)={T.restrict(torch.full((1, 3, 16, 16), 3.0)).mean():.4f}")
+
+    for bad in ("legacy-unit", "box-units"):
+        try:
+            restrict(x, filter=bad)
+            check(f"{bad!r} is refused", False, "accepted")
+        except ValueError:
+            check(f"{bad!r} is refused", True)
 
 
 def test_galerkin():
@@ -395,7 +474,8 @@ def test_fixed_point_consistency():
 
 if __name__ == "__main__":
     for fn in (test_grid_transfer, test_grid_transfer_module,
-               test_transfer_filters, test_galerkin, test_widening,
+               test_transfer_filters, test_unit_normalisation,
+               test_galerkin, test_widening,
                test_prox_subgradients, test_vcycle_shapes_and_grads,
                test_vcycle_mri_and_group, test_plain_lista,
                test_fixed_point_consistency):

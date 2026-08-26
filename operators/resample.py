@@ -153,15 +153,80 @@ def use_filter(name):
         _default_filter = prev
 
 
+#: Suffix selecting the symmetric normalisation, e.g. "box-unit".
+UNIT_SUFFIX = "-unit"
+
+
+def split_normalisation(name):
+    """`("box-unit", ...)` -> `("box", "unit")`; a bare name -> `(name, "dc")`.
+
+    Two ways to split the `factor^d` between `R` and `P`, both of which keep
+    the round trip `P R` preserving constants:
+
+      "dc"    sum(h) = 1,            c = factor^d   (= 4 at factor 2, 2-D)
+              Each operator preserves constants on its own: `R(1) = P(1) = 1`.
+              A restricted iterate therefore sits at the same POINTWISE
+              amplitude as the fine one, which is what `preload_with_widening`
+              assumes when it copies the fine prox thresholds down.
+
+      "unit"  sum(h) = factor^(d/2), c = 1
+              `R = P^T` exactly, and `||P||_2 ~ 1`. The `factor^d` is split
+              evenly instead of being carried entirely by `P`, so `R(1) = 2`
+              and `P(1) = 0.5` at factor 2. Cleaner operator algebra --
+              `Resample.adjoint` becomes a true adjoint rather than
+              `1/factor^d` of one -- at the cost of putting the coarse iterate
+              on a different scale from the fine one.
+
+    The coarse Gram `R E^H E P` is IDENTICAL under both (the gains cancel in
+    the product), so this changes the coarse problem's variables, not the
+    coarse problem. What it does reach is anything nonlinear in the coarse
+    iterate -- the prox thresholds -- and `sigma_c = sigma . ||h||_2`, which
+    tracks the kernel automatically.
+    """
+    if torch.is_tensor(name) or name is None:
+        return name, "dc"
+    if name.endswith(UNIT_SUFFIX):
+        return name[:-len(UNIT_SUFFIX)], "unit"
+    return name, "dc"
+
+
+def _norm_gains(norm, factor):
+    """`(gamma, c)`: the kernel is scaled by `gamma`, and `P = c . R^T`.
+
+    `gamma^2 . c == factor^d` always, which is what makes `P R` preserve
+    constants either way. At `d = 2`, `gamma = factor` gives `c = 1`.
+    """
+    if norm == "unit":
+        return float(factor), 1.0
+    return 1.0, float(factor) ** 2
+
+
+def adjoint_scale(filter=None, factor=DEFAULT_FACTOR):
+    """The `c` in `prolong == c . restrict^T`."""
+    filter = _check_filter(filter)
+    _, norm = split_normalisation(filter)
+    return _norm_gains(norm, factor)[1]
+
+
 def _check_filter(name):
     if torch.is_tensor(name):
         return name
     if name is None:
         return _default_filter
-    if name not in TRANSFER_FILTERS:
+    base, norm = split_normalisation(name)
+    if base not in TRANSFER_FILTERS:
         raise ValueError(
             f"unknown transfer filter {name!r}; expected one of "
-            f"{', '.join(TRANSFER_FILTERS)}, or a torch.Tensor kernel.")
+            f"{', '.join(TRANSFER_FILTERS)} (optionally suffixed "
+            f"{UNIT_SUFFIX!r} for the symmetric normalisation), or a "
+            f"torch.Tensor kernel.")
+    if norm == "unit" and base == "legacy":
+        raise ValueError(
+            f"'legacy{UNIT_SUFFIX}' is not meaningful: 'legacy' pairs a "
+            f"mean-pool restriction with bilinear interpolation, which are "
+            f"not transposes at ANY normalisation, so there is no c to set "
+            f"to 1. Use 'box{UNIT_SUFFIX}' for the mean-pool as a genuine "
+            f"adjoint pair.")
     return name
 
 
@@ -288,7 +353,7 @@ _FILTER_SPECS = {
 
 def filter_length(filter=None, factor=DEFAULT_FACTOR, length=None):
     """Kernel length a given filter uses at this factor."""
-    filter = _check_filter(filter)
+    filter, _ = split_normalisation(_check_filter(filter))
     if torch.is_tensor(filter):
         return filter.shape[-1]
     if filter == "legacy":
@@ -305,7 +370,8 @@ def transfer_kernel(filter=None, factor=DEFAULT_FACTOR, length=None,
     `filter` may be a name from `TRANSFER_FILTERS` or a raw kernel tensor
     (1-D and taken as separable, or 2-D / 4-D and taken as-is).
     """
-    filter = _check_filter(filter)
+    filter, _norm = split_normalisation(_check_filter(filter))
+    gamma = _norm_gains(_norm, factor)[0]
     if torch.is_tensor(filter):
         k = filter.to(dtype=dtype, device=device)
         if k.dim() == 1:
@@ -316,7 +382,7 @@ def transfer_kernel(filter=None, factor=DEFAULT_FACTOR, length=None,
             raise ValueError(
                 f"a custom transfer kernel must be 1-D (separable), 2-D, or "
                 f"(1, 1, L, L); got {tuple(filter.shape)}.")
-        return k / k.sum()
+        return gamma * k / k.sum()
     if filter == "legacy":
         raise ValueError(
             "filter='legacy' is a code path, not a kernel -- it pairs a 2x2 "
@@ -328,7 +394,7 @@ def transfer_kernel(filter=None, factor=DEFAULT_FACTOR, length=None,
     build, mult = _FILTER_SPECS[filter]
     length = mult * int(factor) if length is None else int(length)
     h = build(factor, length, dtype, device)
-    return torch.outer(h, h)[None, None]
+    return gamma * torch.outer(h, h)[None, None]
 
 
 def sinc_kernel2d(factor=2, length=None, dtype=torch.float32, device=None):
@@ -463,7 +529,9 @@ def restrict(x, factor=DEFAULT_FACTOR, length=None, julia_compat=False,
 def prolong(x, scale=DEFAULT_FACTOR, length=None, filter=None):
     """Prolongation `P`: zero-insert by `scale`, then the same filter.
 
-    Exactly `scale^2 . restrict^T` for every filter but `'legacy'`.
+    Exactly `adjoint_scale(filter) . restrict^T` for every filter but
+    `'legacy'` -- `scale^2` under the default normalisation, `1` under
+    `'-unit'`.  See `split_normalisation`.
     """
     filter = _check_filter(filter)
     scale = int(scale)
@@ -472,7 +540,7 @@ def prolong(x, scale=DEFAULT_FACTOR, length=None, filter=None):
 
     a, b = transfer_padding(filter, scale, length)
     groups = x.shape[1]
-    w = _weight_for(x, filter, scale, length, groups) * (scale ** 2)
+    w = _weight_for(x, filter, scale, length, groups) * adjoint_scale(filter, scale)
 
     def fn(t):
         t = F.conv_transpose2d(t, w, stride=scale, groups=groups)
@@ -510,7 +578,7 @@ def restrict_noise(sigma, factor=DEFAULT_FACTOR, length=None,
 
 
 def is_adjoint_pair(filter=None):
-    """Whether `prolong == factor^2 . restrict^T` for this filter.
+    """Whether `prolong == adjoint_scale(filter) . restrict^T` for this filter.
 
     True for every kernel; False only for `'legacy'`, whose two halves come
     from different families.
@@ -570,6 +638,10 @@ class GridTransfer(nn.Module):
         self.factor = int(factor)
         self.length = filter_length(filter, self.factor, length)
         self.filter = filter if not torch.is_tensor(filter) else "custom"
+        # gamma is the kernel's target sum, adjoint_scale the c in P = c . R^T.
+        # Both are pinned by the normalisation; see `split_normalisation`.
+        _, self.norm = split_normalisation(filter)
+        self.gamma, self.adjoint_scale = _norm_gains(self.norm, self.factor)
         self.pad = transfer_padding(filter, self.factor, self.length)
 
         k = transfer_kernel(filter, self.factor, self.length)
@@ -582,11 +654,17 @@ class GridTransfer(nn.Module):
 
     # -- the normalised kernel ---------------------------------------------
     def kernel(self, device=None, dtype=None):
-        """Sum-normalised, so `restrict(const) == const` survives training."""
+        """Renormalised to `gamma`, so the R/P scale survives training.
+
+        NOT to 1: under the "-unit" normalisation the kernel is supposed to
+        sum to `factor^(d/2)`, and forcing it to 1 here would quietly undo the
+        normalisation the caller asked for while leaving `adjoint_scale` at 1.
+        """
         w = self.weight
         if device is not None or dtype is not None:
             w = w.to(device=device, dtype=dtype)
-        return w / w.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-3)
+        denom = w.sum(dim=(-2, -1), keepdim=True)
+        return self.gamma * w / denom.clamp(min=1e-3)
 
     @property
     def noise_scale(self):
@@ -629,7 +707,7 @@ class GridTransfer(nn.Module):
     def prolong(self, z):
         a, b = self.pad
         w, groups = self._w(z)
-        w = w * (self.factor ** 2)
+        w = w * self.adjoint_scale
 
         def fn(t):
             t = F.conv_transpose2d(t, w, stride=self.factor, groups=groups)
@@ -646,7 +724,8 @@ class GridTransfer(nn.Module):
 
     def extra_repr(self):
         return (f"filter={self.filter!r}, factor={self.factor}, "
-                f"length={self.length}, channels={self.weight.shape[0]}, "
+                f"length={self.length}, norm={self.norm!r}, "
+                f"c={self.adjoint_scale:g}, channels={self.weight.shape[0]}, "
                 f"learn={self.learn}")
 
 
