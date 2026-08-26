@@ -137,8 +137,7 @@ def train_ccl(
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss,
                        "train/lr": opt.param_groups[0]["lr"],
-                       "train/epoch": epoch,
-                       **get_param_logs(net)}, step=global_step)
+                       "train/epoch": epoch}, step=global_step)
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss})
 
@@ -155,6 +154,12 @@ def train_ccl(
             vloss = vtot / max(vn, 1)
             if wandb:
                 wandb.log({"val/loss": vloss}, step=global_step)
+                # Parameter values ride the VALIDATION cadence: walking the model costs a
+                # host transfer per tensor, and thresholds / step sizes drift on the
+                # timescale of training, not of an epoch. Grads are still populated here --
+                # every loop zero_grads at the TOP of the next step -- so grad_norm reports
+                # the last training step's gradients rather than being absent.
+                wandb.log(get_param_logs(net), step=global_step)
             else:
                 print(f"[VAL] epoch={epoch} loss={vloss:.6f}")
             net.train()

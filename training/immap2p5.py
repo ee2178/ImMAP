@@ -298,7 +298,6 @@ def train_joint_denoising_recon(
                 "train/lr": get_lr(opt)[0],
                 "train/epoch": epoch,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
-                **get_param_logs(net),
             }
             wandb.log(log_dict, step=global_step)
         elif wandb is None:
@@ -424,6 +423,12 @@ def train_joint_denoising_recon(
                         ),
                         **{f"val/{k}": v.item() for k, v in mean_metrics.items()},
                     }, step=global_step)
+                    # Parameter values ride the VALIDATION cadence: walking the model costs a
+                    # host transfer per tensor, and thresholds / step sizes drift on the
+                    # timescale of training, not of an epoch. Grads are still populated here --
+                    # every loop zero_grads at the TOP of the next step -- so grad_norm reports
+                    # the last training step's gradients rather than being absent.
+                    wandb.log(get_param_logs(net), step=global_step)
                     wandb.log(get_filter_grids(net), step=global_step)
 
 

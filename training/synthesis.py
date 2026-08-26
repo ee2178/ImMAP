@@ -301,8 +301,8 @@ def train_synthesis(
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss,
                        "train/lr": opt.param_groups[0]["lr"], "train/epoch": epoch,
-                       **{f"train/{k}": v for k, v in train_metrics.items()},
-                       **get_param_logs(net)}, step=global_step)
+                       **{f"train/{k}": v for k, v in train_metrics.items()}},
+                      step=global_step)
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 
@@ -400,6 +400,12 @@ def train_synthesis(
                                 f"rms(pred)/rms(gt)={rr:.3f}")
 
                 wandb.log(log, step=global_step)
+                # Parameter values ride the VALIDATION cadence: walking the model costs a
+                # host transfer per tensor, and thresholds / step sizes drift on the
+                # timescale of training, not of an epoch. Grads are still populated here --
+                # every loop zero_grads at the TOP of the next step -- so grad_norm reports
+                # the last training step's gradients rather than being absent.
+                wandb.log(get_param_logs(net), step=global_step)
 
             else:
                 print(f"[VAL] epoch={epoch} " +

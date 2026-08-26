@@ -224,7 +224,6 @@ def train_recon(
                 "train/lr": get_lr(opt)[0],
                 "train/epoch": epoch,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
-                **get_param_logs(net),
             }
             wandb.log(log_dict, step=global_step)
         elif wandb is None:
@@ -368,6 +367,11 @@ def train_recon(
                     {f"val/{k}": v for k, v in mean_metrics.items()},
                     step=global_step,
                 )
+                # Parameter values ride the VALIDATION cadence, not the epoch one, and for the
+                # same reason get_filter_grids does: both walk the whole model and pay a host
+                # transfer per tensor, and neither answers a question that needs answering
+                # every epoch -- thresholds and step sizes drift on the timescale of training.
+                wandb.log(get_param_logs(net), step=global_step)
                 wandb.log(get_filter_grids(net), step=global_step)
             else:
                 print(f"[VAL] epoch={epoch} {mean_metrics}")

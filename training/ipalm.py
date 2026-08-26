@@ -162,7 +162,6 @@ def train_ipalm(
                     f"train/{k}": v.item()
                     for k, v in train_metrics.items()
                 },
-                **get_param_logs(net),
             }
 
             if wandb is not None:
@@ -287,6 +286,12 @@ def train_ipalm(
                     step=step,
                 )
 
+                # Parameter values ride the VALIDATION cadence: walking the model costs a
+                # host transfer per tensor, and thresholds / step sizes drift on the
+                # timescale of training, not of an epoch. Grads are still populated here --
+                # every loop zero_grads at the TOP of the next step -- so grad_norm reports
+                # the last training step's gradients rather than being absent.
+                wandb.log(get_param_logs(net), step=step)
                 wandb.log(
                     get_filter_grids(net),
                     step=step,

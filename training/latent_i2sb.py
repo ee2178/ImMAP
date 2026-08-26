@@ -345,8 +345,8 @@ def train_latent_i2sb(
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss, "train/lr": opt.param_groups[0]["lr"],
                        "train/epoch": epoch,
-                       **{f"train/{k}": v for k, v in train_metrics.items()},
-                       **get_param_logs(R)}, step=global_step)
+                       **{f"train/{k}": v for k, v in train_metrics.items()}},
+                      step=global_step)
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 
@@ -434,6 +434,12 @@ def _validate(D_joint, R, D_t1ce, bridge, val_loader, device, *, M, interval, lo
         }, step=global_step)
         # learned latent dictionary R (real-valued GroupCDL); no-op if R has no filter banks
         try:
+            # Parameter values ride the VALIDATION cadence: walking the model costs a
+            # host transfer per tensor, and thresholds / step sizes drift on the
+            # timescale of training, not of an epoch. Grads are still populated here --
+            # every loop zero_grads at the TOP of the next step -- so grad_norm reports
+            # the last training step's gradients rather than being absent.
+            wandb.log(get_param_logs(R), step=global_step)
             wandb.log(get_filter_grids(R), step=global_step)
         except (AttributeError, NotImplementedError, AssertionError):
             pass

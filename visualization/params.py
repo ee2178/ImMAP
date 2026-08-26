@@ -1,26 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-Scalar logging for a network's learnable parameters -- thresholds, step sizes, extrapolation
-weights, anything.
+Logging for a network's small learnable parameters -- thresholds, step sizes, extrapolation
+weights, anything whose LITERAL VALUE is interpretable.
 
 `visualization/filters.py` renders what the DICTIONARIES look like; this renders what the
 SCALARS are doing. For an unrolled net those scalars carry most of the interpretable behaviour:
-CDLNet's per-layer soft-threshold `t`, SBCDLNet's step sizes, IPALMNet's `eta` / `beta` / `theta`.
-Watching them over training answers questions a loss curve cannot -- whether thresholds are
-collapsing to zero, whether a learned step is pinned at its bound, whether later unrolled layers
-are doing anything at all.
+LPDS's per-layer `tau` / `theta`, the V-cycle's coarse-correction `alpha`, CDLNet's soft
+threshold. Watching them over training answers questions a loss curve cannot -- whether
+thresholds are collapsing to zero, whether a learned step is pinned at its bound, whether later
+unrolled layers are doing anything at all.
 
-Two layers, both optional:
+Literal values, not summaries
+-----------------------------
+This used to emit mean / std / min / max / grad_norm for EVERY trainable tensor, plus per-layer
+means for stacked ones. On MGLPDSNet R8 that was 3648 wandb series per call, and -- because
+every one of them ended in a `float()` -- 3648 separate GPU->CPU synchronisations, each one
+stalling the pipeline behind it.
 
-    get_param_logs(net)   generic. Summary scalars (mean/std/min/max, and grad norm when a
-                          backward has run) for every trainable tensor, plus a per-LAYER
-                          breakdown when a tensor's leading axis indexes unrolled iterations.
-                          Works on any nn.Module and knows nothing about this repo.
+It also answered the wrong question. A mean over an 8281-element conv dictionary is not
+interpretable; the number that matters is `tau[0]`, and a summary of a two-element tensor is
+strictly worse than the two elements.
+
+So: tensors with at most `max_elems` entries are logged ELEMENT BY ELEMENT, at their literal
+values, in ONE transfer per tensor. Everything larger is skipped entirely rather than
+summarised -- use `visualization/filters.py` to look at dictionaries. Gradient NORMS are still
+emitted for every tensor, large ones included: one scalar apiece, and the cheapest check that a
+parameter is being learned at all.
+
+Everything is gathered and transferred in two batched `.tolist()` calls, so the cost is TWO host
+synchronisations for the whole model rather than one per scalar. On MGLPDSNet R8 that is 1080
+scalars (348 literal values + 732 grad norms) and 2 syncs, against 3648 scalars and 3648 syncs.
+
+    get_param_logs(net)   generic; knows nothing about this repo.
 
     net.param_logs()      optional hook. A model returning {name: float} here gets it merged in
                           under the same prefix. Use it for quantities that are not parameters
                           but functions of them -- e.g. a learned step evaluated at several
                           noise levels, which no generic walker could reconstruct.
+                          (models/sb_cdlnet.py and models/sb_groupcdl.py define one.)
 
 INVARIANT, same as visualization/filters.py: this must never raise. Callers wrap it loosely or
 not at all, and a logging helper must not be able to kill a training run. Anything unexpected is
@@ -39,79 +56,96 @@ def _finite(x):
     return v if v == v and abs(v) != float("inf") else None
 
 
-def _summary(t):
-    """mean / std / min / max of one tensor, as plain floats."""
-    t = t.detach()
+def _values(p):
+    """Every element of `p`, as plain floats, in ONE host transfer.
+
+    `.tolist()` costs a single synchronisation for the whole tensor; calling `float()` per
+    element would cost one each, which is the entire reason this function exists.
+    """
+    t = p.detach()
     if t.is_complex():
         t = t.abs()
-    t = t.float().reshape(-1)
-    if t.numel() == 0:
-        return {}
-    out = {"mean": _finite(t.mean()), "min": _finite(t.min()), "max": _finite(t.max())}
-    if t.numel() > 1:
-        out["std"] = _finite(t.std())
-    return {k: v for k, v in out.items() if v is not None}
+    flat = t.float().reshape(-1).tolist()
+    return [_finite(v) for v in flat]
 
 
-def _layer_axis(p, K):
-    """True when p's leading axis indexes unrolled layers, so a per-layer split is meaningful.
-
-    The heuristic is deliberately narrow: dim0 must equal the model's own K. Parameters that
-    live in a ModuleList (CDLNet's A/B) already carry the layer index in their NAME and are not
-    matched here -- only stacked tensors like CDLNet's t (K, 2, M, 1, 1) are."""
-    return K is not None and p.ndim >= 1 and p.shape[0] == K
-
-
-def get_param_logs(net, prefix="params", with_grad=True, per_layer=True,
-                   max_layers=64, max_scalars=4000):
+def get_param_logs(net, prefix="params", max_elems=64, max_scalars=4000,
+                   with_grad=True):
     """-> {f"{prefix}/...": float} ready to hand straight to wandb.log.
+
+    Two kinds of series, and no value summaries anywhere:
+
+      VALUES     the literal value of every element of every trainable tensor with at most
+                 `max_elems` entries. A single-element tensor logs as `{prefix}/{name}`; a
+                 larger one as `{prefix}/{name}.{i}` over its flattened index -- for LPDS's
+                 `tau` of shape (2, 1) that is `.0` (the constant) and `.1` (the sigma-slope),
+                 which is the split worth watching separately. Tensors above `max_elems` get no
+                 value series at all; use `visualization/filters.py` to look at dictionaries.
+
+      GRADIENTS  `{prefix}/{name}.grad_norm`, for EVERY trainable tensor including the ones too
+                 large to log literally. One scalar each, and the cheapest way to answer "is
+                 this actually being learned, or sitting at its initialisation?" -- which is the
+                 whole reason it is on by default. It is the one summary kept, because a
+                 gradient has no small literal form worth logging.
+
+    Both are gathered into a single tensor and transferred once, so the whole call costs TWO
+    host synchronisations regardless of model size -- not one per scalar, which is what made
+    the previous version expensive on GPU.
 
     Parameters
     ----------
-    with_grad   also log ||grad|| per tensor. Only populated after backward() and before
-                zero_grad(), so call this right after the optimizer step (or during validation,
-                where it is simply absent).
-    per_layer   additionally emit one scalar per unrolled layer for stacked parameters -- this
-                is what turns "threshold mean = 0.02" into a curve over depth.
-    max_layers  skip the per-layer split for very deep stacks.
-    max_scalars hard cap on how many series this can create, so a large model cannot silently
-                flood the run with thousands of wandb panels.
+    max_elems    value-logging cutoff. 64 covers the per-layer scalars (LPDS's `tau` / `theta`
+                 are 2 elements, the V-cycle's `alpha` is 1) without touching dictionaries.
+                 Note a PER-CHANNEL threshold has one element per subband, so at small M it
+                 falls under this cutoff and logs M series per layer; `max_scalars` is what
+                 stops that from flooding a run. Every such tensor still gets its grad_norm
+                 either way.
+    max_scalars  hard cap on how many series this can create. Values are collected before
+                 gradients, so if the cap binds it is the grad_norms that are lost -- raise it
+                 rather than guessing from a truncated panel list.
+    with_grad    log the gradient norms described above. They read `p.grad`, which is only
+                 populated between backward() and zero_grad(). Every loop in training/ zero_grads
+                 at the TOP of the step, so at validation time the last training step's
+                 gradients are still in place. A loop that zero_grads at the END of a step would
+                 log nothing here -- the key is simply absent, never wrong.
     """
     logs = {}
     try:
-        K = getattr(net, "K", None)
-        if not isinstance(K, int):
-            K = None
+        val_names, val_chunks, val_sizes = [], [], []
+        grad_names, grad_vals = [], []
 
         for name, p in net.named_parameters():
-            if not p.requires_grad or len(logs) >= max_scalars:
+            if not p.requires_grad:
                 continue
             base = f"{prefix}/{name}"
-            for stat, val in _summary(p).items():
-                logs[f"{base}.{stat}"] = val
-
+            if p.numel() <= max_elems:
+                t = p.detach()
+                t = t.abs() if t.is_complex() else t
+                val_chunks.append(t.float().reshape(-1))
+                val_names.append(base)
+                val_sizes.append(t.numel())
             if with_grad and p.grad is not None:
-                g = _finite(p.grad.detach().float().norm())
-                if g is not None:
-                    logs[f"{base}.grad_norm"] = g
+                g = p.grad.detach()
+                grad_vals.append((g.abs() if g.is_complex() else g).float().norm())
+                grad_names.append(f"{base}.grad_norm")
 
-            if per_layer and _layer_axis(p, K) and K <= max_layers:
-                # collapse everything after the layer axis; if axis 1 is small it usually
-                # separates DIFFERENT quantities (CDLNet's t is [constant, sigma-slope]), so
-                # keep it split rather than averaging two unrelated numbers together
-                split1 = p.ndim >= 2 and p.shape[1] <= 4
-                for k in range(K):
-                    if len(logs) >= max_scalars:
-                        break
-                    if split1:
-                        for j in range(p.shape[1]):
-                            v = _finite(p[k, j].detach().float().mean())
-                            if v is not None:
-                                logs[f"{base}.layer{k:02d}.c{j}"] = v
-                    else:
-                        v = _finite(p[k].detach().float().mean())
-                        if v is not None:
-                            logs[f"{base}.layer{k:02d}"] = v
+        # ONE transfer for every value, and one for every gradient norm.
+        if val_chunks:
+            flat = torch.cat(val_chunks).tolist()
+            at = 0
+            for base, n in zip(val_names, val_sizes):
+                for i in range(n):
+                    v = _finite(flat[at + i])
+                    if v is None or len(logs) >= max_scalars:
+                        continue
+                    logs[base if n == 1 else f"{base}.{i}"] = v
+                at += n
+
+        if grad_vals:
+            for nm, gv in zip(grad_names, torch.stack(grad_vals).tolist()):
+                gv = _finite(gv)
+                if gv is not None and len(logs) < max_scalars:
+                    logs[nm] = gv
 
         # model-supplied derived quantities (see the module docstring)
         hook = getattr(net, "param_logs", None)
