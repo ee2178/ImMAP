@@ -73,11 +73,11 @@ def train_ipalm(
     for step in range(start_step, max_steps):
 
         try:
-            kspace, smaps, image, organ_mask = next(train_iter)
+            kspace, smaps, image, organ_mask, _pad_hw = next(train_iter)
 
         except StopIteration:
             train_iter = iter(train_loader)
-            kspace, smaps, image, organ_mask = next(train_iter)
+            kspace, smaps, image, organ_mask, _pad_hw = next(train_iter)
 
         kspace = kspace.to(device, non_blocking=True)
         smaps = smaps.to(device, non_blocking=True)
@@ -185,7 +185,7 @@ def train_ipalm(
 
             with torch.no_grad():
 
-                for kspace_v, smaps_v, image_v, organ_mask_v in val_loader:
+                for kspace_v, smaps_v, image_v, organ_mask_v, _pad_hw_v in val_loader:
 
                     kspace_v = kspace_v.to(device, non_blocking=True)
                     smaps_v = smaps_v.to(device, non_blocking=True)

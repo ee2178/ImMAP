@@ -43,8 +43,8 @@ def _call_net(net, x, E, sigma):
 # ---------------------------------------------------------------------------
 def recon(net, batch, cfg, device, sigma, generator=None):
     """CS-MRI reconstruction. Mirrors the val block of `training/recon.py`."""
-    kspace, smaps, image, _organ_mask = (b.to(device, non_blocking=True)
-                                         for b in batch)
+    kspace, smaps, image, _organ_mask, pad_hw = (
+        b.to(device, non_blocking=True) for b in batch)
     mri = cfg["mri"]
 
     mask = get_mask(image, R=mri["R"], acs_lines=mri["acs_lines"],
@@ -61,7 +61,12 @@ def recon(net, batch, cfg, device, sigma, generator=None):
     )
 
     E = Mask(mask) @ FFT2D() @ Sense(extra["smaps"])
-    out = _call_net(net, y, E, sigma_n)
+    # Same image-domain embedding the training loop uses; without it
+    # the operator would be padded here and not there, and the numbers
+    # would not be comparable to the training curves.
+    E, T = embed_operator(E, tuple(image.shape[-2:]),
+                          int(getattr(net, "pad_stride", 1) or 1))
+    out = T.forward(_call_net(net, y, E, sigma_n))
 
     if mri.get("whiten_kspace", False) and "Zinv" in extra:
         out = extra["Zinv"] * out

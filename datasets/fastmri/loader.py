@@ -5,6 +5,7 @@ import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 from datasets.registry import register_loader
+from operators.truncate import embedded_size
 
 # ============================================================
 # Config
@@ -60,6 +61,7 @@ class FastMRIDataset(Dataset):
         kspace_root=None,
         smap_root=None,
         scale_fac=None,
+        pad_multiple=1,
     ):
 
         if anatomy not in FASTMRI_PATHS:
@@ -73,6 +75,11 @@ class FastMRIDataset(Dataset):
         self.start_slice = start_slice
         self.end_slice = end_slice
         self.task = task
+        # Image-domain embedding for unrolled multigrid nets: the recon branch
+        # reports the smallest grid >= the measured one that is divisible by
+        # this, and training builds `E @ Truncate` onto it. 1 disables it.
+        # See operators/truncate.py for why this beats padding the operator.
+        self.pad_multiple = int(pad_multiple)
 
         # ----------------------------------------------------
         # Build filtered file list (IMPORTANT PART)
@@ -202,7 +209,15 @@ class FastMRIDataset(Dataset):
 
             mask = (smaps.abs().sum(dim=1, keepdim=True) > 0)
 
-            return kspace, smaps, image, mask
+            # The grid the NETWORK should solve on. Derived here rather than in
+            # the training loop because this is where the final image size is
+            # settled (crops, per-volume matrix sizes), and because an eval
+            # script then reproduces the embedding from the batch alone.
+            H, W = image.shape[-2:]
+            pad_hw = torch.tensor(
+                embedded_size((H, W), self.pad_multiple), dtype=torch.long)
+
+            return kspace, smaps, image, mask, pad_hw
 
 
 # ============================================================
@@ -223,6 +238,7 @@ def get_fastmri_loader(
     kspace_root=None,
     smap_root=None,
     scale_fac=None,
+    pad_multiple=1,
     drop_last=True,
 ):
     dataset = FastMRIDataset(
@@ -236,6 +252,7 @@ def get_fastmri_loader(
         kspace_root=kspace_root,
         smap_root=smap_root,
         scale_fac=scale_fac,
+        pad_multiple=pad_multiple,
     )
 
     return DataLoader(

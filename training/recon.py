@@ -17,9 +17,44 @@ from training.common import (
     prepare_measurement,
 )
 from visualization.filters import get_filter_grids
-from visualization.image import recon_panel, residual_kspace
+from visualization.image import recon_panel
 from physics.mask import get_mask_cached as get_mask
 from operators import Mask, FFT2D, Sense
+from operators.truncate import embed_operator
+
+
+def _embed(net, E, image, pad_hw):
+    """`(E @ Truncate, T)` for one batch, with the size contract checked.
+
+    The loader decides H'/W' from its own `pad_multiple`; the NETWORK is what
+    actually constrains them. Checking here turns a config that disagrees into
+    a named error instead of letting `kspace_pre_process` quietly fall back to
+    resampling the mask -- the failure this embedding exists to remove.
+    """
+    stride = int(getattr(net, "pad_stride", 1) or 1)
+    hw = tuple(image.shape[-2:])
+
+    if pad_hw is None:                       # loader predates the 5th return
+        return embed_operator(E, hw, stride)
+
+    p = torch.as_tensor(pad_hw).reshape(-1, 2)
+    if p.shape[0] > 1 and not bool((p == p[0]).all()):
+        raise ValueError(
+            f"the batch mixes embedded sizes ({p.tolist()}); a batch must be "
+            f"uniform for a single operator to cover it.")
+    big = (int(p[0, 0]), int(p[0, 1]))
+
+    if big[0] % stride or big[1] % stride:
+        raise ValueError(
+            f"data.pad_multiple gives {big[0]}x{big[1]}, which {type(net).__name__} "
+            f"cannot use: it needs a multiple of pad_stride={stride}. Set "
+            f"data.<split>.pad_multiple to {stride} (or a multiple of it).")
+    if big[0] < hw[0] or big[1] < hw[1]:
+        raise ValueError(f"embedded size {big} is smaller than the image {hw}.")
+
+    from operators.truncate import Truncate
+    T = Truncate(big, hw)
+    return (E if T.is_identity else E @ T), T
 
 
 def train_recon(
@@ -99,10 +134,10 @@ def train_recon(
         for _ in range(steps_per_epoch):
 
             try:
-                kspace, smaps, image, organ_mask = next(train_iter)
+                kspace, smaps, image, organ_mask, pad_hw = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                kspace, smaps, image, organ_mask = next(train_iter)
+                kspace, smaps, image, organ_mask, pad_hw = next(train_iter)
 
             kspace = kspace.to(device, non_blocking=True)
             smaps = smaps.to(device, non_blocking=True)
@@ -130,9 +165,15 @@ def train_recon(
             smaps = extra["smaps"]
             E = Mask(mask) @ FFT2D() @ Sense(smaps)
 
+            # Solve on a grid the network can halve cleanly, measure on the one
+            # the scanner used. T crops back and its adjoint zero-pads, so
+            # E @ T is exact -- no resampled mask, no reflect-padded maps.
+            E, T = _embed(net, E, image, pad_hw)
+
             opt.zero_grad(set_to_none=True)
 
             recon, _ = net(y, E=E, sigma=sigma_n)
+            recon = T.forward(recon)
 
             if whiten_kspace and "Zinv" in extra:
                 recon = extra["Zinv"] * recon
@@ -254,7 +295,8 @@ def train_recon(
 
             with torch.no_grad():
 
-                for kspace_v, smaps_v, image_v, organ_mask_v in val_loader:
+                for (kspace_v, smaps_v, image_v, organ_mask_v,
+                     pad_hw_v) in val_loader:
 
                     kspace_v = kspace_v.to(device, non_blocking=True)
                     smaps_v = smaps_v.to(device, non_blocking=True)
@@ -278,8 +320,10 @@ def train_recon(
 
                     smaps_v = extra_v["smaps"]
                     E_v = Mask(mask_v) @ FFT2D() @ Sense(smaps_v)
+                    E_v, T_v = _embed(net, E_v, image_v, pad_hw_v)
 
                     recon_v, _ = net(y_v, E=E_v, sigma=sigma_v)
+                    recon_v = T_v.forward(recon_v)
 
                     if whiten_kspace and "Zinv" in extra_v:
                         recon_v = extra_v["Zinv"] * recon_v
@@ -305,7 +349,7 @@ def train_recon(
                     # to beat: it is what the undersampling artifact looks like
                     # BEFORE reconstruction, so "did the net remove it or move
                     # it around" is answerable at a glance.
-                    zf_v = E_v.adjoint(y_v)
+                    zf_v = T_v.forward(E_v.adjoint(y_v))
                     if whiten_kspace and "Zinv" in extra_v:
                         zf_v = extra_v["Zinv"] * zf_v
 
@@ -325,35 +369,11 @@ def train_recon(
                         f"R={R} acs={acs_lines} mask={mask_dist} sigma={sig:.4f} "
                         f"| this slice: PSNR {float(m1['psnr']):.2f} dB, "
                         f"SSIM {float(m1['ssim']):.4f}, "
-                        f"NRMSE {float(m1['nrmse']):.4f}\n"
-                        f"residual: peak {100 * pstats['res_max']:.1f}%, "
-                        f"rms {100 * pstats['res_rms']:.2f}% of peak signal "
-                        f"(panel saturates at {100 / pstats['gain']:.0f}%)"
+                        f"NRMSE {float(m1['nrmse']):.4f}"
                     )
 
                     wandb.log(
-                        {
-                            "val/recon_example": wandb.Image(panel, caption=caption),
-                            "val/residual_kspace": wandb.Image(
-                                residual_kspace(image_v, recon_v),
-                                caption=(
-                                    f"epoch {epoch}: log|FFT(recon - gt)|. "
-                                    f"Energy laid out along the UNSAMPLED "
-                                    f"phase-encode lines (a comb of period R={R} "
-                                    f"for an equispaced mask, scattered for a "
-                                    f"random one) = unrecovered undersampling: a "
-                                    f"data-consistency / capacity problem. Energy "
-                                    f"piled at the band edges and corners = "
-                                    f"grid-locked structure at a coarse level's "
-                                    f"Nyquist, i.e. the multigrid transfer pair or "
-                                    f"a strided-ConvTranspose checkerboard -- more "
-                                    f"depth will NOT remove that one. Flat floor = "
-                                    f"noise."
-                                ),
-                            ),
-                            "val/residual_rms_frac": pstats["res_rms"],
-                            "val/residual_peak_frac": pstats["res_max"],
-                        },
+                        {"val/recon_example": wandb.Image(panel, caption=caption)},
                         step=global_step,
                     )
 

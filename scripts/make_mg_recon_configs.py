@@ -237,6 +237,26 @@ _DISPLAY_NAME = {
 }
 
 
+def _pad_multiple(spec, params):
+    """The image grid this cell's network needs, i.e. its `pad_stride`.
+
+    Derived from the model block rather than written by hand, because the two
+    drifting apart is exactly the failure the embedding exists to remove: a
+    pad_multiple smaller than pad_stride sends `kspace_pre_process` back to
+    resampling the mask, silently. `training/recon.py::_embed` re-checks this
+    against the live model and raises, so a mismatch cannot reach a run.
+
+    An AltSplitCDLNet's grid comes from its DENOISER: the outer loop runs
+    `preproc="identity"` and never pads, while the prox slot is the multigrid
+    net with the levels.
+    """
+    p = params.get("denoiser_kws", params)
+    K = p.get("K")
+    s_ = int(p.get("s", 1) or 1)
+    levels = 1 if (K is None or isinstance(K, int)) else len(list(K[1]))
+    return s_ * (2 ** (levels - 1))
+
+
 def _display_name(spec_type, params):
     """The run's name. Falls back to `<class>_<variant>` for an unmapped model
     so a new cell stays distinguishable instead of silently colliding."""
@@ -306,6 +326,8 @@ def make_config(anatomy, r, model, args):
                 "GPU node after any change to that file.")
     note = " ".join(notes) if notes else None
 
+    pad_multiple = _pad_multiple(spec, params)
+
     def data(split, shuffle_slices):
         return {
             "name": "fastmri",
@@ -320,6 +342,12 @@ def make_config(anatomy, r, model, args):
             "scale_fac": a["scale_fac"],
             "kspace_root": a["kspace_root"].format(split=split),
             "smap_root": a["smap_root"].format(split=split),
+            # Image-domain embedding: the loader reports the smallest grid
+            # >= the image that divides by this, and training unrolls on it
+            # via `E @ Truncate`. Padding the IMAGE keeps E exact; padding the
+            # OPERATOR (the old path) resamples the mask. See
+            # operators/truncate.py and notebooks/pad_stride_init_gap.ipynb.
+            "pad_multiple": pad_multiple,
         }
 
     total_steps = args.num_epochs * args.steps_per_epoch

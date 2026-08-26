@@ -41,6 +41,7 @@ import datasets                              # noqa: F401  triggers loader regis
 from datasets.registry import build_loader
 from models import build_model
 from operators import FFT2D, Mask, Sense
+from operators.truncate import embed_operator
 from physics.mask import get_mask_cached as get_mask
 from training.common import prepare_measurement
 from training.metrics import compute_metrics
@@ -82,7 +83,7 @@ def evaluate(model, cfg, sigma, loader, device, seed):
     totals = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0}
     n = 0
 
-    for kspace, smaps, image, _ in loader:
+    for kspace, smaps, image, _, _pad_hw in loader:
         kspace = kspace.to(device, non_blocking=True)
         smaps = smaps.to(device, non_blocking=True)
         image = image.to(device, non_blocking=True)
@@ -101,8 +102,14 @@ def evaluate(model, cfg, sigma, loader, device, seed):
         )
 
         E = Mask(mask) @ FFT2D() @ Sense(extra["smaps"])
+        # Same image-domain embedding training uses. Skipping it here would pad
+        # the operator at eval and not at train, so the CSV would not be
+        # comparable to the curves it is meant to summarise.
+        E, T = embed_operator(E, tuple(image.shape[-2:]),
+                              int(getattr(model, "pad_stride", 1) or 1))
 
         recon, _ = model(y, E=E, sigma=sigma_n)
+        recon = T.forward(recon)
 
         m = compute_metrics(image.abs(), recon.abs())
         for k in totals:

@@ -80,7 +80,7 @@ sigma_val = SIGMA if SIGMA is not None else ref["training"].get("val_noise_std",
 
 loader = build_loader(ref["data"]["val"], shuffle=False, drop_last=False)
 batch = next(b for i, b in enumerate(loader) if i == SLICE)
-kspace, smaps, image, _ = (b.to(device) for b in batch)
+kspace, smaps, image, _, _pad_hw = (b.to(device) for b in batch)
 
 mri = ref["mri"]
 mask = get_mask(image, R=mri["R"], acs_lines=mri["acs_lines"],
