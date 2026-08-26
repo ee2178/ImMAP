@@ -116,6 +116,24 @@ def main(config_path):
     start_step = 0
     ckpt_path = cfg.get("paths", {}).get("ckpt", None)
 
+    # `paths.init_ckpt`: weights-only WARM START, as opposed to `paths.ckpt`,
+    # which is a full resume (optimizer, scheduler and step all restored).
+    # Transferring a model trained on a different problem -- an easier
+    # acceleration, a different anatomy -- wants none of that: a fresh Adam and
+    # the whole cosine schedule, from step 0. Passing optimizer=None below is
+    # what makes it weights-only; load_ckpt skips whatever it is handed None
+    # for, so the source checkpoint keeps its optimizer state untouched and does
+    # not need rewriting first.
+    #
+    # POPPED, not read in place: cfg["paths"] is splatted as **cfg["paths"] into
+    # every train_* function, and none of them accepts this key -- leaving it
+    # would be a TypeError at dispatch, in every task branch.
+    #
+    # Ignored once `ckpt` exists, so a run that has started (train.py stamps
+    # paths.ckpt into its saved config) never re-applies the warm start over its
+    # own progress on a requeue.
+    init_ckpt = cfg.get("paths", {}).pop("init_ckpt", None)
+
     if ckpt_path:
         print(f"Loading checkpoint from {ckpt_path}")
 
@@ -128,6 +146,11 @@ def main(config_path):
         )
 
         print(f"Resuming from step {start_step}")
+
+    elif init_ckpt:
+        print(f"Warm-starting weights from {init_ckpt}")
+        load_ckpt(path=init_ckpt, model=model, device=device)
+        print("Fresh optimizer and scheduler; starting from step 0.")
 
     # compile the fused flex kernel once, on the final model object
     if getattr(model, "attn_backend", None) == "flex":
