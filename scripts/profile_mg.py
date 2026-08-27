@@ -73,6 +73,60 @@ from physics.mask import make_acc_mask              # noqa: E402
 # ===========================================================================
 #  synthetic measurement
 # ===========================================================================
+def build_problems_from_data(cfg, split, n_volumes, R, acs_lines, sigma,
+                            device, pad_stride, seed=0):
+    """Real fastMRI slices, as a LIST of `(y, E, sigma)` problems.
+
+    A list, not one problem, because the point of timing on real data is the
+    SHAPE MIX. `build_problem` makes a single 320x320 measurement, and at one
+    shape `cudnn.benchmark` tunes once and every rep hits a warm plan -- which
+    is not what training sees. Real volumes come at several matrix sizes, each
+    snapped up to its own multiple of `pad_stride` by the embedding, so the
+    autotuner pays a tuning cost per shape and the plan cache has to hold them
+    all. That is the cost this mode exists to expose.
+
+    k-space is simulated from the stored image and maps, matching
+    `kspace_type: "simulated"` in the configs; the operator carries the same
+    `E @ Truncate` embedding the training loop builds.
+    """
+    from datasets.fastmri.loader import FastMRIDataset
+    from operators.noise import mri_awgn
+    from operators.truncate import embed_operator
+
+    d = dict(cfg["data"][split])
+    d.pop("name", None)
+    d.pop("task", None)
+    d.pop("batch_size", None)
+    ds = FastMRIDataset(task="recon", **d)
+    if len(ds) == 0:
+        raise SystemExit(f"[profile] no volumes under {d.get('smap_root')!r}")
+
+    problems, shapes = [], []
+    step = max(1, len(ds) // max(n_volumes, 1))
+    for k in range(min(n_volumes, len(ds))):
+        _kspace, smaps, image, _om, _pad = ds[(k * step) % len(ds)]
+        if smaps.dim() == 3:
+            smaps = smaps.unsqueeze(0)
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        smaps, image = smaps.to(device), image.to(device)
+        H, W = image.shape[-2:]
+
+        mask = make_acc_mask(shape=(H, W), accel=R, acs_lines=acs_lines,
+                             mode="uniform", offset=0)
+        mask = mask.reshape(1, 1, H, W).float().to(device)
+        E = Mask(mask) @ FFT2D() @ Sense(smaps)
+
+        g = torch.Generator(device=device).manual_seed(seed + k)
+        y, sig, _ = mri_awgn(image, mask, smaps, sigma, "uniform", generator=g)
+        E, T = embed_operator(E, (H, W), pad_stride)
+        sig = torch.as_tensor(sig, device=device).reshape(1, 1, 1, 1).float()
+
+        problems.append((y, E, sig))
+        shapes.append(((H, W), T.big, smaps.shape[1]))
+    return problems, shapes
+
+
 def build_problem(size, coils, batch, R, acs_lines, sigma, device, seed=0):
     """A SENSE measurement of the requested shape.
 
@@ -334,18 +388,28 @@ def breakdown_run(model, y, E, sigma, device, by_level=False):
     return dict(totals), dict(counts), wall
 
 
-def time_run(model, y, E, sigma, reps, warmup, device):
-    """Uninstrumented wall clock. This is the number to quote."""
+def time_run(model, problems, reps, warmup, device):
+    """Uninstrumented wall clock. This is the number to quote.
+
+    `problems` is a list of `(y, E, sigma)`; reps cycle through it. Warmup runs
+    EVERY problem at least once, which matters under `cudnn.benchmark`: an
+    untuned shape entering the timed loop would charge its one-off autotuning
+    cost to a single rep and skew the max (and, with few reps, the median).
+    """
     cuda = device.type == "cuda"
+    if not isinstance(problems, list):
+        problems = [problems]
     with torch.no_grad():
-        for _ in range(warmup):
+        for i in range(max(warmup, len(problems))):
+            y, E, sigma = problems[i % len(problems)]
             model(y, E=E, sigma=sigma)
         if cuda:
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
 
         samples = []
-        for _ in range(reps):
+        for i in range(reps):
+            y, E, sigma = problems[i % len(problems)]
             t0 = time.perf_counter()
             model(y, E=E, sigma=sigma)
             if cuda:
@@ -390,6 +454,13 @@ def main():
     ap.add_argument("--cudnn-benchmark", action="store_true",
                     help="enable cuDNN autotuning (off by default everywhere in "
                          "this repo); shapes are fixed, so warmup pays for it")
+    ap.add_argument("--data", action="store_true",
+                    help="time on REAL slices from the config's own data block "
+                         "instead of a synthetic measurement; cycles several "
+                         "volumes so the real shape mix is covered")
+    ap.add_argument("--data-split", default="train", choices=("train", "val"))
+    ap.add_argument("--data-volumes", type=int, default=4,
+                    help="how many volumes to cycle through with --data")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -411,14 +482,20 @@ def main():
     print(f"device   : {device}"
           + (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     print(f"torch    : {torch.__version__}")
-    print(f"problem  : {args.batch}x{args.coils} coils, {size[0]}x{size[1]}, "
-          f"sigma={args.sigma}, {args.reps} reps after {args.warmup} warmup")
+    if args.data:
+        print(f"problem  : REAL slices, {args.data_volumes} volumes from the "
+              f"config's {args.data_split} split, sigma={args.sigma}, "
+              f"{args.reps} reps after {args.warmup} warmup")
+    else:
+        print(f"problem  : {args.batch}x{args.coils} coils, {size[0]}x{size[1]}, "
+              f"sigma={args.sigma}, {args.reps} reps after {args.warmup} warmup")
     print(f"cudnn.benchmark : {torch.backends.cudnn.benchmark}\n")
 
     rows, first_median, outputs = [], {}, {}
     for cfg_path in args.configs:
         with open(cfg_path) as f:
-            mri = json.load(f).get("mri", {})
+            full_cfg = json.load(f)
+        mri = full_cfg.get("mri", {})
         R = args.R if args.R is not None else mri.get("R", 4)
         acs = args.acs_lines if args.acs_lines is not None else mri.get("acs_lines", 20)
 
@@ -433,10 +510,24 @@ def main():
             with ctx():
                 # rebuilt inside the context: the fused-Gram matcher runs in
                 # CompositeOperator.__init__
-                y, E, sigma = build_problem(size, args.coils, args.batch, R, acs,
-                                            args.sigma, device, args.seed)
                 model, label, n_par = load_model(cfg_path, device, args.seed)
-                stats = time_run(model, y, E, sigma, args.reps, args.warmup, device)
+                if args.data:
+                    problems, shapes = build_problems_from_data(
+                        full_cfg, args.data_split, args.data_volumes, R, acs,
+                        args.sigma, device, int(getattr(model, "pad_stride", 1) or 1),
+                        args.seed)
+                    if mode == modes[0][0]:
+                        print(f"--- real slices timed ({name}, "
+                              f"{args.data_split}) ---")
+                        for (hw, big, nc) in shapes:
+                            grew = "" if hw == big else f" -> {big[0]}x{big[1]}"
+                            print(f"    {hw[0]}x{hw[1]}{grew}   {nc} coils")
+                        print()
+                else:
+                    problems = [build_problem(size, args.coils, args.batch, R, acs,
+                                              args.sigma, device, args.seed)]
+                y, E, sigma = problems[0]
+                stats = time_run(model, problems, args.reps, args.warmup, device)
                 if args.ab or args.ab_prox:
                     with torch.no_grad():
                         outputs[(name, mode)] = model(y, E=E, sigma=sigma)[0].clone()

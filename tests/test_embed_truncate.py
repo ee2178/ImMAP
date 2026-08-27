@@ -20,7 +20,7 @@ from operators.noise import mri_awgn
 from physics.mask import make_acc_mask
 from preprocessing.kspace import kspace_pre_process
 
-PASS, FAIL = [], []
+PASS, FAIL, SKIPPED = [], [], []
 
 
 def check(name, cond, detail=""):
@@ -195,6 +195,113 @@ def test_train_step_end_to_end():
         check("a pad_multiple below pad_stride is rejected", "pad_stride" in str(e))
 
 
+def test_real_fastmri():
+    """The same properties, on a real slice -- plus what only real data shows."""
+    print("\n[real fastMRI data]")
+    from tests.fastmri_fixture import (adjoint_tol, banner, load_slice,
+                                       survey_sizes)
+    from models.mg_lpds import MGLPDSNet
+    from operators.noise import mri_awgn
+    from physics.mask import make_acc_mask
+    from training.recon import _embed
+
+    sample = load_slice(anatomy="brain", pad_multiple=8)
+    print(banner(sample))
+    if sample is None:
+        SKIPPED.append("real fastMRI data")
+        return
+
+    image, smaps = sample["image"], sample["smaps"]
+    H, W = image.shape[-2:]
+    pad_hw = sample["pad_hw"]
+    big = (int(pad_hw[0, 0]), int(pad_hw[0, 1]))
+
+    check("dataset's pad_hw matches embedded_size",
+          big == embedded_size((H, W), 8), f"{big} vs {embedded_size((H, W), 8)}")
+    check("embedded grid divides by 8", big[0] % 8 == 0 and big[1] % 8 == 0, str(big))
+    if big == (H, W):
+        print("        NOTE: this volume already divides by 8, so Truncate is the "
+              "identity here.\n              The padded path is covered by the "
+              "synthetic tests above.")
+
+    # mri_awgn's sigma only means "noise std of the coil-combined adjoint" if
+    # the maps are unit-RSS. Synthetic maps are normalised by construction;
+    # these came off the preprocessing pipeline.
+    rss = smaps.abs().pow(2).sum(1).sqrt()
+    sup = rss[rss > 1e-3]
+    check("real coil maps are unit-RSS on their support",
+          bool((sup - 1.0).abs().max() < 5e-2),
+          f"max deviation {float((sup - 1.0).abs().max()):.3e}")
+
+    # THE PREMISE. Zero-padding the image domain is only reasonable because the
+    # anatomy sits inside the FOV. That is a claim about the DATA, so it can
+    # only be checked here. Measure the energy in the ring the pad will occupy.
+    T_probe = Truncate(big, (H, W))
+    if not T_probe.is_identity:
+        padded_gt = T_probe.adjoint(image)
+        ring = 1.0 - float(T_probe.forward(padded_gt).abs().pow(2).sum()
+                           / padded_gt.abs().pow(2).sum().clamp_min(1e-20))
+        check("the pad ring is exactly zero by construction", abs(ring) < 1e-12,
+              f"{ring:.2e}")
+    # ... and how much signal already sits in the outermost rows/cols, which is
+    # what would get *cropped* if this were the other direction.
+    edge = max(big[0] - H, big[1] - W, 1)
+    border = image.clone()
+    border[..., edge:-edge, edge:-edge] = 0
+    frac = float(border.abs().pow(2).sum() / image.abs().pow(2).sum().clamp_min(1e-20))
+    check(f"anatomy is inside the FOV (outer {edge}px holds <1% of energy)",
+          frac < 0.01, f"{100 * frac:.3f}%")
+
+    # the operator built from real maps, embedded
+    mask = make_acc_mask((H, W), 8, acs_lines=20)
+    while mask.dim() < 4:
+        mask = mask.unsqueeze(0)
+    E = Mask(mask) @ FFT2D() @ Sense(smaps)
+    y, _, _ = mri_awgn(image, mask, smaps, 0.005, "uniform")
+    E_emb, T = embed_operator(E, (H, W), 8)
+
+    torch.manual_seed(3)
+    xb = torch.randn(1, 1, *big, dtype=torch.complex64)
+    lhs = torch.vdot(E_emb(xb).flatten(), y.flatten())
+    rhs = torch.vdot(xb.flatten(), E_emb.adjoint(y).flatten())
+    rel = float(abs(lhs - rhs) / abs(lhs).clamp_min(1e-20))
+    # tolerance scales with the accumulation length; see adjoint_tol
+    tol = adjoint_tol(y.numel())
+    check("adjointness holds on real maps", rel < tol,
+          f"relative {rel:.2e} vs tol {tol:.2e} ({y.numel():,} terms)")
+
+    ref = T.adjoint(E.gram(T.forward(xb)))
+    d = float((E_emb.gram(xb) - ref).abs().max())
+    check("gram == T^H (E^H E) T on real maps", d < 1e-3, f"max|diff| {d:.2e}")
+
+    # a real batch through the training path (small dictionary: the point here
+    # is the operator and the sizes, not the width of the filter bank)
+    base = dict(M=16, C=1, P=3, s=2, widen=1, degrees=1, lam0=1e-3, tau0=0.5,
+                theta0=0.0, alpha0=1.0, is_complex=True, preproc="kspace",
+                resize_noise=True)
+    torch.manual_seed(1)
+    net = MGLPDSNet(K=[1, [2, 2, 2]], **base).eval()
+    E2, T2 = _embed(net, E, image, pad_hw)
+    with torch.no_grad():
+        recon, _ = net(y, E=E2, sigma=torch.full((1, 1, 1, 1), 0.005))
+    check("model runs on the real embedded grid",
+          tuple(recon.shape[-2:]) == big, str(tuple(recon.shape[-2:])))
+    recon = T2.forward(recon)
+    check("cropped output matches the real image grid", recon.shape == image.shape)
+    check("output is finite", bool(torch.isfinite(recon.abs()).all()))
+
+    # does the embedding fire on this dataset at all?
+    sizes = survey_sizes(anatomy="brain", pad_multiple=8)
+    if sizes:
+        tot = sum(sizes.values())
+        ok8 = sum(v for (h, w), v in sizes.items() if h % 8 == 0 and w % 8 == 0)
+        print(f"        size histogram over {tot} volumes: "
+              f"{dict(sorted(sizes.items(), key=lambda kv: -kv[1]))}")
+        print(f"        {tot - ok8}/{tot} volumes need the embedding "
+              f"({100 * (tot - ok8) / max(tot, 1):.1f}%)")
+        check("survey read every volume", tot > 0, f"{tot} volumes")
+
+
 def test_loader_contract():
     print("\n[dataset reports the embedded size]")
     import inspect
@@ -212,7 +319,9 @@ if __name__ == "__main__":
     test_network_is_flat_across_sizes()
     test_train_step_end_to_end()
     test_loader_contract()
-    print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
+    test_real_fastmri()
+    tail = f", {len(SKIPPED)} section(s) SKIPPED: {', '.join(SKIPPED)}" if SKIPPED else ""
+    print(f"\n{len(PASS)} passed, {len(FAIL)} failed{tail}")
     for f in FAIL:
         print(f"  FAILED: {f}")
     raise SystemExit(1 if FAIL else 0)

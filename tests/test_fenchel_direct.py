@@ -12,7 +12,7 @@ import torch
 
 from models.prox import FenchelProx, SoftThreshold, build_prox
 
-PASS, FAIL = [], []
+PASS, FAIL, SKIPPED = [], [], []
 
 
 def check(name, cond, detail=""):
@@ -121,11 +121,84 @@ def test_network_output_unchanged():
     check("MGLPDSNet gradients identical", rel < 1e-5, f"relative {rel:.2e}")
 
 
+def test_real_fastmri():
+    """The rewrite must be exact on real magnitudes, not just on randn.
+
+    Synthetic z is unit-scale and dense; a real latent after a real forward pass
+    is neither. `t / |z|` is where the two forms could diverge -- on a genuinely
+    sparse code many entries sit near zero, which is exactly the branch the
+    `clamp_min` guard covers.
+    """
+    print("\n[real fastMRI data]")
+    from tests.fastmri_fixture import load_slice, banner
+    from models.mg_lpds import MGLPDSNet
+    from operators import FFT2D, Mask, Sense
+    from operators.noise import mri_awgn
+    from physics.mask import make_acc_mask
+
+    sample = load_slice(anatomy="brain", pad_multiple=8)
+    print(banner(sample))
+    if sample is None:
+        SKIPPED.append("real fastMRI data")
+        return
+
+    image, smaps = sample["image"], sample["smaps"]
+    H, W = image.shape[-2:]
+    mask = make_acc_mask((H, W), 8, acs_lines=20)
+    while mask.dim() < 4:
+        mask = mask.unsqueeze(0)
+    E = Mask(mask) @ FFT2D() @ Sense(smaps)
+    y, _, _ = mri_awgn(image, mask, smaps, 0.005, "uniform")
+    sig = torch.full((1, 1, 1, 1), 0.005)
+
+    from operators.truncate import embed_operator
+    base = dict(M=16, C=1, P=3, s=2, widen=1, degrees=1, lam0=1e-3, tau0=0.5,
+                theta0=0.0, alpha0=1.0, is_complex=True, preproc="kspace",
+                resize_noise=True)
+    torch.manual_seed(1)
+    net = MGLPDSNet(K=[1, [2, 2, 2]], **base).eval()
+    E_emb, T = embed_operator(E, (H, W), net.pad_stride)
+
+    with torch.no_grad():
+        a, b = both_ways(lambda: T.forward(net(y, E=E_emb, sigma=sig)[0]))
+    rel = float((a - b).abs().norm() / b.abs().norm().clamp_min(1e-20))
+    check("output identical on a real slice", rel < 1e-6, f"relative {rel:.2e}")
+
+    # Report how sparse the real code is, but do NOT assert on it: at
+    # initialisation the dictionary is untrained and the code is dense, so
+    # nothing sits near the eps guard. That is a fact about an untrained
+    # network, not a property of the rewrite. The z = 0 branch is covered
+    # exactly, and deterministically, by the exact-zeros row in
+    # test_values_and_grads above.
+    with torch.no_grad():
+        _, latent = net(y, E=E_emb, sigma=sig)
+    z = latent[1] if isinstance(latent, tuple) else latent
+    a_z = z.abs()
+    tiny = float((a_z < 1e-6 * a_z.max()).float().mean())
+    print(f"        real code: {100 * tiny:.2f}% of entries below 1e-6 of max, "
+          f"min|z|/max|z| = {float(a_z.min() / a_z.max().clamp_min(1e-30)):.2e}")
+    print("        (dense at init, as expected; the z=0 branch is covered "
+          "synthetically)")
+
+    def grad_sum():
+        net.zero_grad(set_to_none=True)
+        out = T.forward(net(y, E=E_emb, sigma=sig)[0])
+        (out.abs() - image.abs()).pow(2).mean().backward()
+        return sum(float(p.grad.abs().sum()) for p in net.parameters()
+                   if p.grad is not None)
+
+    ga, gb = both_ways(grad_sum)
+    rel = abs(ga - gb) / max(abs(gb), 1e-20)
+    check("gradients identical on a real slice", rel < 1e-5, f"relative {rel:.2e}")
+
+
 if __name__ == "__main__":
     test_values_and_grads()
     test_dispatch()
     test_network_output_unchanged()
-    print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
+    test_real_fastmri()
+    tail = f", {len(SKIPPED)} section(s) SKIPPED: {', '.join(SKIPPED)}" if SKIPPED else ""
+    print(f"\n{len(PASS)} passed, {len(FAIL)} failed{tail}")
     for f in FAIL:
         print(f"  FAILED: {f}")
     raise SystemExit(1 if FAIL else 0)
