@@ -63,6 +63,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import models.components as components_mod          # noqa: E402
 import models.lpds as lpds_mod                      # noqa: E402
 import models.mg_lpds as mg_mod                     # noqa: E402
+import models.prox as prox_mod                       # noqa: E402
 import operators.base as base_mod                   # noqa: E402
 from models import build_model                      # noqa: E402
 from operators import FFT2D, Mask, Sense            # noqa: E402
@@ -126,6 +127,26 @@ def load_model(cfg_path, device, seed=0):
 # ===========================================================================
 #  Tier-1 toggles  (for --ab)
 # ===========================================================================
+
+
+@contextlib.contextmanager
+def direct_prox_disabled():
+    """Restore `prox_{g*}(z) = z - prox_g(z)` written as a literal subtraction.
+
+    The direct form is `z * min(1, t/|z|)`: same map, four elementwise passes
+    over the M-channel tensor instead of about seven. Elementwise is the
+    largest single bucket in this model, and this runs once per LPDS sweep.
+
+    Toggled at the class attribute rather than by editing the module, so the
+    A/B measures exactly this one change. Unlike `tier1_disabled` nothing has
+    to be rebuilt: the flag is read per call, not at construction.
+    """
+    orig = prox_mod.FenchelProx.DIRECT
+    prox_mod.FenchelProx.DIRECT = False
+    try:
+        yield
+    finally:
+        prox_mod.FenchelProx.DIRECT = orig
 @contextlib.contextmanager
 def tier1_disabled():
     """Restore the pre-optimisation behaviour of every Tier-1 change.
@@ -356,6 +377,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--ab", action="store_true",
                     help="also run with the Tier-1 Gram optimisations disabled")
+    ap.add_argument("--ab-prox", action="store_true",
+                    help="also run with the direct Fenchel prox disabled, i.e. "
+                         "z - prox_g(z) spelled out; measures that change alone")
     ap.add_argument("--counts", action="store_true",
                     help="exact op counts and the grid each ran at")
     ap.add_argument("--breakdown", action="store_true",
@@ -402,6 +426,8 @@ def main():
         modes = [("optimised", contextlib.nullcontext)]
         if args.ab:
             modes.append(("pre-Tier1", tier1_disabled))
+        if args.ab_prox:
+            modes.append(("subtracted-prox", direct_prox_disabled))
 
         for mode, ctx in modes:
             with ctx():
@@ -411,7 +437,7 @@ def main():
                                             args.sigma, device, args.seed)
                 model, label, n_par = load_model(cfg_path, device, args.seed)
                 stats = time_run(model, y, E, sigma, args.reps, args.warmup, device)
-                if args.ab:
+                if args.ab or args.ab_prox:
                     with torch.no_grad():
                         outputs[(name, mode)] = model(y, E=E, sigma=sigma)[0].clone()
             rows.append((name, label, n_par, mode, stats))
@@ -447,11 +473,11 @@ def main():
                           f"{n if n else '':>8}{per}")
                 print()
 
-    print(f"{'config':<16}{'model':<28}{'params':>10}  {'mode':<11}"
+    print(f"{'config':<16}{'model':<28}{'params':>10}  {'mode':<17}"
           f"{'median':>9}{'min':>8}{'max':>8}{'peak MB':>10}")
-    print("-" * 100)
+    print("-" * 106)
     for name, label, n_par, mode, s in rows:
-        print(f"{name:<16}{label:<28}{n_par:>10,}  {mode:<11}"
+        print(f"{name:<16}{label:<28}{n_par:>10,}  {mode:<17}"
               f"{s['median']:>8.2f}{s['lo']:>8.2f}{s['hi']:>8.2f}{s['peak_mb']:>10.0f}")
 
     subject = os.path.splitext(os.path.basename(args.configs[0]))[0]
@@ -463,26 +489,34 @@ def main():
                 r = first_median[(subject, mode)] / first_median[(n, m)]
                 print(f"  {mode:<11} {subject} / {n} = {r:.2f}x")
 
-    if args.ab:
-        print()
-        for name in dict.fromkeys(r[0] for r in rows):
-            a, b = first_median.get((name, "pre-Tier1")), first_median.get((name, "optimised"))
-            if a and b:
-                print(f"  Tier-1 speedup  {name:<16} {a / b:.2f}x   "
-                      f"({a:.2f} -> {b:.2f} ms)")
+    baselines = ([("pre-Tier1", "Tier-1")] if args.ab else []) \
+        + ([("subtracted-prox", "direct prox")] if args.ab_prox else [])
 
-        # The optimisations are meant to be exact, not approximate. Re-check
-        # that here rather than trusting it: same seed, so the two modes differ
-        # only by the four changes.
+    if baselines:
         print()
-        for name in dict.fromkeys(r[0] for r in rows):
-            u, v = outputs.get((name, "optimised")), outputs.get((name, "pre-Tier1"))
-            if u is None or v is None:
-                continue
-            err = ((u - v).abs().max() / (v.abs().max() + 1e-12)).item()
-            verdict = ("bit-identical" if err == 0.0 else
-                       "exact to fp roundoff" if err < 1e-6 else "MISMATCH")
-            print(f"  equivalence     {name:<16} max rel err = {err:.3e}  {verdict}")
+        for mode, tag in baselines:
+            for name in dict.fromkeys(r[0] for r in rows):
+                a = first_median.get((name, mode))
+                b = first_median.get((name, "optimised"))
+                if a and b:
+                    print(f"  {tag + ' speedup':<25}{name:<16} {a / b:.2f}x   "
+                          f"({a:.2f} -> {b:.2f} ms)")
+
+        # These optimisations are meant to be exact, not approximate. Re-check
+        # rather than trusting it: same seed, so the modes differ only by the
+        # change under test.
+        print()
+        for mode, tag in baselines:
+            for name in dict.fromkeys(r[0] for r in rows):
+                u = outputs.get((name, "optimised"))
+                v = outputs.get((name, mode))
+                if u is None or v is None:
+                    continue
+                err = ((u - v).abs().max() / (v.abs().max() + 1e-12)).item()
+                verdict = ("bit-identical" if err == 0.0 else
+                           "exact to fp roundoff" if err < 1e-6 else "MISMATCH")
+                print(f"  {tag + ' equivalence':<25}{name:<16} "
+                      f"max rel err = {err:.3e}  {verdict}")
 
 
 if __name__ == "__main__":
