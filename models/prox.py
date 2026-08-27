@@ -168,6 +168,10 @@ def soft_threshold(x, t):
 class SoftThreshold(nn.Module):
     """Elementwise prox of `tau(sigma) ||z||_1`, tau per-channel and >= 0."""
 
+    # Guards the division in `fenchel`; see its docstring for why the value at
+    # z = 0 is exact regardless.
+    fenchel_eps = 1e-12
+
     def __init__(self, channels, tau0=1e-2, degrees=0):
         super().__init__()
         self.tau = Polynomial(channels, degrees=degrees, tau0=tau0)
@@ -178,6 +182,27 @@ class SoftThreshold(nn.Module):
 
     def forward(self, z, sigma=None, cache=None):
         return soft_threshold(z, self.threshold(z, sigma)), cache
+
+    def fenchel(self, z, sigma=None, cache=None):
+        """`prox_{g*}(z) = z - ST(z, t)`, formed DIRECTLY rather than by
+        subtraction.
+
+            z - sgn(z) relu(|z| - t)  ==  z * min(1, t / |z|)
+
+        because `prox_g` shrinks the modulus to `relu(|z| - t)` and leaves the
+        phase alone, so the conjugate keeps the phase and clips the modulus at
+        `t`. Same answer, fewer passes over an M-channel tensor: the left form
+        is abs, sgn (itself abs + div), sub, relu, mul, sub; the right is abs,
+        div, clamp, mul. Elementwise is ~46% of this model's runtime and this
+        runs once per LPDS sweep, 84 times per forward.
+
+        `clamp_min` on the modulus keeps `t / |z|` finite at z = 0. The value
+        there is unaffected: `|z| <= t` means `prox_g(z) = 0`, so the conjugate
+        returns `z` -- and `min(1, t/eps) = 1` gives exactly that.
+        """
+        t = self.threshold(z, sigma)
+        a = z.abs().clamp_min(self.fenchel_eps)
+        return z * (t / a).clamp_max(1.0), cache
 
     def subgradient(self, z, sigma=None, cache=None):
         # Moreau: z - ST(z, t) = sgn(z) min(|z|, t) -- exact and cheap.
@@ -543,13 +568,28 @@ class FenchelProx(nn.Module):
 
     Turns soft-thresholding into clipping and group-thresholding into group
     clipping, which is what the LPDS / dual family of unrollings needs.
+
+    When the wrapped prox offers a `fenchel` method it is used instead of the
+    literal subtraction, which is the same map written in fewer elementwise
+    passes. `SoftThreshold` provides one; anything that does not (the group
+    prox, whose cost is the adjacency rather than the elementwise tail) falls
+    back to `z - prox_g(z)` and is unaffected.
     """
+
+    # Class-level so it can be flipped globally, matching
+    # `_GaussConvNd.INPLACE_COMBINE`: a kill switch if the direct form ever
+    # misbehaves, and what an A/B run toggles to measure what it is worth.
+    DIRECT = True
 
     def __init__(self, prox):
         super().__init__()
         self.prox = prox
 
     def forward(self, z, sigma=None, cache=None):
+        if self.DIRECT:
+            direct = getattr(self.prox, "fenchel", None)
+            if direct is not None:
+                return direct(z, sigma, cache)
         zt, cache = self.prox(z, sigma, cache)
         return z - zt, cache
 

@@ -361,14 +361,21 @@ def main():
     ap.add_argument("--breakdown", action="store_true",
                     help="split GPU time into fft / conv / resample / other")
     ap.add_argument("--by-level", action="store_true",
-                    help="with --breakdown, key each family by its input grid "
-                         "size, separating the multigrid levels")
+                    help="key each family by its input grid size, separating "
+                         "the multigrid levels; implies --breakdown")
     ap.add_argument("--cudnn-benchmark", action="store_true",
                     help="enable cuDNN autotuning (off by default everywhere in "
                          "this repo); shapes are fixed, so warmup pays for it")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+
+    # --by-level only keys the breakdown's families; on its own it silently
+    # produced nothing, which cost a real debugging round trip. Imply the flag
+    # it needs and say so.
+    if args.by_level and not args.breakdown:
+        args.breakdown = True
+        print("[profile] --by-level implies --breakdown; enabling it.")
 
     device = torch.device(args.device)
     size = (args.size[0], args.size[-1])

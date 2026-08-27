@@ -105,6 +105,22 @@ def main(config_path):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+
+    # cuDNN autotuning. Measured +17% on MGLPDSNet (130.51 -> 108.05 ms, L40S,
+    # 320x320 / 16 coils / batch 1), essentially ALL of it from one shape: the
+    # coarsest level's ConvTranspose at 40x40, where the default heuristic
+    # picks 196 us/call against autotuning's 35. Only the multigrid models have
+    # small-spatial / high-channel transposed convs, which is why the flat
+    # baseline never showed it.
+    #
+    # Autotuning re-benchmarks per distinct input shape, so it is a win only
+    # when shapes are stable. The image-domain embedding makes them stable:
+    # every sample is snapped up to a multiple of the model's pad_stride, so a
+    # dataset of varied fastMRI matrix sizes collapses to a handful of grids.
+    # Set `training.cudnn_benchmark: false` if you ever feed genuinely
+    # unbounded sizes.
+    torch.backends.cudnn.benchmark = bool(
+        cfg.get("training", {}).get("cudnn_benchmark", True))
     # Init model from scratch if no ckpt provided
     model = build_model(cfg).to(device)
     optimizer = build_optimizer(model, cfg)
