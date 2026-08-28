@@ -451,7 +451,8 @@ def make_config(anatomy, r, model, args):
             "val_seed": VAL_SEED,
             "loss_type": "magnitude-nl1-nl2",
             "clip_grad": 1.0,
-            "use_organ_mask": False,
+            # Loss AND metrics AND the wandb panel -- see training/recon.py.
+            "use_organ_mask": bool(getattr(args, "organ_mask", False)),
             # None disables the averaged-loss backtrack THRESHOLD (a non-finite
             # loss still triggers a protective restore). The margin is in loss
             # units and this grid's scale is not known in advance -- pick one
@@ -509,6 +510,14 @@ def main():
                    help="print the configs instead of writing them (no torch needed)")
     p.add_argument("--list-cells", action="store_true",
                    help="print the sbatch index -> cell map and exit")
+    p.add_argument("--organ-mask", action="store_true",
+                   help="restrict the loss, the metrics and the logged panel "
+                        "to the coil-sensitivity support (`organ_mask`). Use "
+                        "for knee, where the air background is large and its "
+                        "reconstruction is not what the comparison is about. "
+                        "OFF by default and deliberately not per-anatomy: it "
+                        "changes what PSNR/NRMSE/SSIM MEAN, so a masked run "
+                        "cannot go in the same table as an unmasked one.")
     p.add_argument("--accels", nargs="*", type=int, default=None,
                    help="restrict to these accelerations (with --list-cells)")
     args = p.parse_args()

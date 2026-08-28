@@ -83,10 +83,17 @@ def evaluate(model, cfg, sigma, loader, device, seed):
     totals = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0}
     n = 0
 
-    for kspace, smaps, image, _, _pad_hw in loader:
+    # Same switch the run trained under, read from the run's own config, so the
+    # CSV summarises the val curve rather than a different quantity that
+    # happens to share its name.
+    use_organ_mask = cfg.get("training", {}).get("use_organ_mask", False)
+
+    for kspace, smaps, image, organ_mask, _pad_hw in loader:
         kspace = kspace.to(device, non_blocking=True)
         smaps = smaps.to(device, non_blocking=True)
         image = image.to(device, non_blocking=True)
+        organ_mask = (organ_mask.to(device, non_blocking=True)
+                      if use_organ_mask else None)
 
         mask = get_mask(image, R=mri["R"], acs_lines=mri["acs_lines"],
                         mode=mri.get("mask_dist", "uniform"),
@@ -111,7 +118,7 @@ def evaluate(model, cfg, sigma, loader, device, seed):
         recon, _ = model(y, E=E, sigma=sigma_n)
         recon = T.forward(recon)
 
-        m = compute_metrics(image.abs(), recon.abs())
+        m = compute_metrics(image.abs(), recon.abs(), mask=organ_mask)
         for k in totals:
             totals[k] += float(m[k].detach())
         n += 1

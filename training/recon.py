@@ -83,6 +83,14 @@ def train_recon(
     val_seed=None,
     ### Loss
     loss_type="complex-mse",
+    # `organ_mask` is the coil-sensitivity support the recon loader returns.
+    # This ONE flag governs all three places it can act, because splitting it
+    # would let the loss optimise one region while the curves scored another:
+    #   * the loss           (image * mask vs recon * mask)
+    #   * PSNR / NRMSE / SSIM (restricted to the region -- see training.metrics)
+    #   * the wandb panel     (masked images, so the picture matches the number)
+    # Off by default: turning it on changes what every metric MEANS, so runs
+    # either side of the switch are not comparable.
     use_organ_mask=False,
     ### Fit (epoch-based)
     num_epochs=1000,          # total epochs (was: max_steps)
@@ -111,6 +119,15 @@ def train_recon(
 
     loss_fn = LOSS_REGISTRY[loss_type]
     ckpt_path = os.path.join(save_dir, "net.ckpt")
+
+    def metric_mask(m):
+        """The mask to hand `compute_metrics` / the panel, or None when off.
+
+        One place decides whether masking is live, so the loss, the numbers and
+        the picture can never end up disagreeing about which region this run is
+        about. `apply_loss_mask` reads the same flag.
+        """
+        return m if use_organ_mask else None
 
     best_loss = float("inf")        # lower is better -> start high
     backtrack_enabled = backtrack_thresh is not None
@@ -214,7 +231,8 @@ def train_recon(
 
         # Metrics on the last batch -- for LOGGING ONLY.
         with torch.no_grad():
-            train_metrics = compute_metrics(image.abs(), recon.abs())
+            train_metrics = compute_metrics(
+                image.abs(), recon.abs(), mask=metric_mask(organ_mask))
         train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
         # A non-finite loss always attempts a restore (protective: never let a
@@ -330,7 +348,9 @@ def train_recon(
                     if whiten_kspace and "Zinv" in extra_v:
                         recon_v = extra_v["Zinv"] * recon_v
 
-                    m = compute_metrics(image_v.abs(), recon_v.abs())
+                    m = compute_metrics(
+                        image_v.abs(), recon_v.abs(),
+                        mask=metric_mask(organ_mask_v))
 
                     val_metrics["psnr"] += m["psnr"].detach()
                     val_metrics["ssim"] += m["ssim"].detach()
@@ -355,21 +375,37 @@ def train_recon(
                     if whiten_kspace and "Zinv" in extra_v:
                         zf_v = extra_v["Zinv"] * zf_v
 
+                    # Show the same pixels the metrics scored. An unmasked
+                    # panel next to a masked PSNR invites reading a background
+                    # artifact as the cause of a number that never saw it --
+                    # and the residual tile, which is where such an artifact is
+                    # most visible, would be the most misleading of the four.
+                    # `p_mask` also zeroes the ZERO-FILLED tile: it is the
+                    # reference the recon is judged against, so masking one and
+                    # not the other would make the comparison unfair by eye.
+                    p_mask = metric_mask(organ_mask_v)
+                    img_p, rec_p, zf_p = (
+                        (image_v, recon_v, zf_v) if p_mask is None else
+                        (image_v * p_mask, recon_v * p_mask, zf_v * p_mask))
+
                     panel, pstats = recon_panel(
-                        image_v, recon_v, zero_filled=zf_v, gain=residual_gain,
+                        img_p, rec_p, zero_filled=zf_p, gain=residual_gain,
                     )
 
                     # metrics of the DISPLAYED slice, not the val-set mean --
                     # a caption quoting the set mean next to one image is a
                     # standing invitation to misread the picture.
-                    m1 = compute_metrics(image_v[:1].abs(), recon_v[:1].abs())
+                    m1 = compute_metrics(
+                        image_v[:1].abs(), recon_v[:1].abs(),
+                        mask=None if p_mask is None else p_mask[:1])
                     sig = float(torch.as_tensor(sigma_v).reshape(-1)[0])
 
                     caption = (
                         f"epoch {epoch} | zero-filled | recon | ground truth | "
                         f"|residual| x{pstats['gain']:g}\n"
                         f"R={R} acs={acs_lines} mask={mask_dist} sigma={sig:.4f} "
-                        f"| this slice: PSNR {float(m1['psnr']):.2f} dB, "
+                        f"| this slice{' [organ mask]' if p_mask is not None else ''}: "
+                        f"PSNR {float(m1['psnr']):.2f} dB, "
                         f"SSIM {float(m1['ssim']):.4f}, "
                         f"NRMSE {float(m1['nrmse']):.4f}"
                     )

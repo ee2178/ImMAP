@@ -1,8 +1,10 @@
 """
 Metric registry for the evaluation sweep.
 
-Every metric here takes `(gt, recon)` and returns ONE VALUE PER SAMPLE, shape
-`(B,)`. That is the difference from `training.metrics.compute_metrics`, which
+Every metric here takes `(gt, recon, mask=None)` and returns ONE VALUE PER
+SAMPLE, shape `(B,)`. `mask` is the recon loader's `organ_mask`; a metric that
+cannot restrict itself to a region (lpips) accepts and ignores it, so the sweep
+can pass it uniformly. That is the difference from `training.metrics.compute_metrics`, which
 reduces over the whole tensor including the batch axis: at `batch_size=1` the
 two agree exactly, but above it `compute_metrics` returns a batch-pooled number
 whose value depends on the batch size. A sweep has to be able to change the
@@ -12,7 +14,8 @@ a spread rather than just a mean.
 The underlying definitions are `training.metrics`' own, called per sample, so
 the means this produces are directly comparable to what training logged.
 
-Add a metric by writing `fn(gt, recon) -> (B,)` and putting it in `REGISTRY`.
+Add a metric by writing `fn(gt, recon, mask=None) -> (B,)` and putting it in
+`REGISTRY`.
 `higher_is_better` is carried so a summary table can be read without knowing
 each metric's convention.
 """
@@ -41,23 +44,30 @@ def _mag(x):
     return x.abs() if torch.is_complex(x) else x
 
 
-def _per_sample(fn, gt, recon):
-    """Apply a batch-reducing metric one sample at a time."""
+def _per_sample(fn, gt, recon, mask=None):
+    """Apply a batch-reducing metric one sample at a time.
+
+    The mask is sliced with the sample, so each value is restricted to THAT
+    slice's organ region -- pooling first and masking after would let a large
+    organ in one slice pay for a small one in another.
+    """
     gt, recon = _mag(gt), _mag(recon)
-    return torch.stack([fn(gt[i:i + 1], recon[i:i + 1]).reshape(())
-                        for i in range(gt.shape[0])])
+    return torch.stack([
+        fn(gt[i:i + 1], recon[i:i + 1],
+           mask=None if mask is None else mask[i:i + 1]).reshape(())
+        for i in range(gt.shape[0])])
 
 
-def psnr(gt, recon):
-    return _per_sample(_psnr, gt, recon)
+def psnr(gt, recon, mask=None):
+    return _per_sample(_psnr, gt, recon, mask)
 
 
-def nrmse(gt, recon):
-    return _per_sample(_nrmse, gt, recon)
+def nrmse(gt, recon, mask=None):
+    return _per_sample(_nrmse, gt, recon, mask)
 
 
-def ssim(gt, recon):
-    out = _ssim(_mag(gt), _mag(recon))         # already per-sample
+def ssim(gt, recon, mask=None):
+    out = _ssim(_mag(gt), _mag(recon), mask=mask)      # already per-sample
     return out.reshape(out.shape[0]) if out.dim() else out.reshape(1)
 
 
@@ -96,8 +106,15 @@ def _to_lpips_input(x, lo, hi):
     return (2.0 * x - 1.0).clamp(-1.0, 1.0).repeat(1, 3, 1, 1)
 
 
-def lpips(gt, recon, net="alex"):
+def lpips(gt, recon, mask=None, net="alex"):
     """Perceptual distance on JOINTLY min-max normalised magnitude images.
+
+    `mask` is ACCEPTED AND IGNORED. LPIPS is a deep-feature distance with a
+    receptive field spanning far more than one pixel, so there is no honest way
+    to restrict it to a region: zeroing outside the mask changes the features
+    everywhere near the boundary, and averaging its output spatially is not
+    what the metric computes. Reported unmasked; say so if it is quoted next to
+    masked PSNR.
 
     LPIPS is not scale invariant, so the normalisation is part of the metric's
     definition, not a detail. Normalising gt and recon TOGETHER (per sample, by

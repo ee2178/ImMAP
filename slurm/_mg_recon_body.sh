@@ -15,6 +15,11 @@
 #   ONLY            "" = every model tag; e.g. "mglpds mggrouplpds" for a subset
 #   ACCELS          "" = every acceleration; e.g. "8" for R=8 only
 #   ATTN            "" = the generator default (flex); triton|gather to override.
+#   ORGAN_MASK      "" = off; 1 restricts the loss, the metrics AND the logged
+#                   panel to the coil-sensitivity support. For knee, whose air
+#                   background is most of the slice. Runs with it on are NOT
+#                   comparable to runs with it off -- the metrics measure a
+#                   different region -- so set it per experiment, not globally.
 #                   Set it in the launcher rather than relying on the default,
 #                   so the run directory records which backend produced it.
 #
@@ -31,6 +36,7 @@ REGENERATE="${REGENERATE:-1}"
 ONLY="${ONLY:-}"
 ACCELS="${ACCELS:-}"
 ATTN="${ATTN:-}"
+ORGAN_MASK="${ORGAN_MASK:-}"
 
 source ~/.bashrc
 conda activate gcdl
@@ -68,7 +74,8 @@ echo "       config: ${BASE_CONFIG}"
 # Cheap, and it keeps a stale hand-edited config from silently deciding a run.
 if [ "${REGENERATE}" = "1" ]; then
     python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
-        --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} >/dev/null
+        --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} \
+        ${ORGAN_MASK:+--organ-mask} >/dev/null
 fi
 
 if [ ! -f "${BASE_CONFIG}" ]; then

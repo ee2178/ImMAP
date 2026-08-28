@@ -164,6 +164,11 @@ def plot_hist(
     alphas = _per_series(alpha, n)
 
     for k, v in enumerate(values):
+        # `edgecolor` must not be passed at all for "step": there the edge IS the visible line,
+        # and an explicit edgecolor -- None included -- overrides `color` and resets it to the
+        # rcParam default (black). Passing it unconditionally made every step series black, so
+        # the per-series `color` was silently dead on the multi-series default path.
+        style = {} if histtype == "step" else {"edgecolor": "black"}
         ax.hist(
             v,
             bins=edges,
@@ -173,7 +178,7 @@ def plot_hist(
             color=colors[k],
             alpha=alphas[k],
             linewidth=0.8 if histtype == "step" else 0.3,
-            edgecolor=None if histtype == "step" else "black",
+            **style,
         )
 
     for x, lb in _as_vlines(vlines):

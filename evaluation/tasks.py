@@ -7,7 +7,8 @@ one function here and nothing else.
 
 An adapter has the signature
 
-    adapter(net, batch, cfg, device, sigma, generator) -> (gt, recon)
+    adapter(net, batch, cfg, device, sigma, generator)
+        -> (gt, recon, organ_mask_or_None)
 
 both complex or both real, shape `(B, C, H, W)`, on `device`.
 
@@ -42,10 +43,18 @@ def _call_net(net, x, E, sigma):
 
 # ---------------------------------------------------------------------------
 def recon(net, batch, cfg, device, sigma, generator=None):
-    """CS-MRI reconstruction. Mirrors the val block of `training/recon.py`."""
-    kspace, smaps, image, _organ_mask, pad_hw = (
+    """CS-MRI reconstruction. Mirrors the val block of `training/recon.py`.
+
+    Returns `(gt, recon, organ_mask)`. The mask is None unless the config asks
+    for it, so the sweep restricts its metrics to exactly the region the run
+    was trained and validated on -- a sweep that scored the whole image on a
+    mask-trained run would not be summarising the curves it sits next to.
+    """
+    kspace, smaps, image, organ_mask, pad_hw = (
         b.to(device, non_blocking=True) for b in batch)
     mri = cfg["mri"]
+    if not cfg.get("training", {}).get("use_organ_mask", False):
+        organ_mask = None
 
     mask = get_mask(image, R=mri["R"], acs_lines=mri["acs_lines"],
                     mode=mri.get("mask_dist", "uniform"),
@@ -70,7 +79,7 @@ def recon(net, batch, cfg, device, sigma, generator=None):
 
     if mri.get("whiten_kspace", False) and "Zinv" in extra:
         out = extra["Zinv"] * out
-    return image, out
+    return image, out, organ_mask
 
 
 def denoiser(net, batch, cfg, device, sigma, generator=None):
@@ -87,7 +96,8 @@ def denoiser(net, batch, cfg, device, sigma, generator=None):
         noisy, sigma_n = awgn(gt, [sigma, sigma],
                               dist=cfg["training"].get("noise_dist", "uniform"))
 
-    return gt, _call_net(net, noisy, Identity(), sigma_n)
+    # No organ mask: denoising has no sensitivity support to restrict to.
+    return gt, _call_net(net, noisy, Identity(), sigma_n), None
 
 
 REGISTRY = {
@@ -97,6 +107,8 @@ REGISTRY = {
 
 
 def build_adapter(task):
+    """An adapter maps `(net, batch, cfg, device, sigma, gen)` to
+    `(gt, recon, organ_mask_or_None)`."""
     if task not in REGISTRY:
         raise ValueError(
             f"no evaluation adapter for task {task!r}; registered: "

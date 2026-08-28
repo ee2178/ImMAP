@@ -85,9 +85,10 @@ def evaluate(model, cfg, loader, metrics, sigma, device, seed):
     acc = {name: [] for name in metrics}
 
     for batch in loader:
-        gt, recon = adapter(model, batch, cfg, device, sigma, gen)
+        gt, recon, organ_mask = adapter(model, batch, cfg, device, sigma, gen)
         for name, fn in metrics.items():
-            acc[name].extend(fn(gt, recon).detach().cpu().tolist())
+            acc[name].extend(
+                fn(gt, recon, mask=organ_mask).detach().cpu().tolist())
     return acc
 
 
