@@ -161,6 +161,31 @@ MODELS = {
                     params=dict(LPDS_COMMON, K=LPDS_BASELINE_K)),
     "mglpds":  dict(type="MGLPDSNet",
                     params=dict(LPDS_COMMON, K=LPDS_VCYCLE_K)),
+    # The nonlocal arm. Identical to `mglpds` except for what sits in the prox
+    # slot, so the pair isolates the prior rather than the architecture:
+    # SoftThreshold -> GroupThreshold, everything else held.
+    #
+    # WINDOW = 15, not the 35 the BSD432 group configs use. The point of doing
+    # this inside a V-cycle is that the COARSE levels supply the long range, so
+    # each level can stay local: 15x15 on the 160x160 level-0 latent, and the
+    # 80x80 and 40x40 levels reach the rest. Cost is O(window^2) per pixel per
+    # level, so 35 would be ~5.4x the attention work for reach the hierarchy
+    # already provides.
+    #
+    # sim_fun="distance" is forced by the dtype: the phase-invariant
+    # similarities need |<q,k>|, which FlexAttention cannot form on complex
+    # features (models/prox.py raises). See tests/test_group_lpds.py.
+    "mggrouplpds": dict(
+        type="MGGroupLPDS",
+        params=dict(LPDS_COMMON, K=LPDS_VCYCLE_K,
+                    window=15, Mh=64, dK=5, nheads=1,
+                    sim_fun="distance", attn_backend="flex",
+                    flex_block_size=128),
+        note=("nonlocal prox at every grid level: GroupThreshold in the LPDS "
+              "prox slot. window=15 with the V-cycle supplying long range; "
+              "sim_fun='distance' because flex cannot carry a phase-invariant "
+              "similarity on complex features."),
+    ),
     "altsplit":   _altsplit(6),
     "mgaltsplit": _altsplit([1, [4, 4, 6]]),
 }
@@ -191,7 +216,7 @@ VAL_NOISE_STD = 0.005          # mean(NOISE_STD): mrireco.jl:277 evaluates there
 VAL_SEED = 1234
 
 
-def cells(anatomy=None):
+def cells(anatomy=None, only=None, accels=None):
     """The canonical cell order, optionally for one anatomy.
 
     knee and brain have SEPARATE sbatch files, so each indexes its own list and
@@ -201,7 +226,11 @@ def cells(anatomy=None):
     out = []
     for a in ([anatomy] if anatomy else ANATOMIES):
         for r in ACCELS:
+            if accels and r not in accels:
+                continue
             for model in MODELS:
+                if only and model not in only:
+                    continue
                 out.append((a, r, model))
     return out
 
@@ -298,7 +327,7 @@ def make_config(anatomy, r, model, args):
     # that swapped its similarity, and losing either one in the run directory
     # is how a caveat stops travelling with its numbers.
     notes = [spec["note"]] if spec.get("note") else []
-    attn = getattr(args, "attn", "triton")
+    attn = getattr(args, "attn", "flex")
 
     if "attn_backend" in params:
         params["attn_backend"] = attn
@@ -318,6 +347,14 @@ def make_config(anatomy, r, model, args):
                     f"and materialises the window.")
                 params["sim_fun"] = "distance"
         elif attn == "triton":
+            if params.get("sim_fun") not in ("pidistance", "pidot"):
+                raise SystemExit(
+                    f"[configs] --attn triton with sim_fun="
+                    f"'{params.get('sim_fun')}': the triton kernel implements "
+                    f"only the phase-invariant similarities, and models/prox.py "
+                    f"rejects anything else on that backend. Either use "
+                    f"--attn flex (what these experiments do), or set the "
+                    f"cell's sim_fun to 'pidistance'.")
             notes.append(
                 "attn_backend='triton' -- the fused kernel in "
                 "models/circulant_triton.py, carrying the reference's exact "
@@ -428,21 +465,33 @@ def main():
     p.add_argument("--anatomy", choices=("knee", "brain"), default=None,
                    help="restrict to one anatomy. The sbatch files pass this so "
                         "each indexes its own cell list.")
-    p.add_argument("--attn", choices=("triton", "flex", "gather"), default="triton",
-                   help="attention backend for the group models. 'triton' (default) "
-                        "keeps the reference's exact pidistance and stays fused. "
-                        "'flex' also fuses but cannot carry pidistance for complex "
-                        "features, so the similarity drops to 'distance'; use it "
-                        "where triton is unavailable. 'gather' keeps pidistance and "
+    p.add_argument("--attn", choices=("triton", "flex", "gather"), default="flex",
+                   help="attention backend for the group models. 'flex' (default) "
+                        "fuses and is what the current experiments use, with "
+                        "sim_fun='distance' -- it cannot carry a phase-invariant "
+                        "similarity on complex features. 'triton' keeps the "
+                        "reference's exact pidistance and stays fused, but REJECTS "
+                        "sim_fun='distance', so switching backend also means "
+                        "switching similarity. 'gather' keeps pidistance and "
                         "materialises the window (~39x slower, ~15x the memory).")
     p.add_argument("--dry-run", action="store_true",
                    help="print the configs instead of writing them (no torch needed)")
     p.add_argument("--list-cells", action="store_true",
                    help="print the sbatch index -> cell map and exit")
+    p.add_argument("--accels", nargs="*", type=int, default=None,
+                   help="restrict to these accelerations (with --list-cells)")
     args = p.parse_args()
 
     if args.list_cells:
-        for i, (anatomy, r, model) in enumerate(cells(args.anatomy)):
+        # --only / --accels narrow the list AND renumber it, so an experiment
+        # that runs a subset gets a dense 0..N-1 array range of its own rather
+        # than having to know the full grid's indices.
+        unknown = sorted(set(args.only or ()) - set(MODELS))
+        if unknown:
+            raise SystemExit(f"[cells] unknown model tag(s) {unknown}; "
+                             f"known: {sorted(MODELS)}")
+        for i, (anatomy, r, model) in enumerate(
+                cells(args.anatomy, only=args.only, accels=args.accels)):
             print(f"{i}\t{anatomy}\tR{r}\t{model}")
         return
 

@@ -33,9 +33,16 @@ both -- which is exactly why `ObjectiveDownsample` does not generalise.
 
 Not ported (deliberately, see docs/multigrid_port.md)
 -----------------------------------------------------
-* the group / guided prox variants (`GroupLPDSStack`) -- the prox slot is
-  pluggable, so `window > 1` plus `Mh` would reach them, but nothing exercises
-  that here and the attention machinery is untested against this layer.
+* the GUIDED prox variant.  The GROUP prox is supported: `window > 1` plus
+  `Mh` puts a `GroupThreshold` in `LPDSLayer`'s prox slot, which is the real
+  GroupLPDS -- a primal-dual sweep with nonlocal thresholding, extrapolation
+  and all.  Reach it through `MGGroupLPDS` in `models/__init__.py`.
+
+  `MGGroupLPDS` PREVIOUSLY meant `MGCDLNet(dual=True, W>1, Mh)`: a LISTA
+  layer -- ONE variable, no `(x, z)` pair, no `tau`/`theta` extrapolation --
+  whose only LPDS-like feature was the Fenchel prox. That reading is gone; the
+  registry rejects its keys (`W`, `eta0`, `dual`) with a migration message.
+  The ungrouped `MGLPDS` still means the LISTA-layer version.
 * `SensitivityNet`.  `mg_lpds.jl` makes it a no-op whenever `use_smaps=true`,
   which is what every reference config and this repo's pipeline use (the maps
   come from the dataset).  `MGLPDSNet` takes the maps through `E`, so adding a
@@ -55,7 +62,7 @@ from models.base import set_weight
 from models.lpds import LPDSLayer, LPDSStack, make_lpds_layer
 from models.multigrid import (_ChannelScale, identity_widen_weight,
                               widen_filter, widen_prox_)
-from models.prox import PixelConv
+from models.prox import GroupThreshold, PixelConv
 from operators.identity import Identity
 from operators.projections import uball_project
 from operators.resample import (GridTransfer, _check_filter, galerkin,
@@ -275,16 +282,29 @@ class PDVCycle(nn.Module):
 
         # Only the DUAL channels widen; the primal stays at C.
         M_c = M * self.widen
+        # The group prox's attention width has to widen WITH the dual channels.
+        # `widen_prox_` tiles Walpha/Wbeta/Wtheta/Wphi by `widen` along both
+        # channel axes, so a coarse prox left at the fine Mh is the wrong shape
+        # and `preload_pd_with_widening` dies on the copy. `VCycle` already
+        # does this; PDVCycle did not, which stayed invisible while widen == 1.
+        coarse_kws = dict(layer_kws)
+        if coarse_kws.get("Mh") is not None:
+            coarse_kws["Mh"] = int(coarse_kws["Mh"]) * self.widen
+            pk = dict(coarse_kws.get("prox_kws") or {})
+            if pk.get("Mh") is not None:
+                pk["Mh"] = int(pk["Mh"]) * self.widen
+                coarse_kws["prox_kws"] = pk
+
         if len(iters) > 2:
             self.mglayer = PDVCycle(iters[1:], C, M_c, widen=self.widen,
                                     alpha0=alpha0, julia_compat=julia_compat,
                                     spectral_init=False,
                                     transfer_filter=self.transfer_filter,
                                     learn_transfer=learn_transfer,
-                                    **layer_kws)
+                                    **coarse_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
-                C, M_c, spectral_init=False, **layer_kws))
+                C, M_c, spectral_init=False, **coarse_kws))
 
         preload_pd_with_widening(self.mglayer, self.lpdsA.first, self.widen)
 
@@ -470,6 +490,19 @@ class MGLPDSNet(nn.Module):
                 f"2^(levels-1={self.levels - 1})). With preproc='identity' "
                 f"nothing pads it, so the V-cycle's restrict/prolong round trip "
                 f"would not land back on the input grid.")
+
+    # ----------------------------------------------------------------------
+    def compile_flex(self):
+        """torch.compile every group prox's fused kernel (GPU; call once).
+
+        `train.py` calls this whenever `attn_backend == "flex"`. Without it a
+        group-prox MGLPDSNet raises AttributeError there -- the flag was
+        already threaded through the constructor, but the hook was missing.
+        """
+        for m in self.modules():
+            if isinstance(m, GroupThreshold) and m.attn_backend == "flex":
+                m.compile_flex()
+        return self
 
     @torch.no_grad()
     def project(self):

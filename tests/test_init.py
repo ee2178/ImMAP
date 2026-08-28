@@ -141,12 +141,44 @@ def test_lpds_is_a_residual_connection():
         o2, z2 = prim(y, E=Identity(), sigma=0.05)
         check("MG-CDLNet read-out is D z", rel(o2, prim.D(z2)) < 1e-5)
 
-    for name in ("MGLPDS", "MGGroupLPDS"):
-        p = dict(K=[1, [2, 2]], M=4, C=1, P=5, s=1, is_complex=False)
-        if name == "MGGroupLPDS":
-            p.update(W=5, Mh=2)
-        m = build_model({"model": {"type": name, "params": p}})
-        check(f"build_model({name}) pins dual=True", m.dual)
+    # dual=True ALWAYS means the real primal-dual net now. MGLPDS and
+    # MGGroupLPDS both build MGLPDSNet; the MGCDLNet(dual=True) imitation is
+    # unreachable. Behaviour is covered by tests/test_group_lpds.py; what is
+    # checked here is that the registry routes and refuses correctly.
+    from models.mg_lpds import MGLPDSNet
+
+    m = build_model({"model": {"type": "MGLPDS", "params": dict(
+        K=[1, [2, 2]], M=4, C=1, P=5, s=1, is_complex=False)}})
+    check("build_model(MGLPDS) builds the real MGLPDSNet", isinstance(m, MGLPDSNet))
+
+    # the legacy key `W` carries over to `window` rather than exploding
+    m = build_model({"model": {"type": "MGGroupLPDS", "params": dict(
+        K=[1, [2, 2]], M=4, C=1, P=5, s=1, is_complex=False, W=5, Mh=2)}})
+    check("MGGroupLPDS translates W -> window", isinstance(m, MGLPDSNet))
+
+    # ...but a LISTA-only key must not be silently dropped
+    try:
+        build_model({"model": {"type": "MGLPDS", "params": dict(
+            K=[1, [2, 2]], M=4, C=1, P=5, s=1, is_complex=False, eta0=0.1)}})
+        check("MGLPDS refuses eta0 (LISTA-only)", False)
+    except ValueError as e:
+        check("MGLPDS refuses eta0 (LISTA-only)", "eta" in str(e))
+
+    # and the imitation itself is unreachable, from either direction
+    try:
+        build_model({"model": {"type": "MGCDLNet", "params": dict(
+            K=[1, [2, 2]], M=4, C=1, P=5, s=1, is_complex=False, dual=True)}})
+        check("MGCDLNet refuses dual=True", False)
+    except ValueError as e:
+        check("MGCDLNet refuses dual=True", "MGLPDS" in str(e))
+
+    from models.multigrid import MGCDLNet
+    try:
+        MGCDLNet(K=[1, [2, 2]], M=4, C=1, P=5, s=1, is_complex=False, dual=True)
+        check("MGCDLNet(dual=True) refuses direct construction too", False)
+    except ValueError as e:
+        check("MGCDLNet(dual=True) refuses direct construction too",
+              "MGLPDSNet" in str(e))
 
     try:
         build_model({"model": {"type": "MGGroupCDL",

@@ -12,6 +12,23 @@ from operators.fourier import ifftc
 from operators.noise import mri_awgn
 from models import build_model
 
+# ===========================================================================
+#  Per-step device syncs
+# ===========================================================================
+# `loss.item()` blocks until every queued CUDA kernel has finished. Calling it
+# inside the training loop -- once to accumulate the epoch mean and again to
+# refresh tqdm's postfix -- drains the queue TWICE per step, so the CPU cannot
+# run ahead and enqueue the next step's work. The GPU then sits idle between
+# steps, which is what a sawtooth in `nvidia-smi` utilisation actually is.
+#
+# Two fixes, applied to every loop in this package:
+#   * accumulate `running_loss` as a 0-d CUDA tensor (`loss.detach()`) and
+#     convert ONCE at the end of the epoch;
+#   * refresh the progress bar every `POSTFIX_EVERY` steps rather than every
+#     step. It is cosmetic, and one sync per 50 steps costs nothing.
+POSTFIX_EVERY = 50
+
+
 def grad_norm(params):
     """
     Compute the ℓ2 norm of gradients.

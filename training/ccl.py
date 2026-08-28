@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr
+from training.common import save_ckpt, load_ckpt, get_lr, set_lr, POSTFIX_EVERY
 from visualization.params import get_param_logs
 from training.ccl_loss import ConstrainedContrastiveLoss
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -101,13 +101,14 @@ def train_ccl(
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
-            running_loss += float(loss.item())
+            running_loss += loss.detach()          # on-device; no sync
             n_batches += 1
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
+            if n_batches % POSTFIX_EVERY == 0:
+                pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
-        avg_loss = running_loss / max(n_batches, 1)
+        avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
         nonfinite = not math.isfinite(avg_loss)
 
         # ============== averaged-loss backtracking ==============

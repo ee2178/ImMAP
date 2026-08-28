@@ -40,7 +40,7 @@ import torchvision.utils as vutils
 from tqdm import tqdm
 
 from operators import Identity
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask
+from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, POSTFIX_EVERY
 from training.metrics import compute_metrics
 from visualization.params import get_param_logs
 from training.losses import LOSS_REGISTRY, weighted_loss
@@ -137,15 +137,16 @@ def train_dt_synthesis(
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
-            running_loss += float(loss.item())
-            running_src += float(src_loss.item())
+            running_loss += loss.detach()          # on-device; no sync
+            running_src += src_loss.detach()
             n_batches += 1
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.3e}", src=f"{src_loss.item():.3e}", epoch=epoch)
+            if n_batches % POSTFIX_EVERY == 0:
+                pbar.set_postfix(loss=f"{loss.item():.3e}", src=f"{src_loss.item():.3e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
-        avg_loss = running_loss / max(n_batches, 1)
-        avg_src = running_src / max(n_batches, 1)
+        avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
+        avg_src = float(running_src) / max(n_batches, 1)
         nonfinite = not math.isfinite(avg_loss)
 
         train_metrics = compute_metrics(y_t, x_hat_m, psnr_only=psnr_only)

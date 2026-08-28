@@ -65,7 +65,7 @@ import torch.nn as nn
 import torchvision.utils as vutils
 from tqdm import tqdm
 
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask
+from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, POSTFIX_EVERY
 from training.metrics import compute_metrics
 from visualization.params import get_param_logs
 from training.losses import LOSS_REGISTRY, weighted_loss
@@ -266,13 +266,14 @@ def train_synthesis(
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
-            running_loss += float(loss.item())
+            running_loss += loss.detach()          # on-device; no sync
             n_batches += 1
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
+            if n_batches % POSTFIX_EVERY == 0:
+                pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
-        avg_loss = running_loss / max(n_batches, 1)
+        avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
         nonfinite = not math.isfinite(avg_loss)
 
         train_metrics = synthesis_metrics(target_m, pred_m, src, organ_mask,

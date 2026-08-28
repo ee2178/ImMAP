@@ -4,8 +4,8 @@
         "name": "MGGroupLPDS_BSD432"
     },
     "model": {
-        "type": "MGGroupLPDS",
-        "_comment": "Same network as MGGroupCDL with dual=True pinned: the prox becomes z - GT(z) (group clipping, Moreau's identity) and the read-out becomes y~ - D z. Everything else is shared.",
+        "type": "MGGroupCDL",
+        "_comment": "Was type 'MGGroupLPDS' back when that name meant MGCDLNet(dual=True) -- a LISTA layer with a Fenchel prox. That imitation is gone; dual=True now always builds the real primal-dual net. This file keeps the architecture it actually had (its own params said dual=false; the old registry branch overrode it), i.e. plain MGGroupCDL. For a real nonlocal primal-dual denoiser use type 'MGGroupLPDS' with window/Mh instead of W/Mh.",
         "params": {
             "K": [
                 3,

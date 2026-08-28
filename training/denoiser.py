@@ -9,7 +9,7 @@ from tqdm import tqdm
 from datasets.fastmri.common import load_fastmri_data
 from operators import Identity
 from operators.noise import awgn
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr
+from training.common import save_ckpt, load_ckpt, get_lr, set_lr, POSTFIX_EVERY
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics, psnr
 from visualization.params import get_param_logs
@@ -100,12 +100,13 @@ def train_denoiser(
             if hasattr(net, "project"): net.project()
             if sched is not None: sched.step()
 
-            running_loss += float(loss.item())
+            running_loss += loss.detach()          # on-device; no sync
             n_batches += 1
 
             # Smooth per-step progress; heavy logging happens at epoch end.
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.2e}", epoch=epoch)
+            if n_batches % POSTFIX_EVERY == 0:
+                pbar.set_postfix(loss=f"{loss.item():.2e}", epoch=epoch)
 
         # Steps completed so far -> use as the wandb step axis.
         global_step = (epoch + 1) * steps_per_epoch
@@ -113,7 +114,7 @@ def train_denoiser(
         # ==================================================================
         # END-OF-EPOCH: averaged-loss backtracking + checkpoint + logging
         # ==================================================================
-        avg_loss = running_loss / max(n_batches, 1)
+        avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
         nonfinite = not math.isfinite(avg_loss)
 
         # Metrics on the last batch — for LOGGING ONLY. PSNR no longer drives

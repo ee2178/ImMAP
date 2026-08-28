@@ -10,6 +10,7 @@ from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
 from visualization.params import get_param_logs
 from training.common import (
+    POSTFIX_EVERY,
     save_ckpt,
     load_ckpt,
     get_lr,
@@ -230,18 +231,19 @@ def train_joint_denoising_recon(
             if sched is not None:
                 sched.step()
 
-            running_loss += float(loss.item())
+            running_loss += loss.detach()          # on-device; no sync
             n_batches += 1
 
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.2e}", epoch=epoch)
+            if n_batches % POSTFIX_EVERY == 0:
+                pbar.set_postfix(loss=f"{loss.item():.2e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
 
         # ==================================================================
         # END-OF-EPOCH: averaged-loss backtracking + checkpoint + logging
         # ==================================================================
-        avg_loss = running_loss / max(n_batches, 1)
+        avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
         nonfinite = not math.isfinite(avg_loss)
 
         # Metrics on the last batch -- for LOGGING ONLY.

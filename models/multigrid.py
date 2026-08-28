@@ -461,7 +461,17 @@ class MGCDLNet(nn.Module):
         K_outer, iters = _parse_K(K)
         self.K, self.iters = K_outer, iters
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)
-        self.is_complex, self.dual = bool(is_complex), bool(dual)
+        if dual:
+            raise ValueError(
+                "MGCDLNet(dual=True) is the LISTA-layer imitation of LPDS: a "
+                "Fenchel prox and a `y~ - D z` read-out on ONE variable, with "
+                "no primal iterate and no tau/theta extrapolation. It is no "
+                "longer reachable -- use MGLPDSNet (models/mg_lpds.py), or the "
+                "MGLPDS / MGGroupLPDS names in build_model, which are the real "
+                "primal-dual net. The flag is kept only so an old checkpoint "
+                "config fails here with this message instead of silently "
+                "building a different algorithm.")
+        self.is_complex, self.dual = bool(is_complex), False
         if preproc not in ("image", "kspace", "identity"):
             raise ValueError(
                 f"preproc must be 'image' (denoising), 'kspace' "

@@ -9,6 +9,7 @@ from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
 from visualization.params import get_param_logs
 from training.common import (
+    POSTFIX_EVERY,
     save_ckpt,
     load_ckpt,
     get_lr,
@@ -148,10 +149,12 @@ def train_ipalm(
         if sched is not None:
             sched.step()
 
-        train_metrics = compute_metrics(
-            image.abs(),
-            recon.abs(),
-        )
+        # Metrics are consumed only by the log block and the progress bar,
+        # both of which are throttled -- computing them every step was work
+        # thrown away, and `.item()`-ing them was a sync per step on top.
+        show = (step % log_every == 0) or (step % POSTFIX_EVERY == 0)
+        train_metrics = (compute_metrics(image.abs(), recon.abs())
+                         if show else None)
 
         if step % log_every == 0:
 
@@ -360,10 +363,11 @@ def train_ipalm(
         
         pbar.update(1)
 
-        pbar.set_postfix(
-            loss=f"{loss.item():.2e}",
-            psnr=f"{train_metrics['psnr']:.2f}",
-        )
+        if train_metrics is not None:
+            pbar.set_postfix(
+                loss=f"{loss.item():.2e}",
+                psnr=f"{train_metrics['psnr']:.2f}",
+            )
         
 
     pbar.close()

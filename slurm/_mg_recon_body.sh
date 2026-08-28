@@ -12,12 +12,25 @@
 #   CONFIG_ROOT     default "config"
 #   SWEEP_EPOCHS    "" = the config's num_epochs; e.g. 20 to probe first
 #   REGENERATE      1 = regenerate configs from the generator before running
+#   ONLY            "" = every model tag; e.g. "mglpds mggrouplpds" for a subset
+#   ACCELS          "" = every acceleration; e.g. "8" for R=8 only
+#   ATTN            "" = the generator default (flex); triton|gather to override.
+#                   Set it in the launcher rather than relying on the default,
+#                   so the run directory records which backend produced it.
+#
+# ONLY / ACCELS narrow AND RENUMBER the cell list, so an experiment that runs a
+# subset gets its own dense 0..N-1 array range. The bound is checked at runtime
+# against the filtered list, so a stale --array fails loudly rather than
+# silently training the wrong cell.
 
 : "${ANATOMY:?the calling sbatch must set ANATOMY=knee|brain}"
 : "${IMMAP_ROOT:?the calling sbatch must set IMMAP_ROOT=/path/to/ImMAP}"
 CONFIG_ROOT="${CONFIG_ROOT:-config}"
 SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"
 REGENERATE="${REGENERATE:-1}"
+ONLY="${ONLY:-}"
+ACCELS="${ACCELS:-}"
+ATTN="${ATTN:-}"
 
 source ~/.bashrc
 conda activate gcdl
@@ -31,11 +44,13 @@ mkdir -p logs
 # ---- resolve this task's cell from the generator ------------------------------------------
 # --anatomy so each launcher indexes ONLY its own cells: the array bound is
 # per-anatomy, and knee task 3 and brain task 3 are different runs.
-CELLS="$(python scripts/make_mg_recon_configs.py --list-cells --anatomy "${ANATOMY}")"
+CELLS="$(python scripts/make_mg_recon_configs.py --list-cells \
+    --anatomy "${ANATOMY}" ${ONLY:+--only ${ONLY}} ${ACCELS:+--accels ${ACCELS}})"
 N_TOTAL="$(echo "${CELLS}" | wc -l)"
 
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TOTAL}" ]; then
-    echo "[grid] task ${SLURM_ARRAY_TASK_ID} >= ${N_TOTAL} ${ANATOMY} cells -- fix --array"
+    echo "[grid] task ${SLURM_ARRAY_TASK_ID} >= ${N_TOTAL} ${ANATOMY} cells" \
+         "${ONLY:+(ONLY=\"${ONLY}\")}${ACCELS:+ (ACCELS=\"${ACCELS}\")} -- fix --array"
     echo "       (should be 0-$(( N_TOTAL - 1 )))"
     exit 1
 fi
@@ -53,7 +68,7 @@ echo "       config: ${BASE_CONFIG}"
 # Cheap, and it keeps a stale hand-edited config from silently deciding a run.
 if [ "${REGENERATE}" = "1" ]; then
     python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
-        --anatomy "${ANATOMY}" >/dev/null
+        --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} >/dev/null
 fi
 
 if [ ! -f "${BASE_CONFIG}" ]; then

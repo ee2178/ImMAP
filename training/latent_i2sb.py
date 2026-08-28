@@ -39,7 +39,8 @@ from tqdm import tqdm
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from training.common import (save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, load_model,
+from training.common import (
+    POSTFIX_EVERY,save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, load_model,
                              snr_loss_weight)
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
@@ -309,13 +310,14 @@ def train_latent_i2sb(
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
-            running_loss += float(loss.item())
+            running_loss += loss.detach()          # on-device; no sync
             n_batches += 1
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
+            if n_batches % POSTFIX_EVERY == 0:
+                pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
-        avg_loss = running_loss / max(n_batches, 1)
+        avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
         nonfinite = not math.isfinite(avg_loss)
 
         # one-step denoise metrics (pred_x0 vs x0), masked like the loss
