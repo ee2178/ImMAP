@@ -112,12 +112,20 @@ if (lo, hi) != (0.0, 0.01):
 # preproc='image' pads y~ but leaves E's mask/maps behind, and subtracts a plain
 # mean where reconstruction needs the E^H E DC correction. The models raise on
 # the first of those, but catching it here names the config, not a tensor shape.
-# AltSplitCDLNet is exempt: with smap_update its unroll re-forms E^H y per layer.
+#
+# Only models that HAVE the knob are subject to it. A baseline reconstructing
+# straight from k-space -- E2EVarNet -- has no preprocessing stage at all, so
+# `preproc` is absent from its params and there is nothing to check. Keyed on
+# the key's presence rather than an exemption list, so the next baseline that
+# lacks it does not have to be added here.
+#
+# AltSplitCDLNet stays exempt for a different reason: with smap_update its
+# unroll re-forms E^H y per layer.
 params = cfg["model"]["params"]
-if cfg["model"]["type"] != "AltSplitCDLNet" \
-        and params.get("preproc") not in ("kspace", "identity"):
+if ("preproc" in params and cfg["model"]["type"] != "AltSplitCDLNet"
+        and params["preproc"] not in ("kspace", "identity")):
     raise SystemExit(
-        f"[grid] {base}: model.params.preproc={params.get('preproc')!r}. "
+        f"[grid] {base}: model.params.preproc={params['preproc']!r}. "
         f"Reconstruction needs 'kspace' (pads the operator, removes DC through "
         f"E^H E) or 'identity' (no preprocessing at all).")
 
