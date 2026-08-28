@@ -188,6 +188,29 @@ MODELS = {
     ),
     "altsplit":   _altsplit(6),
     "mgaltsplit": _altsplit([1, [4, 4, 6]]),
+
+    # BASELINE. fastMRI's End-to-End VarNet, vendored unmodified under
+    # models/e2evarnet/_fastmri/. Published defaults (12 cascades, chans=18,
+    # sens_chans=8) -- deliberately NOT retuned to this grid, because a
+    # baseline that has been fiddled with is not a baseline.
+    #
+    # Three asymmetries to carry with the numbers:
+    #   * it ESTIMATES its own coil maps, where the unrolled cells are handed
+    #     the dataset's. That is the method, not an oversight -- but it makes
+    #     this the harder task, and the comparison favours the unrolled nets.
+    #   * it returns an RSS MAGNITUDE image, so only magnitude metrics apply.
+    #   * it has no noise-adaptive parameter, so sigma ~ U[0, 0.01] is a
+    #     handicap the sigma-conditioned cells do not carry.
+    # It also has ~10x the parameters of the flat LPDSNet; `count_parameters`
+    # in each config records it.
+    "varnet": dict(
+        type="E2EVarNet",
+        params=dict(num_cascades=12, sens_chans=8, sens_pools=4,
+                    chans=18, pools=4, mask_center=True),
+        note=("fastMRI E2E-VarNet baseline at published defaults. Estimates "
+              "its own sensitivity maps and returns RSS magnitude, so it is "
+              "comparable on PSNR/SSIM/NRMSE and on nothing phase-sensitive."),
+    ),
 }
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
@@ -279,6 +302,10 @@ def _pad_multiple(spec, params):
     `preproc="identity"` and never pads, while the prox slot is the multigrid
     net with the levels.
     """
+    if spec.get("type") == "E2EVarNet":
+        # Works at the measured size; its NormUnet pads internally to a
+        # multiple of 16. No image-domain embedding, so no constraint.
+        return 1
     p = params.get("denoiser_kws", params)
     K = p.get("K")
     s_ = int(p.get("s", 1) or 1)
@@ -323,6 +350,10 @@ def make_config(anatomy, r, model, args):
     spec = MODELS[model]
 
     params = dict(spec["params"])
+    if spec["type"] == "E2EVarNet":
+        # The mask's ACS width. VarNet's SensitivityModel can infer it, but the
+        # config knows it exactly, and the inference assumes a symmetric centre.
+        params["acs_lines"] = 20
     # Notes accumulate: a cell can be both an LPDS variant and on a backend
     # that swapped its similarity, and losing either one in the run directory
     # is how a caveat stops travelling with its numbers.

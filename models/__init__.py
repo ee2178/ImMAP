@@ -134,6 +134,14 @@ def build_model(cfg):
         return MGLPDSNet(**params)
 
     # unrolled linearized ADMM with a learned CDL prox (+ optional joint coils)
+    elif model_type == "E2EVarNet":
+        # fastMRI's End-to-End VarNet, vendored unmodified under
+        # models/e2evarnet/_fastmri/. It estimates its OWN coil maps (that is
+        # the method) and returns an RSS MAGNITUDE image, so it is comparable
+        # on the magnitude metrics this grid reports and on nothing else.
+        from .e2evarnet import E2EVarNet
+        return E2EVarNet(**params)
+
     elif model_type == "AltSplitCDLNet":
         return AltSplitCDLNet(**params)
 
