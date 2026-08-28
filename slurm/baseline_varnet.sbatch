@@ -52,6 +52,16 @@
 #     real handicap and part of what the comparison measures -- worth checking
 #     whether the gap widens with sigma before attributing it to architecture.
 #
+#   * On the KNEE cells it is scored under the organ mask (see below), and that
+#     removes an advantage it would otherwise have had for the wrong reason.
+#     VarNet outputs an RSS MAGNITUDE, which is non-negative and noise-biased,
+#     so its background is a positive floor by construction -- it has no way to
+#     produce the near-zero air the complex-output unrolled nets can. Unmasked,
+#     that is charged to VarNet as error in a region nobody is reconstructing.
+#     Nothing in the architecture suppresses the background either: its
+#     SensitivityModel divides the estimated maps by their own RSS, which
+#     normalises them to unit norm in air rather than letting them decay.
+#
 # It also carries roughly an order of magnitude more parameters than the flat
 # LPDSNet. Each generated config records `count_parameters`.
 #
@@ -86,11 +96,16 @@ REGENERATE=1
 # This array spans BOTH anatomies, which the shared body does not: it indexes
 # one anatomy's cell list. Resolve the cell here and hand the body a single
 # (anatomy, accel) so its own bound check still applies.
+#
+# ORGAN_MASK follows the ANATOMY, not the model: it has to match whatever the
+# unrolled cells for that anatomy were scored under, or the baseline column is
+# a different quantity from the columns beside it. knee is masked (exp2), brain
+# is not (exp1).
 case "${SLURM_ARRAY_TASK_ID:-0}" in
-    0) ANATOMY=knee;  ACCELS="8" ;;
-    1) ANATOMY=knee;  ACCELS="4" ;;
-    2) ANATOMY=brain; ACCELS="8" ;;
-    3) ANATOMY=brain; ACCELS="4" ;;
+    0) ANATOMY=knee;  ACCELS="8"; ORGAN_MASK=1 ;;
+    1) ANATOMY=knee;  ACCELS="4"; ORGAN_MASK=1 ;;
+    2) ANATOMY=brain; ACCELS="8"; ORGAN_MASK="" ;;
+    3) ANATOMY=brain; ACCELS="4"; ORGAN_MASK="" ;;
     *) echo "[varnet] task ${SLURM_ARRAY_TASK_ID} is outside 0-3." >&2; exit 1 ;;
 esac
 # The body indexes the FILTERED list, which is one cell long here.

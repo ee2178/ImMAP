@@ -19,7 +19,15 @@
 #                   panel to the coil-sensitivity support. For knee, whose air
 #                   background is most of the slice. Runs with it on are NOT
 #                   comparable to runs with it off -- the metrics measure a
-#                   different region -- so set it per experiment, not globally.
+#                   different region.
+#
+#                   Set it per ANATOMY, not per experiment. REGENERATE rewrites
+#                   every config for the anatomy (ONLY/ACCELS narrow which cell
+#                   RUNS, not which configs are WRITTEN), so two launchers that
+#                   touch one anatomy with different ORGAN_MASK values will
+#                   fight: whichever regenerates last decides, and a resume can
+#                   pick up the other one's answer. Currently knee=1 (exp2 +
+#                   baseline_varnet cells 0,1), brain="" (exp1 + cells 2,3).
 #                   Set it in the launcher rather than relying on the default,
 #                   so the run directory records which backend produced it.
 #

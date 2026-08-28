@@ -59,6 +59,34 @@
 # similarity. If the group arm underperforms, that is a live explanation
 # alongside "self-similarity does not help here".
 #
+# ORGAN MASK -- ON FOR THIS EXPERIMENT
+# -----------------------------------
+# ORGAN_MASK=1 restricts the loss, PSNR/NRMSE/SSIM, and the logged panel to the
+# coil-sensitivity support. Knee is why the switch exists: air is most of the
+# slice, and an unmasked PSNR is dominated by how well each model reproduces a
+# noise floor nobody is trying to reconstruct.
+#
+# What this changes about reading the results:
+#
+#   * These numbers are NOT comparable to the brain runs (exp1) or to any
+#     earlier knee run, which were scored over the whole image. Different
+#     region, different quantity. Do not put them in one table.
+#   * The hypothesis is unaffected. It is a claim about cell 2 vs cell 1 WITHIN
+#     this submit, and all three cells are masked identically.
+#   * Masking is likely to FLATTER the nonlocal arm less than the local one, if
+#     anything: self-similarity has more to exploit in a large uniform
+#     background than in the organ. Worth remembering if cell 2's margin here
+#     is smaller than an earlier unmasked probe suggested -- that is expected,
+#     not a regression.
+#   * SSIM additionally erodes the mask by the 5-pixel window radius, so it
+#     scores the organ interior. See training/metrics.py.
+#
+# COUPLED TO slurm/baseline_varnet.sbatch. Regeneration rewrites EVERY config
+# for the anatomy, not just this submit's cells, so both launchers that touch
+# knee must set this the same way or whichever regenerates last silently wins.
+# baseline_varnet sets ORGAN_MASK=1 on its knee cells (0 and 1) to match. If
+# you turn this off, turn those off too.
+#
 # BEFORE SUBMITTING
 #   * cell 2 is the only one that has never run. Probe it alone first:
 #       SWEEP_EPOCHS=20 sbatch --array=2 slurm/exp2_knee_group.sbatch
@@ -78,6 +106,7 @@ ONLY="lpdsnet mglpds mggrouplpds"
 ACCELS="8"
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it
+ORGAN_MASK=1                         # see ORGAN MASK below
 CONFIG_ROOT="config"
 SWEEP_EPOCHS=""                      # empty = the config's num_epochs
 REGENERATE=1                         # 1 = regenerate configs before running
