@@ -207,7 +207,31 @@ class FastMRIDataset(Dataset):
             # Mask from coil support
             # ---------------------------
 
-            mask = (smaps.abs().sum(dim=1, keepdim=True) > 0)
+            # dim=0, NOT dim=1: the `.squeeze()` above already dropped the
+            # leading singleton slice axis, so smaps is (NC, H, W) and the coil
+            # axis is first. dim=1 summed over H and returned (NC, 1, W), which
+            # -- being the same trailing size as the image -- BROADCASTS
+            # against a (1, H, W) image rather than raising, so `image * mask`
+            # would have quietly grown a coil axis instead of masking anything.
+            # It went unnoticed while use_organ_mask was False everywhere and
+            # nothing consumed this.
+            if smaps.dim() != 3:
+                raise ValueError(
+                    f"expected smaps (NC, H, W) after squeeze, got "
+                    f"{tuple(smaps.shape)}. A single-coil volume squeezes the "
+                    f"coil axis away entirely, and the sum below would then "
+                    f"run over a spatial axis.")
+
+            mask = (smaps.abs().sum(dim=0, keepdim=True) > 0)
+
+            # Cheap, and it is the invariant every consumer relies on: the mask
+            # multiplies the image in the loss, the metrics and the val panel,
+            # and a mismatch there broadcasts into a wrong shape instead of
+            # failing. Checking it at the source names the file, not a tensor.
+            if mask.shape[-2:] != image.shape[-2:]:
+                raise ValueError(
+                    f"organ mask {tuple(mask.shape)} does not cover the image "
+                    f"{tuple(image.shape)} in {fname}.")
 
             # The grid the NETWORK should solve on. Derived here rather than in
             # the training loop because this is where the final image size is

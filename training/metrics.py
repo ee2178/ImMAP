@@ -44,11 +44,25 @@ def _as_weight(mask, like):
     than an all-ones weight that would still change the arithmetic.
 
     The mask is the support of the coil sensitivities -- `datasets/fastmri`
-    returns `smaps.abs().sum(1, keepdim=True) > 0` -- so it is (B, 1, H, W) and
+    reduces the smaps over their COIL axis -- so it is (B, 1, H, W) and
     broadcasts over a multi-channel image.
+
+    The spatial dims must match exactly; only the channel axis may broadcast.
+    A mask whose H/W disagree is not a mask for this image, and the error says
+    so: the bare `expand_as` failure names two shapes and leaves the reader to
+    work out which axis was reduced by mistake.
     """
     if mask is None:
         return None
+
+    if mask.shape[-2:] != like.shape[-2:]:
+        raise ValueError(
+            f"organ mask {tuple(mask.shape)} does not match the image "
+            f"{tuple(like.shape)} in its spatial dims. Expected (B, 1, H, W) "
+            f"with H/W equal. A mask of the form (B, NC, 1, W) or (B, NC, H, 1) "
+            f"means the coil reduction that built it ran over a SPATIAL axis "
+            f"instead of the coil axis -- see datasets/fastmri/loader.py.")
+
     dtype = like.real.dtype if torch.is_complex(like) else like.dtype
     w = mask.to(dtype=dtype, device=like.device)
     return w.expand_as(like) if w.shape != like.shape else w

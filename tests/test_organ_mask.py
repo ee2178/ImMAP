@@ -185,6 +185,67 @@ def test_identity_and_edges():
           all(abs(float(f[k]) - float(g[k])) < 1e-6 for k in f))
 
 
+def test_coil_axis_regression():
+    """The reduction that builds the mask must run over COILS.
+
+    `datasets/fastmri/loader.py` had `smaps.abs().sum(dim=1)` on a tensor that
+    `.squeeze()` had already reduced to (NC, H, W), so it summed over H. The
+    result, (NC, 1, W), has the same trailing size as the image and therefore
+    BROADCASTS in the loss instead of raising -- `image * mask` grew a coil
+    axis and trained on it. Only the metrics failed loudly, and only because
+    they call expand_as.
+
+    Both halves are pinned here: the reduction axis, and a metric that refuses
+    the wrong shape with a message naming the cause.
+    """
+    print("\n[the coil reduction runs over coils]")
+    NC, H, W = 15, 640, 372
+    smaps = torch.randn(1, NC, H, W, dtype=torch.complex64).squeeze()
+    check("squeeze leaves (NC, H, W)", tuple(smaps.shape) == (NC, H, W),
+          str(tuple(smaps.shape)))
+
+    good = (smaps.abs().sum(dim=0, keepdim=True) > 0)
+    bad = (smaps.abs().sum(dim=1, keepdim=True) > 0)
+    check("dim=0 gives (1, H, W)", tuple(good.shape) == (1, H, W),
+          str(tuple(good.shape)))
+    check("dim=1 gives the reported (NC, 1, W)", tuple(bad.shape) == (NC, 1, W),
+          str(tuple(bad.shape)))
+
+    image = torch.randn(1, 1, H, W, dtype=torch.complex64)
+    recon = image + 0.01 * torch.randn_like(image)
+
+    # the silent half: multiplying by the bad mask does not raise
+    grown = image * bad.unsqueeze(0)
+    check("the bad mask broadcasts in the LOSS instead of raising",
+          tuple(grown.shape) == (1, NC, H, W), str(tuple(grown.shape)))
+    kept = image * good.unsqueeze(0)
+    check("the good mask leaves the shape alone",
+          tuple(kept.shape) == tuple(image.shape), str(tuple(kept.shape)))
+
+    # the loud half: the metric names the cause rather than failing in expand_as
+    try:
+        compute_metrics(image.abs(), recon.abs(), mask=bad.unsqueeze(0))
+        check("a spatially-reduced mask is rejected", False, "no error raised")
+    except ValueError as e:
+        check("a spatially-reduced mask is rejected",
+              "coil" in str(e) and "loader.py" in str(e))
+    except RuntimeError as e:
+        check("a spatially-reduced mask is rejected", False,
+              f"raised the bare expand_as error instead: {e}")
+
+    m = compute_metrics(image.abs(), recon.abs(), mask=good.unsqueeze(0))
+    check("the good mask scores finite metrics",
+          all(torch.isfinite(torch.as_tensor(v)) for v in m.values()))
+
+    # and it actually tracks the support: zero a band in EVERY coil
+    sm = smaps.clone()
+    sm[:, :100, :] = 0
+    band = (sm.abs().sum(dim=0, keepdim=True) > 0)
+    check("the mask follows the coil support",
+          (not bool(band[:, :100, :].any())) and bool(band[:, 100:, :].all()),
+          f"{int(band.sum())} of {H * W} px kept")
+
+
 def test_batch_and_channels():
     print("\n[shapes]")
     gt = torch.rand(3, 1, 64, 64)
@@ -232,6 +293,7 @@ if __name__ == "__main__":
     test_ssim_map_not_inputs()
     test_nrmse_range_is_masked_too()
     test_identity_and_edges()
+    test_coil_axis_regression()
     test_batch_and_channels()
     test_gradients_flow()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
