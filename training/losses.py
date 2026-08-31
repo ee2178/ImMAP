@@ -109,6 +109,48 @@ def complex_nl1_nl2(x, y, sigma, eps=1e-8):
 def mag_nl1_nl2(x, y, sigma, eps=1e-8):
     return complex_nl1_nl2(x.abs(), y.abs(), sigma, eps=eps)
 
+def mse_vgg(x, y, sigma=None, vgg_weight=1.0, mse_weight=1.0,
+            size_normalize=False, imagenet_norm=False):
+    """MSE + `vgg_weight` * VGG(relu4_3) feature-MSE -- the perception/distortion combination.
+
+    WHY THIS EXISTS SEPARATELY FROM `vgg-feature`. The TF reference is PURE perceptual: its
+    `Recon_perceptualLoss` returns `perceptualLoss_weight * style_loss` and nothing else (there
+    is no MAE term, despite what the config comment there says). `vgg_feature_loss` ports that
+    faithfully and should stay that way.
+
+    That objective is a poor fit for an I2SB regressor. VGG features are largely invariant to a
+    global affine change of intensity, so a pure perceptual loss does not pin the ABSOLUTE scale
+    of x0_hat -- and the reverse bridge mixes x0_hat with the running state x_t on an absolute
+    scale at every step (see sb.base.reverse_sample). A drift the perceptual loss cannot see
+    therefore compounds over NFE steps. The pixel term is what anchors it.
+
+    SETTING vgg_weight. The two terms are not naturally commensurate, and the reference's
+    `size_normalize` makes the gap enormous: it divides the feature MSE by H*W*CH, which at a
+    192px input is ~1/295000, so the perceptual term would contribute nothing next to a pixel
+    MSE. This function therefore defaults to `size_normalize=False` (a plain mean feature-MSE).
+    Even then the scale is data-dependent -- use `vgg_mse_balance` below, which train_i2sb prints
+    on the first step, and pick `vgg_weight` from the ratio it reports rather than guessing.
+    """
+    mse = torch.mean((x - y).abs() ** 2)
+    vgg = vgg_feature_loss(x, y, weight=1.0, size_normalize=size_normalize,
+                           imagenet_norm=imagenet_norm)
+    return mse_weight * mse + vgg_weight * vgg
+
+
+@torch.no_grad()
+def vgg_mse_balance(x, y, size_normalize=False, imagenet_norm=False):
+    """(mse, vgg, vgg_weight_for_parity) on one batch -- the numbers needed to set `vgg_weight`.
+
+    The third value is mse/vgg: the weight at which the two terms contribute equally on this
+    batch. A sensible perceptual run sits BELOW it (the pixel term should still dominate), but
+    knowing where parity is beats guessing across five orders of magnitude.
+    """
+    mse = float(torch.mean((x - y).abs() ** 2))
+    vgg = float(vgg_feature_loss(x, y, weight=1.0, size_normalize=size_normalize,
+                                 imagenet_norm=imagenet_norm))
+    return mse, vgg, (mse / vgg if vgg > 0 else float("nan"))
+
+
 LOSS_REGISTRY = {
     "complex-mse": complex_mse,
     "magnitude-mse": magnitude_mse,
@@ -116,7 +158,15 @@ LOSS_REGISTRY = {
     "sigma-scaled-complex-mse": sigma_scaled_complex_mse,
     "complex-nl1-nl2": complex_nl1_nl2,
     "magnitude-nl1-nl2": mag_nl1_nl2,
-    "vgg-feature": vgg_feature_loss,
+    "vgg-feature": vgg_feature_loss,   # PURE perceptual -- the faithful TF port
+    "mse-vgg": mse_vgg,                # MSE + vgg_weight * perceptual (see mse_vgg's docstring)
+}
+
+# Losses that accept extra keyword arguments from cfg["training"]["loss_params"]. Everything
+# else takes only (x, y, sigma), so passing params to them is a config error worth catching.
+LOSS_PARAM_KEYS = {
+    "vgg-feature": {"weight", "size_normalize", "imagenet_norm"},
+    "mse-vgg": {"vgg_weight", "mse_weight", "size_normalize", "imagenet_norm"},
 }
 
 

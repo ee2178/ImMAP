@@ -33,7 +33,8 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, snr_loss_weight, POSTFIX_EVERY
-from training.losses import LOSS_REGISTRY, POINTWISE_REGISTRY, weighted_loss
+from training.losses import (LOSS_REGISTRY, POINTWISE_REGISTRY, LOSS_PARAM_KEYS,
+                            weighted_loss, vgg_mse_balance)
 from training.metrics import compute_metrics
 from sb.base import build_schedule, n_steps, forward_sample, forward_std, predict_x0
 from sb.i2sb import i2sb_sample
@@ -49,7 +50,7 @@ def masked_mse(pred, target, organ_mask, use_mask):
 
 
 def _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
-                 std_fwd, loss_weight):
+                 std_fwd, loss_weight, loss_params=None):
     """The x0-regression objective, with two INDEPENDENT weightings composed on top of it:
 
         per-pixel   w_pix = 1 + (et_weight - 1) * et      enhancing-tumor upweighting
@@ -64,15 +65,20 @@ def _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
     unchanged -- tune it in the tens-to-hundreds, not around 1 (see weighted_loss's docstring: ET
     covers ~0.3% of a slice, so weight 50 puts ~13% of the objective on the tumor and 330 ~50%).
 
-    Note what each weighting costs: the full LOSS_REGISTRY (vgg-feature, sigma-scaled, the ratio
-    losses) is only available when BOTH are off, because neither a perceptual loss nor a ratio loss
-    is a per-pixel mean. Any weighting therefore drops to the pointwise error, and `loss_type` must
-    name a POINTWISE_REGISTRY entry."""
+    Note what each weighting costs: the full LOSS_REGISTRY (vgg-feature, mse-vgg, sigma-scaled,
+    the ratio losses) is only available when BOTH are off, because neither a perceptual loss nor a
+    ratio loss is a per-pixel mean. Any weighting therefore drops to the pointwise error, and
+    `loss_type` must name a POINTWISE_REGISTRY entry.
+
+    `loss_params` (cfg["training"]["loss_params"]) reaches the registry entry only on that same
+    untouched path -- the weighted branches call the POINTWISE entry, which takes no options.
+    train_i2sb refuses the combination at startup rather than dropping the params silently."""
     tgt, prd = apply_loss_mask(x0, pred_x0, mask, use_mask)
 
     if loss_weight == "uniform":
         if et_weight == 1:
-            return loss_fn(tgt, prd, std_fwd)            # untouched path: whole registry available
+            # untouched path: whole registry available, and the only one that takes loss_params
+            return loss_fn(tgt, prd, std_fwd, **(loss_params or {}))
         return weighted_loss(loss_type, prd, tgt, et, et_weight)
 
     # per-sample t-weighting: reduce per sample FIRST, then weight, so w_t is a per-sample scalar
@@ -85,6 +91,46 @@ def _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
         err = (1.0 + (et_weight - 1.0) * et.expand_as(err)) * err
     per_sample = err.flatten(1).mean(dim=1)                                # (B,)
     return (snr_loss_weight(std_fwd, loss_weight) * per_sample).mean()
+
+
+def _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params):
+    """Print the pixel/perceptual split of a perceptual loss on the FIRST training batch.
+
+    `vgg_weight` spans orders of magnitude depending on `size_normalize` and on the data scale,
+    and a badly set one does not fail -- it silently trains a pure-MSE or a pure-VGG run under a
+    config that claims otherwise. This prints where the two terms actually sit, and the weight at
+    which they would contribute equally.
+
+    Read it as an order of magnitude, not a target: the net is untrained here, so both terms are
+    at their largest and their RATIO will drift as training proceeds.
+    """
+    tgt, prd = apply_loss_mask(x0, pred_x0, mask, use_mask)
+    kw = {k: v for k, v in (loss_params or {}).items()
+          if k in ("size_normalize", "imagenet_norm")}
+    try:
+        mse, vgg, parity = vgg_mse_balance(tgt, prd, **kw)
+    except Exception as e:                       # no VGG weights cached / no network on a node
+        print(f"[i2sb] could not measure the VGG/MSE balance: {type(e).__name__}: {e}")
+        return
+    if loss_type == "mse-vgg":
+        w = float((loss_params or {}).get("vgg_weight", 1.0))
+        share = w * vgg / (mse + w * vgg) if (mse + w * vgg) > 0 else float("nan")
+        print(f"[i2sb] loss balance on batch 0: mse={mse:.4e}  vgg={vgg:.4e}  "
+              f"vgg_weight={w:g}\n"
+              f"       -> perceptual term is {share:.1%} of the objective; "
+              f"vgg_weight={parity:.3e} would make it 50%")
+        if share < 1e-3:
+            print("       WARNING: the perceptual term is numerically negligible -- this run is "
+                  "effectively pure MSE.\n"
+                  "       If size_normalize is true, that alone divides the VGG term by H*W*CH.")
+        elif share > 0.95:
+            print("       WARNING: the pixel term is numerically negligible -- x0_hat's absolute "
+                  "scale is unconstrained,\n       which the reverse bridge compounds over NFE "
+                  "steps. Lower vgg_weight.")
+    else:
+        print(f"[i2sb] pure perceptual loss: vgg={vgg:.4e} (pixel MSE would be {mse:.4e}). "
+              f"No pixel term is\n       being optimized -- see training.losses.mse_vgg for why "
+              f"that is risky for a bridge regressor.")
 
 
 def _split_batch(batch, device):
@@ -117,7 +163,9 @@ def train_i2sb(
     backtrack_thresh=0.5,
     backtrack_factor=0.9,
     use_mask=True,
-    loss_type="complex-mse",         # any key in training.losses.LOSS_REGISTRY (e.g. "vgg-feature")
+    loss_type="complex-mse",         # any key in training.losses.LOSS_REGISTRY (e.g. "mse-vgg")
+    loss_params=None,                # extra kwargs for that loss (e.g. {"vgg_weight": 1e-3});
+                                     # only valid with loss_weight="uniform" and et_weight=1
     loss_weight="uniform",           # per-sample t-weighting: "uniform" | "snr" (~t=0) | "t1" (~t=1)
     et_weight=1.0,                   # per-pixel enhancing-tumor weight; 1 = off. Needs the loader's
                                      # et_mask: true. Tune in the tens-to-hundreds (see _bridge_loss).
@@ -149,6 +197,25 @@ def train_i2sb(
     if loss_type not in LOSS_REGISTRY:
         raise ValueError(f"loss_type {loss_type!r} not in LOSS_REGISTRY {sorted(LOSS_REGISTRY)}.")
     loss_fn = LOSS_REGISTRY[loss_type]
+
+    # loss_params only reaches the registry entry on the unweighted path (see _bridge_loss), and
+    # only a few entries take options at all. Both mistakes are silent -- the run trains a
+    # different objective than the config describes -- so refuse them here.
+    loss_params = dict(loss_params or {})
+    if loss_params:
+        allowed = LOSS_PARAM_KEYS.get(loss_type, set())
+        bad = sorted(set(loss_params) - allowed)
+        if bad:
+            raise ValueError(
+                f"loss_params {bad} are not accepted by loss_type {loss_type!r}. "
+                f"Accepted: {sorted(allowed) or 'none -- this loss takes only (x, y, sigma)'}.")
+        if loss_weight != "uniform" or et_weight != 1:
+            raise ValueError(
+                f"loss_params={loss_params} is set, but loss_weight={loss_weight!r} / "
+                f"et_weight={et_weight} route the objective through the POINTWISE registry, "
+                f"which takes no options. Drop loss_params, or set loss_weight='uniform' and "
+                f"et_weight=1.")
+    report_balance = loss_type in ("mse-vgg", "vgg-feature")
 
     # bridge schedule: "brownian" = the constant t(1-t) Brownian bridge (tau = peak noise std),
     # "i2sb" = the faithful paper schedule (mirrored-quadratic betas via beta_max). For a fully
@@ -197,8 +264,11 @@ def train_i2sb(
 
             opt.zero_grad()
             pred_x0 = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
+            if report_balance:
+                report_balance = False
+                _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params)
             loss = _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
-                                std_fwd, loss_weight)
+                                std_fwd, loss_weight, loss_params)
 
             loss.backward()
             if clip_grad is not None:
@@ -259,6 +329,7 @@ def train_i2sb(
                 posterior=posterior, clip_denoise=clip_denoise, val_nfe=val_nfe,
                 target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
                 loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
+                loss_params=loss_params,
                 data_range=data_range, wandb=wandb, global_step=global_step,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
@@ -309,7 +380,7 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
 def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
-              data_range, wandb, global_step):
+              data_range, wandb, global_step, loss_params=None):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -342,7 +413,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             # per-sample weight would be meaningless) -- but ET weighting still applies.
             sigma_v = torch.zeros(bs, 1, 1, 1, device=device)
             loss = _bridge_loss(loss_fn, loss_type, x0, pred, mask, use_mask, et, et_weight,
-                                sigma_v, "uniform")
+                                sigma_v, "uniform", loss_params)
             xt, step = x1, None
         else:  # single_pass: one random step, one forward (same as a training step)
             step = torch.randint(0, interval, (bs,), generator=gen, device=device)
@@ -350,7 +421,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
             pred = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
             loss = _bridge_loss(loss_fn, loss_type, x0, pred, mask, use_mask, et, et_weight,
-                                std_fwd, loss_weight)
+                                std_fwd, loss_weight, loss_params)
 
         x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
         mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only, data_range=data_range)

@@ -13,6 +13,7 @@ from .mg_lpds import MGLPDSNet, PDVCycle
 from .ladmm import AltSplitCDLNet
 from .sb_cdlnet import SBCDLNet
 from .sb_groupcdl import SBGroupCDL
+from .sb_unet import SBUnet
 
 
 def build_model(cfg):
@@ -58,6 +59,12 @@ def build_model(cfg):
     # prox in place of the soft threshold. Its schedule params must match cfg["i2sb"] too.
     elif model_type == "SBGroupCDL":
         return SBGroupCDL(**params)
+
+    # The I2SB paper's regressor: ADM's UNet conditioned on the bridge STEP (not sigma) via a
+    # sinusoidal embedding + per-ResBlock FiLM. Like the SB* nets it inverts sigma through its
+    # own schedule copy, so model.params must match cfg["i2sb"].
+    elif model_type == "SBUnet":
+        return SBUnet(**params)
 
     # Multigrid family, all one class:
     #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations
