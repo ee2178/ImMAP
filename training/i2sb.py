@@ -133,6 +133,29 @@ def _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params):
               f"that is risky for a bridge regressor.")
 
 
+_LPIPS_WARNED = False
+
+
+def _val_lpips_sum(gt, pred):
+    """Summed LPIPS over the batch, or None if LPIPS is unavailable.
+
+    Deliberately non-fatal. LPIPS downloads pretrained weights on first use, which fails on an
+    offline compute node -- killing a 48-hour training run over a MONITORING metric would be the
+    wrong trade. Warn once, then keep training without it. Warm the cache on a login node if you
+    need the number.
+    """
+    global _LPIPS_WARNED
+    try:
+        from evaluation.metrics import lpips as _lpips
+        return float(_lpips(gt, pred).sum())
+    except Exception as e:                                   # noqa: BLE001
+        if not _LPIPS_WARNED:
+            _LPIPS_WARNED = True
+            print(f"[i2sb] val_lpips is on but LPIPS is unavailable ({type(e).__name__}: {e}). "
+                  f"Continuing without it.")
+        return None
+
+
 def _split_batch(batch, device):
     """Batch is (x0, x1, cond, mask) or (x0, x1, cond, mask, et) when the loader has et_mask=True.
     cond may have 0 channels (conditioning off) -> None; et is None when absent."""
@@ -170,6 +193,12 @@ def train_i2sb(
     et_weight=1.0,                   # per-pixel enhancing-tumor weight; 1 = off. Needs the loader's
                                      # et_mask: true. Tune in the tens-to-hundreds (see _bridge_loss).
     psnr_only=False,
+    val_lpips=False,                 # also report val/lpips (perceptual distance, LOWER is
+                                     # better). Off by default: it needs the `lpips` package and
+                                     # downloads weights on first use. Turn it on whenever the
+                                     # objective is perceptual -- PSNR alone cannot rank those
+                                     # runs, because trading distortion for perceptual quality is
+                                     # exactly what they are doing.
     data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
                                      # data in [-1, 1]. Must match the loader's actual scaling or
                                      # every reported dB is offset by 20*log10(data_range).
@@ -329,8 +358,8 @@ def train_i2sb(
                 posterior=posterior, clip_denoise=clip_denoise, val_nfe=val_nfe,
                 target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
                 loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
-                loss_params=loss_params,
                 data_range=data_range, wandb=wandb, global_step=global_step,
+                loss_params=loss_params, val_lpips=val_lpips,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -380,7 +409,7 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
 def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
-              data_range, wandb, global_step, loss_params=None):
+              data_range, wandb, global_step, loss_params=None, val_lpips=False):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -391,6 +420,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
     net.eval()
     agg = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "nrmse": 0.0}
     n_samples = 0
+    lp_sum, lp_n = 0.0, 0        # LPIPS, averaged per sample like psnr/ssim
     et_sse, et_n = 0.0, 0.0      # pooled over the whole split, not averaged per batch: most
                                  # batches contain little or no tumor, so a mean of per-batch
                                  # ET-PSNRs would be dominated by the emptiest ones
@@ -425,6 +455,11 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
 
         x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
         mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only, data_range=data_range)
+        if val_lpips:
+            v = _val_lpips_sum(x0_m, pred_m)
+            if v is not None:
+                lp_sum += v
+                lp_n += bs
         agg["loss"] += float(loss) * bs
         for k in ("psnr", "ssim", "nrmse"):
             if k in mets:
@@ -436,6 +471,8 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         last = (x1, xt, x0_m, pred_m, mask, step)
 
     mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
+    if lp_n:
+        mean_metrics["lpips"] = lp_sum / lp_n
     # ET PSNR, area-normalized over the split, on the same data_range as metrics.psnr.
     # This is the number et_weight is meant to move; whole-brain psnr barely registers a change
     # confined to ~0.3% of the voxels.
