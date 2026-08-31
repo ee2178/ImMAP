@@ -39,7 +39,8 @@
             "end_slice": 25,
             "scale_fac": 5000.0,
             "kspace_root": "../datasets/fastmri/knee/multicoil_train",
-            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/train"
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/train",
+            "pad_multiple": 2
         },
         "val": {
             "name": "fastmri",
@@ -53,7 +54,8 @@
             "end_slice": 13,
             "scale_fac": 5000.0,
             "kspace_root": "../datasets/fastmri/knee/multicoil_val",
-            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/val"
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/val",
+            "pad_multiple": 2
         }
     },
     "training": {
@@ -61,15 +63,15 @@
         "steps_per_epoch": 50,
         "val_every_epochs": 100,
         "noise_std": [
-            0.0,
-            0.01
+            0.04,
+            0.06
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.005,
+        "val_noise_std": 0.05,
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
-        "use_organ_mask": false,
+        "use_organ_mask": true,
         "backtrack_thresh": null,
         "backtrack_factor": 0.9
     },
@@ -90,7 +92,7 @@
     "scheduler": {
         "type": "CosineAnnealingLR",
         "params": {
-            "eta_min": 1.0e-6,
+            "eta_min": 0.000001,
             "T_max": 300000
         }
     },

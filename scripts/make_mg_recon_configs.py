@@ -13,7 +13,7 @@ its own cell list via `--list-cells --anatomy <a>`, so the two stay in sync.
 
 Every cell trains on SYNTHETIC k-space (`kspace_type: "simulated"`): the clean
 coil-combined image is pushed through Sense -> Fourier -> mask with complex AWGN
-at sigma ~ U[0, 0.01] added in the coil-image domain. See
+at sigma ~ U[0.04, 0.06] added in the coil-image domain. See
 `operators/noise.py::mri_awgn`, the port of `genobs(clo::SyntheticMRIReco, ...)`
 in `Sljiva/src/closures/mrireco.jl`.
 
@@ -199,8 +199,12 @@ MODELS = {
     #     the dataset's. That is the method, not an oversight -- but it makes
     #     this the harder task, and the comparison favours the unrolled nets.
     #   * it returns an RSS MAGNITUDE image, so only magnitude metrics apply.
-    #   * it has no noise-adaptive parameter, so sigma ~ U[0, 0.01] is a
-    #     handicap the sigma-conditioned cells do not carry.
+    #   * it has no noise-adaptive parameter, so sigma ~ U[0.04, 0.06] is a
+    #     handicap the sigma-conditioned cells do not carry. This got HEAVIER
+    #     when the range moved up from [0, 0.01]: the sigma-conditioned cells
+    #     see a 1.5x spread they can adapt their thresholds to, and VarNet has
+    #     to pick one compromise across it. Check whether its gap widens with
+    #     sigma before attributing the gap to architecture.
     # It also has ~10x the parameters of the flat LPDSNet; `count_parameters`
     # in each config records it.
     "varnet": dict(
@@ -234,8 +238,29 @@ ANATOMIES = {
     ),
 }
 
-NOISE_STD = [0.0, 0.01]        # sigma ~ U[0, 0.01], the experiment's whole point
-VAL_NOISE_STD = 0.005          # mean(NOISE_STD): mrireco.jl:277 evaluates there
+# sigma ~ U[0.04, 0.06], added in the COIL-IMAGE domain (operators/noise.py::
+# mri_awgn), on data already divided by the anatomy's scale_fac -- so these are
+# fractions of unit signal scale, ~5%.
+#
+# Raised from [0.0, 0.01] because at that level every cell reconstructed almost
+# perfectly and the grid stopped separating the models: a comparison run in a
+# regime where the prior does not have to do any work measures nothing about
+# the prior.
+#
+# HOW THIS RELATES TO THE Sljiva REFERENCE, because it is not a straight copy.
+# `config/synthmri_closure.yaml` TRAINS at noise_level [0.00, 0.001] -- lower
+# than even our old setting -- and the fastMRI eval scripts then EVALUATE at a
+# single pinned 0.05 (`scripts/eval_guidedfastmri.jl:44`). 0.05 is the centre of
+# the range below, so this setup moves the reference's TEST operating point into
+# TRAINING and matches train to test, rather than reproducing its protocol.
+#
+# That is a defensible design and it is the one asked for, but it is a different
+# experiment from the paper's: a net trained at the level it is tested at should
+# beat one trained near-noiseless and tested at 0.05, so these numbers are not
+# directly comparable to published ones. Say which protocol produced a number
+# whenever one is quoted.
+NOISE_STD = [0.04, 0.06]
+VAL_NOISE_STD = 0.05           # mean(NOISE_STD): mrireco.jl:277 evaluates there
 VAL_SEED = 1234
 
 
@@ -343,6 +368,28 @@ def make_eval_config(save_dir, out_csv, comment):
         "metrics": list(EVAL_METRICS),
         "seed": EVAL_SEED,
     }
+
+
+def _lr_for(spec, args):
+    """The initial LR for one cell.
+
+    The nonlocal (group-attention) cells get their own, lower value. They kept
+    tripping the averaged-loss backtrack at the shared 5e-4: the attention
+    projections are the only parameters in this grid whose gradients pass
+    through a softmax over a 15x15 neighbourhood at three grid levels, and an
+    early step large enough to saturate it moves the whole adjacency at once.
+    Backtracking then restores the checkpoint and halves the LR, which costs
+    the epoch and leaves the run's effective schedule undefined -- so start
+    where it does not fire rather than letting the backtracker find it.
+
+    Keyed on the cell CARRYING attention, not on a tag list, so a GroupCDL or
+    MGGroupCDL cell added later inherits it without a second edit here. The
+    non-attention cells are untouched at args.lr.
+    """
+    params = spec["params"]
+    is_group = ("attn_backend" in params
+                or "attn_backend" in params.get("denoiser_kws", {}))
+    return args.lr_group if is_group else args.lr
 
 
 def make_config(anatomy, r, model, args):
@@ -471,7 +518,7 @@ def make_config(anatomy, r, model, args):
         },
         "optimizer": {
             "type": "Adam",
-            "params": {"lr": args.lr},
+            "params": {"lr": _lr_for(spec, args)},
         },
         "scheduler": {
             "type": "CosineAnnealingLR",
@@ -492,6 +539,12 @@ def main():
     p.add_argument("--steps-per-epoch", type=int, default=50)
     p.add_argument("--val-every-epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=5.0e-4)
+    p.add_argument("--lr-group", type=float, default=2.0e-4,
+                   help="initial LR for the group-attention cells "
+                        "(MGGroupLPDS, and any GroupCDL/MGGroupCDL added "
+                        "later). Lower than --lr because they backtrack at "
+                        "5e-4. Cosine T_max is unchanged, so these cells "
+                        "anneal from a lower start over the same budget.")
     p.add_argument("--only", nargs="*", default=None,
                    help="restrict to these model tags")
     p.add_argument("--anatomy", choices=("knee", "brain"), default=None,
@@ -536,17 +589,29 @@ def main():
         return
 
     if not args.dry_run:
-        # Imported here so --dry-run / --list-cells work without torch.
         # write_config is the repo's canonical writer: it re-reads the file with
         # yaml.safe_load (which is how train.py loads it) and rejects anything
         # that would come back as a string, e.g. json's `1e-06` for eta_min.
+        #
+        # It lives in training/config_io.py, which imports nothing but the
+        # standard library and PyYAML. `import training.config_io` would still
+        # execute training/__init__.py (-> torchvision), so the module is loaded
+        # BY PATH: writing a config has no business requiring a GPU training
+        # environment, and requiring one meant this script could only run on the
+        # cluster. training.common re-exports the same function for everyone else.
+        import importlib.util
+        _p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "training", "config_io.py")
         try:
-            from training.common import write_config
-        except ImportError as e:
+            _s = importlib.util.spec_from_file_location("_immap_config_io", _p)
+            _m = importlib.util.module_from_spec(_s)
+            _s.loader.exec_module(_m)
+            write_config = _m.write_config
+        except Exception as e:                      # noqa: BLE001
             raise SystemExit(
-                f"could not import training.common.write_config ({e}).\n"
-                f"Run this in the training env (conda activate gcdl), or use "
-                f"--dry-run to inspect the configs without writing.")
+                f"could not load write_config from {_p} ({e}).\n"
+                f"It needs only PyYAML. Use --dry-run to inspect the configs "
+                f"without writing.")
 
     written = []
     seen_names = {}

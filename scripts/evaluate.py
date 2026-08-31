@@ -9,7 +9,7 @@ needs no change here.
 
     python scripts/evaluate.py --eval-config config/eval/mri_recon.json
     python scripts/evaluate.py --runs trained_nets/mg_recon/knee --metrics psnr ssim
-    python scripts/evaluate.py --runs trained_nets/... --sigmas 0 0.005 0.01
+    python scripts/evaluate.py --runs trained_nets/... --sigmas 0.04 0.05 0.06
 
 What is held fixed across runs
 ------------------------------

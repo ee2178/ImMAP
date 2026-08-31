@@ -1,5 +1,5 @@
 {
-    "_comment": "Evaluate every brain cell in one sweep (8 runs). Per-cell configs are in config/eval/brain/.",
+    "_comment": "Evaluate every brain cell in one sweep (12 runs). Per-cell configs are in config/eval/brain/.",
     "runs": "trained_nets/mg_recon/brain",
     "out": "results/eval/brain.csv",
     "metrics": [

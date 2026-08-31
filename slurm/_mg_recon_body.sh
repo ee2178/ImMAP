@@ -120,9 +120,35 @@ if mri.get("kspace_type") != "simulated":
         f"[grid] {base} has kspace_type={mri.get('kspace_type')!r}. This grid is the "
         f"SYNTHETIC k-space experiment -- 'simulated' is the whole point.")
 
+# The expected range is READ FROM THE GENERATOR, not written here as well. It
+# was duplicated as a literal (0.0, 0.01) and that made changing the noise level
+# a two-file edit whose second half fails at submit time, on every cell at once.
+# The generator's module level is stdlib-only -- write_config is imported lazily
+# inside main() -- so this import is safe on a node without torch.
+# Same relative path the REGENERATE step above invokes; the body runs from the
+# repo root.
+import importlib.util
+try:
+    _spec = importlib.util.spec_from_file_location(
+        "_mkcfg", "scripts/make_mg_recon_configs.py")
+    _gen = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_gen)
+    _expected = tuple(float(v) for v in _gen.NOISE_STD)
+except Exception as _e:                 # noqa: BLE001
+    # Do not block the run on a check that cannot be performed -- but say so,
+    # because a silently skipped guard is worse than none.
+    print(f"[grid] WARNING: could not read NOISE_STD from the generator "
+          f"({_e}); the noise-range check is SKIPPED.", file=sys.stderr)
+    _expected = None
+
 lo, hi = cfg["training"]["noise_std"]
-if (lo, hi) != (0.0, 0.01):
-    raise SystemExit(f"[grid] {base} has noise_std={[lo, hi]}, expected [0.0, 0.01].")
+if _expected is not None and (float(lo), float(hi)) != _expected:
+    raise SystemExit(
+        f"[grid] {base} has noise_std={[lo, hi]}, but the generator's "
+        f"NOISE_STD is {list(_expected)}. The config is stale -- regenerate it "
+        f"(REGENERATE=1) rather than editing it by hand.")
+if hi <= lo:
+    raise SystemExit(f"[grid] {base} has noise_std={[lo, hi]}: hi must exceed lo.")
 
 # preproc='image' pads y~ but leaves E's mask/maps behind, and subtracts a plain
 # mean where reconstruction needs the E^H E DC correction. The models raise on

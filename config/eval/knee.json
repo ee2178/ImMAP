@@ -1,5 +1,5 @@
 {
-    "_comment": "Evaluate every knee cell in one sweep (8 runs). Per-cell configs are in config/eval/knee/.",
+    "_comment": "Evaluate every knee cell in one sweep (12 runs). Per-cell configs are in config/eval/knee/.",
     "runs": "trained_nets/mg_recon/knee",
     "out": "results/eval/knee.csv",
     "metrics": [

@@ -1,61 +1,55 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "LPDSNet_brain_R8_synth"
+        "name": "E2EVarNet_mg_knee_R8_synth"
     },
     "model": {
-        "type": "MGLPDSNet",
+        "type": "E2EVarNet",
         "params": {
-            "M": 169,
-            "C": 1,
-            "P": 7,
-            "s": 2,
-            "widen": 1,
-            "degrees": 1,
-            "lam0": 0.001,
-            "tau0": 0.5,
-            "theta0": 0.0,
-            "alpha0": 1.0,
-            "is_complex": true,
-            "preproc": "kspace",
-            "resize_noise": true,
-            "K": 30
-        }
+            "num_cascades": 12,
+            "sens_chans": 8,
+            "sens_pools": 4,
+            "chans": 18,
+            "pools": 4,
+            "mask_center": true,
+            "acs_lines": 20
+        },
+        "_comment": "fastMRI E2E-VarNet baseline at published defaults. Estimates its own sensitivity maps and returns RSS magnitude, so it is comparable on PSNR/SSIM/NRMSE and on nothing phase-sensitive."
     },
     "paths": {
-        "save_dir": "trained_nets/mg_recon/brain/lpdsnet_R8",
+        "save_dir": "trained_nets/mg_recon/knee/varnet_R8",
         "ckpt": null
     },
     "data": {
         "train": {
             "name": "fastmri",
             "task": "recon",
-            "anatomy": "brain",
+            "anatomy": "knee",
             "batch_size": 1,
             "crop_size": null,
             "center_crop": null,
             "random_flips": false,
-            "start_slice": 0,
-            "end_slice": 8,
-            "scale_fac": 2000.0,
-            "kspace_root": "../datasets/fastmri/brain/multicoil_train",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/train",
-            "pad_multiple": 2
+            "start_slice": 12,
+            "end_slice": 25,
+            "scale_fac": 5000.0,
+            "kspace_root": "../datasets/fastmri/knee/multicoil_train",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/train",
+            "pad_multiple": 1
         },
         "val": {
             "name": "fastmri",
             "task": "recon",
-            "anatomy": "brain",
+            "anatomy": "knee",
             "batch_size": 1,
             "crop_size": null,
             "center_crop": null,
             "random_flips": false,
-            "start_slice": 0,
-            "end_slice": 1,
-            "scale_fac": 2000.0,
-            "kspace_root": "../datasets/fastmri/brain/multicoil_val",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/val",
-            "pad_multiple": 2
+            "start_slice": 12,
+            "end_slice": 13,
+            "scale_fac": 5000.0,
+            "kspace_root": "../datasets/fastmri/knee/multicoil_val",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pd/val",
+            "pad_multiple": 1
         }
     },
     "training": {
@@ -71,7 +65,7 @@
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
-        "use_organ_mask": false,
+        "use_organ_mask": true,
         "backtrack_thresh": null,
         "backtrack_factor": 0.9
     },

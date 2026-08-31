@@ -15,7 +15,7 @@
 #SBATCH --error=logs/slurm_%A_%a.err
 #SBATCH --array=0-7           # MUST equal the knee cell count; checked at runtime
 #
-# fastMRI KNEE (PD), synthetic k-space, sigma ~ U[0, 0.01].
+# fastMRI KNEE (PD), synthetic k-space, sigma ~ U[0.04, 0.06].
 #
 #   4 models x 2 accelerations (R=8, R=4) = 8 cells
 #

@@ -56,7 +56,8 @@
             "end_slice": 8,
             "scale_fac": 2000.0,
             "kspace_root": "../datasets/fastmri/brain/multicoil_train",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/train"
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/train",
+            "pad_multiple": 2
         },
         "val": {
             "name": "fastmri",
@@ -70,7 +71,8 @@
             "end_slice": 1,
             "scale_fac": 2000.0,
             "kspace_root": "../datasets/fastmri/brain/multicoil_val",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/val"
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/val",
+            "pad_multiple": 2
         }
     },
     "training": {
@@ -78,11 +80,11 @@
         "steps_per_epoch": 50,
         "val_every_epochs": 100,
         "noise_std": [
-            0.0,
-            0.01
+            0.04,
+            0.06
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.005,
+        "val_noise_std": 0.05,
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
@@ -107,7 +109,7 @@
     "scheduler": {
         "type": "CosineAnnealingLR",
         "params": {
-            "eta_min": 1.0e-6,
+            "eta_min": 0.000001,
             "T_max": 300000
         }
     },

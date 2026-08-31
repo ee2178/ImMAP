@@ -31,7 +31,7 @@
 #
 # WHAT IS AND IS NOT HELD CONSTANT
 # --------------------------------
-# Held: the data, the mask (R, acs_lines, mask_dist), sigma ~ U[0, 0.01], the
+# Held: the data, the mask (R, acs_lines, mask_dist), sigma ~ U[0.04, 0.06], the
 # loss, the LR, the schedule and the step budget -- all inherited from the same
 # generator block as every other cell, so the training budget is equal.
 #
