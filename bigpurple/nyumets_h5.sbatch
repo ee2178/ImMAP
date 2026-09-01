@@ -21,12 +21,19 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
-set -euo pipefail
-
 # --- conda ------------------------------------------------------------------------------
+# No `set -euo pipefail` here: conda's activate functions read unset variables ($PS1,
+# $_CE_CONDA, $CONDA_SHLVL) before init, so `set -u` aborts the job during activation.
+# Guard the two steps that can actually fail instead.
+#
 # module load anaconda3/cpu/2023.09          # uncomment if conda is not already on PATH
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate env
+CONDA_BASE="$(conda info --base 2>/dev/null)"
+if [ -z "$CONDA_BASE" ]; then
+    echo "conda not on PATH -- uncomment the module load line above" >&2
+    exit 1
+fi
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+conda activate env || { echo "conda activate env failed" >&2; exit 1; }
 
 # ~/.local/lib/python3.x/site-packages shadows the env and outranks it; a stray
 # `pip install --user` in this account would silently override the env's own packages.

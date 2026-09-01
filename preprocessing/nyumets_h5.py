@@ -6,7 +6,7 @@ FLAIR / T1 / CT1 / T2 quartet. Sessions missing any of the four are skipped.
 
 Layout mirrors preprocessing/cmap.py, so the existing BraTS loaders read these unchanged:
 
-    <out>/<patient>/<patient>_<session>_img.h5
+    <out>/<patient>_<session>/<patient>_<session>_img.h5
         img_raw          (n, H, W, C) float32   unnormalized intensities
         img_median_mad   (n, H, W, C) float32   per-contrast median/MAD, within brain
         img              -> soft link to img_median_mad (an alias, zero extra bytes)
@@ -197,7 +197,11 @@ def main():
 
     rows, shapes, skipped = [], {}, []
     for i, (key, files) in enumerate(sessions.items(), 1):
-        path = os.path.join(cfg.out, key[0], f"{key[0]}_{key[1]}_img.h5")
+        # ONE DIRECTORY PER SESSION, not per patient. I2SBDataset.index_img_from_root takes
+        # imgs[0] -- the first *_img.h5 in each subdirectory -- so grouping a patient's
+        # sessions under one folder would silently index only one of them.
+        case = f"{key[0]}_{key[1]}"
+        path = os.path.join(cfg.out, case, f"{case}_img.h5")
         if os.path.exists(path) and not cfg.overwrite:
             continue
         try:
