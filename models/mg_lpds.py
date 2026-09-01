@@ -59,6 +59,7 @@ import torch
 import torch.nn as nn
 
 from models.base import set_weight
+from models.level_trace import LevelTraceMixin
 from models.lpds import LPDSLayer, LPDSStack, make_lpds_layer
 from models.multigrid import (_ChannelScale, identity_widen_weight,
                               widen_filter, widen_prox_)
@@ -397,7 +398,7 @@ class PDVCycle(nn.Module):
 # ===========================================================================
 #  MGLPDSNet
 # ===========================================================================
-class MGLPDSNet(nn.Module):
+class MGLPDSNet(LevelTraceMixin, nn.Module):
     """LPDS whose iterations are primal-dual V-cycles.
 
     `K` follows the same convention as `MGCDLNet`, so the multigrid ablation is

@@ -52,6 +52,7 @@ import torch
 import torch.nn as nn
 
 from models.base import set_weight
+from models.level_trace import LevelTraceMixin
 from models.components import ConvTranspose2d
 from models.lista import LISTA, LISTALayer, gram
 from models.prox import GroupThreshold, PixelConv, FenchelProx, resize_noise
@@ -439,7 +440,7 @@ class _ChannelScale(nn.Module):
 # ===========================================================================
 #  CDLNet container (cdlnet.jl)
 # ===========================================================================
-class MGCDLNet(nn.Module):
+class MGCDLNet(LevelTraceMixin, nn.Module):
     """CDLNet whose iterations are multigrid V-cycles.
 
     `K` may be given either as the Julia-style `[K_outer, [i0, i1, ...]]` or as
