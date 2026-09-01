@@ -1,0 +1,9 @@
+{
+    "splits": {
+        "train": 0.6,
+        "val": 0.3,
+        "test": 0.1
+    },
+    "seed": 0,
+    "group": "prefix"
+}

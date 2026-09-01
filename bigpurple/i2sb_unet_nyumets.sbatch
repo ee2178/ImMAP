@@ -11,7 +11,12 @@
 #
 # PREREQUISITES, in order:
 #   1. sbatch bigpurple/nyumets_h5.sbatch          # -> $HOME/scratch/datasets/NYUMets_h5
-#   2. python datasets/NYUMets/make_split_symlinks.py --source ../datasets/NYUMets_h5
+#   2. python datasets/make_split_symlinks.py --source ../datasets/NYUMets_h5 \
+#          --config config/NYUMets/split.json          # 60/30/10, group=prefix, seed 0
+#      --group prefix is REQUIRED for NYUMets (group sessions by patient); the default is
+#      --group none, which would split per session and leak a patient across train and val.
+#      Re-running RESHUFFLES (needs --force) -- do not redo it against a checkpoint you
+#      intend to keep comparing, or the val set changes underneath you.
 #   3. python -m scripts.calibrate_nyumets_bridge --root ../datasets/NYUMets_h5_train --scale 3.0
 #      -> confirm beta_max; it is inherited from BraTS and NYUMets is a different cohort.
 #
@@ -31,7 +36,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
-#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
