@@ -1,35 +1,32 @@
 #!/bin/bash
 #
-# I2SB with the paper's ADM UNet on NYUMets, both conditioning settings:
+# I2SB with the paper's ADM UNet on NYUMets: all contrasts -> CT1.
 #
-#     task 0   i2sb_unet_t1.json    T1 -> CT1       cond_idx []        C = 1
-#     task 1   i2sb_unet_all.json   all -> CT1      cond_idx [0,1,3]   C = 4
+#     config/NYUMets/i2sb_unet_all.json     cond_idx [0,1,3] (FLAIR, T1, T2)   C = 4
 #
-# The pair isolates one thing -- what FLAIR and T2 are worth on top of the bridge itself.
-# Everything else (architecture, schedule, optimizer, loss, data) is identical, so a gap is
-# attributable to conditioning and nothing else. Same design as torch/i2sb_unet.sbatch.
+# THE MODEL IS THE PAPER'S, NOT "A UNET". models/sb_unet.py is a port of ADM /
+# guided-diffusion's UNet, which is what I2SB uses unmodified, conditioned on the discrete
+# bridge POSITION through a sinusoidal embedding and per-ResBlock FiLM.
 #
-# PREREQUISITES, in order:
-#   1. sbatch bigpurple/nyumets_h5.sbatch          # -> $HOME/scratch/datasets/NYUMets_h5
-#   2. python datasets/make_split_symlinks.py --source ../datasets/NYUMets_h5 \
-#          --config config/NYUMets/split.json          # 60/30/10, group=prefix, seed 0
-#      --group prefix is REQUIRED for NYUMets (group sessions by patient); the default is
-#      --group none, which would split per session and leak a patient across train and val.
-#      Re-running RESHUFFLES (needs --force) -- do not redo it against a checkpoint you
-#      intend to keep comparing, or the val set changes underneath you.
-#   3. python -m scripts.calibrate_nyumets_bridge --root ../datasets/NYUMets_h5_train --scale 3.0
-#      -> confirm beta_max; it is inherited from BraTS and NYUMets is a different cohort.
+# PREREQUISITE: the h5 set from bigpurple/nyumets_h5.sbatch. The 60/30/10 patient-grouped
+# split runs INSIDE this script (see SPLIT below), so chaining is one dependency:
 #
-# beta_max lives in BOTH cfg["i2sb"] AND cfg["model"]["params"]: SBUnet carries its own copy
-# of the schedule to invert std_fwd back to the step index, and train_i2sb calls
-# assert_schedule_matches() at startup. If you change one, change both or the job dies.
+#   sbatch --dependency=afterok:<h5 jobid> --kill-on-invalid-dep=yes \
+#          bigpurple/i2sb_unet_nyumets.sbatch
 #
-# Submit:    sbatch bigpurple/i2sb_unet_nyumets.sbatch
-# One only:  sbatch --array=0 bigpurple/i2sb_unet_nyumets.sbatch
+# --kill-on-invalid-dep=yes matters: without it, a failed h5 job leaves this one queued
+# forever as DependencyNeverSatisfied rather than failing.
+#
+# The split prints a bridge calibration to this job's log. It is INFORMATIONAL -- beta_max
+# stays at the BraTS-inherited 0.3 unless you edit the config. beta_max lives in BOTH
+# cfg["i2sb"] AND cfg["model"]["params"] (SBUnet carries its own schedule copy to invert
+# std_fwd back to the step index) and train_i2sb calls assert_schedule_matches() at startup,
+# so if you change it, change both or the job dies.
+#
+# Submit:  sbatch bigpurple/i2sb_unet_nyumets.sbatch
 
 #SBATCH --partition=a100_short
 #SBATCH --job-name=i2sb-unet-nyumets
-#SBATCH --array=0-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
@@ -38,8 +35,8 @@
 #SBATCH --time=3-00:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/%x_%A_%a.out
-#SBATCH --error=logs/%x_%A_%a.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 # a100_short caps at 3 days; the BraTS budget is 1500 x 200 = 300k steps. If that does not
 # fit, resume from the checkpoint or move to a100_long (28d, 19 nodes).
@@ -60,19 +57,50 @@ export PYTHONNOUSERSITE=1
 IMMAP_ROOT="${IMMAP_ROOT:-$HOME/scratch/ImMAP}"
 cd "$IMMAP_ROOT" || { echo "no such dir: $IMMAP_ROOT" >&2; exit 1; }
 
-CONFIGS=(config/NYUMets/i2sb_unet_t1.json config/NYUMets/i2sb_unet_all.json)
+CFG="${CFG:-config/NYUMets/i2sb_unet_all.json}"
+SOURCE="${SOURCE:-../datasets/NYUMets_h5}"
+SPLIT_CONFIG="${SPLIT_CONFIG:-config/NYUMets/split.json}"
 
-TASK=${SLURM_ARRAY_TASK_ID:-0}
-if [ "$TASK" -ge "${#CONFIGS[@]}" ]; then
-    echo "array index $TASK >= ${#CONFIGS[@]} configs; fix --array" >&2
-    exit 1
-fi
-CFG="${CONFIGS[$TASK]}"
+# --- optional split, run in sequence before training ------------------------------------
+#   SPLIT=auto   (default) split only if <SOURCE>_train is missing -- never touches an
+#                existing split, so a resubmit cannot reshuffle val under a checkpoint
+#   SPLIT=never  skip entirely
+#   SPLIT=force  re-split even if it exists (RESHUFFLES; invalidates old comparisons)
+do_split() {
+    echo "[split] $SOURCE -> ${SOURCE}_{train,val,test}  ($SPLIT_CONFIG)"
+    # A FILE, not `python -m`: datasets/__init__.py eagerly imports every registered loader
+    # (torchvision, wandb) and this script needs none of them.
+    python datasets/make_split_symlinks.py --source "$SOURCE" --config "$SPLIT_CONFIG" "$@" \
+        || { echo "[split] FAILED" >&2; return 1; }
+    echo "[split] bridge calibration (informational -- beta_max is NOT applied):"
+    python -m scripts.calibrate_nyumets_bridge --root "${SOURCE}_train" --scale 3.0 \
+        || echo "[split] calibration failed; not fatal"
+    return 0
+}
+
+case "${SPLIT:-auto}" in
+    never)
+        echo "[split] SPLIT=never, skipping"
+        ;;
+    auto)
+        if [ -d "${SOURCE}_train" ]; then
+            echo "[split] ${SOURCE}_train exists -> skipping (SPLIT=force to redo)"
+        else
+            do_split || exit 1
+        fi
+        ;;
+    force)
+        do_split --force || exit 1
+        ;;
+    *)
+        echo "SPLIT must be auto|never|force, got '${SPLIT}'" >&2
+        exit 1
+        ;;
+esac
 
 # The config's data roots are RELATIVE TO THE REPO ROOT (../datasets/NYUMets_h5_{train,val},
 # i.e. $HOME/scratch/datasets/... given IMMAP_ROOT=$HOME/scratch/ImMAP) -- the same convention
-# the raw ../datasets/NYUMets symlink uses. They only resolve because of the cd above, so
-# check them here rather than failing 20 minutes into a queued job.
+# the raw ../datasets/NYUMets symlink uses. They only resolve because of the cd above.
 python - "$CFG" <<'PY' || exit 1
 import json, os, sys
 cfg = json.load(open(sys.argv[1]))
@@ -81,13 +109,13 @@ bad = [(s, cfg["data"][s]["root"]) for s in ("train", "val")
 for s, r in bad:
     print(f"  !! data.{s}.root does not exist: {r}  (cwd {os.getcwd()})", file=sys.stderr)
 if bad:
-    print("  run the h5 build then the split, or fix the 'root' fields in "
-          f"{sys.argv[1]}.", file=sys.stderr)
+    print(f"  the split did not produce them, or the 'root' fields in {sys.argv[1]} are wrong.",
+          file=sys.stderr)
     sys.exit(1)
 PY
 
 echo "host   : $(hostname)"
 echo "gpu    : $(nvidia-smi --query-gpu=name --format=csv,noheader)"
-echo "task $TASK -> $CFG"
+echo "config : $CFG"
 
 python train.py "$CFG"
