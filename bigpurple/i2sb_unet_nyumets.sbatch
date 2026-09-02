@@ -29,14 +29,15 @@
 #SBATCH --job-name=i2sb-unet-nyumets
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --chdir=/gpfs/scratch/ee2178/ImMAP
+#SBATCH --output=/gpfs/scratch/ee2178/ImMAP/logs/%x_%j.out
+#SBATCH --error=/gpfs/scratch/ee2178/ImMAP/logs/%x_%j.err
 
 # a100_short caps at 3 days; the BraTS budget is 1500 x 200 = 300k steps. If that does not
 # fit, resume from the checkpoint or move to a100_long (28d, 19 nodes).
@@ -60,6 +61,27 @@ cd "$IMMAP_ROOT" || { echo "no such dir: $IMMAP_ROOT" >&2; exit 1; }
 CFG="${CFG:-config/NYUMets/i2sb_unet_all.json}"
 SOURCE="${SOURCE:-../datasets/NYUMets_h5}"
 SPLIT_CONFIG="${SPLIT_CONFIG:-config/NYUMets/split.json}"
+
+# --- GPU preflight, BEFORE any work ------------------------------------------------------
+# `nvidia-smi --query-gpu=name` answers over NVML and succeeds even when the device cannot be
+# opened, so it is NOT a usability check -- a node whose GPU is held in Exclusive_Process mode
+# by a stray process prints its name happily and then fails at the first .to(device) with
+# `cudaErrorDevicesUnavailable`. Allocating one real tensor is the check that means something.
+python - <<'PY' || exit 1
+import sys, torch
+if not torch.cuda.is_available():
+    print("PREFLIGHT: no CUDA device visible -- was --gres honoured?", file=sys.stderr)
+    sys.exit(1)
+try:
+    torch.zeros(1, device="cuda")
+except Exception as err:
+    print(f"PREFLIGHT: GPU visible but a context could not be created on it: {err}",
+          file=sys.stderr)
+    print("  the card is allocated but held or wedged; resubmit, and if the same node "
+          "recurs use --exclude=<node>", file=sys.stderr)
+    sys.exit(1)
+print(f"gpu    : {torch.cuda.get_device_name(0)}  (context OK)")
+PY
 
 # --- optional split, run in sequence before training ------------------------------------
 #   SPLIT=auto   (default) split only if <SOURCE>_train is missing -- never touches an
@@ -115,7 +137,6 @@ if bad:
 PY
 
 echo "host   : $(hostname)"
-echo "gpu    : $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "config : $CFG"
 
 python train.py "$CFG"

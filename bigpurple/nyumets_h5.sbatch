@@ -18,8 +18,9 @@
 #SBATCH --time=12:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --chdir=/gpfs/scratch/ee2178/ImMAP
+#SBATCH --output=/gpfs/scratch/ee2178/ImMAP/logs/%x_%j.out
+#SBATCH --error=/gpfs/scratch/ee2178/ImMAP/logs/%x_%j.err
 
 # --- conda ------------------------------------------------------------------------------
 # No `set -euo pipefail` here: conda's activate functions read unset variables ($PS1,

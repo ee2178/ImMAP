@@ -11,7 +11,17 @@ Layout mirrors preprocessing/cmap.py, so the existing BraTS loaders read these u
         img_median_mad   (n, H, W, C) float32   per-contrast median/MAD, within brain
         img              -> soft link to img_median_mad (an alias, zero extra bytes)
         mask             (n, H, W, 1) uint8     brain mask
+        support          (n, H, W, 1) uint8     common acquisition support (see below)
         slice_index      (n,)         int32     maps n back to the original RAS z
+
+COMMON SUPPORT. Contrasts of one session do not always cover the same anatomy -- a T1 whose
+FOV reaches the eyes paired with a CT1 whose FOV does not is the usual case. Every channel is
+therefore masked to the INTERSECTION of the per-contrast acquisition supports, so T1 and CT1
+share a domain exactly. Without it a T1 -> CT1 bridge is trained to delete an eye that
+legitimately exists in its input, and the loss is dominated by a region the target never
+acquired. Disable with --no-intersect-support. Per-contrast `support_lost_<C>` attrs record
+how much of each contrast's own support the intersection dropped -- a large value on one
+contrast IS the FOV mismatch.
 
 Channel order is [FLAIR, T1, T1ce, T2] -- the BraTS order, so `contrast_idx` and every
 existing config keep their meaning. NYUMets writes the enhanced T1 as CT1; the stored
@@ -35,6 +45,7 @@ import argparse
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import h5py
 import nibabel as nib
 
@@ -85,6 +96,39 @@ def load_ras(path):
     return np.asarray(v, dtype=np.float32), img.affine
 
 
+def _morph(m, r, op):
+    """2D per-slice dilate/erode of a bool mask with a (2r+1)^2 box."""
+    x = m[:, None].float()
+    if op == "dilate":
+        x = F.max_pool2d(x, 2 * r + 1, 1, r)
+    else:
+        x = -F.max_pool2d(-x, 2 * r + 1, 1, r)
+    return x[:, 0] > 0.5
+
+
+def support_mask(img, frac, r):
+    """(D,C,H,W) -> (D,C,H,W) bool: where each contrast actually has ACQUIRED data.
+
+    This is a different question from "is this tissue", and needs a different rule. The
+    threshold is low -- just above the air noise floor -- so that dark-but-acquired voxels
+    (CSF on T1) stay inside the support; an opening then drops isolated noise speckle and a
+    closing fills interior holes, so the result is a field-of-view region rather than a
+    tissue segmentation.
+    """
+    out = torch.zeros(img.shape, dtype=torch.bool)
+    for c in range(img.shape[1]):
+        v = img[:, c].float()
+        flat = v.reshape(-1)
+        step = max(1, flat.numel() // 2_000_000)          # torch.quantile caps around 16M
+        hi = torch.quantile(flat[::step], 0.995).clamp_min(1e-6)
+        m = v > frac * hi
+        if r > 0:
+            m = _morph(_morph(m, r, "erode"), r, "dilate")     # opening: drop speckle
+            m = _morph(_morph(m, r, "dilate"), r, "erode")     # closing: fill holes
+        out[:, c] = m
+    return out
+
+
 def brain_mask(img, bg_frac):
     """(D,C,H,W) -> (D,H,W) bool.
 
@@ -105,7 +149,7 @@ def brain_mask(img, bg_frac):
 
 
 def build(files, cfg):
-    """-> (raw_hwc, norm_hwc, mask_hwc, slice_idx, stats, orig_depth, affine)."""
+    """-> (raw, norm, mask, support, slice_idx, stats, orig_depth, affine, lost)."""
     vols, affines = zip(*(load_ras(files[c]) for c in CONTRASTS))
     if len({v.shape for v in vols}) != 1:
         raise ValueError(f"shapes differ: {[v.shape for v in vols]} -- not on a common grid")
@@ -113,7 +157,28 @@ def build(files, cfg):
         raise ValueError("affines differ -- contrasts are not co-registered")
 
     img = torch.from_numpy(np.stack([v.transpose(2, 0, 1) for v in vols], axis=1))  # (D,C,H,W)
-    fg = brain_mask(img, cfg.bg_frac)
+
+    # COMMON SUPPORT. Contrasts of the same session do not always cover the same anatomy --
+    # a T1 whose FOV includes the eyes paired with a CT1 whose FOV does not is the usual
+    # case. Left alone, the bridge is trained to DELETE an eye that legitimately exists in
+    # its input, and the loss is dominated by a region the target simply never acquired.
+    # So intersect the per-contrast supports and give every channel the same one.
+    #
+    # This cannot come from brain_mask: that AVERAGES the contrasts, so an eye voxel carrying
+    # signal in one of four contrasts still lands at ~1/4 of its normalised value, well above
+    # bg_frac, and survives.
+    lost = {}
+    if cfg.intersect_support:
+        sup = support_mask(img, cfg.support_frac, cfg.support_close)
+        fov = sup.all(dim=1)                                   # (D,H,W)
+        for c, name in enumerate(CONTRASTS):
+            own = sup[:, c].sum()
+            lost[name] = float(1.0 - (fov & sup[:, c]).sum() / own.clamp_min(1))
+        img = img * fov.unsqueeze(1).to(img.dtype)
+    else:
+        fov = torch.ones(img.shape[:1] + img.shape[2:], dtype=torch.bool)
+
+    fg = brain_mask(img, cfg.bg_frac) & fov
     clipped = (channelwise_percentile_clip(img, fg, cfg.clip[0], cfg.clip[1])
                if cfg.clip else img)
     norm, stats = normalize_masked(clipped, fg, mode=MODE)
@@ -123,6 +188,7 @@ def build(files, cfg):
         raw = center_crop_spatial(raw, cfg.crop, h_axis=2, w_axis=3)
         norm = center_crop_spatial(norm, cfg.crop, h_axis=2, w_axis=3)
         fg = center_crop_spatial(fg, cfg.crop, h_axis=1, w_axis=2)
+        fov = center_crop_spatial(fov, cfg.crop, h_axis=1, w_axis=2)
 
     frac = fg.reshape(fg.shape[0], -1).float().mean(dim=1).numpy()
     keep = frac >= cfg.min_brain_frac
@@ -135,10 +201,11 @@ def build(files, cfg):
 
     to_hwc = lambda t: np.transpose(t.numpy()[idx], (0, 2, 3, 1))
     return (to_hwc(raw), to_hwc(norm), fg.numpy()[idx][..., None],
-            idx, stats, orig_depth, affines[0])
+            fov.numpy()[idx][..., None], idx, stats, orig_depth, affines[0], lost)
 
 
-def write_h5(path, raw, norm, mask, idx, stats, orig_depth, affine, key, files, cfg):
+def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key,
+             files, cfg, lost):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     comp = "gzip" if cfg.compress else None
     chunk = lambda a: (1,) + a.shape[1:]
@@ -152,6 +219,10 @@ def write_h5(path, raw, norm, mask, idx, stats, orig_depth, affine, key, files, 
         f["img"] = h5py.SoftLink("/" + norm_key(MODE))
         f.create_dataset("mask", data=mask.astype(np.uint8),
                          chunks=chunk(mask), compression=comp)
+        # the common acquisition support every channel was cropped to; kept so the region
+        # that was zeroed is inspectable rather than merely gone
+        f.create_dataset("support", data=support.astype(np.uint8),
+                         chunks=chunk(support), compression=comp)
         f.create_dataset("slice_index", data=idx.astype(np.int32))
         f.attrs["subject_id"] = f"{key[0]}_{key[1]}"
         f.attrs["patient"], f.attrs["session"] = key
@@ -164,6 +235,13 @@ def write_h5(path, raw, norm, mask, idx, stats, orig_depth, affine, key, files, 
         f.attrs["orig_depth"] = int(orig_depth)
         f.attrs["min_brain_frac"] = float(cfg.min_brain_frac)
         f.attrs["mask_rule"] = f"mean_c(v/p99.5_c) > {cfg.bg_frac}"
+        f.attrs["intersect_support"] = bool(cfg.intersect_support)
+        f.attrs["support_rule"] = (f"intersect_c(open/close(v_c > {cfg.support_frac}*p99.5_c), "
+                                   f"r={cfg.support_close})" if cfg.intersect_support else "none")
+        # fraction of each contrast's OWN support dropped by the intersection: a large value
+        # on one contrast is the FOV mismatch (eyes in T1, absent in CT1) this guards against
+        for _c in CONTRASTS:
+            f.attrs[f"support_lost_{_c}"] = float(lost.get(_c, 0.0))
         f.attrs["affine"] = np.asarray(affine, dtype=np.float32)
         f.attrs["source_files"] = ",".join(os.path.basename(files[c]) for c in CONTRASTS)
         f.attrs["axis_order"] = "N,H,W,C ; slice_index maps N back to the canonical-RAS z"
@@ -178,6 +256,17 @@ def main():
     ap.add_argument("--clip", type=float, nargs=2, default=(0.5, 99.5),
                     help="foreground percentile clip before the stats; '--clip 0 0' disables")
     ap.add_argument("--bg-frac", type=float, default=0.05, dest="bg_frac")
+    ap.add_argument("--no-intersect-support", action="store_false", dest="intersect_support",
+                    help="do NOT force a common support across contrasts (not recommended: "
+                         "a bridge then learns to delete anatomy its target never acquired)")
+    ap.add_argument("--support-frac", type=float, default=0.02, dest="support_frac",
+                    help="acquisition-support threshold as a fraction of each contrast's "
+                         "p99.5; low on purpose, so dark-but-acquired CSF stays inside")
+    ap.add_argument("--support-close", type=int, default=2, dest="support_close",
+                    help="radius of the opening/closing on the support mask; 0 disables")
+    ap.add_argument("--support-warn", type=float, default=0.02, dest="support_warn",
+                    help="warn when the intersection drops more than this fraction of a "
+                         "contrast's own support")
     ap.add_argument("--min-brain-frac", type=float, default=0.02, dest="min_brain_frac")
     ap.add_argument("--start", type=int, default=None)
     ap.add_argument("--end", type=int, default=None)
@@ -195,7 +284,7 @@ def main():
         sessions = dict(list(sessions.items())[:cfg.limit])
     print(f"{len(sessions)} complete {'/'.join(CONTRASTS)} sessions under {cfg.root}")
 
-    rows, shapes, skipped = [], {}, []
+    rows, shapes, skipped, support_lost = [], {}, [], []
     for i, (key, files) in enumerate(sessions.items(), 1):
         # ONE DIRECTORY PER SESSION, not per patient. I2SBDataset.index_img_from_root takes
         # imgs[0] -- the first *_img.h5 in each subdirectory -- so grouping a patient's
@@ -205,12 +294,19 @@ def main():
         if os.path.exists(path) and not cfg.overwrite:
             continue
         try:
-            raw, norm, mask, idx, stats, depth, aff = build(files, cfg)
+            raw, norm, mask, support, idx, stats, depth, aff, lost = build(files, cfg)
         except Exception as err:
             skipped.append((key, str(err)))
             print(f"  !! {key[0]}/{key[1]}: {err}")
             continue
-        write_h5(path, raw, norm, mask, idx, stats, depth, aff, key, files, cfg)
+        write_h5(path, raw, norm, mask, support, idx, stats, depth, aff, key, files, cfg,
+                 lost)
+        if lost:
+            worst = max(lost, key=lost.get)
+            if lost[worst] > cfg.support_warn:
+                print(f"  ?? {key[0]}/{key[1]}: intersection dropped {lost[worst]:.1%} of "
+                      f"{worst}'s support -- FOV mismatch between contrasts")
+            support_lost.append((key, dict(lost)))
         shapes[raw.shape[1:3]] = shapes.get(raw.shape[1:3], 0) + 1
         rows.append({"patient": key[0], "session": key[1], "path": path,
                      "n_slices": len(idx), "orig_depth": depth,
@@ -227,6 +323,15 @@ def main():
 
     print(f"\n{len(rows)} written, {len(skipped)} skipped -> {cfg.out}")
     print("in-plane sizes:", dict(shapes))
+    if support_lost:
+        import statistics
+        print("\ncommon-support intersection, fraction of each contrast's own support dropped:")
+        for c in CONTRASTS:
+            vals = [d[c] for _, d in support_lost]
+            print(f"  {c:<6} median {statistics.median(vals):6.2%}   max {max(vals):6.2%}")
+        worst = max(support_lost, key=lambda kv: max(kv[1].values()))
+        print(f"  worst session: {worst[0][0]}/{worst[0][1]}  "
+              + "  ".join(f"{k} {v:.1%}" for k, v in worst[1].items()))
     if not cfg.crop and len(shapes) > 1:
         print("!! ragged in-plane sizes -- pass --crop to get a single shape before training")
 
