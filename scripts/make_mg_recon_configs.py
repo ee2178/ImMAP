@@ -8,7 +8,7 @@ config per (anatomy, acceleration, model) cell to
     config/<anatomy>/mg/<model>_R<r>.json
 
 4 models x 2 accelerations = 8 runs PER ANATOMY. knee and brain have separate
-sbatch files (`slurm/mg_recon_{knee,brain}.sbatch`); each asks this script for
+sbatch files (`torch/mg_recon_{knee,brain}.sbatch`); each asks this script for
 its own cell list via `--list-cells --anatomy <a>`, so the two stay in sync.
 
 Every cell trains on SYNTHETIC k-space (`kspace_type: "simulated"`): the clean

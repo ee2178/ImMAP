@@ -648,12 +648,12 @@ remains the default, so `config/knee/recon.json` is unaffected.
 ```bash
 python scripts/make_mg_recon_configs.py --list-cells --anatomy knee
 python scripts/make_mg_recon_configs.py                # write config/{knee,brain}/mg/*.json
-sbatch slurm/mg_recon_knee.sbatch                      # 8 cells; --array=0 for one
-sbatch slurm/mg_recon_brain.sbatch                     # 8 cells (paths unverified)
+sbatch torch/mg_recon_knee.sbatch                      # 8 cells; --array=0 for one
+sbatch torch/mg_recon_brain.sbatch                     # 8 cells (paths unverified)
 python scripts/eval_mg_recon.py --runs trained_nets/mg_recon --out results/mg_recon.csv
 ```
 
-Both launchers source `slurm/_mg_recon_body.sh`, which holds the logic they
+Both launchers source `torch/_mg_recon_body.sh`, which holds the logic they
 share; only `ANATOMY` differs. Two launchers that drift apart is how a grid ends
 up half-comparable.
 

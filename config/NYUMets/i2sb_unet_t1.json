@@ -1,0 +1,123 @@
+{
+    "task": "i2sb",
+    "experiment": {
+        "name": "I2SB_Unet_NYUMets_CT1_from_T1"
+    },
+    "model": {
+        "type": "SBUnet",
+        "params": {
+            "C": 1,
+            "out_channels": 1,
+            "model_channels": 64,
+            "num_res_blocks": 2,
+            "channel_mult": [
+                1,
+                2,
+                3,
+                4
+            ],
+            "attention_resolutions": [
+                32,
+                16
+            ],
+            "image_size": 128,
+            "num_heads": 4,
+            "num_head_channels": 32,
+            "dropout": 0.0,
+            "use_scale_shift_norm": true,
+            "resblock_updown": false,
+            "conv_resample": true,
+            "kind": "i2sb",
+            "n_points": 1000,
+            "beta_max": 0.3,
+            "t0": 0.0001,
+            "T": 1.0
+        }
+    },
+    "i2sb": {
+        "kind": "i2sb",
+        "n_points": 1000,
+        "beta_max": 0.3,
+        "deterministic": false,
+        "posterior": "ddpm",
+        "clip_denoise": false,
+        "val_mode": "single_pass",
+        "val_seed": 0,
+        "val_nfe": 20,
+        "target_channels": 1
+    },
+    "data": {
+        "train": {
+            "name": "i2sb",
+            "root": "../datasets/NYUMets_h5_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [],
+            "image_key": "img_median_mad",
+            "et_mask": false,
+            "scales": [
+                3.0,
+                3.0,
+                3.0,
+                3.0
+            ],
+            "crop_size": 128,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "i2sb",
+            "root": "../datasets/NYUMets_h5_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [],
+            "image_key": "img_median_mad",
+            "et_mask": false,
+            "scales": [
+                3.0,
+                3.0,
+                3.0,
+                3.0
+            ],
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 1500,
+        "steps_per_epoch": 200,
+        "val_every_epochs": 25,
+        "clip_grad": 1.0,
+        "backtrack_thresh": 1000,
+        "backtrack_factor": 0.9,
+        "use_mask": true,
+        "loss_type": "complex-mse",
+        "loss_weight": "uniform",
+        "et_weight": 1.0,
+        "psnr_only": false,
+        "data_range": 2.0
+    },
+    "paths": {
+        "save_dir": "trained_nets/nyumets/I2SB_Unet_NYUMets_CT1_from_T1",
+        "ckpt": null
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0001
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1e-06,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "schrodinger-bridge",
+        "id": null
+    }
+}
