@@ -198,8 +198,20 @@ def channelwise_percentile_clip(img, fg_mask, p_lo, p_hi, max_samples=2_000_000)
 
 
 def center_crop_spatial(a, size, h_axis, w_axis):
-    """Center-crop a numpy array to size x size along the given spatial axes."""
+    """Center-crop a numpy array to size x size along the given spatial axes.
+
+    RAISES if either axis is SHORTER than `size`. Without the guard the start index goes
+    negative, Python reads it as an offset from the end, and the function silently returns an
+    array of length (size - H) // 2 -- a 168-row volume cropped to 224 came back as 28 rows and
+    was only caught much later by a RandomCrop inside the dataloader. Every BraTS subject is
+    240x240 so this never fired there; a dataset with non-uniform matrix sizes needs a
+    crop-or-pad instead (see preprocessing/nyumets_h5.center_crop_or_pad).
+    """
     H, W = a.shape[h_axis], a.shape[w_axis]
+    if H < size or W < size:
+        raise ValueError(
+            f"center_crop_spatial: input {(H, W)} is smaller than the crop size {size}; "
+            f"cropping cannot enlarge it. Use a crop <= {min(H, W)}, or pad first.")
     h0, w0 = (H - size) // 2, (W - size) // 2
     sl = [slice(None)] * a.ndim
     sl[h_axis] = slice(h0, h0 + size)

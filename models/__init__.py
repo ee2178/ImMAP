@@ -10,6 +10,8 @@ from .cclnet import CCLNet, Unet2D
 from .multigrid import MGCDLNet, VCycle
 from .lpds import LPDSLayer, LPDSStack
 from .mg_lpds import MGLPDSNet, PDVCycle
+from .guided_lpds import GuidedLPDSLayer, GuidedLPDSNet, LGGSNet
+from .guided_prox import GuidedFenchelProx, GuidedGroupThreshold
 from .ladmm import AltSplitCDLNet
 from .sb_cdlnet import SBCDLNet
 from .sb_groupcdl import SBGroupCDL
@@ -139,6 +141,28 @@ def build_model(cfg):
                 "MGLPDSNet was given window > 1, which builds a GROUP prox. "
                 "Use MGGroupLPDS so the config states that intent.")
         return MGLPDSNet(**params)
+
+    # LGGS -- Longitudinally-Guided Group-Sparse reconstruction: the LPDS unrolling
+    # whose dual prox is a GUIDED group threshold, so a fully-sampled prior study
+    # shapes the nonlocal grouping without contributing its own intensities.
+    # `window` is the SELF window and is 1 in every published LGGS config (the
+    # guide window carries the nonlocality), so unlike MGGroupLPDS it is not an
+    # error here.
+    elif model_type in ("LGGS", "GuidedLPDSNet", "LGGSNet"):
+        params = dict(params)
+        if params.get("guide_window", 1) <= 1:
+            raise ValueError(
+                f"{model_type} needs guide_window > 1 (odd): with a 1x1 guide "
+                f"window each guide adjacency has a single neighbour and the "
+                f"guide contributes only its co-located pixel, which is not a "
+                f"nonlocal guide at all. The published setting is "
+                f"guide_window=15.")
+        if params.get("Mh") is None:
+            raise ValueError(
+                f"{model_type} needs Mh (the compressed attention channel "
+                f"count): the guided prox builds its similarity from "
+                f"W_theta/W_phi, which only exist when Mh is set.")
+        return LGGSNet(**params)
 
     # unrolled linearized ADMM with a learned CDL prox (+ optional joint coils)
     elif model_type == "E2EVarNet":

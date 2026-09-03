@@ -53,9 +53,14 @@ echo "python : $(which python)"
 echo "root   : $NYUMETS"
 echo "out    : $OUT"
 
+# A rebuild MUST pass --overwrite: main() skips any session whose h5 already exists, so
+# without it a re-run after a preprocessing change silently keeps the old data.
+OVERWRITE_FLAG=""
+[ -n "${OVERWRITE:-}" ] && OVERWRITE_FLAG="--overwrite"
+
 python -m preprocessing.nyumets_h5 \
     --root "$NYUMETS/data/imaging/patientId" \
     --out  "$OUT" \
     --crop 224 \
     --min-brain-frac 0.02 \
-    --compress
+    --compress $OVERWRITE_FLAG

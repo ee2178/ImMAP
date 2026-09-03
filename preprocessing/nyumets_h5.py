@@ -96,6 +96,35 @@ def load_ras(path):
     return np.asarray(v, dtype=np.float32), img.affine
 
 
+def center_crop_or_pad(a, size, h_axis, w_axis):
+    """Center-crop to `size` on the two spatial axes, ZERO-PADDING any axis shorter than it.
+
+    cmap.center_crop_spatial only crops. Given H < size it computes a NEGATIVE start index,
+    which Python reads as an offset from the end, so it silently returns an array of length
+    (size - H) // 2 instead of failing -- a 168-row volume with --crop 224 came out 28 rows,
+    and only surfaced much later as a RandomCrop error inside the dataloader. BraTS never hit
+    it because every subject is 240x240; NYUMets matrix sizes are NOT uniform, so the pad
+    branch is load-bearing here.
+
+    Padding rather than resampling keeps the voxel spacing honest, and padded voxels are zero
+    and fall outside the support mask, so nothing downstream mistakes them for anatomy.
+    """
+    is_bool = a.dtype == torch.bool
+    if is_bool:
+        a = a.to(torch.uint8)
+    for axis in (h_axis, w_axis):
+        n = a.shape[axis]
+        if n > size:
+            a = a.narrow(axis, (n - size) // 2, size)
+        elif n < size:
+            before = (size - n) // 2
+            pad = [0] * (2 * a.dim())
+            j = (a.dim() - 1 - axis) * 2          # F.pad fills from the LAST dim backwards
+            pad[j], pad[j + 1] = before, size - n - before
+            a = F.pad(a, pad)
+    return a.to(torch.bool) if is_bool else a
+
+
 def _morph(m, r, op):
     """2D per-slice dilate/erode of a bool mask with a (2r+1)^2 box."""
     x = m[:, None].float()
@@ -149,7 +178,7 @@ def brain_mask(img, bg_frac):
 
 
 def build(files, cfg):
-    """-> (raw, norm, mask, support, slice_idx, stats, orig_depth, affine, lost)."""
+    """-> (raw, norm, mask, support, slice_idx, stats, orig_depth, affine, lost, native_hw)."""
     vols, affines = zip(*(load_ras(files[c]) for c in CONTRASTS))
     if len({v.shape for v in vols}) != 1:
         raise ValueError(f"shapes differ: {[v.shape for v in vols]} -- not on a common grid")
@@ -184,11 +213,12 @@ def build(files, cfg):
     norm, stats = normalize_masked(clipped, fg, mode=MODE)
 
     raw, orig_depth = img, img.shape[0]
+    native_hw = tuple(int(v) for v in img.shape[2:4])
     if cfg.crop:
-        raw = center_crop_spatial(raw, cfg.crop, h_axis=2, w_axis=3)
-        norm = center_crop_spatial(norm, cfg.crop, h_axis=2, w_axis=3)
-        fg = center_crop_spatial(fg, cfg.crop, h_axis=1, w_axis=2)
-        fov = center_crop_spatial(fov, cfg.crop, h_axis=1, w_axis=2)
+        raw = center_crop_or_pad(raw, cfg.crop, h_axis=2, w_axis=3)
+        norm = center_crop_or_pad(norm, cfg.crop, h_axis=2, w_axis=3)
+        fg = center_crop_or_pad(fg, cfg.crop, h_axis=1, w_axis=2)
+        fov = center_crop_or_pad(fov, cfg.crop, h_axis=1, w_axis=2)
 
     frac = fg.reshape(fg.shape[0], -1).float().mean(dim=1).numpy()
     keep = frac >= cfg.min_brain_frac
@@ -201,11 +231,11 @@ def build(files, cfg):
 
     to_hwc = lambda t: np.transpose(t.numpy()[idx], (0, 2, 3, 1))
     return (to_hwc(raw), to_hwc(norm), fg.numpy()[idx][..., None],
-            fov.numpy()[idx][..., None], idx, stats, orig_depth, affines[0], lost)
+            fov.numpy()[idx][..., None], idx, stats, orig_depth, affines[0], lost, native_hw)
 
 
 def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key,
-             files, cfg, lost):
+             files, cfg, lost, native_hw):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     comp = "gzip" if cfg.compress else None
     chunk = lambda a: (1,) + a.shape[1:]
@@ -232,6 +262,8 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         f.attrs["norm_stats"] = stats
         f.attrs["clip_percentiles"] = np.asarray(cfg.clip or (-1, -1), dtype=np.float32)
         f.attrs["crop_size"] = int(cfg.crop) if cfg.crop else -1
+        # native in-plane size BEFORE the crop/pad, so a padded session is identifiable
+        f.attrs["native_size"] = np.asarray(native_hw, dtype=np.int32)
         f.attrs["orig_depth"] = int(orig_depth)
         f.attrs["min_brain_frac"] = float(cfg.min_brain_frac)
         f.attrs["mask_rule"] = f"mean_c(v/p99.5_c) > {cfg.bg_frac}"
@@ -275,6 +307,9 @@ def main():
     ap.add_argument("--compress", action="store_true")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="report the native in-plane size distribution from HEADERS ONLY and "
+                         "exit -- use it to choose --crop before building anything")
     cfg = ap.parse_args()
     if cfg.clip and float(cfg.clip[1]) <= 0:
         cfg.clip = None
@@ -284,7 +319,41 @@ def main():
         sessions = dict(list(sessions.items())[:cfg.limit])
     print(f"{len(sessions)} complete {'/'.join(CONTRASTS)} sessions under {cfg.root}")
 
+    if cfg.dry_run:
+        # nib.load is lazy and as_closest_canonical only rewrites the affine, so .shape costs
+        # no voxel reads -- this is seconds over the whole cohort.
+        hist, per_contrast, bad = {}, {c: {} for c in CONTRASTS}, []
+        for key, files in sessions.items():
+            try:
+                shp = {c: nib.as_closest_canonical(nib.load(files[c])).shape[:2]
+                       for c in CONTRASTS}
+            except Exception as err:
+                bad.append((key, str(err)))
+                continue
+            for c, hw in shp.items():
+                per_contrast[c][hw] = per_contrast[c].get(hw, 0) + 1
+            if len(set(shp.values())) != 1:
+                bad.append((key, f"contrasts disagree in-plane: {shp}"))
+            hw = shp[CONTRASTS[0]]
+            hist[hw] = hist.get(hw, 0) + 1
+        print("\nnative in-plane sizes (H, W), by session:")
+        for hw, n in sorted(hist.items(), key=lambda kv: -kv[1]):
+            print(f"  {str(hw):<14} {n:>5}")
+        dims = [d for hw in hist for d in hw]
+        if dims:
+            print(f"\nsmallest single in-plane dimension seen: {min(dims)}")
+            print(f"largest  single in-plane dimension seen: {max(dims)}")
+            print("\n--crop N pads any session smaller than N and crops any larger, so:")
+            print(f"  --crop {max(dims)}  keeps every voxel (pads the small ones)")
+            print(f"  --crop {min(dims)}  crops everything, never pads (loses FOV on the big ones)")
+            print("The loader's crop_size must be <= --crop, and a RandomCrop much smaller")
+            print("than the padded region will sample mostly zeros on the small sessions.")
+        for k, why in bad[:10]:
+            print(f"  !! {k[0]}/{k[1]}: {why}")
+        return
+
     rows, shapes, skipped, support_lost = [], {}, [], []
+    natives, padded = {}, []
     for i, (key, files) in enumerate(sessions.items(), 1):
         # ONE DIRECTORY PER SESSION, not per patient. I2SBDataset.index_img_from_root takes
         # imgs[0] -- the first *_img.h5 in each subdirectory -- so grouping a patient's
@@ -294,13 +363,16 @@ def main():
         if os.path.exists(path) and not cfg.overwrite:
             continue
         try:
-            raw, norm, mask, support, idx, stats, depth, aff, lost = build(files, cfg)
+            raw, norm, mask, support, idx, stats, depth, aff, lost, native = build(files, cfg)
         except Exception as err:
             skipped.append((key, str(err)))
             print(f"  !! {key[0]}/{key[1]}: {err}")
             continue
         write_h5(path, raw, norm, mask, support, idx, stats, depth, aff, key, files, cfg,
-                 lost)
+                 lost, native)
+        natives[native] = natives.get(native, 0) + 1
+        if cfg.crop and (native[0] < cfg.crop or native[1] < cfg.crop):
+            padded.append((key, native))
         if lost:
             worst = max(lost, key=lost.get)
             if lost[worst] > cfg.support_warn:
@@ -322,7 +394,8 @@ def main():
         w.writerows(rows)
 
     print(f"\n{len(rows)} written, {len(skipped)} skipped -> {cfg.out}")
-    print("in-plane sizes:", dict(shapes))
+    print("native in-plane sizes:", dict(natives))
+    print("stored in-plane sizes:", dict(shapes))
     if support_lost:
         import statistics
         print("\ncommon-support intersection, fraction of each contrast's own support dropped:")
@@ -332,8 +405,19 @@ def main():
         worst = max(support_lost, key=lambda kv: max(kv[1].values()))
         print(f"  worst session: {worst[0][0]}/{worst[0][1]}  "
               + "  ".join(f"{k} {v:.1%}" for k, v in worst[1].items()))
-    if not cfg.crop and len(shapes) > 1:
-        print("!! ragged in-plane sizes -- pass --crop to get a single shape before training")
+    if padded:
+        print(f"\n{len(padded)} session(s) were smaller than --crop {cfg.crop} and were "
+              f"ZERO-PADDED up to it:")
+        for k, n in padded[:8]:
+            print(f"    {k[0]}/{k[1]}  native {n[0]}x{n[1]}")
+        if len(padded) > 8:
+            print(f"    ... and {len(padded) - 8} more")
+    if len(shapes) > 1:
+        # The failure this guards against is not cosmetic: I2SBDataset applies a fixed
+        # RandomCrop, which throws the moment it meets a stored image smaller than crop_size,
+        # and only after the loader has already yielded a few good batches.
+        print("!! STORED SHAPES ARE RAGGED -- a loader with a fixed crop_size will fail on "
+              "the odd one out. Set --crop, or raise it above the largest native size.")
 
 
 if __name__ == "__main__":
