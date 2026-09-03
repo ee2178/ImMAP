@@ -52,7 +52,12 @@
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain --only mglpds
 
 ANATOMY=brain
-ONLY="mglpds"                        # the LPDSNet arm is already trained
+# The LPDSNet arm was trained under sigma ~ U[0, 0.01] and is NOT a valid
+# comparison for these cells any more -- the grid moved to U[0.04, 0.06]. Rerun
+# it before reading this experiment:
+#     sbatch --array=0,6 torch/mg_recon_brain.sbatch
+# (cells 0 and 6 of the full brain list are lpdsnet R8 and R4.)
+ONLY="mglpds"
 ACCELS=""                            # empty = both R8 and R4
 CONFIG_ROOT="config"
 SWEEP_EPOCHS=""                      # empty = the config's num_epochs

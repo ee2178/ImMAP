@@ -62,6 +62,18 @@ CELLS="$(python scripts/make_mg_recon_configs.py --list-cells \
     --anatomy "${ANATOMY}" ${ONLY:+--only ${ONLY}} ${ACCELS:+--accels ${ACCELS}})"
 N_TOTAL="$(echo "${CELLS}" | wc -l)"
 
+# An array that is too SHORT is the quiet failure: every task succeeds and the
+# grid is simply missing cells, with nothing in any log to say so. Warn from the
+# task that would have been last. Not fatal -- `sbatch --array=0,6` to rerun two
+# cells is a legitimate thing to do -- but it must be visible.
+if [ -n "${SLURM_ARRAY_TASK_MAX:-}" ] \
+        && [ "${SLURM_ARRAY_TASK_MAX}" -lt "$((N_TOTAL - 1))" ] \
+        && [ "${SLURM_ARRAY_TASK_ID}" -eq "${SLURM_ARRAY_TASK_MAX}" ]; then
+    echo "[grid] NOTE: --array tops out at ${SLURM_ARRAY_TASK_MAX} but there are" \
+         "${N_TOTAL} ${ANATOMY} cells${ONLY:+ (ONLY=\"${ONLY}\")}." \
+         "Cells $((SLURM_ARRAY_TASK_MAX + 1))..$((N_TOTAL - 1)) are NOT being run." >&2
+fi
+
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TOTAL}" ]; then
     echo "[grid] task ${SLURM_ARRAY_TASK_ID} >= ${N_TOTAL} ${ANATOMY} cells" \
          "${ONLY:+(ONLY=\"${ONLY}\")}${ACCELS:+ (ACCELS=\"${ACCELS}\")} -- fix --array"

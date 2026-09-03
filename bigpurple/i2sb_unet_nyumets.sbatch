@@ -25,7 +25,7 @@
 #
 # Submit:  sbatch bigpurple/i2sb_unet_nyumets.sbatch
 
-#SBATCH --partition=a100_short
+#SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-unet-nyumets
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -39,8 +39,14 @@
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.err
 
-# a100_short caps at 3 days; the BraTS budget is 1500 x 200 = 300k steps. If that does not
-# fit, resume from the checkpoint or move to a100_long (28d, 19 nodes).
+# PARTITION: `radiology` (rc-*, 10 nodes, 28-day limit) -- the fenglab-adjacent queue, and
+# the one Sljiva's hpc/ scripts default to. The shared a100_short pool repeatedly handed out
+# GPUs already held in Exclusive_Process mode (cudaErrorDevicesUnavailable at the first
+# .to(device)); radiology does not, being far less contended. Fall back to
+# --partition=a100_short --exclusive if radiology is full.
+#
+# --time is 3 days but radiology allows 28, so raise it freely -- SBCDLNet unrolls K=30 and
+# is much slower per step than SBUnet, so its 3000 x 100 budget may not fit in 3 days.
 # No `set -euo pipefail` -- it breaks conda activate (unset $PS1 / $CONDA_SHLVL under -u).
 
 # --- conda ------------------------------------------------------------------------------
@@ -67,21 +73,54 @@ SPLIT_CONFIG="${SPLIT_CONFIG:-config/NYUMets/split.json}"
 # opened, so it is NOT a usability check -- a node whose GPU is held in Exclusive_Process mode
 # by a stray process prints its name happily and then fails at the first .to(device) with
 # `cudaErrorDevicesUnavailable`. Allocating one real tensor is the check that means something.
-python - <<'PY' || exit 1
+# Holds are often TRANSIENT -- a previous job's process has exited but the driver has not
+# yet torn its context down, which is seconds, not minutes. Retry before giving up. (Sljiva's
+# hpc/arraysubmit.sh does the same thing at job level: `while [ 1 ]; do <run> && break; done`.)
+PREFLIGHT_TRIES="${PREFLIGHT_TRIES:-6}"
+PREFLIGHT_WAIT="${PREFLIGHT_WAIT:-30}"
+
+gpu_ok=0
+for try in $(seq 1 "$PREFLIGHT_TRIES"); do
+    if python - <<'PY'
 import sys, torch
 if not torch.cuda.is_available():
-    print("PREFLIGHT: no CUDA device visible -- was --gres honoured?", file=sys.stderr)
+    print("no CUDA device visible -- was --gres honoured?", file=sys.stderr)
     sys.exit(1)
 try:
     torch.zeros(1, device="cuda")
 except Exception as err:
-    print(f"PREFLIGHT: GPU visible but a context could not be created on it: {err}",
-          file=sys.stderr)
-    print("  the card is allocated but held or wedged; resubmit, and if the same node "
-          "recurs use --exclude=<node>", file=sys.stderr)
+    print(f"context creation failed: {err}", file=sys.stderr)
     sys.exit(1)
 print(f"gpu    : {torch.cuda.get_device_name(0)}  (context OK)")
 PY
+    then
+        gpu_ok=1
+        break
+    fi
+    echo "PREFLIGHT: attempt $try/$PREFLIGHT_TRIES failed; retrying in ${PREFLIGHT_WAIT}s" >&2
+    sleep "$PREFLIGHT_WAIT"
+done
+
+if [ "$gpu_ok" -ne 1 ]; then
+    echo "=========== PREFLIGHT FAILED after $PREFLIGHT_TRIES attempts ===========" >&2
+    echo "--- node / allocation ---" >&2
+    echo "host=$(hostname)  job=$SLURM_JOB_ID  gpus=$SLURM_JOB_GPUS  step=$SLURM_STEP_GPUS" >&2
+    echo "CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES-<unset>}'" >&2
+    env | grep -iE '^(CUDA|NVIDIA|GPU)' >&2
+    echo "--- what SLURM thinks it gave us ---" >&2
+    scontrol show job "$SLURM_JOB_ID" 2>/dev/null | grep -iE 'gres|tres|nodelist|numnodes' >&2
+    echo "--- compute mode + who holds the card ---" >&2
+    nvidia-smi --query-gpu=index,uuid,name,compute_mode,persistence_mode,memory.used \
+               --format=csv 2>&1 >&2
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 >&2
+    echo "--- your other jobs on this node ---" >&2
+    squeue -u "$USER" -w "$(hostname)" -o '%.12i %.20j %.10T %.15b' 2>/dev/null >&2
+    echo "=======================================================================" >&2
+    echo "If compute_mode is Exclusive_Process and the app list is non-empty, another" >&2
+    echo "process owns the card. If the app list is EMPTY yet the context still fails," >&2
+    echo "the GPU is wedged and the node needs draining -- report it with the host above." >&2
+    exit 1
+fi
 
 # --- optional split, run in sequence before training ------------------------------------
 #   SPLIT=auto   (default) split only if <SOURCE>_train is missing -- never touches an

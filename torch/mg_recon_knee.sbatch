@@ -13,7 +13,7 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-7           # MUST equal the knee cell count; checked at runtime
+#SBATCH --array=0-11          # MUST equal the knee cell count; checked at runtime
 #
 # fastMRI KNEE (PD), synthetic k-space, sigma ~ U[0.04, 0.06].
 #
