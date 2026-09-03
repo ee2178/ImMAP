@@ -71,18 +71,32 @@ DATE_RE = re.compile(r"((?:19|20)\d{2})[-_.]?(\d{2})[-_.]?(\d{2})")
 
 
 def find_sessions(root):
-    """-> {(patient, session): {contrast: path}}, keeping only complete quartets."""
+    """-> {(patient, session): {contrast: path}}, keeping only complete quartets.
+
+    LAYOUT: patientId/<PID>/studyId/<STUDY_ID>/{FLAIR,T1,CT1,T2}.nii -- `studyId` is a fixed
+    literal directory and the session is one level BELOW it.
+
+    The session key is therefore the IMMEDIATE PARENT DIRECTORY of the file: contrasts
+    acquired together live together, which is the only rule that survives this layout. It
+    replaces a date-regex-then-first-path-component fallback that returned the literal string
+    "studyId" for every file, collapsing all of a patient's studies into one pseudo-session
+    whose contrasts were then taken from DIFFERENT dates -- which is what produced both the
+    mass "shapes differ" failures and the apparent in-plane disagreements between contrasts.
+
+    Matching is on the BASENAME, not the whole relative path, so a directory name can never
+    be mistaken for a contrast tag. RTSTRUCT_segmentation.nii is dropped by SKIP_RE;
+    RTSTRUCT_MRI.nii simply matches no contrast rule.
+    """
     out = {}
     for pid in sorted(e.name for e in os.scandir(root) if e.is_dir()):
         for path in glob.glob(os.path.join(root, pid, "**", "*.nii*"), recursive=True):
-            rel = os.path.relpath(path, os.path.join(root, pid)).replace(os.sep, "/")
-            if SKIP_RE.search(rel):
+            fname = os.path.basename(path)
+            if SKIP_RE.search(fname):
                 continue
-            lab = next((l for l, rx in RULES if rx.search(rel)), None)
+            lab = next((l for l, rx in RULES if rx.search(fname)), None)
             if lab is None:
                 continue
-            m = DATE_RE.search(rel)
-            ses = "-".join(m.groups()) if m else rel.split("/")[0] or "single"
+            ses = os.path.basename(os.path.dirname(path)) or "single"
             out.setdefault((pid, ses), {}).setdefault(lab, path)
     return {k: v for k, v in sorted(out.items()) if all(c in v for c in CONTRASTS)}
 
@@ -348,8 +362,14 @@ def main():
             print(f"  --crop {min(dims)}  crops everything, never pads (loses FOV on the big ones)")
             print("The loader's crop_size must be <= --crop, and a RandomCrop much smaller")
             print("than the padded region will sample mostly zeros on the small sessions.")
-        for k, why in bad[:10]:
-            print(f"  !! {k[0]}/{k[1]}: {why}")
+        if bad:
+            print(f"\n{len(bad)} of {len(sessions)} sessions have contrasts that DISAGREE "
+                  f"in-plane ({100*len(bad)/max(len(sessions),1):.1f}%) -- these raise "
+                  f"'shapes differ' and are skipped by the build:")
+            for k, why in bad[:10]:
+                print(f"  !! {k[0]}/{k[1]}: {why}")
+            if len(bad) > 10:
+                print(f"  ... and {len(bad) - 10} more")
         return
 
     rows, shapes, skipped, support_lost = [], {}, [], []
