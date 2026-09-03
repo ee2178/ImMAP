@@ -36,8 +36,8 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --chdir=/gpfs/scratch/ee2178/ImMAP
-#SBATCH --output=/gpfs/scratch/ee2178/ImMAP/logs/%x_%j.out
-#SBATCH --error=/gpfs/scratch/ee2178/ImMAP/logs/%x_%j.err
+#SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.out
+#SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.err
 
 # a100_short caps at 3 days; the BraTS budget is 1500 x 200 = 300k steps. If that does not
 # fit, resume from the checkpoint or move to a100_long (28d, 19 nodes).
