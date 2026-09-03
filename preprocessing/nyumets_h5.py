@@ -102,11 +102,23 @@ def find_sessions(root):
 
 
 def load_ras(path):
-    """(H, W, D) float32 in canonical RAS, plus the affine. No resampling."""
+    """(H, W, D) float32 in canonical RAS, plus the affine. No resampling.
+
+    REFUSES complex input rather than casting it. `np.asarray(z, dtype=np.float32)` on a
+    complex array discards the imaginary part behind a ComplexWarning -- it would silently
+    throw away the phase and leave the real part (NOT the magnitude) in its place, which is
+    worse than either intended behaviour. If NYUMets ever turns out to carry complex volumes,
+    decide explicitly here whether to store magnitude+phase as separate channels.
+    """
     img = nib.as_closest_canonical(nib.load(path))
     v = np.asanyarray(img.dataobj)
     while v.ndim > 3:
         v = v[..., 0]
+    if np.iscomplexobj(v):
+        raise NotImplementedError(
+            f"{path} holds complex data ({v.dtype}); this builder stores real channels only. "
+            f"Decide how to carry phase (e.g. magnitude and phase as separate channels) "
+            f"before proceeding -- casting here would drop the imaginary part silently.")
     return np.asarray(v, dtype=np.float32), img.affine
 
 
@@ -336,20 +348,39 @@ def main():
     if cfg.dry_run:
         # nib.load is lazy and as_closest_canonical only rewrites the affine, so .shape costs
         # no voxel reads -- this is seconds over the whole cohort.
-        hist, per_contrast, bad = {}, {c: {} for c in CONTRASTS}, []
+        hist, per_contrast, bad, dtypes = {}, {c: {} for c in CONTRASTS}, [], {}
         for key, files in sessions.items():
             try:
-                shp = {c: nib.as_closest_canonical(nib.load(files[c])).shape[:2]
-                       for c in CONTRASTS}
+                imgs = {c: nib.as_closest_canonical(nib.load(files[c])) for c in CONTRASTS}
+                shp = {c: im.shape[:2] for c, im in imgs.items()}
             except Exception as err:
                 bad.append((key, str(err)))
                 continue
+            # The NIfTI datatype is the ONLY authoritative answer to "is this complex".
+            # NIfTI can hold complex64/128/256; if the files were magnitude-only DICOM
+            # exports they will be int16/uint16/float32 and the phase is simply not there.
+            for c, im in imgs.items():
+                dt = str(im.header.get_data_dtype())
+                dtypes[(c, dt)] = dtypes.get((c, dt), 0) + 1
             for c, hw in shp.items():
                 per_contrast[c][hw] = per_contrast[c].get(hw, 0) + 1
             if len(set(shp.values())) != 1:
                 bad.append((key, f"contrasts disagree in-plane: {shp}"))
             hw = shp[CONTRASTS[0]]
             hist[hw] = hist.get(hw, 0) + 1
+        print("\nstored NIfTI datatype, by contrast:")
+        for c in CONTRASTS:
+            row = {dt: n for (cc, dt), n in dtypes.items() if cc == c}
+            print(f"  {c:<6} " + "  ".join(f"{dt} x{n}" for dt, n in sorted(row.items())))
+        cplx = sorted({dt for (_, dt) in dtypes if "complex" in dt.lower()})
+        if cplx:
+            print(f"  ** COMPLEX data present ({', '.join(cplx)}) -- phase is available and "
+                  f"load_ras will refuse rather than silently drop it")
+        else:
+            print("  -> all real: these are MAGNITUDE images and the phase is not in the")
+            print("     files. No amount of preprocessing recovers it; it would have to come")
+            print("     from the source DICOM (or the scanner) if it was ever saved at all.")
+
         print("\nnative in-plane sizes (H, W), by session:")
         for hw, n in sorted(hist.items(), key=lambda kv: -kv[1]):
             print(f"  {str(hw):<14} {n:>5}")
