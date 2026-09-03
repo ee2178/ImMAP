@@ -94,8 +94,20 @@ do_split() {
     # (torchvision, wandb) and this script needs none of them.
     python datasets/make_split_symlinks.py --source "$SOURCE" --config "$SPLIT_CONFIG" "$@" \
         || { echo "[split] FAILED" >&2; return 1; }
+    # Calibrate against exactly what THIS config feeds the net -- image_key and the divisor
+    # applied to the two bridge endpoints -- read from the config rather than hardcoded, so
+    # the reported beta_max cannot drift from the run it is meant to describe.
+    local KEY SCALE
+    KEY=$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['data']['train']['image_key'])" "$CFG")
+    SCALE=$(python -c "
+import json,sys
+c=json.load(open(sys.argv[1]))['data']['train']
+s=c.get('scales') or [1,1,1,1]
+print(s[c.get('x1_idx',1)])" "$CFG")
     echo "[split] bridge calibration (informational -- beta_max is NOT applied):"
-    python -m scripts.calibrate_nyumets_bridge --root "${SOURCE}_train" --scale 3.0 \
+    echo "[split]   image_key=$KEY  scale=$SCALE  (from $CFG)"
+    python -m scripts.calibrate_nyumets_bridge --root "${SOURCE}_train" \
+        --image-key "$KEY" --scale "$SCALE" \
         || echo "[split] calibration failed; not fatal"
     return 0
 }

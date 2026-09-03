@@ -5,3 +5,4 @@ from datasets.registry import build_loader, register_loader  # re-export
 from datasets.fastmri import loader as _fastmri_loader  # noqa: F401
 from datasets.BSD432 import loader as _bsd432_loader     # noqa: F401
 from datasets.BraTS import ccl_register, synth_register, i2sb_register, stack_register
+from datasets.NYUMets import longitudinal_register  # noqa: F401

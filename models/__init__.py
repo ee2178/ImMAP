@@ -11,6 +11,7 @@ from .multigrid import MGCDLNet, VCycle
 from .lpds import LPDSLayer, LPDSStack
 from .mg_lpds import MGLPDSNet, PDVCycle
 from .guided_lpds import GuidedLPDSLayer, GuidedLPDSNet, LGGSNet
+from .guided_cdl import GuidedGroupCDL, GuidedLISTALayer, LGGCDLNet
 from .guided_prox import GuidedFenchelProx, GuidedGroupThreshold
 from .ladmm import AltSplitCDLNet
 from .sb_cdlnet import SBCDLNet
@@ -163,6 +164,36 @@ def build_model(cfg):
                 f"count): the guided prox builds its similarity from "
                 f"W_theta/W_phi, which only exist when Mh is set.")
         return LGGSNet(**params)
+
+    # LGGS's ISTA sibling, for REAL-valued data: the same guided group threshold,
+    # applied as SHRINKAGE rather than through its Fenchel conjugate. Clipping
+    # (what the LPDS dual step applies) pins the modulus at tau for every
+    # |z| > tau, so on real features the gradient there is exactly zero and the
+    # iterate stops learning wherever the prox is active; complex features keep
+    # a live gradient through the phase, which is why LGGS is the complex-valued
+    # member of the pair and this is the real-valued one.
+    elif model_type in ("GuidedGroupCDL", "LGGCDL", "LGGCDLNet"):
+        params = dict(params)
+        if params.get("guide_window", 1) <= 1:
+            raise ValueError(
+                f"{model_type} needs guide_window > 1 (odd): with a 1x1 guide "
+                f"window each guide adjacency has a single neighbour and the "
+                f"guide contributes only its co-located pixel, which is not a "
+                f"nonlocal guide at all. The published setting is "
+                f"guide_window=15.")
+        if params.get("Mh") is None:
+            raise ValueError(
+                f"{model_type} needs Mh (the compressed attention channel "
+                f"count): the guided prox builds its similarity from "
+                f"W_theta/W_phi, which only exist when Mh is set.")
+        if params.get("is_complex"):
+            raise ValueError(
+                f"{model_type} is the REAL-valued member of the guided family "
+                f"and was given is_complex=true. On complex data use LGGS "
+                f"(model type 'LGGS'), whose primal-dual iteration has the "
+                f"better-conditioned data term; the clipping pathology this "
+                f"class exists to avoid does not bite there.")
+        return GuidedGroupCDL(**params)
 
     # unrolled linearized ADMM with a learned CDL prox (+ optional joint coils)
     elif model_type == "E2EVarNet":
