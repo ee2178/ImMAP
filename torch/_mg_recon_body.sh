@@ -26,10 +26,13 @@
 #                   RUNS, not which configs are WRITTEN), so two launchers that
 #                   touch one anatomy with different ORGAN_MASK values will
 #                   fight: whichever regenerates last decides, and a resume can
-#                   pick up the other one's answer. Currently knee=1 (exp2 +
-#                   baseline_varnet cells 0,1), brain="" (exp1 + cells 2,3).
+#                   pick up the other one's answer. Currently BOTH anatomies
+#                   are 1, set in mg_recon_{knee,brain}.sbatch,
+#                   exp1_brain_mglpds.sbatch, exp2_knee_group.sbatch and all
+#                   four baseline_varnet cells. Change them together.
 #                   Set it in the launcher rather than relying on the default,
-#                   so the run directory records which backend produced it.
+#                   so the run directory records which REGION it was scored
+#                   over. (This said "backend" -- copy-paste from ATTN.)
 #
 # ONLY / ACCELS narrow AND RENUMBER the cell list, so an experiment that runs a
 # subset gets its own dense 0..N-1 array range. The bound is checked at runtime

@@ -88,7 +88,7 @@
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
-        "use_organ_mask": false,
+        "use_organ_mask": true,
         "backtrack_thresh": null,
         "backtrack_factor": 0.9
     },

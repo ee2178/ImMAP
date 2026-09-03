@@ -59,6 +59,8 @@ ANATOMY=brain
 # (cells 0 and 6 of the full brain list are lpdsnet R8 and R4.)
 ONLY="mglpds"
 ACCELS=""                            # empty = both R8 and R4
+ORGAN_MASK=1                         # matches mg_recon_brain.sbatch and
+                                     # baseline_varnet cells 2,3
 CONFIG_ROOT="config"
 SWEEP_EPOCHS=""                      # empty = the config's num_epochs
 REGENERATE=1                         # 1 = regenerate configs before running

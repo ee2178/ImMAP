@@ -52,7 +52,7 @@
 #     real handicap and part of what the comparison measures -- worth checking
 #     whether the gap widens with sigma before attributing it to architecture.
 #
-#   * On the KNEE cells it is scored under the organ mask (see below), and that
+#   * It is scored under the organ mask on BOTH anatomies, and that
 #     removes an advantage it would otherwise have had for the wrong reason.
 #     VarNet outputs an RSS MAGNITUDE, which is non-negative and noise-biased,
 #     so its background is a positive floor by construction -- it has no way to
@@ -99,13 +99,14 @@ REGENERATE=1
 #
 # ORGAN_MASK follows the ANATOMY, not the model: it has to match whatever the
 # unrolled cells for that anatomy were scored under, or the baseline column is
-# a different quantity from the columns beside it. knee is masked (exp2), brain
-# is not (exp1).
+# a different quantity from the columns beside it. BOTH anatomies are masked
+# now; it is still written per-cell rather than hoisted, because the two can
+# legitimately diverge again and a single value would hide that.
 case "${SLURM_ARRAY_TASK_ID:-0}" in
     0) ANATOMY=knee;  ACCELS="8"; ORGAN_MASK=1 ;;
     1) ANATOMY=knee;  ACCELS="4"; ORGAN_MASK=1 ;;
-    2) ANATOMY=brain; ACCELS="8"; ORGAN_MASK="" ;;
-    3) ANATOMY=brain; ACCELS="4"; ORGAN_MASK="" ;;
+    2) ANATOMY=brain; ACCELS="8"; ORGAN_MASK=1 ;;
+    3) ANATOMY=brain; ACCELS="4"; ORGAN_MASK=1 ;;
     *) echo "[varnet] task ${SLURM_ARRAY_TASK_ID} is outside 0-3." >&2; exit 1 ;;
 esac
 # The body indexes the FILTERED list, which is one cell long here.

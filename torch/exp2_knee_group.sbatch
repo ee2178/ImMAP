@@ -81,11 +81,11 @@
 #   * SSIM additionally erodes the mask by the 5-pixel window radius, so it
 #     scores the organ interior. See training/metrics.py.
 #
-# COUPLED TO slurm/baseline_varnet.sbatch. Regeneration rewrites EVERY config
-# for the anatomy, not just this submit's cells, so both launchers that touch
-# knee must set this the same way or whichever regenerates last silently wins.
-# baseline_varnet sets ORGAN_MASK=1 on its knee cells (0 and 1) to match. If
-# you turn this off, turn those off too.
+# COUPLED TO torch/mg_recon_knee.sbatch and torch/baseline_varnet.sbatch.
+# Regeneration rewrites EVERY config for the anatomy, not just this submit's
+# cells, so every launcher that touches knee must set this the same way or
+# whichever regenerates last silently wins. All of them are ORGAN_MASK=1, as
+# are the brain launchers. If you turn this off, turn those off too.
 #
 # BEFORE SUBMITTING
 #   * cell 2 is the only one that has never run. Probe it alone first:
