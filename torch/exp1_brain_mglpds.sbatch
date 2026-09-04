@@ -69,16 +69,16 @@ REGENERATE=1                         # 1 = regenerate configs before running
 # $BASH_SOURCE-relative path looks for the body next to that copy -- which was
 # never shipped. Resolve the checkout explicitly.
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do
-    if [ -n "${_c}" ] && [ -f "${_c}/slurm/_mg_recon_body.sh" ]; then
+    if [ -n "${_c}" ] && [ -f "${_c}/torch/_mg_recon_body.sh" ]; then
         IMMAP_ROOT="${_c}"
         break
     fi
 done
-if [ ! -f "${IMMAP_ROOT:-}/slurm/_mg_recon_body.sh" ]; then
+if [ ! -f "${IMMAP_ROOT:-}/torch/_mg_recon_body.sh" ]; then
     echo "[exp1] cannot locate the ImMAP checkout (tried IMMAP_ROOT," \
          "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}, ~/scratch/ee2178/ImMAP)." >&2
     echo "[exp1] submit from the repo root, or: IMMAP_ROOT=/path/to/ImMAP sbatch $0" >&2
     exit 1
 fi
 
-source "${IMMAP_ROOT}/slurm/_mg_recon_body.sh"
+source "${IMMAP_ROOT}/torch/_mg_recon_body.sh"
