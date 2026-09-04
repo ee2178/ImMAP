@@ -20,8 +20,8 @@
 # ANATOMY picks which tree to walk -- knee, brain, or all. It defaults to knee
 # because that is what has been run so far. Set it below, or per-invocation:
 #
-#     ANATOMY=brain sbatch --array=0-N slurm/mg_recon_resume.sbatch
-#     bash slurm/mg_recon_resume.sbatch --list brain
+#     ANATOMY=brain sbatch --array=0-N torch/mg_recon_resume.sbatch
+#     bash torch/mg_recon_resume.sbatch --list brain
 #
 # `--list` always reports runs excluded BY THE ANATOMY FILTER, so switching to
 # the other anatomy later cannot silently leave work behind.
@@ -29,7 +29,7 @@
 # SUBMIT FROM THE REPO ROOT, or make sure `logs/` exists relative to wherever
 # you do run sbatch. `#SBATCH --output=logs/...` is resolved against the SUBMIT
 # directory -- not this file's location, and not the `cd "${IMMAP_ROOT}"` below.
-# Submitting from slurm/ makes slurmd try to open slurm/logs/..., fail, and kill
+# Submitting from torch/ makes slurmd try to open torch/logs/..., fail, and kill
 # the job BEFORE the script runs, so there is no log to explain what happened.
 # `#SBATCH` directives cannot expand variables, so this cannot be fixed here.
 #
@@ -37,8 +37,8 @@
 # reads that instead of re-enumerating:
 #
 #     conda activate gcdl
-#     bash slurm/mg_recon_resume.sbatch --list
-#     sbatch --array=0-<N-1> slurm/mg_recon_resume.sbatch
+#     bash torch/mg_recon_resume.sbatch --list
+#     sbatch --array=0-<N-1> torch/mg_recon_resume.sbatch
 #
 # The manifest exists because the run list SHRINKS as runs finish. When each
 # array task enumerated for itself, a task starting after another had completed
@@ -59,7 +59,7 @@
 # ------------------------------------------
 # Each run directory ends up with TWO configs, and they are not interchangeable:
 #
-#   config.gen.json  written by slurm/_mg_recon_body.sh from the generator.
+#   config.gen.json  written by torch/_mg_recon_body.sh from the generator.
 #                    `paths.ckpt: null`, `wandb.id: null` -- a FRESH run.
 #   config.json      written by train.py after wandb.init. Carries the assigned
 #                    `wandb.id` and `paths.ckpt = <save_dir>/net.ckpt`, and has
@@ -260,7 +260,7 @@ print(f"\n{n} run(s) to resume.  manifest: {manifest}")
 if n:
     env = "" if anatomy == "knee" else f"ANATOMY={anatomy} "
     print(f"submit with:  {env}sbatch --array=0-{n - 1} "
-          f"slurm/mg_recon_resume.sbatch")
+          f"torch/mg_recon_resume.sbatch")
 else:
     print("nothing to resume.")
 PY

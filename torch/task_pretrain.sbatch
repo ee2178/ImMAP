@@ -16,7 +16,7 @@
 #
 # STAGE 1 of 2: pretrain the FULL model on an EASIER inverse problem.
 #
-# Curriculum on the TASK, not on depth. slurm/stack_pretrain.sbatch changes
+# Curriculum on the TASK, not on depth. torch/stack_pretrain.sbatch changes
 # K_outer and needs scripts/stack_init.py to reshape the checkpoint; this
 # changes nothing about the architecture, so the transfer in stage 2 is a plain
 # state-dict load with no surgery at all.
@@ -35,13 +35,13 @@
 # sigma = 0.01 is pure extrapolation on a line that was never constrained there.
 # The sampling gets easier; the noise model does not.
 #
-# STAGE 2 is slurm/task_transfer.sbatch. Chain them:
+# STAGE 2 is torch/task_transfer.sbatch. Chain them:
 #
-#   JID=$(sbatch --parsable slurm/task_pretrain.sbatch)
-#   sbatch --dependency=afterok:${JID} slurm/task_transfer.sbatch
+#   JID=$(sbatch --parsable torch/task_pretrain.sbatch)
+#   sbatch --dependency=afterok:${JID} torch/task_transfer.sbatch
 #
 # ============================================================================
-#  SET THE EXPERIMENT HERE  (must match slurm/task_transfer.sbatch)
+#  SET THE EXPERIMENT HERE  (must match torch/task_transfer.sbatch)
 # ============================================================================
 ANATOMY="${ANATOMY:-brain}"          # brain | knee
 RTAG="${RTAG:-R8}"                   # the HARD problem, i.e. the stage-2 target
@@ -127,4 +127,4 @@ PY
 python train.py "${GEN_CONFIG}"
 
 echo "[task] STAGE 1 done. Checkpoint: ${RUN_DIR}/net.ckpt"
-echo "[task] now:  sbatch slurm/task_transfer.sbatch"
+echo "[task] now:  sbatch torch/task_transfer.sbatch"

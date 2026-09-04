@@ -17,17 +17,17 @@
 #
 # BASELINE -- fastMRI E2E-VarNet on every cell the experiments use.
 #
-#   0   knee   R8      matches exp2 (slurm/exp2_knee_group.sbatch)
+#   0   knee   R8      matches exp2 (torch/exp2_knee_group.sbatch)
 #   1   knee   R4
-#   2   brain  R8      matches exp1 (slurm/exp1_brain_mglpds.sbatch)
+#   2   brain  R8      matches exp1 (torch/exp1_brain_mglpds.sbatch)
 #   3   brain  R4
 #
 # One array covers both experiments: the baseline is the same model everywhere,
 # so splitting it per experiment would only create two files that must be kept
 # in step. Submit a subset with --array if you only need part of it, e.g.
 #
-#     sbatch --array=2-3 slurm/baseline_varnet.sbatch      # brain only (exp 1)
-#     sbatch --array=0   slurm/baseline_varnet.sbatch      # knee R8 only (exp 2)
+#     sbatch --array=2-3 torch/baseline_varnet.sbatch      # brain only (exp 1)
+#     sbatch --array=0   torch/baseline_varnet.sbatch      # knee R8 only (exp 2)
 #
 # WHAT IS AND IS NOT HELD CONSTANT
 # --------------------------------
@@ -80,10 +80,10 @@
 #
 # BEFORE SUBMITTING
 #     python -m tests.test_e2evarnet
-#     SWEEP_EPOCHS=20 sbatch --array=0 slurm/baseline_varnet.sbatch
+#     SWEEP_EPOCHS=20 sbatch --array=0 torch/baseline_varnet.sbatch
 #
 # SUBMIT FROM THE REPO ROOT -- `#SBATCH --output=logs/...` resolves against the
-# SUBMIT directory, so from slurm/ the job dies before the script runs.
+# SUBMIT directory, so from torch/ the job dies before the script runs.
 #
 # Index map:
 #   python scripts/make_mg_recon_configs.py --list-cells --only varnet
@@ -116,12 +116,12 @@ export SLURM_ARRAY_TASK_ID
 # sbatch runs a COPY of this file from the node's spool dir, so a
 # $BASH_SOURCE-relative path looks for the body next to that copy.
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do
-    if [ -n "${_c}" ] && [ -f "${_c}/slurm/_mg_recon_body.sh" ]; then
+    if [ -n "${_c}" ] && [ -f "${_c}/torch/_mg_recon_body.sh" ]; then
         IMMAP_ROOT="${_c}"
         break
     fi
 done
-if [ ! -f "${IMMAP_ROOT:-}/slurm/_mg_recon_body.sh" ]; then
+if [ ! -f "${IMMAP_ROOT:-}/torch/_mg_recon_body.sh" ]; then
     echo "[varnet] cannot locate the ImMAP checkout (tried IMMAP_ROOT," \
          "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}, ~/scratch/ee2178/ImMAP)." >&2
     echo "[varnet] submit from the repo root, or: IMMAP_ROOT=/path/to/ImMAP sbatch $0" >&2
@@ -129,4 +129,4 @@ if [ ! -f "${IMMAP_ROOT:-}/slurm/_mg_recon_body.sh" ]; then
 fi
 
 echo "[varnet] baseline cell: ${ANATOMY} R${ACCELS}"
-source "${IMMAP_ROOT}/slurm/_mg_recon_body.sh"
+source "${IMMAP_ROOT}/torch/_mg_recon_body.sh"

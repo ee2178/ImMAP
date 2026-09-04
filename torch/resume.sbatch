@@ -18,10 +18,10 @@
 # denoising, i2sb or synthesis -- it hands the config back to train.py, which
 # already knows how to continue from `paths.ckpt`.
 #
-#     sbatch slurm/resume.sbatch trained_nets/mg_recon/knee/mglpds_R8
-#     sbatch slurm/resume.sbatch trained_nets/mg_recon/knee/mglpds_R8/config.json
-#     sbatch slurm/resume.sbatch 3xk91abz            # <- a wandb run id
-#     RUN=trained_nets/task/brain/mglpds_R8_warm sbatch slurm/resume.sbatch
+#     sbatch torch/resume.sbatch trained_nets/mg_recon/knee/mglpds_R8
+#     sbatch torch/resume.sbatch trained_nets/mg_recon/knee/mglpds_R8/config.json
+#     sbatch torch/resume.sbatch 3xk91abz            # <- a wandb run id
+#     RUN=trained_nets/task/brain/mglpds_R8_warm sbatch torch/resume.sbatch
 #
 # A directory is resolved to `<dir>/config.json`. Anything that is not an
 # existing path is taken as a WANDB RUN ID and looked up by scanning
@@ -32,8 +32,8 @@
 #
 # Look before you leap:
 #
-#     bash slurm/resume.sbatch --check trained_nets/mg_recon/knee/mglpds_R8
-#     bash slurm/resume.sbatch --check 3xk91abz
+#     bash torch/resume.sbatch --check trained_nets/mg_recon/knee/mglpds_R8
+#     bash torch/resume.sbatch --check 3xk91abz
 #
 # which prints the run's progress and exits without submitting anything.
 #
@@ -48,7 +48,7 @@
 # There is no index here to shift. For several runs, submit several jobs:
 #
 #     for d in trained_nets/mg_recon/knee/*/; do
-#         bash slurm/resume.sbatch --check "$d" && sbatch slurm/resume.sbatch "$d"
+#         bash torch/resume.sbatch --check "$d" && sbatch torch/resume.sbatch "$d"
 #     done
 #
 # `--check` exits non-zero on a finished or unresumable run, so that loop skips
@@ -75,7 +75,7 @@
 #
 # SUBMIT FROM THE REPO ROOT. `#SBATCH --output=logs/...` resolves against the
 # SUBMIT directory, not this file's location and not the `cd` below. From
-# slurm/ the job dies before the script runs, so there is no log to say why.
+# torch/ the job dies before the script runs, so there is no log to say why.
 # `#SBATCH` directives cannot expand variables, so this cannot be fixed here.
 
 set -o pipefail

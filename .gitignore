@@ -9,3 +9,7 @@ __pycache__/
 *.pyd
 *.err
 *.out
+
+# eval dumps: regenerable from a checkpoint, and large
+eval_dump/
+figures/out/

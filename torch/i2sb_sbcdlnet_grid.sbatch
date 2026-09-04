@@ -40,7 +40,7 @@
 # Check first:  python diagnose_et.py <train_root>   and backfill with
 #               python preprocessing/cmap.py --config config/BraTS/cmap.yaml --add-seg-only
 #
-# Submit:  sbatch slurm/i2sb_sbcdlnet_grid.sbatch
+# Submit:  sbatch torch/i2sb_sbcdlnet_grid.sbatch
 # COST: 16 full trainings. Probe first -- set SWEEP_EPOCHS small, look at the surface, then
 # full-train the interesting corner.
 

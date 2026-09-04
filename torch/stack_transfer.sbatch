@@ -46,14 +46,14 @@
 # The prox THRESHOLDS are transferred untouched in both arms; see
 # models/stacking.py for why zeroing them destroys the pretrain.
 #
-# Submit:      sbatch slurm/stack_transfer.sbatch
-# One cell:    sbatch --array=2 slurm/stack_transfer.sbatch
-# Chained:     JID=$(sbatch --parsable slurm/stack_pretrain.sbatch)
-#              sbatch --dependency=afterok:${JID} slurm/stack_transfer.sbatch
-# Probe first: SWEEP_EPOCHS=20 sbatch slurm/stack_transfer.sbatch
+# Submit:      sbatch torch/stack_transfer.sbatch
+# One cell:    sbatch --array=2 torch/stack_transfer.sbatch
+# Chained:     JID=$(sbatch --parsable torch/stack_pretrain.sbatch)
+#              sbatch --dependency=afterok:${JID} torch/stack_transfer.sbatch
+# Probe first: SWEEP_EPOCHS=20 sbatch torch/stack_transfer.sbatch
 
 # ============================================================================
-#  SET THE EXPERIMENT HERE  (must match slurm/stack_pretrain.sbatch)
+#  SET THE EXPERIMENT HERE  (must match torch/stack_pretrain.sbatch)
 # ============================================================================
 ANATOMY="${ANATOMY:-brain}"          # brain | knee
 RTAG="${RTAG:-R8}"
@@ -106,9 +106,9 @@ mkdir -p "${RUN_DIR}"
 if [ "${ARM}" != "baseline" ]; then
     if [ ! -f "${PRE_DIR}/net.ckpt" ]; then
         echo "[stack] no pretrained checkpoint at ${PRE_DIR}/net.ckpt." >&2
-        echo "[stack] run STAGE 1 first:  sbatch slurm/stack_pretrain.sbatch" >&2
+        echo "[stack] run STAGE 1 first:  sbatch torch/stack_pretrain.sbatch" >&2
         echo "[stack] (cell 0, the baseline, does not need it and can run alone:" >&2
-        echo "[stack]  sbatch --array=0 slurm/stack_transfer.sbatch)" >&2
+        echo "[stack]  sbatch --array=0 torch/stack_transfer.sbatch)" >&2
         exit 1
     fi
     python scripts/stack_init.py \

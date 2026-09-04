@@ -69,11 +69,11 @@
 # unit normalisation, so a double restriction scales by 4 and the prolongation
 # divides it straight back out. It is bookkeeping, not strength.
 #
-# Submit all:   sbatch slurm/transfer_window.sbatch
-# One cell:     sbatch --array=3 slurm/transfer_window.sbatch
-# A subset:     sbatch --array=0,1,3 slurm/transfer_window.sbatch
-# Probe first:  SWEEP_EPOCHS=20 sbatch slurm/transfer_window.sbatch
-# Other side:   ANATOMY=knee sbatch slurm/transfer_window.sbatch
+# Submit all:   sbatch torch/transfer_window.sbatch
+# One cell:     sbatch --array=3 torch/transfer_window.sbatch
+# A subset:     sbatch --array=0,1,3 torch/transfer_window.sbatch
+# Probe first:  SWEEP_EPOCHS=20 sbatch torch/transfer_window.sbatch
+# Other side:   ANATOMY=knee sbatch torch/transfer_window.sbatch
 
 # ============================================================================
 #  SET THE EXPERIMENT HERE
@@ -96,7 +96,7 @@ conda activate gcdl
 
 # sbatch runs a COPY of this file from the node spool dir, so $BASH_SOURCE does
 # not point at the repo. Resolve it explicitly, the same way
-# slurm/mg_recon_knee.sbatch does.
+# torch/mg_recon_knee.sbatch does.
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do
     if [ -n "${_c}" ] && [ -f "${_c}/train.py" ]; then
         IMMAP_ROOT="${_c}"

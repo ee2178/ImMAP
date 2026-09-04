@@ -22,7 +22,7 @@
 # is a much harder map, so a LARGER peak bridge noise (more stochasticity) may be needed -- hence
 # the sweep over [0.1, 1.0].
 #
-# Submit:   sbatch slurm/i2sb_tau_sweep.sbatch
+# Submit:   sbatch torch/i2sb_tau_sweep.sbatch
 # Probe first, then full-train the winner: set SWEEP_EPOCHS below to something small (e.g. 50).
 
 # ---- sweep knobs (edit these) ------------------------------------------------------------------
@@ -33,7 +33,7 @@ TAUS=(0.10 0.20 0.30 0.40 0.50 0.60 0.80 1.00)   # peak bridge-noise std; LEN MU
 SWEEP_EPOCHS=""                        # empty = use the config's num_epochs; set e.g. 50 to probe cheaply
 # ------------------------------------------------------------------------------------------------
 
-# Environment (mirrors slurm/i2sb.sbatch)
+# Environment (mirrors torch/i2sb.sbatch)
 source ~/.bashrc
 conda activate gcdl
 cd ~/scratch/ee2178/ImMAP

@@ -42,10 +42,10 @@
 #
 # BEFORE SUBMITTING
 #   * confirm the brain data roots resolve; this grid has only ever run on knee
-#   * one probe cell first:  SWEEP_EPOCHS=20 sbatch --array=0 slurm/exp1_brain_mglpds.sbatch
+#   * one probe cell first:  SWEEP_EPOCHS=20 sbatch --array=0 torch/exp1_brain_mglpds.sbatch
 #
 # SUBMIT FROM THE REPO ROOT. `#SBATCH --output=logs/...` resolves against the
-# SUBMIT directory, not this file's location; from slurm/ the job dies before
+# SUBMIT directory, not this file's location; from torch/ the job dies before
 # the script runs and leaves no log to say why.
 #
 # Check the index map any time:

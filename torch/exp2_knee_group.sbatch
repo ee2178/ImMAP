@@ -89,13 +89,13 @@
 #
 # BEFORE SUBMITTING
 #   * cell 2 is the only one that has never run. Probe it alone first:
-#       SWEEP_EPOCHS=20 sbatch --array=2 slurm/exp2_knee_group.sbatch
+#       SWEEP_EPOCHS=20 sbatch --array=2 torch/exp2_knee_group.sbatch
 #     and watch memory -- attention at three grids is new here.
 #   * flex compiles on first use (train.py calls compile_flex when
 #     attn_backend="flex"); expect a slow first step, not a hang.
 #
 # SUBMIT FROM THE REPO ROOT -- `#SBATCH --output=logs/...` resolves against the
-# SUBMIT directory, so from slurm/ the job dies before the script runs.
+# SUBMIT directory, so from torch/ the job dies before the script runs.
 #
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
@@ -115,16 +115,16 @@ REGENERATE=1                         # 1 = regenerate configs before running
 # $BASH_SOURCE-relative path looks for the body next to that copy -- which was
 # never shipped. Resolve the checkout explicitly.
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do
-    if [ -n "${_c}" ] && [ -f "${_c}/slurm/_mg_recon_body.sh" ]; then
+    if [ -n "${_c}" ] && [ -f "${_c}/torch/_mg_recon_body.sh" ]; then
         IMMAP_ROOT="${_c}"
         break
     fi
 done
-if [ ! -f "${IMMAP_ROOT:-}/slurm/_mg_recon_body.sh" ]; then
+if [ ! -f "${IMMAP_ROOT:-}/torch/_mg_recon_body.sh" ]; then
     echo "[exp2] cannot locate the ImMAP checkout (tried IMMAP_ROOT," \
          "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}, ~/scratch/ee2178/ImMAP)." >&2
     echo "[exp2] submit from the repo root, or: IMMAP_ROOT=/path/to/ImMAP sbatch $0" >&2
     exit 1
 fi
 
-source "${IMMAP_ROOT}/slurm/_mg_recon_body.sh"
+source "${IMMAP_ROOT}/torch/_mg_recon_body.sh"

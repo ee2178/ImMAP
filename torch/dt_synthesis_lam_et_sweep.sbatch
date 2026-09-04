@@ -37,7 +37,7 @@
 # i.e. this grid spans "no weighting" to "moderate", after the previous [0.01, 1.0] grid
 # turned out to start too high. Log spacing because the multiplier moves by decades.
 #
-# Submit:   sbatch slurm/dt_synthesis_lam_et_sweep.sbatch
+# Submit:   sbatch torch/dt_synthesis_lam_et_sweep.sbatch
 # Probe:    set SWEEP_EPOCHS below (e.g. 600) to rank the values cheaply before committing
 #           48h x 6. T_max is rescaled to match so the cosine schedule still completes.
 #
@@ -53,7 +53,7 @@ LAMS=(0 0.001 0.00316 0.01 0.0316 0.1)             # 0 = control, then log-space
 SWEEP_EPOCHS=""                                    # empty = use the config's num_epochs
 # ------------------------------------------------------------------------------------------------
 
-# Environment (mirrors slurm/dt_synthesis_et.sbatch)
+# Environment (mirrors torch/dt_synthesis_et.sbatch)
 source ~/.bashrc
 conda activate gcdl
 cd ~/scratch/ee2178/ImMAP

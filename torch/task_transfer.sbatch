@@ -43,14 +43,14 @@
 # concluding the pretrain did not help -- the gentler restart is a different
 # arm, not a fix, so do not silently fold it into the default.
 #
-# Submit:      sbatch slurm/task_transfer.sbatch
-# One cell:    sbatch --array=1 slurm/task_transfer.sbatch
-# Chained:     JID=$(sbatch --parsable slurm/task_pretrain.sbatch)
-#              sbatch --dependency=afterok:${JID} slurm/task_transfer.sbatch
-# Probe first: SWEEP_EPOCHS=20 sbatch slurm/task_transfer.sbatch
+# Submit:      sbatch torch/task_transfer.sbatch
+# One cell:    sbatch --array=1 torch/task_transfer.sbatch
+# Chained:     JID=$(sbatch --parsable torch/task_pretrain.sbatch)
+#              sbatch --dependency=afterok:${JID} torch/task_transfer.sbatch
+# Probe first: SWEEP_EPOCHS=20 sbatch torch/task_transfer.sbatch
 
 # ============================================================================
-#  SET THE EXPERIMENT HERE  (must match slurm/task_pretrain.sbatch)
+#  SET THE EXPERIMENT HERE  (must match torch/task_pretrain.sbatch)
 # ============================================================================
 ANATOMY="${ANATOMY:-brain}"          # brain | knee
 RTAG="${RTAG:-R8}"
@@ -100,9 +100,9 @@ mkdir -p "${RUN_DIR}"
 
 if [ "${ARM}" = "warm" ] && [ ! -f "${PRE_DIR}/net.ckpt" ]; then
     echo "[task] no pretrained checkpoint at ${PRE_DIR}/net.ckpt." >&2
-    echo "[task] run STAGE 1 first:  PRE_R=${PRE_R} sbatch slurm/task_pretrain.sbatch" >&2
+    echo "[task] run STAGE 1 first:  PRE_R=${PRE_R} sbatch torch/task_pretrain.sbatch" >&2
     echo "[task] (cell 0, the baseline, does not need it:" >&2
-    echo "[task]  sbatch --array=0 slurm/task_transfer.sbatch)" >&2
+    echo "[task]  sbatch --array=0 torch/task_transfer.sbatch)" >&2
     exit 1
 fi
 

@@ -28,7 +28,7 @@
 # (0.01, 0.0316, 0.1, 0.3162, 1.0) maps onto exactly the values below. Log spacing for the
 # same reason as before: linear would put four of five points in the aggressive regime.
 #
-# Submit:   sbatch slurm/synth_lam_sweep.sbatch
+# Submit:   sbatch torch/synth_lam_sweep.sbatch
 # Probe:    set SWEEP_EPOCHS below (e.g. 600) to rank the values cheaply before committing
 #           48h x 5. T_max is rescaled to match so the cosine schedule still completes.
 
@@ -39,7 +39,7 @@ LAMS=(4.3 11.6 34.4 107 335)                       # per-ET-pixel weights; LEN M
 SWEEP_EPOCHS=""                                    # empty = use the config's num_epochs
 # ------------------------------------------------------------------------------------------------
 
-# Environment (mirrors slurm/dt_synthesis_et.sbatch)
+# Environment (mirrors torch/dt_synthesis_et.sbatch)
 source ~/.bashrc
 conda activate gcdl
 cd ~/scratch/ee2178/ImMAP

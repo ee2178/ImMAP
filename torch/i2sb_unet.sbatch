@@ -56,8 +56,8 @@
 # its own schedule copy to invert std_fwd, and train_i2sb.assert_schedule_matches kills the
 # job at startup if the two drift apart.
 #
-# Submit:  sbatch slurm/i2sb_unet.sbatch
-# One only:  sbatch --array=0 slurm/i2sb_unet.sbatch
+# Submit:  sbatch torch/i2sb_unet.sbatch
+# One only:  sbatch --array=0 torch/i2sb_unet.sbatch
 
 source ~/.bashrc
 conda activate gcdl

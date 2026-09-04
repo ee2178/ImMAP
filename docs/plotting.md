@@ -130,3 +130,29 @@ any keyword given as a list matching the panel count is spread across the panels
 subplot_hists({nm: img[..., c] for c, nm in enumerate(CONTRASTS)},
               mask=brain, p=99.5, ncols=4, suptitle="within-brain distributions")
 ```
+
+
+## Inspecting a set of runs: the dump + viewer
+
+`visualization/` is for one array at a time, in a notebook. Comparing several
+trained runs over many slices is a different job, and rebuilding every network
+in process to do it (as `notebooks/compare_mg_recon.py` does) is far too slow to
+scrub through. That path is two steps:
+
+```bash
+# once per run, on the cluster: forward pass -> per-volume HDF5
+python scripts/dump_eval.py --runs trained_nets/mg_recon/brain \
+    --only lpdsnet_R8 mglpds_R8 mggrouplpds_R8 --n-volumes 8 --slices 0:16
+```
+
+```bash
+# locally, against an rsync'd copy: scrub, mark rows, place zoom windows
+python figures/viewer.py figures/configs/mg_brain_R8.py -n 3
+```
+
+The dump reuses the adapter in `evaluation/tasks.py`, so its images and
+`results/*.csv`'s numbers come from one forward pass and cannot disagree. The
+viewer reads HDF5 + numpy + PIL only — no torch, no checkpoints — so it starts
+instantly and needs no GPU. Picks land in `figures/rows/<variant>.json` and
+`figures/zooms/<variant>.json`, kept apart so re-picking one never discards the
+other. See the module docstrings for the key bindings and the file contract.

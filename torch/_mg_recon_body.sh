@@ -1,4 +1,4 @@
-# Shared body for slurm/mg_recon_{knee,brain}.sbatch -- NOT submittable alone.
+# Shared body for torch/mg_recon_{knee,brain}.sbatch -- NOT submittable alone.
 #
 # The caller sets ANATOMY (knee|brain) and sources this. Everything else is
 # identical between the two, so it lives here rather than being copied: two

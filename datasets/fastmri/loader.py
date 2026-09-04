@@ -62,6 +62,8 @@ class FastMRIDataset(Dataset):
         smap_root=None,
         scale_fac=None,
         pad_multiple=1,
+        enumerate_slices=False,
+        volumes=None,
     ):
 
         if anatomy not in FASTMRI_PATHS:
@@ -80,15 +82,41 @@ class FastMRIDataset(Dataset):
         # this, and training builds `E @ Truncate` onto it. 1 disables it.
         # See operators/truncate.py for why this beats padding the operator.
         self.pad_multiple = int(pad_multiple)
+        self.enumerate_slices = bool(enumerate_slices)
 
         # ----------------------------------------------------
         # Build filtered file list (IMPORTANT PART)
         # ----------------------------------------------------
         self.files = self._build_file_list(anatomy)
 
+        if volumes is not None:
+            # An explicit subset, named the way `item_id` reports it. Order
+            # follows `volumes`, so a figure's column order is the caller's.
+            want = [v if v.endswith(".h5") else f"{v}.h5" for v in volumes]
+            have = set(self.files)
+            missing = [v for v in want if v not in have]
+            if missing:
+                raise ValueError(
+                    f"volume(s) {missing} are not in {self.kspace_root} (or were "
+                    f"filtered out by anatomy={anatomy!r}); "
+                    f"{len(self.files)} available")
+            self.files = want
+
         if len(self.files) == 0:
             raise ValueError(f"No valid scans found for anatomy={anatomy}")
-        
+
+        # ----------------------------------------------------
+        # Index: one entry per ITEM the dataset serves
+        # ----------------------------------------------------
+        # Default (`enumerate_slices=False`) is one item per volume with the
+        # slice drawn at __getitem__ time -- the training behaviour, unchanged.
+        # `enumerate_slices=True` makes each (volume, slice) its own item, so a
+        # sequential pass covers whole volumes in a reproducible order. That is
+        # what `scripts/dump_eval.py` needs: a viewer scrubs slices, and a
+        # dataset that hands back one random slice per volume cannot supply
+        # them.
+        self.index = self._build_index()
+
         # If the task is denoising, build a transform. 
         if task == "denoising":
 
@@ -136,8 +164,35 @@ class FastMRIDataset(Dataset):
 
         return valid
 
+    def _volume_slices(self, fname):
+        """How many slices `fname` actually has, from the preprocessed image."""
+        with h5py.File(os.path.join(self.smap_root, fname), "r") as f:
+            return int(f["image"].shape[0])
+
+    def _build_index(self):
+        """`[(fname, slice_or_None)]`, one entry per item served."""
+        if not self.enumerate_slices:
+            return [(f, None) for f in self.files]
+
+        out = []
+        for f in self.files:
+            n = self._volume_slices(f)
+            # `end_slice=None` means "to the end of the volume" here. In the
+            # sampling path it means "always start_slice", which is the right
+            # default there and the wrong one for a dump.
+            hi = n if self.end_slice is None else min(int(self.end_slice), n)
+            lo = min(int(self.start_slice), hi)
+            out.extend((f, s) for s in range(lo, hi))
+        if not out:
+            raise ValueError(
+                f"enumerate_slices produced no items: start_slice="
+                f"{self.start_slice}, end_slice={self.end_slice} selects nothing "
+                f"in volumes of {[self._volume_slices(f) for f in self.files[:3]]}"
+                f"... slices")
+        return out
+
     def __len__(self):
-        return len(self.files)
+        return len(self.index)
 
     def _sample_slice(self):
         lo = self.start_slice
@@ -146,14 +201,29 @@ class FastMRIDataset(Dataset):
             return lo
         return random.randint(lo, hi - 1)
 
+    def item_id(self, idx):
+        """`(volume, slice)` for item `idx` -- the key a picked row is saved under.
+
+        Only meaningful under `enumerate_slices=True`; in the sampling path the
+        slice is not decided until `__getitem__` runs, so there is no stable
+        answer to give and asking is a bug worth naming.
+        """
+        fname, sl = self.index[idx]
+        if sl is None:
+            raise RuntimeError(
+                "item_id() needs enumerate_slices=True: without it the slice is "
+                "drawn inside __getitem__ and no stable identity exists.")
+        return os.path.splitext(fname)[0], int(sl)
+
     def __getitem__(self, idx):
 
-        fname = self.files[idx]
+        fname, sl = self.index[idx]
 
         kspace_path = os.path.join(self.kspace_root, fname)
         smap_path = os.path.join(self.smap_root, fname)
 
-        sl = self._sample_slice()
+        if sl is None:
+            sl = self._sample_slice()
         sl = slice(sl, sl + 1)
 
         # Split into recon and denoising branches
@@ -264,6 +334,9 @@ def get_fastmri_loader(
     scale_fac=None,
     pad_multiple=1,
     drop_last=True,
+    enumerate_slices=False,
+    volumes=None,
+    num_workers=8,
 ):
     dataset = FastMRIDataset(
         task =task,
@@ -277,16 +350,24 @@ def get_fastmri_loader(
         smap_root=smap_root,
         scale_fac=scale_fac,
         pad_multiple=pad_multiple,
+        enumerate_slices=enumerate_slices,
+        volumes=volumes,
     )
 
+    # Every keyword this function does not name is silently dropped by the
+    # registry, so a new dataset option must be added HERE as well as on the
+    # class or it becomes a no-op that looks like it worked.
+    num_workers = int(num_workers)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
         # Some extra defaults to improve GPU utilization
-        num_workers=8,          # tune
+        num_workers=num_workers,          # tune
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4
+        # Both of these are illegal at num_workers=0, which a dump run wants so
+        # that item order is trivially the index order.
+        persistent_workers=num_workers > 0,
+        **({"prefetch_factor": 4} if num_workers > 0 else {}),
     )

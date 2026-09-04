@@ -66,8 +66,8 @@
 # PREREQUISITE: the h5 files need 'img_median_mad' --
 #   python preprocessing/cmap.py --config config/BraTS/cmap.yaml
 #
-# Submit:  sbatch slurm/i2sb_vgg_sweep.sbatch
-# One cell: sbatch --array=3 slurm/i2sb_vgg_sweep.sbatch
+# Submit:  sbatch torch/i2sb_vgg_sweep.sbatch
+# One cell: sbatch --array=3 torch/i2sb_vgg_sweep.sbatch
 
 # ---- sweep knobs (edit these) --------------------------------------------------------------
 BASE_CONFIG="config/BraTS/i2sb_sbcdlnet_vgg.json"

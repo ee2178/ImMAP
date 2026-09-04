@@ -25,17 +25,17 @@
 # iters=[4,4,6], K_outer=1 runs at 0.124x the cost of K_outer=6 -- BETTER than
 # the naive 1/6. 100k steps here is roughly 12k K=6-equivalent steps.
 #
-# STAGE 2 is slurm/stack_transfer.sbatch, which seeds all six outer slots from
+# STAGE 2 is torch/stack_transfer.sbatch, which seeds all six outer slots from
 # whatever this produces. Chain them:
 #
-#   JID=$(sbatch --parsable slurm/stack_pretrain.sbatch)
-#   sbatch --dependency=afterok:${JID} slurm/stack_transfer.sbatch
+#   JID=$(sbatch --parsable torch/stack_pretrain.sbatch)
+#   sbatch --dependency=afterok:${JID} torch/stack_transfer.sbatch
 #
 # Or run this alone first and submit stage 2 by hand once you have looked at the
 # curve -- there is no point seeding six slots from a pretrain that went nowhere.
 
 # ============================================================================
-#  SET THE EXPERIMENT HERE  (must match slurm/stack_transfer.sbatch)
+#  SET THE EXPERIMENT HERE  (must match torch/stack_transfer.sbatch)
 # ============================================================================
 ANATOMY="${ANATOMY:-brain}"          # brain | knee
 RTAG="${RTAG:-R8}"
@@ -121,4 +121,4 @@ PY
 python train.py "${GEN_CONFIG}"
 
 echo "[stack] STAGE 1 done. Checkpoint: ${RUN_DIR}/net.ckpt"
-echo "[stack] now:  sbatch slurm/stack_transfer.sbatch"
+echo "[stack] now:  sbatch torch/stack_transfer.sbatch"

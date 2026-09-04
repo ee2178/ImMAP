@@ -7,10 +7,17 @@ one function here and nothing else.
 
 An adapter has the signature
 
-    adapter(net, batch, cfg, device, sigma, generator)
+    adapter(net, batch, cfg, device, sigma, generator, extras=None)
         -> (gt, recon, organ_mask_or_None)
 
 both complex or both real, shape `(B, C, H, W)`, on `device`.
+
+`extras`, when a dict is passed, is FILLED IN with whatever else that task's
+forward pass happened to produce -- the zero-filled adjoint, the sampling
+mask, the realised noise level. `scripts/dump_eval.py` wants those for the
+viewer; the metric sweep does not and passes nothing, so the two share one
+forward pass instead of the dump reimplementing it and drifting. An adapter
+that has nothing to offer may ignore the argument.
 
 `sigma` is PINNED by the caller rather than sampled per batch. Evaluation wants
 a fixed operating point (or a sweep of them); sampling would average over the
@@ -29,7 +36,7 @@ import torch
 from operators import FFT2D, Identity, Mask, Sense
 from operators.noise import awgn
 from physics.mask import get_mask_cached as get_mask
-from training.common import prepare_measurement
+from training.common import embed_for_net, prepare_measurement
 
 
 def _call_net(net, x, E, sigma):
@@ -42,7 +49,7 @@ def _call_net(net, x, E, sigma):
 
 
 # ---------------------------------------------------------------------------
-def recon(net, batch, cfg, device, sigma, generator=None):
+def recon(net, batch, cfg, device, sigma, generator=None, extras=None):
     """CS-MRI reconstruction. Mirrors the val block of `training/recon.py`.
 
     Returns `(gt, recon, organ_mask)`. The mask is None unless the config asks
@@ -70,19 +77,29 @@ def recon(net, batch, cfg, device, sigma, generator=None):
     )
 
     E = Mask(mask) @ FFT2D() @ Sense(extra["smaps"])
-    # Same image-domain embedding the training loop uses; without it
-    # the operator would be padded here and not there, and the numbers
-    # would not be comparable to the training curves.
-    E, T = embed_operator(E, tuple(image.shape[-2:]),
-                          int(getattr(net, "pad_stride", 1) or 1))
+    # Same image-domain embedding the training loop uses -- literally the same
+    # function. `pad_hw` is the loader's decision and has to be honoured:
+    # re-deriving the embedded size from `pad_stride` alone would build a
+    # different operator here than the val loop built, and the sweep would stop
+    # reproducing the curves it is meant to summarise.
+    E, T = embed_for_net(net, E, image, pad_hw)
     out = T.forward(_call_net(net, y, E, sigma_n))
 
     if mri.get("whiten_kspace", False) and "Zinv" in extra:
         out = extra["Zinv"] * out
+
+    if extras is not None:
+        # The zero-filled adjoint is the artifact the network had to remove, so
+        # a viewer showing recon without it cannot answer "removed, or moved?".
+        zf = T.forward(E.adjoint(y))
+        if mri.get("whiten_kspace", False) and "Zinv" in extra:
+            zf = extra["Zinv"] * zf
+        extras.update(zero_filled=zf, sampling_mask=mask, sigma_n=sigma_n)
+
     return image, out, organ_mask
 
 
-def denoiser(net, batch, cfg, device, sigma, generator=None):
+def denoiser(net, batch, cfg, device, sigma, generator=None, extras=None):
     """Gaussian denoising. Mirrors the val block of `training/denoiser.py`.
 
     A loader may hand back either a clean image (noise added here) or a
@@ -96,6 +113,12 @@ def denoiser(net, batch, cfg, device, sigma, generator=None):
         noisy, sigma_n = awgn(gt, [sigma, sigma],
                               dist=cfg["training"].get("noise_dist", "uniform"))
 
+    if extras is not None:
+        # `zero_filled` is the degraded input under any task; for denoising
+        # that is the noisy image, so the viewer's "input" column means the
+        # same thing across tasks without knowing which one it is looking at.
+        extras.update(zero_filled=noisy, sigma_n=sigma_n)
+
     # No organ mask: denoising has no sensitivity support to restrict to.
     return gt, _call_net(net, noisy, Identity(), sigma_n), None
 
@@ -107,7 +130,7 @@ REGISTRY = {
 
 
 def build_adapter(task):
-    """An adapter maps `(net, batch, cfg, device, sigma, gen)` to
+    """An adapter maps `(net, batch, cfg, device, sigma, gen, extras=None)` to
     `(gt, recon, organ_mask_or_None)`."""
     if task not in REGISTRY:
         raise ValueError(

@@ -24,7 +24,7 @@
 #     1  brain  R8  mglpds
 #     ...
 #
-# Same four models as the knee launcher; see slurm/mg_recon_knee.sbatch for what
+# Same four models as the knee launcher; see torch/mg_recon_knee.sbatch for what
 # each pair does and does not isolate.
 #
 # UNVERIFIED PATHS. The brain roots follow the knee pattern --
@@ -34,11 +34,11 @@
 # (start_slice 0, end_slice 8, versus knee's 12-25). A wrong path fails at
 # loader construction, so:
 #
-#     sbatch --array=0 slurm/mg_recon_brain.sbatch
+#     sbatch --array=0 torch/mg_recon_brain.sbatch
 #
 # costs ~30 seconds and confirms the setup before the other seven go out.
 #
-# Submit:      sbatch slurm/mg_recon_brain.sbatch
+# Submit:      sbatch torch/mg_recon_brain.sbatch
 # Probe first: SWEEP_EPOCHS=20 below, then look at the val curves.
 
 ANATOMY=brain
@@ -53,7 +53,7 @@ REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch does NOT execute this file in place: it copies the script's contents to
 # the compute node's spool dir and runs that copy, so ${BASH_SOURCE[0]} is
-# /opt/slurm/.../job<id>/slurm_script and a $BASH_SOURCE-relative source looks
+# /opt/torch/.../job<id>/slurm_script and a $BASH_SOURCE-relative source looks
 # for the body next to the copy -- which was never shipped. Resolve the repo
 # explicitly. Override with IMMAP_ROOT=/path/to/ImMAP sbatch ...
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do

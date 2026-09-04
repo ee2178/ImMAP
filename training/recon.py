@@ -16,46 +16,17 @@ from training.common import (
     set_lr,
     apply_loss_mask,
     prepare_measurement,
+    embed_for_net,
 )
 from visualization.filters import get_filter_grids
 from visualization.image import recon_panel
 from physics.mask import get_mask_cached as get_mask
 from operators import Mask, FFT2D, Sense
-from operators.truncate import embed_operator
 
 
-def _embed(net, E, image, pad_hw):
-    """`(E @ Truncate, T)` for one batch, with the size contract checked.
-
-    The loader decides H'/W' from its own `pad_multiple`; the NETWORK is what
-    actually constrains them. Checking here turns a config that disagrees into
-    a named error instead of letting `kspace_pre_process` quietly fall back to
-    resampling the mask -- the failure this embedding exists to remove.
-    """
-    stride = int(getattr(net, "pad_stride", 1) or 1)
-    hw = tuple(image.shape[-2:])
-
-    if pad_hw is None:                       # loader predates the 5th return
-        return embed_operator(E, hw, stride)
-
-    p = torch.as_tensor(pad_hw).reshape(-1, 2)
-    if p.shape[0] > 1 and not bool((p == p[0]).all()):
-        raise ValueError(
-            f"the batch mixes embedded sizes ({p.tolist()}); a batch must be "
-            f"uniform for a single operator to cover it.")
-    big = (int(p[0, 0]), int(p[0, 1]))
-
-    if big[0] % stride or big[1] % stride:
-        raise ValueError(
-            f"data.pad_multiple gives {big[0]}x{big[1]}, which {type(net).__name__} "
-            f"cannot use: it needs a multiple of pad_stride={stride}. Set "
-            f"data.<split>.pad_multiple to {stride} (or a multiple of it).")
-    if big[0] < hw[0] or big[1] < hw[1]:
-        raise ValueError(f"embedded size {big} is smaller than the image {hw}.")
-
-    from operators.truncate import Truncate
-    T = Truncate(big, hw)
-    return (E if T.is_identity else E @ T), T
+# `_embed` moved to training/common.py so evaluation/tasks.py can build the
+# identical operator; the alias keeps this module's call sites unchanged.
+_embed = embed_for_net
 
 
 def train_recon(

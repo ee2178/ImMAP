@@ -34,8 +34,8 @@
 # Reads config/<anatomy>/mg/mggrouplpds_<R>.json unchanged -- no training, no
 # checkpoints written.
 #
-# Submit:   sbatch slurm/profile_grouplpds.sbatch
-# Options:  ANATOMY=brain RTAG=R4 IMG=304x704 sbatch slurm/profile_grouplpds.sbatch
+# Submit:   sbatch torch/profile_grouplpds.sbatch
+# Options:  ANATOMY=brain RTAG=R4 IMG=304x704 sbatch torch/profile_grouplpds.sbatch
 
 ANATOMY="${ANATOMY:-knee}"
 RTAG="${RTAG:-R8}"

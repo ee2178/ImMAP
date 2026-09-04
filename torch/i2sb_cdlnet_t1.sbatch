@@ -39,7 +39,7 @@
 # copy either way, so for THIS config beta_max lives only in cfg["i2sb"] -- unlike the
 # SBCDLNet/SBUnet configs, where cfg["model"]["params"] duplicates it.
 #
-# Submit:  sbatch slurm/i2sb_cdlnet_t1.sbatch
+# Submit:  sbatch torch/i2sb_cdlnet_t1.sbatch
 
 source ~/.bashrc
 conda activate gcdl

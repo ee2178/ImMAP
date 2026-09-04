@@ -65,7 +65,7 @@
 # The MSE-only control this is measured against is config/BraTS/i2sb_sbcdlnet_mednorm.json --
 # identical apart from the loss, so run that one too if you have not already.
 #
-# Submit:  sbatch slurm/i2sb_vgg.sbatch
+# Submit:  sbatch torch/i2sb_vgg.sbatch
 
 source ~/.bashrc
 conda activate gcdl

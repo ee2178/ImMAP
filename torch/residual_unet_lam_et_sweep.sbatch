@@ -17,7 +17,7 @@
 #
 # et_weight sweep over the RESIDUAL U-NET task (config/BraTS/residual_synthesis_unet.json:
 # task=synthesis, Unet2D, residual_mode=true). The counterpart of
-# slurm/synth_lam_sweep.sbatch, same grid, so the two architectures are directly
+# torch/synth_lam_sweep.sbatch, same grid, so the two architectures are directly
 # comparable arm for arm.
 #
 # Six arms: et_weight = 1 (CONTROL, the unweighted loss) plus five log-spaced to ~34x.
@@ -42,7 +42,7 @@
 # plausible-looking, but with exactly that detail missing. Watch val/resid_ratio (rms of the
 # predicted residual over rms of the true one): ~1 is healthy, drifting to 0 is the collapse.
 #
-# Submit:   sbatch slurm/residual_unet_et_weight_sweep.sbatch
+# Submit:   sbatch torch/residual_unet_et_weight_sweep.sbatch
 # Probe:    set SWEEP_EPOCHS below (e.g. 30) to rank cheaply before committing 48h x 6.
 #           T_max is rescaled to match so the cosine schedule still completes.
 #
@@ -58,7 +58,7 @@ LAMS=(1 1.3 2.1 4.3 11.6)                            # 1 = control (unweighted),
 SWEEP_EPOCHS="50"                                           # empty = use the config's num_epochs
 # ------------------------------------------------------------------------------------------------
 
-# Environment (mirrors slurm/residual_synthesis_unet_et.sbatch)
+# Environment (mirrors torch/residual_synthesis_unet_et.sbatch)
 source ~/.bashrc
 conda activate gcdl
 cd ~/scratch/ee2178/ImMAP

@@ -39,10 +39,10 @@
 # V-cycle alone. Both cells now use the E^H E DC correction (preproc='kspace'),
 # so at least that is not a third confound.
 #
-# Brain is a separate launcher: slurm/mg_recon_brain.sbatch
+# Brain is a separate launcher: torch/mg_recon_brain.sbatch
 #
-# Submit:      sbatch slurm/mg_recon_knee.sbatch
-# One cell:    sbatch --array=0 slurm/mg_recon_knee.sbatch
+# Submit:      sbatch torch/mg_recon_knee.sbatch
+# One cell:    sbatch --array=0 torch/mg_recon_knee.sbatch
 # Probe first: SWEEP_EPOCHS=20 below, then look at the val curves.
 
 ANATOMY=knee
@@ -57,20 +57,20 @@ REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch does NOT execute this file in place: it copies the script's contents to
 # the compute node's spool dir and runs that copy, so ${BASH_SOURCE[0]} is
-# /opt/slurm/.../job<id>/slurm_script and a $BASH_SOURCE-relative source looks
+# /opt/torch/.../job<id>/slurm_script and a $BASH_SOURCE-relative source looks
 # for the body next to the copy -- which was never shipped. Resolve the repo
 # explicitly. Override with IMMAP_ROOT=/path/to/ImMAP sbatch ...
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do
-    if [ -n "${_c}" ] && [ -f "${_c}/slurm/_mg_recon_body.sh" ]; then
+    if [ -n "${_c}" ] && [ -f "${_c}/torch/_mg_recon_body.sh" ]; then
         IMMAP_ROOT="${_c}"
         break
     fi
 done
-if [ ! -f "${IMMAP_ROOT:-}/slurm/_mg_recon_body.sh" ]; then
-    echo "[grid] cannot locate slurm/_mg_recon_body.sh (tried IMMAP_ROOT," \
+if [ ! -f "${IMMAP_ROOT:-}/torch/_mg_recon_body.sh" ]; then
+    echo "[grid] cannot locate torch/_mg_recon_body.sh (tried IMMAP_ROOT," \
          "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}, ~/scratch/ee2178/ImMAP)." >&2
     echo "[grid] submit from the repo root, or: IMMAP_ROOT=/path/to/ImMAP sbatch $0" >&2
     exit 1
 fi
 export IMMAP_ROOT
-source "${IMMAP_ROOT}/slurm/_mg_recon_body.sh"
+source "${IMMAP_ROOT}/torch/_mg_recon_body.sh"

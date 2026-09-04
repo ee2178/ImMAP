@@ -22,7 +22,7 @@
 # image_weight=0 is the pure-latent baseline; too large a weight risks the latent-collapse the latent
 # term is there to prevent -- the sweep is to find the sweet spot.
 #
-# Submit:  sbatch slurm/latent_i2sb_imgweight_sweep.sbatch
+# Submit:  sbatch torch/latent_i2sb_imgweight_sweep.sbatch
 # Probe first: set SWEEP_EPOCHS to something small (e.g. 500), compare val, then full-train the winner.
 
 # ---- sweep knobs (edit these) ------------------------------------------------------------------
@@ -33,7 +33,7 @@ IMAGE_WEIGHTS=(0.0 0.01 0.05 0.1 0.3 1.0 3.0)   # image-domain loss weights; LEN
 SWEEP_EPOCHS=""                           # empty = config's num_epochs; set e.g. 500 to probe cheaply
 # ------------------------------------------------------------------------------------------------
 
-# Environment (mirrors slurm/latent_i2sb.sbatch)
+# Environment (mirrors torch/latent_i2sb.sbatch)
 source ~/.bashrc
 conda activate gcdl
 cd ~/scratch/ee2178/ImMAP
