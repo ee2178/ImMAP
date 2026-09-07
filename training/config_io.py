@@ -16,48 +16,51 @@ the code below needing nothing but the standard library and PyYAML.
 import json
 import os
 import re
-from decimal import Decimal, InvalidOperation
 
 import yaml
 
 
-_PLAIN_MAX_LEN = 24          # longest plain-decimal expansion we are willing to write
-# Sentinel for a float we serialize ourselves (see _plain_floats). Plain ASCII on purpose:
+# Sentinel for a float we serialize ourselves (see _canon_floats). Plain ASCII on purpose:
 # a NUL would be legal in a str but puts raw NUL bytes in this source file. write_config
 # asserts it is absent from the payload before substituting, so a collision cannot pass.
 _RAW = "@@__raw_float_{}__@@"
 
 
-def _plain_float(v):
-    """Plain decimal text for a float, or None to keep json's own repr.
+def _canon_float(v):
+    """`1e-06` -> `1.0e-6`, or None to keep json's own repr.
 
-    `1e-06` -> `0.000001`. The obvious canonical form is `1.0e-6` -- a decimal point plus a signed
-    exponent, which YAML 1.1 specifies as a float and modern PyYAML accepts. It is not enough in
-    practice: some PyYAML builds hand `1.0e-6` back as the STRING '1.0e-6' (observed on the HPC
-    node, where every config carrying `eta_min: 1.0e-6` failed the check in write_config). Plain
-    decimal has no such ambiguity -- it matches the bare `[0-9]+\.[0-9]*` float production in
-    YAML 1.1, YAML 1.2 and JSON alike, with no exponent clause for a resolver to disagree about.
+    train.py reads configs with yaml.safe_load, so YAML 1.1 number rules apply, not JSON's: a
+    float needs a decimal point in the mantissa AND an explicitly signed exponent. json.dump
+    writes `1e-06`, which matches no float production and comes back as the STRING '1e-06' --
+    CosineAnnealingLR then does arithmetic on it. json.load is unaffected, which is what makes
+    this easy to miss when eyeballing a config.
 
-    A `.0` is appended when the expansion has no fractional part, because `1e+6` -> `1000000`
-    would come back as an INT and silently change the type of a value written as a float.
+    `1.0e-6` is the spelling every hand-written config in this repo uses, so machine-written
+    configs match them rather than introducing a second convention. (An earlier version wrote
+    plain decimals, `0.000001`, on the theory that some PyYAML builds reject the exponent form.
+    That was a misdiagnosis: the config that triggered it held `1e-06` as a STRING already, and
+    the regex of the day rewrote the characters inside the quotes without changing the fact that
+    it was quoted. Both spellings load as floats; this one matches the repo.)
 
-    Values whose expansion would exceed _PLAIN_MAX_LEN keep json's form: spelling out 1e-40 helps
-    nobody, and write_config's validation still refuses the write if the round-trip really does
-    produce a string.
+    A mantissa that has no decimal point gets `.0` appended, because `1e+6` -> `1000000` would
+    come back as an INT and silently change the type of a value written as a float.
+
+    Returning None means json's repr is already a plain decimal (`0.0001`), which YAML reads as a
+    float with no help. write_config validates the round-trip either way, so a spelling that does
+    not survive `yaml.safe_load` is refused rather than written.
     """
     r = repr(float(v))
     if "e" not in r and "E" not in r:
-        return None                                  # no exponent -> json's repr is already fine
-    try:
-        plain = format(Decimal(r).normalize(), "f")
-    except (InvalidOperation, ValueError, ArithmeticError):
-        return None
-    if len(plain) > _PLAIN_MAX_LEN:
-        return None
-    return plain if "." in plain else plain + ".0"
+        return None                       # already a plain decimal, or inf/nan
+    mant, _, exp = r.lower().partition("e")
+    if "." not in mant:
+        mant += ".0"
+    sign = "-" if exp.startswith("-") else "+"
+    digits = exp.lstrip("+-").lstrip("0") or "0"
+    return f"{mant}e{sign}{digits}"
 
 
-def _plain_floats(o, raws):
+def _canon_floats(o, raws):
     """Replace every float needing re-spelling with a unique placeholder, collecting the
     replacement text in `raws`.
 
@@ -69,15 +72,15 @@ def _plain_floats(o, raws):
     exactly as it is, so the validation below still catches it and fails loudly.
     """
     if isinstance(o, float):
-        p = _plain_float(o)
+        p = _canon_float(o)
         if p is None:
             return o
         raws.append(p)
         return _RAW.format(len(raws) - 1)
     if isinstance(o, dict):
-        return {k: _plain_floats(v, raws) for k, v in o.items()}
+        return {k: _canon_floats(v, raws) for k, v in o.items()}
     if isinstance(o, list):
-        return [_plain_floats(v, raws) for v in o]
+        return [_canon_floats(v, raws) for v in o]
     return o
 
 
@@ -92,7 +95,7 @@ def write_config(cfg, path):
     the same loader train.py uses before it is accepted.
     """
     raws = []
-    marked = _plain_floats(cfg, raws)
+    marked = _canon_floats(cfg, raws)
     text = json.dumps(marked, indent=4)
     for i, plain in enumerate(raws):
         token = json.dumps(_RAW.format(i))          # the quoted form, exactly as json wrote it
@@ -123,5 +126,6 @@ def write_config(cfg, path):
 
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w") as f:
-        f.write(text)
+        f.write(text + "\n")     # trailing newline: POSIX, and it keeps a rewritten config from
+                                 # showing a spurious "\ No newline at end of file" in every diff
     return path

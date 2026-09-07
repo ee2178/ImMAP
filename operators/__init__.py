@@ -1,5 +1,6 @@
 from .base import Operator, CompositeOperator
 from .identity import Identity
+from .gain import ChannelGain, bridge_gain
 from .fourier import FFT2D
 from .mask import Mask
 from .sense import Sense

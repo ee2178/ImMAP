@@ -780,4 +780,10 @@ def galerkin(E, scale=DEFAULT_FACTOR, length=None, filter=None):
         return Identity()
     if isinstance(E, Identity):
         return E
+    # An operator that is diagonal in SPACE commutes with restriction and prolongation, so its
+    # Galerkin coarsening is itself: R (E^H E) P = (E^H E) R P. Wrapping it in `E . P` anyway
+    # would leave the coarse Gram carrying a spurious R.P smoothing and cost two extra resamples
+    # per apply. operators/gain.py's ChannelGain is the case this exists for.
+    if getattr(E, "commutes_with_resample", False):
+        return E
     return E @ Resample(scale, length, filter)

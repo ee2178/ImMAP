@@ -116,7 +116,7 @@
     "scheduler": {
         "type": "CosineAnnealingLR",
         "params": {
-            "eta_min": 0.000001,
+            "eta_min": 1.0e-6,
             "T_max": 300000
         }
     },

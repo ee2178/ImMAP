@@ -147,10 +147,9 @@ def load_ckpt(
 # re-exported here because `from training.common import write_config` is what
 # the rest of the repo (and the sbatch bodies) already say.
 from training.config_io import (            # noqa: F401
-    _PLAIN_MAX_LEN,
     _RAW,
-    _plain_float,
-    _plain_floats,
+    _canon_float,
+    _canon_floats,
     write_config,
 )
 

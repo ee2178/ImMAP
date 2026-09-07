@@ -1,34 +1,39 @@
 {
     "task": "i2sb",
     "experiment": {
-        "name": "I2SB_SBGroupCDL_T1ce_from_T1_medmad"
+        "name": "I2SB_SBMGCDLNet_T1ce_from_T1_medmad"
     },
     "model": {
-        "type": "SBGroupCDL",
+        "type": "SBMGCDLNet",
         "params": {
-            "K": 30,
-            "M": 169,
-            "Mh": 32,
+            "K": [
+                3,
+                [
+                    8,
+                    8,
+                    4
+                ]
+            ],
             "C": 4,
-            "P": 7,
-            "sc": 2,
-            "W": 35,
-            "dK": 5,
             "prior_idx": 1,
-            "t0": 0.001,
-            "deg_eta": 2,
-            "deg_tau": 2,
+            "M": 169,
+            "P": 7,
+            "s": 2,
+            "widen": 1,
+            "W": 1,
+            "tau0": 0.001,
+            "alpha0": 0.1,
+            "eta0": 0.1,
+            "is_complex": false,
+            "degrees": 2,
+            "dK": 1,
+            "sim_fun": "distance",
             "kind": "i2sb",
             "tau": 0.19,
             "n_points": 1000,
             "beta_max": 0.3,
-            "sim_fun": "distance",
-            "attn_backend": "flex",
-            "flex_block_size": 128,
-            "blend": true,
-            "fenchel": false,
-            "is_complex": false,
-            "init": true
+            "init_strategy": "spectral_norm",
+            "subgrad_mode": "rigorous"
         }
     },
     "i2sb": {
@@ -45,7 +50,7 @@
         "target_channels": 1
     },
     "paths": {
-        "save_dir": "trained_nets/brats/I2SB_SBGroupCDL_T1ce_from_T1_medmad",
+        "save_dir": "trained_nets/brats/I2SB_SBMGCDLNet_T1ce_from_T1_medmad",
         "ckpt": null
     },
     "data": {

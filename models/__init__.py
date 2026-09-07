@@ -16,6 +16,7 @@ from .guided_prox import GuidedFenchelProx, GuidedGroupThreshold
 from .ladmm import AltSplitCDLNet
 from .sb_cdlnet import SBCDLNet
 from .sb_groupcdl import SBGroupCDL
+from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
 
 
@@ -62,6 +63,12 @@ def build_model(cfg):
     # prox in place of the soft threshold. Its schedule params must match cfg["i2sb"] too.
     elif model_type == "SBGroupCDL":
         return SBGroupCDL(**params)
+
+    # The same two-fidelity bridge scaffold, solved by multigrid V-cycles: the two fidelities
+    # collapse into one CDL problem under a channel-gain operator (operators/gain.py), so the
+    # V-cycle applies unchanged. Its schedule params must match cfg["i2sb"] too.
+    elif model_type == "SBMGCDLNet":
+        return SBMGCDLNet(**params)
 
     # The I2SB paper's regressor: ADM's UNet conditioned on the bridge STEP (not sigma) via a
     # sinusoidal embedding + per-ResBlock FiLM. Like the SB* nets it inverts sigma through its
