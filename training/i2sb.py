@@ -42,6 +42,21 @@ from visualization.filters import get_filter_grids
 from visualization.params import get_param_logs
 
 
+# Display window for every logged image panel. The data is med/MAD normalized with scales=3,
+# which puts the brain in [-1, 1] by construction, so this is the window the images are FOR.
+#
+# Deliberately a CONSTANT, not derived from cfg's data_range and not a per-image min-max:
+#   * a min-max stretch is set by whatever the widest single value happens to be, so one
+#     outlier squashes the brain into a few grey levels and the panel reads as black. It also
+#     rescales every epoch, so two panels are never on the same greyscale and a washed-out
+#     prediction gets stretched back to full range and looks correct.
+#   * deriving it from data_range couples the picture to a METRICS knob, so changing how PSNR
+#     is normalized would silently re-window the images.
+# A wrong window is not silent either way: val/display_clip_frac reports how much of the brain
+# falls outside it.
+DISPLAY_VMIN, DISPLAY_VMAX = -1.0, 1.0
+
+
 def masked_mse(pred, target, organ_mask, use_mask):
     """MSE in the (masked) target domain. Mirrors train_synthesis: multiply by the mask,
     then mean over all elements."""
@@ -487,13 +502,23 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         else:
             cols = [x1[:1], pred_m[:1], x0_m[:1]]
             cap = f"T1 prior | I2SB recon (nfe={val_nfe}) | T1ce GT"
-        ref = torch.cat([cols[0], cols[-1]], dim=0)          # scale from prior + GT (clean)
-        lo = float(ref.amin()); hi = max(float(ref.amax()), lo + 1e-8)
+        # Every panel is drawn on the FIXED window [DISPLAY_VMIN, DISPLAY_VMAX] -- see the
+        # module-level constants for why it is a constant rather than a derived quantity.
+        lo, hi = DISPLAY_VMIN, DISPLAY_VMAX
         grid = mask[:1] * torch.cat([((c - lo) / (hi - lo)).clamp(0, 1) for c in cols], dim=0)
         res = (x0_m[:1] - pred_m[:1]).abs(); res = res / res.max().clamp(min=1e-8)
+        # How much of the BRAIN falls outside that window, and how bright the panel came out.
+        # These turn "the image is black" into two numbers: clip_frac ~ 1 means the data is not
+        # on the [-1, 1] scale the window assumes (rescale `scales`), while grid_mean ~ 0 with
+        # clip_frac ~ 0 means the mask is empty. Cheap scalars, logged every validation.
+        inb = x0_m[:1][mask[:1] > 0.5]
         wandb.log({
             "val/example": wandb.Image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
             "val/residual": wandb.Image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
+            "val/display_clip_frac": (float(((inb < lo) | (inb > hi)).float().mean())
+                                      if inb.numel() else float("nan")),
+            "val/display_grid_mean": float(grid.mean()),
+            "val/mask_frac": float((mask[:1] > 0.5).float().mean()),
             **{f"val/{k}": v for k, v in mean_metrics.items()},
         }, step=global_step)
         # learned dictionary filters (works for real or complex CDLNet); no-op if absent
