@@ -42,6 +42,10 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from training.common import (
     POSTFIX_EVERY,save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, load_model,
                              snr_loss_weight)
+
+# Backtracking bookkeeping. `backtrack` is the whole restore-and-drop-the-LR
+# operation; `resync_schedule` re-applies an already-earned reduction on resume.
+from training.common import backtrack as do_backtrack, resync_schedule
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
 from sb.base import build_schedule, n_steps, forward_sample, forward_std
@@ -215,6 +219,12 @@ def train_latent_i2sb(
     clip_grad=1.0,
     backtrack_thresh=0.5,
     backtrack_factor=0.9,
+    # Backtracking bookkeeping, threaded in from train.py so it survives a
+    # requeue. `backtrack_count` sets the LR amplitude (lr0 * factor**count) and
+    # `best_loss` is the bar the on-disk checkpoint already cleared -- resetting
+    # either one on resume is what let a backtracked run climb back to full LR.
+    backtrack_count=0,
+    best_loss=float("inf"),
     use_mask=True,
     loss_type="complex-mse",         # image-loss key in training.losses.LOSS_REGISTRY (image/mixed)
     loss_mode="latent",              # "latent" (MSE on z0) | "image" | "mixed"
@@ -275,11 +285,19 @@ def train_latent_i2sb(
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
 
-    best_loss = float("inf")
+    # best_loss is a PARAMETER now, carried in from the checkpoint: see
+    # the note in the signature.
     train_iter = iter(train_loader)
     total_steps = num_epochs * steps_per_epoch
     pbar = tqdm(total=total_steps, initial=start_epoch * steps_per_epoch,
                 desc="LATENT-I2SB", dynamic_ncols=True)
+
+    # `train.py` rebuilds `sched` from the config on every launch, so its
+    # base_lrs are the run's ORIGINAL learning rate. Re-apply the reductions
+    # this run has already earned, or a requeue silently undoes every backtrack.
+    if backtrack_count:
+        print(f"resuming at backtrack_count={backtrack_count}: LR -> "
+              f"{resync_schedule(opt, sched, backtrack_count, backtrack_factor)}")
 
     for epoch in range(start_epoch, num_epochs):
         R.train()
@@ -331,16 +349,24 @@ def train_latent_i2sb(
                 f"avg loss {avg_loss:.3e} > best {best_loss:.3e} + {backtrack_thresh}")
             print(f"[epoch {epoch}] {reason} — backtracking")
             if os.path.exists(ckpt_path) and math.isfinite(best_loss):
-                R, opt, sched, _ = load_ckpt(ckpt_path, model=R, optimizer=opt,
-                                             scheduler=sched, device=device)
-                new_lr = np.array(get_lr(opt)) * backtrack_factor
-                set_lr(opt, new_lr)
-                print("Updated LR:", new_lr)
+                backtrack_count, new_lr = do_backtrack(
+                    ckpt_path,
+                    model=R,
+                    optimizer=opt,
+                    scheduler=sched,
+                    device=device,
+                    backtrack_count=backtrack_count,
+                    backtrack_factor=backtrack_factor,
+                )
+                print(f"backtrack #{backtrack_count} -> LR {new_lr}")
+                # best_loss unchanged: the on-disk ckpt is still the best model.
             else:
                 raise RuntimeError(f"Backtrack at epoch {epoch} but no valid checkpoint "
                                    f"(best_loss={best_loss}).")
         elif save_ckpt_fn and avg_loss < best_loss:
-            save_ckpt_fn(ckpt_path, model=R, optimizer=opt, scheduler=sched, step=global_step)
+            save_ckpt_fn(ckpt_path, model=R, optimizer=opt, scheduler=sched,
+                         step=global_step, backtrack_count=backtrack_count,
+                         best_loss=avg_loss)
             best_loss = avg_loss
 
         # ---- logging ----

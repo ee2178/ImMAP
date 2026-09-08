@@ -41,6 +41,10 @@ from tqdm import tqdm
 
 from operators import Identity
 from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, POSTFIX_EVERY
+
+# Backtracking bookkeeping. `backtrack` is the whole restore-and-drop-the-LR
+# operation; `resync_schedule` re-applies an already-earned reduction on resume.
+from training.common import backtrack as do_backtrack, resync_schedule
 from training.metrics import compute_metrics
 from visualization.params import get_param_logs
 from training.losses import LOSS_REGISTRY, weighted_loss
@@ -61,6 +65,12 @@ def train_dt_synthesis(
     clip_grad=1.0,
     backtrack_thresh=0.5,
     backtrack_factor=0.9,
+    # Backtracking bookkeeping, threaded in from train.py so it survives a
+    # requeue. `backtrack_count` sets the LR amplitude (lr0 * factor**count) and
+    # `best_loss` is the bar the on-disk checkpoint already cleared -- resetting
+    # either one on resume is what let a backtracked run climb back to full LR.
+    backtrack_count=0,
+    best_loss=float("inf"),
     loss_type="magnitude-l1",
     use_mask=True,
     psnr_only=False,
@@ -80,7 +90,8 @@ def train_dt_synthesis(
     E = Identity()                   # pure transfer: no measurement operator
 
     net.train()
-    best_loss = float("inf")
+    # best_loss is a PARAMETER now, carried in from the checkpoint: see
+    # the note in the signature.
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
 
@@ -90,6 +101,13 @@ def train_dt_synthesis(
                 desc="DT-SYNTHESIS", dynamic_ncols=True)
 
     et_warned = False
+    # `train.py` rebuilds `sched` from the config on every launch, so its
+    # base_lrs are the run's ORIGINAL learning rate. Re-apply the reductions
+    # this run has already earned, or a requeue silently undoes every backtrack.
+    if backtrack_count:
+        print(f"resuming at backtrack_count={backtrack_count}: LR -> "
+              f"{resync_schedule(opt, sched, backtrack_count, backtrack_factor)}")
+
     for epoch in range(start_epoch, num_epochs):
         net.train()
         running_loss, running_src, n_batches = 0.0, 0.0, 0
@@ -158,16 +176,24 @@ def train_dt_synthesis(
                 f"avg loss {avg_loss:.3e} > best {best_loss:.3e} + {backtrack_thresh}")
             print(f"[epoch {epoch}] {reason} — backtracking")
             if os.path.exists(ckpt_path) and math.isfinite(best_loss):
-                net, opt, sched, _ = load_ckpt(ckpt_path, model=net, optimizer=opt,
-                                               scheduler=sched, device=device)
-                new_lr = np.array(get_lr(opt)) * backtrack_factor
-                set_lr(opt, new_lr)
-                print("Updated LR:", new_lr)
+                backtrack_count, new_lr = do_backtrack(
+                    ckpt_path,
+                    model=net,
+                    optimizer=opt,
+                    scheduler=sched,
+                    device=device,
+                    backtrack_count=backtrack_count,
+                    backtrack_factor=backtrack_factor,
+                )
+                print(f"backtrack #{backtrack_count} -> LR {new_lr}")
+                # best_loss unchanged: the on-disk ckpt is still the best model.
             else:
                 raise RuntimeError(f"Backtrack at epoch {epoch} but no valid checkpoint "
                                    f"(best_loss={best_loss}).")
         elif save_ckpt_fn and avg_loss < best_loss:
-            save_ckpt_fn(ckpt_path, model=net, optimizer=opt, scheduler=sched, step=global_step)
+            save_ckpt_fn(ckpt_path, model=net, optimizer=opt, scheduler=sched,
+                         step=global_step, backtrack_count=backtrack_count,
+                         best_loss=avg_loss)
             best_loss = avg_loss
 
         # ---- logging ----

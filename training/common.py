@@ -2,11 +2,13 @@
 
 import os
 import re
+from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 import json
 import numpy as np
 import torch
 import yaml
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from physics.nle import whiten
 from operators.fourier import ifftc
 from operators.noise import mri_awgn
@@ -79,9 +81,18 @@ def save_ckpt(
     step=None,
     optimizer=None,
     scheduler=None,
+    backtrack_count=None,
+    best_loss=None,
 ):
     """
     Save checkpoint.
+
+    `backtrack_count` and `best_loss` are the backtracking state, and both MUST
+    round-trip through the checkpoint. `backtrack_count` is the exponent that
+    sets the LR amplitude (see `backtrack`), so a resume that forgets it
+    silently restores the run's original learning rate; a `best_loss` that
+    resets to +inf makes the first post-resume epoch "improve" unconditionally
+    and overwrite the best model on disk with whatever that epoch produced.
     """
 
     def get_state_dict(obj):
@@ -97,6 +108,8 @@ def save_ckpt(
             "model_state_dict": get_state_dict(model),
             "optimizer_state_dict": get_state_dict(optimizer),
             "scheduler_state_dict": get_state_dict(scheduler),
+            "backtrack_count": backtrack_count,
+            "best_loss": best_loss,
         },
         path,
     )
@@ -140,6 +153,198 @@ def load_ckpt(
     step = ckpt.get("step", 0) + 1
 
     return model, optimizer, scheduler, step
+
+
+def load_ckpt_meta(path, device="cpu"):
+    """
+    Read the backtracking bookkeeping out of a checkpoint, without touching the
+    model / optimizer / scheduler.
+
+    Returns
+    -------
+    (backtrack_count, best_loss) : (int, float)
+        Defaults of `(0, inf)` for checkpoints written before this state was
+        persisted, which reproduces the old behaviour on those files rather than
+        failing on them.
+    """
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    backtrack_count = ckpt.get("backtrack_count", None)
+    best_loss = ckpt.get("best_loss", None)
+
+    if backtrack_count is None:
+        backtrack_count = 0
+
+    if best_loss is None:
+        best_loss = float("inf")
+
+    return int(backtrack_count), float(best_loss)
+
+
+# ===========================================================================
+#  Backtracking
+# ===========================================================================
+# The learning rate after a backtrack is a pure function of a monotone counter:
+#
+#     lr_base = lr0 * backtrack_factor ** backtrack_count
+#
+# where `lr0` is the ORIGINAL config learning rate, recovered from the
+# optimizer's `initial_lr`, and `backtrack_count` is saved in every checkpoint.
+# Nothing here reads the optimizer's *current* lr.
+#
+# Reading the current lr is what was broken. The old code restored
+# `optimizer_state_dict` -- whose `param_groups[i]["lr"]` is the LR as it stood
+# when the best checkpoint was written, often tens of thousands of steps in the
+# past -- and only THEN read the lr to multiply by `backtrack_factor`. Against a
+# step-wise CosineAnnealingLR (68 of 69 configs), winding the LR back up the
+# cosine routinely outweighed the 0.9, so a "backtrack" RAISED the learning
+# rate. Worse, repeated backtracks with no intervening improvement all restored
+# the same checkpoint, so the reduction never compounded and the LR was pinned
+# at `ckpt_lr * 0.9` no matter how many times the run diverged.
+#
+# Deliberate deviation from Sljiva (src/train.jl:455): Sljiva also rolls its
+# epoch counter back to the checkpoint's epoch, so its schedule is re-traversed
+# from an earlier -- and therefore higher -- point on the curve, which leaves the
+# same failure open in principle, just damped. Here the schedule's POSITION runs
+# forward untouched and only its AMPLITUDE (`base_lrs`) is scaled down. That
+# makes the LR strictly decrease at every backtrack for any monotone schedule;
+# for the cosine, lr_new - lr_old = ((1 + cos)/2) * base * (factor - 1) < 0.
+
+
+def initial_lrs(optimizer):
+    """
+    The learning rates this run STARTED from, one per param group.
+
+    torch's `LRScheduler.__init__` stamps `initial_lr` into each param group and
+    `optimizer.state_dict()` carries it, so this value survives checkpointing
+    and any number of backtracks. `ReduceLROnPlateau` is not an `LRScheduler`
+    and stamps nothing, so fall back to the current lr and stamp it ourselves:
+    correct on a fresh run and on the first resume after this change, and
+    persisted from the next save onward.
+    """
+
+    lrs = []
+
+    for pg in optimizer.param_groups:
+
+        if "initial_lr" not in pg:
+            pg["initial_lr"] = pg["lr"]
+
+        lrs.append(float(pg["initial_lr"]))
+
+    return lrs
+
+
+def rescale_schedule(optimizer, scheduler, base_lrs):
+    """
+    Re-point an LR schedule at new base learning rates and resync the optimizer.
+
+    Returns the resulting per-group learning rates.
+    """
+
+    if not isinstance(base_lrs, (list, tuple, np.ndarray)):
+        base_lrs = [base_lrs] * len(optimizer.param_groups)
+
+    base_lrs = [float(b) for b in base_lrs]
+
+    # ReduceLROnPlateau has no base_lrs: it reads and writes group["lr"]
+    # directly, so setting the lr IS setting the schedule.
+    if scheduler is None or isinstance(scheduler, ReduceLROnPlateau):
+        set_lr(optimizer, base_lrs)
+        if scheduler is not None:
+            scheduler._last_lr = base_lrs
+        return base_lrs
+
+    scheduler.base_lrs = base_lrs
+
+    # Evaluate the re-pointed curve at the scheduler's current position.
+    # `_get_closed_form_lr` is the authority where torch provides one; the
+    # public `get_lr()` is *chainable* for these schedulers, i.e. it derives the
+    # next lr from the current group["lr"] -- exactly the stale value we are
+    # replacing -- so calling it here would silently undo the rescale.
+    if hasattr(scheduler, "_get_closed_form_lr"):
+        lrs = [float(v) for v in scheduler._get_closed_form_lr()]
+    elif isinstance(scheduler, LambdaLR):
+        lrs = [
+            float(b * f(scheduler.last_epoch))
+            for b, f in zip(base_lrs, scheduler.lr_lambdas)
+        ]
+    else:
+        lrs = base_lrs
+
+    set_lr(optimizer, lrs)
+    scheduler._last_lr = lrs
+
+    return lrs
+
+
+def backtrack(
+    ckpt_path,
+    model,
+    optimizer,
+    scheduler,
+    device,
+    backtrack_count,
+    backtrack_factor,
+):
+    """
+    Restore the best checkpoint and drop the learning rate, once.
+
+    Restores WEIGHTS ONLY. The optimizer's moment buffers are cleared rather
+    than restored: the run diverged from its pre-backtrack trajectory, so the
+    accumulated Adam momentum is contaminated by the divergent steps, and a
+    fresh optimizer paired with a reduced learning rate is the cleanest restart
+    (this matches Sljiva, src/train.jl:474). The scheduler's state is likewise
+    not restored -- see the note above on amplitude vs. position.
+
+    Returns
+    -------
+    (backtrack_count, lrs) : (int, list of float)
+        The INCREMENTED counter -- the caller must keep it and checkpoint it --
+        and the new per-group learning rates.
+    """
+
+    lr0 = initial_lrs(optimizer)
+
+    load_ckpt(ckpt_path, model=model, device=device)
+
+    # Clear Adam's exp_avg / exp_avg_sq / step counters. Rebinding to a fresh
+    # defaultdict is the supported reset; param_groups (and so initial_lr, and
+    # so lr0 on the next backtrack) are untouched.
+    optimizer.state = defaultdict(dict)
+
+    backtrack_count = int(backtrack_count) + 1
+
+    lrs = rescale_schedule(
+        optimizer,
+        scheduler,
+        [lr * backtrack_factor ** backtrack_count for lr in lr0],
+    )
+
+    return backtrack_count, lrs
+
+
+def resync_schedule(optimizer, scheduler, backtrack_count, backtrack_factor):
+    """
+    Re-apply an already-earned LR reduction, without counting a new backtrack.
+
+    Call this once at the top of a training loop that resumed with
+    `backtrack_count > 0`: `train.py` builds the scheduler from the config, so
+    its `base_lrs` are the run's ORIGINAL learning rate and the reductions from
+    previous backtracks would otherwise be lost on every requeue.
+    """
+
+    backtrack_count = int(backtrack_count)
+
+    if backtrack_count <= 0:
+        return get_lr(optimizer)
+
+    return rescale_schedule(
+        optimizer,
+        scheduler,
+        [lr * backtrack_factor ** backtrack_count for lr in initial_lrs(optimizer)],
+    )
 
 
 # write_config and its float-spelling helpers now live in training/config_io.py,

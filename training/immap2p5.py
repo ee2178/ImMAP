@@ -18,6 +18,10 @@ from training.common import (
     apply_loss_mask,
     prepare_measurement,
 )
+
+# Backtracking bookkeeping. `backtrack` is the whole restore-and-drop-the-LR
+# operation; `resync_schedule` re-applies an already-earned reduction on resume.
+from training.common import backtrack as do_backtrack, resync_schedule
 from visualization.filters import get_filter_grids
 from physics.mask import get_mask_cached as get_mask
 from operators import Mask, FFT2D, Sense, Identity, SSDUMask
@@ -88,6 +92,12 @@ def train_joint_denoising_recon(
     # ---------------------------------------------------------
     backtrack_thresh=None,
     backtrack_factor=0.8,
+    # Backtracking bookkeeping, threaded in from train.py so it survives a
+    # requeue. `backtrack_count` sets the LR amplitude (lr0 * factor**count) and
+    # `best_loss` is the bar the on-disk checkpoint already cleared -- resetting
+    # either one on resume is what let a backtracked run climb back to full LR.
+    backtrack_count=0,
+    best_loss=float("inf"),
     # ---------------------------------------------------------
     # External logging
     # ---------------------------------------------------------
@@ -106,7 +116,8 @@ def train_joint_denoising_recon(
     loss_fn = LOSS_REGISTRY[loss_type]
     ckpt_path = os.path.join(save_dir, "net.ckpt")
 
-    best_loss = float("inf")        # lower is better -> start high
+    # best_loss is a PARAMETER now, carried in from the checkpoint: see
+    # the note in the signature.
     backtrack_enabled = backtrack_thresh is not None
 
     # Build the SSDU operator ONCE; it reshuffles its own mask on each forward.
@@ -131,6 +142,13 @@ def train_joint_denoising_recon(
         desc="TRAIN",
         dynamic_ncols=True,
     )
+
+    # `train.py` rebuilds `sched` from the config on every launch, so its
+    # base_lrs are the run's ORIGINAL learning rate. Re-apply the reductions
+    # this run has already earned, or a requeue silently undoes every backtrack.
+    if backtrack_count:
+        print(f"resuming at backtrack_count={backtrack_count}: LR -> "
+              f"{resync_schedule(opt, sched, backtrack_count, backtrack_factor)}")
 
     for epoch in range(start_epoch, num_epochs):
         net.train()
@@ -264,17 +282,16 @@ def train_joint_denoising_recon(
             print(f"[epoch {epoch}] {reason} — backtracking")
 
             if os.path.exists(ckpt_path) and math.isfinite(best_loss):
-                net, opt, sched, _ = load_ckpt(
+                backtrack_count, new_lr = do_backtrack(
                     ckpt_path,
                     model=net,
                     optimizer=opt,
                     scheduler=sched,
                     device=device,
+                    backtrack_count=backtrack_count,
+                    backtrack_factor=backtrack_factor,
                 )
-                old_lr = np.array(get_lr(opt))
-                new_lr = old_lr * backtrack_factor
-                set_lr(opt, new_lr)
-                print("Updated LR:", new_lr)
+                print(f"backtrack #{backtrack_count} -> LR {new_lr}")
                 # best_loss unchanged: the on-disk ckpt is still the best model.
             else:
                 raise RuntimeError(
@@ -290,6 +307,8 @@ def train_joint_denoising_recon(
                 step=global_step,
                 optimizer=opt,
                 scheduler=sched,
+                backtrack_count=backtrack_count,
+                best_loss=avg_loss,
             )
             best_loss = avg_loss
 

@@ -18,7 +18,7 @@ from training import (
     train_i2sb,
     train_latent_i2sb
 )
-from training.common import load_ckpt, write_config
+from training.common import load_ckpt, load_ckpt_meta, write_config
 
 import datasets                       # triggers registration via __init__
 from datasets.registry import build_loader
@@ -130,6 +130,16 @@ def main(config_path):
     # Optionally resume from checkpoint
     # --------------------------------------------------
     start_step = 0
+
+    # Backtracking state, threaded into whichever train_* function runs below.
+    # It MUST come from the checkpoint rather than being re-initialised here:
+    # `backtrack_count` is the exponent that sets the LR amplitude, so losing it
+    # restores the run's original learning rate on every requeue, and a
+    # `best_loss` of +inf makes the first epoch after a requeue "improve"
+    # unconditionally and overwrite the best model on disk.
+    backtrack_count = 0
+    best_loss = float("inf")
+
     ckpt_path = cfg.get("paths", {}).get("ckpt", None)
 
     # `paths.init_ckpt`: weights-only WARM START, as opposed to `paths.ckpt`,
@@ -161,12 +171,16 @@ def main(config_path):
             device=device,
         )
 
-        print(f"Resuming from step {start_step}")
+        backtrack_count, best_loss = load_ckpt_meta(ckpt_path, device=device)
+
+        print(f"Resuming from step {start_step} "
+              f"(backtrack_count={backtrack_count}, best_loss={best_loss})")
 
     elif init_ckpt:
         print(f"Warm-starting weights from {init_ckpt}")
         load_ckpt(path=init_ckpt, model=model, device=device)
-        print("Fresh optimizer and scheduler; starting from step 0.")
+        print("Fresh optimizer, scheduler and backtracking state; "
+              "starting from step 0.")
 
     # compile the fused flex kernel once, on the final model object
     if getattr(model, "attn_backend", None) == "flex":
@@ -195,6 +209,12 @@ def main(config_path):
 
     task = cfg["task"]
 
+    # Bundled so a new task branch cannot silently forget to forward it.
+    backtrack_state = {
+        "backtrack_count": backtrack_count,
+        "best_loss": best_loss,
+    }
+
     # Saving configs
     # Rewrite checkpoint path so the saved config resumes from net.ckpt
     cfg["paths"]["ckpt"] = os.path.join(
@@ -220,6 +240,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
             **cfg["training"],
             **cfg["paths"],
         )
@@ -236,6 +257,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
             **cfg["training"],
             **cfg["mri"],
             **cfg["paths"],
@@ -253,6 +275,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
             **cfg["training"],
             **cfg["mri"],
             **cfg["paths"],
@@ -269,6 +292,10 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_step=start_step,
+            backtrack_count=backtrack_count,
+            # train_ipalm scores on PSNR (higher is better), so its bar is
+            # best_psnr; load_ckpt_meta carries it in the same checkpoint slot.
+            best_psnr=best_loss,
             **cfg["training"],
             **cfg["mri"],
             **cfg["paths"],
@@ -285,6 +312,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
+            **backtrack_state,
             **cfg["training"],
             **cfg["paths"],
             )
@@ -300,6 +328,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
+            **backtrack_state,
             **cfg["training"],
             **cfg["paths"],
             )
@@ -315,6 +344,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
             **cfg["training"],
             **cfg["paths"],
             )
@@ -330,6 +360,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
+            **backtrack_state,
             **cfg["training"],
             **cfg["i2sb"],
             **cfg["paths"],
@@ -348,6 +379,7 @@ def main(config_path):
             val_loader=val_loader,
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
+            **backtrack_state,
             **cfg["dicts"],
             **cfg["training"],
             **cfg["i2sb"],
