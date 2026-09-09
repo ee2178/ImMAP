@@ -63,7 +63,7 @@
             "end_slice": 8,
             "scale_fac": 2000.0,
             "kspace_root": "../datasets/fastmri/brain/multicoil_train",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/train",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined_espirit/train",
             "pad_multiple": 8
         },
         "val": {
@@ -78,7 +78,7 @@
             "end_slice": 1,
             "scale_fac": 2000.0,
             "kspace_root": "../datasets/fastmri/brain/multicoil_val",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/val",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined_espirit/val",
             "pad_multiple": 8
         }
     },
@@ -87,11 +87,11 @@
         "steps_per_epoch": 50,
         "val_every_epochs": 100,
         "noise_std": [
-            0.04,
-            0.06
+            0.01,
+            0.02
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.05,
+        "val_noise_std": 0.015,
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,

@@ -13,13 +13,23 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-2
+#SBATCH --array=0-1
 #
 # EXPERIMENT 2 -- is nonlocal self-similarity a good prior on KNEE?  R = 8.
 #
 #   0   knee  R8  lpdsnet       flat LPDS, K=30
 #   1   knee  R8  mglpds        V-cycle, K=[6,[4,4,6]], local prox
-#   2   knee  R8  mggrouplpds   V-cycle, same K, NONLOCAL prox at every level
+#
+# THE THIRD CELL LIVES IN torch/exp2_knee_mggroup.sbatch.
+# `mggrouplpds` does not fit an L40S -- attention at three grid levels with a
+# 15x15 window is the memory cost -- so it needs an H200, and `--constraint` is
+# a static #SBATCH directive that cannot vary per array index. Splitting the
+# file is the only way to give one cell a different node type. Both halves are
+# the SAME experiment and MUST be submitted together; the comparison is
+# meaningless with either half missing:
+#
+#     sbatch torch/exp2_knee_group.sbatch        # cells 0,1  (L40S)
+#     sbatch torch/exp2_knee_mggroup.sbatch      # cell  2    (H200)
 #
 # THE HYPOTHESIS, AND WHAT WOULD FALSIFY IT
 # -----------------------------------------
@@ -88,9 +98,8 @@
 # are the brain launchers. If you turn this off, turn those off too.
 #
 # BEFORE SUBMITTING
-#   * cell 2 is the only one that has never run. Probe it alone first:
-#       SWEEP_EPOCHS=20 sbatch --array=2 torch/exp2_knee_group.sbatch
-#     and watch memory -- attention at three grids is new here.
+#   * the group cell is the only one that has never run; probe it from its
+#     own file (see torch/exp2_knee_mggroup.sbatch).
 #   * flex compiles on first use (train.py calls compile_flex when
 #     attn_backend="flex"); expect a slow first step, not a hang.
 #
@@ -99,10 +108,10 @@
 #
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
-#       --accels 8 --only lpdsnet mglpds mggrouplpds
+#       --accels 8 --only lpdsnet mglpds
 
 ANATOMY=knee
-ONLY="lpdsnet mglpds mggrouplpds"
+ONLY="lpdsnet mglpds"                # mggrouplpds -> exp2_knee_mggroup.sbatch
 ACCELS="8"
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it

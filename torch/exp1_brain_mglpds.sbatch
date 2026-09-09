@@ -52,13 +52,17 @@
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain --only mglpds
 
 ANATOMY=brain
-# The LPDSNet arm was trained under sigma ~ U[0, 0.01] and is NOT a valid
-# comparison for these cells any more -- the grid moved to U[0.04, 0.06]. Rerun
-# it before reading this experiment:
+# The LPDSNet arm needs rerunning before this experiment can be read. Two
+# things have changed under it since it was trained: sigma (now U[0.01, 0.02])
+# and the brain sensitivity maps (now ESPIRiT, not Walsh -- see
+# torch/espirit_smaps.sbatch, which also rewrites the ground truth).
 #     sbatch --array=0,6 torch/mg_recon_brain.sbatch
 # (cells 0 and 6 of the full brain list are lpdsnet R8 and R4.)
 ONLY="mglpds"
-ACCELS=""                            # empty = both R8 and R4
+ACCELS="8 4"                         # PINNED. Was "" (= all), which
+                                     # silently grew to include R16 when
+                                     # exp3 added it to the global list.
+                                     # R16 mglpds belongs to exp3.
 ORGAN_MASK=1                         # matches mg_recon_brain.sbatch and
                                      # baseline_varnet cells 2,3
 CONFIG_ROOT="config"

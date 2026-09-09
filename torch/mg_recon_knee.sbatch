@@ -13,15 +13,15 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-11          # MUST equal the knee cell count; checked at runtime
+#SBATCH --array=0-17          # MUST equal the knee cell count; checked at runtime
 #
-# fastMRI KNEE (PD), synthetic k-space, sigma ~ U[0.04, 0.06].
+# fastMRI KNEE (PD), synthetic k-space, sigma ~ U[0.01, 0.02].
 #
-#   4 models x 2 accelerations (R=8, R=4) = 8 cells
+#   6 models x 3 accelerations (R=8, R=4, R=16) = 18 cells
 #
 #     python scripts/make_mg_recon_configs.py --list-cells --anatomy knee
-#     0  knee  R8  lpdsnet
-#     1  knee  R8  mglpds
+#     (indices are printed by that command -- not duplicated here,
+#      because a hardcoded copy goes stale the moment a cell is added)
 #     ...
 #
 # The models, as two paired comparisons:

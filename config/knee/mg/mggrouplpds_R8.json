@@ -78,11 +78,11 @@
         "steps_per_epoch": 50,
         "val_every_epochs": 100,
         "noise_std": [
-            0.04,
-            0.06
+            0.01,
+            0.02
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.05,
+        "val_noise_std": 0.015,
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
