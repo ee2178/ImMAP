@@ -13,12 +13,20 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-8
+#SBATCH --array=0-8%2
 #
 # Replace the WALSH sensitivity maps with ESPIRiT.
 #
 #   0      brain  val     (one task -- the val split is small)
 #   1-8    brain  train   (8 shards of the file list)
+#
+# `%2` THROTTLES TO TWO CONCURRENT TASKS = two GPUs, not nine. The sharding is
+# for RESTARTABILITY, not speed: a shard that times out re-runs only its own
+# slice of the file list, and each task skips volumes already written. Holding
+# nine GPUs for a one-off preprocessing pass would queue for longer than it
+# saves. Raise the number after `%` if the queue is empty and you are in a
+# hurry; drop the whole array to `--array=0-1%1` if you would rather it just
+# trickle.
 #
 # Hyperparameters are the ones chosen in notebooks/espirit_brain.ipynb:
 # acs=(20,20), kernel_size=8, thresh_eig=0.95.

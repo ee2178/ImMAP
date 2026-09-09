@@ -7,13 +7,13 @@ config per (anatomy, acceleration, model) cell to
 
     config/<anatomy>/mg/<model>_R<r>.json
 
-4 models x 2 accelerations = 8 runs PER ANATOMY. knee and brain have separate
+6 models x 3 accelerations = 18 cells PER ANATOMY. knee and brain have separate
 sbatch files (`torch/mg_recon_{knee,brain}.sbatch`); each asks this script for
 its own cell list via `--list-cells --anatomy <a>`, so the two stay in sync.
 
 Every cell trains on SYNTHETIC k-space (`kspace_type: "simulated"`): the clean
 coil-combined image is pushed through Sense -> Fourier -> mask with complex AWGN
-at sigma ~ U[0.04, 0.06] added in the coil-image domain. See
+at sigma ~ U[0.01, 0.02] added in the coil-image domain. See
 `operators/noise.py::mri_awgn`, the port of `genobs(clo::SyntheticMRIReco, ...)`
 in `Sljiva/src/closures/mrireco.jl`.
 
@@ -199,7 +199,7 @@ MODELS = {
     #     the dataset's. That is the method, not an oversight -- but it makes
     #     this the harder task, and the comparison favours the unrolled nets.
     #   * it returns an RSS MAGNITUDE image, so only magnitude metrics apply.
-    #   * it has no noise-adaptive parameter, so sigma ~ U[0.04, 0.06] is a
+    #   * it has no noise-adaptive parameter, so sigma ~ U[0.01, 0.02] is a
     #     handicap the sigma-conditioned cells do not carry. This got HEAVIER
     #     when the range moved up from [0, 0.01]: the sigma-conditioned cells
     #     see a 1.5x spread they can adapt their thresholds to, and VarNet has
@@ -219,7 +219,10 @@ MODELS = {
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
-ACCELS = [8, 4]
+# 16 is exp3's deep-acceleration arm; 8 and 4 are exp1/exp2's. All three are
+# in one list so every cell exists for every R and the launchers select with
+# ACCELS -- which also RENUMBERS, so each experiment keeps a dense array.
+ACCELS = [8, 4, 16]
 
 ANATOMIES = {
     "knee": dict(
@@ -233,7 +236,13 @@ ANATOMIES = {
         anatomy="brain",
         scale_fac=2000.0,
         kspace_root="../datasets/fastmri/brain/multicoil_{split}",
-        smap_root="../datasets/fastmri_preprocessed/brain_T2W_coil_combined/{split}",
+        # ESPIRiT, not the original Walsh maps. Walsh wrote no exact zeros,
+        # so the organ mask (`smaps.abs().sum(0) > 0`) was all-True on brain
+        # and use_organ_mask was a no-op there; and mri_awgn assumes unit-RSS
+        # maps, which Walsh is not. knee was already ESPIRiT -- that mismatch
+        # confounded every knee-vs-brain comparison. Written by
+        # torch/espirit_smaps.sbatch.
+        smap_root="../datasets/fastmri_preprocessed/brain_T2W_coil_combined_espirit/{split}",
         slices=(0, 8),
     ),
 }
@@ -259,8 +268,8 @@ ANATOMIES = {
 # beat one trained near-noiseless and tested at 0.05, so these numbers are not
 # directly comparable to published ones. Say which protocol produced a number
 # whenever one is quoted.
-NOISE_STD = [0.04, 0.06]
-VAL_NOISE_STD = 0.05           # mean(NOISE_STD): mrireco.jl:277 evaluates there
+NOISE_STD = [0.01, 0.02]
+VAL_NOISE_STD = 0.015          # mean(NOISE_STD): mrireco.jl:277 evaluates there
 VAL_SEED = 1234
 
 

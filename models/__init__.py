@@ -8,6 +8,7 @@ from .ipalmnet import IPALMNet
 from .groupcdl import GroupCDL
 from .cclnet import CCLNet, Unet2D
 from .multigrid import MGCDLNet, VCycle
+from .ml_cdlnet import MLCDLNet, MLSplitCDLNet, MLSweep, MLSplitSweep
 from .lpds import LPDSLayer, LPDSStack
 from .mg_lpds import MGLPDSNet, PDVCycle
 from .guided_lpds import GuidedLPDSLayer, GuidedLPDSNet, LGGSNet
@@ -75,6 +76,26 @@ def build_model(cfg):
     # own schedule copy, so model.params must match cfg["i2sb"].
     elif model_type == "SBUnet":
         return SBUnet(**params)
+
+    # Multi*level* family (models/ml_cdlnet.py): the hierarchy is the MODEL
+    # (x = D_1 D_2 ... D_L g_L), not a solver device, so the transfer operators
+    # are the learned strided dictionaries and E is applied at level 1 only.
+    #   MLCDLNet      unrolled ML-ISTA: one state tensor, g_L, no skips
+    #   MLSplitCDLNet unrolled linearized ADMM: one code + one dual per level,
+    #                 which is where the skip connections come from
+    # `MLGroupCDL` / `MLSplitGroupCDL` are the same classes with the nonlocal
+    # group prox, gated the same way MGGroupCDL is.
+    elif model_type in ("MLCDLNet", "MLGroupCDL",
+                        "MLSplitCDLNet", "MLSplitGroupCDL"):
+        params = dict(params)
+        if "Group" in model_type:
+            if params.get("W", 1) <= 1 or params.get("Mh") is None:
+                raise ValueError(
+                    f"{model_type} needs a group prox: set W > 1 (attention "
+                    f"window side, odd) and Mh (attention channels). "
+                    f"Got W={params.get('W', 1)}, Mh={params.get('Mh')}.")
+        cls = MLSplitCDLNet if "Split" in model_type else MLCDLNet
+        return cls(**params)
 
     # Multigrid family, all one class:
     #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations
