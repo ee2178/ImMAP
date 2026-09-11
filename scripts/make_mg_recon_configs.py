@@ -217,6 +217,54 @@ MODELS = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+#  OPT-IN cells
+#
+#  Written by every regeneration, so a launcher's REGENERATE=1 always finds its
+#  config, but listed by --list-cells ONLY when named in --only. Appending them
+#  to the default list would renumber every R4/R16 cell of the full grid, which
+#  mg_recon_{knee,brain}.sbatch index directly -- and exp1's "cells 0 and 6 are
+#  lpdsnet R8 and R4" would silently point at other runs.
+# ---------------------------------------------------------------------------
+
+# MULTILEVEL LPDS (models/ml_lpds.py): the analysis-form multilevel prior
+# sum_l lam_l ||A_l ... A_1 x||_1 under unrolled Condat-Vu. The same primal-dual
+# iteration as `lpdsnet`, with its one clipped dual replaced by one dual per
+# resolution level; `L=1` IS `lpdsnet`.
+#
+# Held against the two LPDS cells: K=30 (lpdsnet's unroll depth), L=3 (mglpds's
+# three grid levels, hence the same pad_stride=8), s=2, P=7, degrees,
+# lam0/tau0/theta0, and everything outside `model`. Dropped: alpha0 (a V-cycle
+# coarse-correction weight) and resize_noise (acts only on spatial noise maps;
+# sigma here is per-image).
+#
+# CAPACITY-MATCHED TO `mglpds` by solving for M:
+#
+#     mllpds    widen=1  channels 17/17/17   3.50M params (0.97x)  11.9 GFLOP
+#     mllpdsw2  widen=2  channels  8/16/32   3.81M params (1.05x)   8.0 GFLOP
+#     mglpds    K=[6,[4,4,6]], M=169         3.62M                 27.8 GFLOP
+#     lpdsnet   K=30, M=169                  1.00M                 18.8 GFLOP
+#
+# (FLOPs per forward on a 160x160 image, torch FlopCounterMode.) Parity forces
+# level 1 far below the baselines' 169 atoms: a level-l >= 2 filter bank is a
+# dense M_{l-1} x M_l bank of 7x7 filters, so depth costs parameters
+# quadratically in width, while FLOPs fall 4x per level. K trades depth for
+# width at roughly constant parameters AND FLOPs (K=10 gives 30/30/30 or
+# 14/28/56), so if these arms lose, K is the first knob to question.
+ML_LPDS_COMMON = dict(
+    {k: v for k, v in LPDS_COMMON.items()
+     if k not in ("M", "widen", "alpha0", "resize_noise")},
+    K=LPDS_BASELINE_K, L=3)
+
+MODELS.update({
+    "mllpds":   dict(type="MLLPDSNet",
+                     params=dict(ML_LPDS_COMMON, M=17, widen=1)),
+    "mllpdsw2": dict(type="MLLPDSNet",
+                     params=dict(ML_LPDS_COMMON, M=8, widen=2)),
+})
+
+OPT_IN = ("mllpds", "mllpdsw2")
+
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
 # 16 is exp3's deep-acceleration arm; 8 and 4 are exp1/exp2's. All three are
@@ -273,12 +321,16 @@ VAL_NOISE_STD = 0.015          # mean(NOISE_STD): mrireco.jl:277 evaluates there
 VAL_SEED = 1234
 
 
-def cells(anatomy=None, only=None, accels=None):
+def cells(anatomy=None, only=None, accels=None, every=False):
     """The canonical cell order, optionally for one anatomy.
 
     knee and brain have SEPARATE sbatch files, so each indexes its own list and
-    the array bound is per-anatomy. Passing no anatomy gives every cell, which
-    is what the generator uses when writing configs.
+    the array bound is per-anatomy. Passing no anatomy gives every cell.
+
+    OPT_IN cells appear only when named in `only`, or with `every=True` -- which
+    is what the generator uses when WRITING configs, so an opt-in launcher's
+    regeneration always produces its config without the default list (and its
+    indices) ever changing.
     """
     out = []
     for a in ([anatomy] if anatomy else ANATOMIES):
@@ -288,6 +340,8 @@ def cells(anatomy=None, only=None, accels=None):
             for model in MODELS:
                 if only and model not in only:
                     continue
+                if model in OPT_IN and not (only or every):
+                    continue
                 out.append((a, r, model))
     return out
 
@@ -296,7 +350,8 @@ def cells(anatomy=None, only=None, accels=None):
 #  Config assembly
 # ===========================================================================
 def _variant(params):
-    """"mg" or "flat", read off the actual K -- not off the cell's name.
+    """"mg" or "flat" (or "L<L>w<widen>"), read off the params -- not off the
+    cell's name.
 
     The flat and multigrid arms of a pair share a MODEL CLASS: `MGLPDSNet` with
     `K=30` is the flat LPDS stack and with `K=[6,[4,4,6]]` is the V-cycle, and
@@ -305,8 +360,13 @@ def _variant(params):
     cannot name a run, and two cells would land on the SAME wandb name.
 
     Derived from K rather than from the cell key so the tag cannot drift if
-    someone edits a K by hand.
+    someone edits a K by hand. The multilevel nets carry their depth in `L`
+    instead (their K is a plain layer count, which would misread as "flat"),
+    and two of them can share L and differ only in widen -- so both go in.
     """
+    p = params.get("denoiser_kws", params)
+    if "L" in p:
+        return f"L{int(p['L'])}w{p.get('widen', 1)}"
     K = params.get("K", params.get("denoiser_kws", {}).get("K"))
     return "flat" if isinstance(K, int) else "mg"
 
@@ -335,15 +395,22 @@ def _pad_multiple(spec, params):
     An AltSplitCDLNet's grid comes from its DENOISER: the outer loop runs
     `preproc="identity"` and never pads, while the prox slot is the multigrid
     net with the levels.
+
+    The multilevel nets (MLCDLNet / MLLPDSNet) carry their depth in `L` and
+    their `K` is a plain layer count, so reading levels off K would give
+    pad_multiple = s instead of s * 2^(L-1).
     """
     if spec.get("type") == "E2EVarNet":
         # Works at the measured size; its NormUnet pads internally to a
         # multiple of 16. No image-domain embedding, so no constraint.
         return 1
     p = params.get("denoiser_kws", params)
-    K = p.get("K")
     s_ = int(p.get("s", 1) or 1)
-    levels = 1 if (K is None or isinstance(K, int)) else len(list(K[1]))
+    if "L" in p:
+        levels = int(p["L"])
+    else:
+        K = p.get("K")
+        levels = 1 if (K is None or isinstance(K, int)) else len(list(K[1]))
     return s_ * (2 ** (levels - 1))
 
 
@@ -625,7 +692,9 @@ def main():
     written = []
     seen_names = {}
     eval_roots = {}
-    for anatomy, r, model in cells(args.anatomy):
+    # every=True: opt-in cells are WRITTEN on every regeneration (only their
+    # listing is gated), so an opt-in launcher always finds its config.
+    for anatomy, r, model in cells(args.anatomy, every=True):
         if args.only and model not in args.only:
             continue
 

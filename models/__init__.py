@@ -9,6 +9,7 @@ from .groupcdl import GroupCDL
 from .cclnet import CCLNet, Unet2D
 from .multigrid import MGCDLNet, VCycle
 from .ml_cdlnet import MLCDLNet, MLSplitCDLNet, MLSweep, MLSplitSweep
+from .ml_lpds import MLLPDSLayer, MLLPDSNet
 from .lpds import LPDSLayer, LPDSStack
 from .mg_lpds import MGLPDSNet, PDVCycle
 from .guided_lpds import GuidedLPDSLayer, GuidedLPDSNet, LGGSNet
@@ -96,6 +97,28 @@ def build_model(cfg):
                     f"Got W={params.get('W', 1)}, Mh={params.get('Mh')}.")
         cls = MLSplitCDLNet if "Split" in model_type else MLCDLNet
         return cls(**params)
+
+    # Multilevel LPDS (models/ml_lpds.py): the ANALYSIS-form multilevel prior
+    # sum_l lambda_l ||A_l ... A_1 x||_1, solved by unrolled Condat-Vu. One dual
+    # per level, all updated in parallel from the same x (no sweep ordering),
+    # and the primal IS the image (no read-out dictionary). L=1 is exactly
+    # MGLPDSNet with an int K. `MLGroupLPDS` is the same class with the
+    # nonlocal group prox at every level, gated the way MGGroupLPDS is.
+    elif model_type in ("MLLPDSNet", "MLGroupLPDS"):
+        params = dict(params)
+        if model_type == "MLGroupLPDS":
+            if params.get("window", 1) <= 1 or params.get("Mh") is None:
+                raise ValueError(
+                    f"MLGroupLPDS needs a group prox: set window > 1 "
+                    f"(attention window side, odd) and Mh (attention "
+                    f"channels). Got window={params.get('window', 1)}, "
+                    f"Mh={params.get('Mh')}. For the plain soft-threshold "
+                    f"prox use MLLPDSNet.")
+        elif params.get("window", 1) > 1:
+            raise ValueError(
+                "MLLPDSNet was given window > 1, which builds a GROUP prox. "
+                "Use MLGroupLPDS so the config states that intent.")
+        return MLLPDSNet(**params)
 
     # Multigrid family, all one class:
     #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations

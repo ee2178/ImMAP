@@ -426,7 +426,94 @@ class MLSplitSweep(_SweepBase):
 # ===========================================================================
 #  shared container
 # ===========================================================================
-class _MLBase(nn.Module):
+class _MLIO(nn.Module):
+    """Preprocessing, preconditions and hooks shared by every multilevel net.
+
+    Split out of `_MLBase` so `models/ml_lpds.py::MLLPDSNet` -- which has no
+    sweeps and no read-out dictionary -- can reuse them.  Needs `self.preproc`,
+    `self.pad_stride`, `self.s` and `self.L`.
+    """
+
+    # -- preconditions -------------------------------------------------------
+    def _check_sigma(self, sigma):
+        """Reject a spatial noise map.
+
+        This port passes sigma UNCHANGED to every level, which is exact (up to a
+        reparameterisation the learned thresholds absorb) for a scalar or a
+        (B,1,1,1) per-image level, and wrong for a map: the profile cannot be
+        absorbed by per-channel coefficients, and a (B,1,H,W) tau would not even
+        broadcast against level 2's (B,M_2,H/2,W/2) code.  Failing here beats
+        failing there.
+        """
+        if torch.is_tensor(sigma) and sigma.dim() == 4 and \
+                (sigma.shape[-1] > 1 or sigma.shape[-2] > 1):
+            raise ValueError(
+                "%s got a spatial noise map of shape %s. Per-level noise "
+                "propagation is not implemented -- sigma is passed unchanged to "
+                "every level, which is exact for a scalar or a (B,1,1,1) "
+                "per-image level but not for a map. Reduce it to a per-image "
+                "level, or implement propagation (see this module's docstring)."
+                % (type(self).__name__, tuple(sigma.shape)))
+
+    def _check_grid(self, hw):
+        H, W = int(hw[0]), int(hw[1])
+        if H % self.pad_stride or W % self.pad_stride:
+            raise ValueError(
+                "%s got a %dx%d input, which is not a multiple of pad_stride=%d "
+                "(= s=%d x 2^(L-1=%d)). With preproc='identity' nothing pads it "
+                "for you, so the deeper levels would not land back on the input "
+                "grid. Crop or pad the data, or reduce L."
+                % (type(self).__name__, H, W, self.pad_stride, self.s, self.L - 1))
+
+    def _check_padding(self, hw, E):
+        """`preproc='image'` pads y~ but NOT the operator -- so E must not care.
+
+        Same trap as `MGCDLNet._check_padding`: the mask and sensitivity maps
+        inside E stay at the original size, so a non-zero pad makes
+        `gram(E, B z)` multiply tensors of different extent.  Denoising
+        (E = Identity) is unaffected.
+        """
+        if isinstance(E, Identity):
+            return
+        H, W = int(hw[0]), int(hw[1])
+        if H % self.pad_stride or W % self.pad_stride:
+            raise ValueError(
+                "%s(preproc=%r) would pad a %dx%d input up to a multiple of "
+                "pad_stride=%d, but the encoding operator %r still holds %dx%d "
+                "masks/maps. Use preproc='kspace' for reconstruction -- it pads "
+                "the operator alongside y~ and applies the E^H E DC correction."
+                % (type(self).__name__, self.preproc, H, W, self.pad_stride,
+                   E, H, W))
+
+    # -- preprocessing -------------------------------------------------------
+    def _pre(self, y, E):
+        if self.preproc == "kspace":
+            y_tilde, E, params = kspace_pre_process(y, E, self.pad_stride)
+            return y_tilde, E, params, kspace_post_process
+        x_adj = E.adjoint(y) if not isinstance(E, Identity) else y
+        if self.preproc == "identity":
+            self._check_grid(x_adj.shape[-2:])
+            return x_adj, E, None, None
+        self._check_padding(x_adj.shape[-2:], E)
+        y_tilde, params = pre_process(x_adj, self.pad_stride)
+        return y_tilde, E, params, (lambda x, p: post_process(x, list(p)))
+
+    # -- hooks ---------------------------------------------------------------
+    @torch.no_grad()
+    def project(self):
+        for m in self.modules():
+            if hasattr(m, "project_"):
+                m.project_()
+
+    def compile_flex(self):
+        """torch.compile every group prox's fused kernel (GPU; call once)."""
+        for m in self.modules():
+            if isinstance(m, GroupThreshold) and m.attn_backend == "flex":
+                m.compile_flex()
+        return self
+
+
+class _MLBase(_MLIO):
     """`preprocess -> K outer sweeps -> read-out -> postprocess`.
 
     Mirrors `MGCDLNet`'s container contract: same `forward(y, E, sigma, z0)`
@@ -494,70 +581,7 @@ class _MLBase(nn.Module):
     def _sweep(self, k):
         return self.sweeps[0] if self.tie_outer else self.sweeps[k]
 
-    # -- preconditions -------------------------------------------------------
-    def _check_sigma(self, sigma):
-        """Reject a spatial noise map.
-
-        This port passes sigma UNCHANGED to every level, which is exact (up to a
-        reparameterisation the learned thresholds absorb) for a scalar or a
-        (B,1,1,1) per-image level, and wrong for a map: the profile cannot be
-        absorbed by per-channel coefficients, and a (B,1,H,W) tau would not even
-        broadcast against level 2's (B,M_2,H/2,W/2) code.  Failing here beats
-        failing there.
-        """
-        if torch.is_tensor(sigma) and sigma.dim() == 4 and \
-                (sigma.shape[-1] > 1 or sigma.shape[-2] > 1):
-            raise ValueError(
-                "%s got a spatial noise map of shape %s. Per-level noise "
-                "propagation is not implemented -- sigma is passed unchanged to "
-                "every level, which is exact for a scalar or a (B,1,1,1) "
-                "per-image level but not for a map. Reduce it to a per-image "
-                "level, or implement propagation (see this module's docstring)."
-                % (type(self).__name__, tuple(sigma.shape)))
-
-    def _check_grid(self, hw):
-        H, W = int(hw[0]), int(hw[1])
-        if H % self.pad_stride or W % self.pad_stride:
-            raise ValueError(
-                "%s got a %dx%d input, which is not a multiple of pad_stride=%d "
-                "(= s=%d x 2^(L-1=%d)). With preproc='identity' nothing pads it "
-                "for you, so the deeper levels would not land back on the input "
-                "grid. Crop or pad the data, or reduce L."
-                % (type(self).__name__, H, W, self.pad_stride, self.s, self.L - 1))
-
-    def _check_padding(self, hw, E):
-        """`preproc='image'` pads y~ but NOT the operator -- so E must not care.
-
-        Same trap as `MGCDLNet._check_padding`: the mask and sensitivity maps
-        inside E stay at the original size, so a non-zero pad makes
-        `gram(E, B z)` multiply tensors of different extent.  Denoising
-        (E = Identity) is unaffected.
-        """
-        if isinstance(E, Identity):
-            return
-        H, W = int(hw[0]), int(hw[1])
-        if H % self.pad_stride or W % self.pad_stride:
-            raise ValueError(
-                "%s(preproc=%r) would pad a %dx%d input up to a multiple of "
-                "pad_stride=%d, but the encoding operator %r still holds %dx%d "
-                "masks/maps. Use preproc='kspace' for reconstruction -- it pads "
-                "the operator alongside y~ and applies the E^H E DC correction."
-                % (type(self).__name__, self.preproc, H, W, self.pad_stride,
-                   E, H, W))
-
     # -- forward -------------------------------------------------------------
-    def _pre(self, y, E):
-        if self.preproc == "kspace":
-            y_tilde, E, params = kspace_pre_process(y, E, self.pad_stride)
-            return y_tilde, E, params, kspace_post_process
-        x_adj = E.adjoint(y) if not isinstance(E, Identity) else y
-        if self.preproc == "identity":
-            self._check_grid(x_adj.shape[-2:])
-            return x_adj, E, None, None
-        self._check_padding(x_adj.shape[-2:], E)
-        y_tilde, params = pre_process(x_adj, self.pad_stride)
-        return y_tilde, E, params, (lambda x, p: post_process(x, list(p)))
-
     def _readout_code(self, codes, k_last):
         if self.readout == "level1" or self.L == 1:
             return codes[1]
@@ -585,23 +609,10 @@ class _MLBase(nn.Module):
         """`(x_hat, z, state)`; implemented per algorithm."""
         raise NotImplementedError
 
-    # -- constraints / hooks -------------------------------------------------
+    # -- constraints ---------------------------------------------------------
     @torch.no_grad()
     def project_(self):
         set_weight(self.D, uball_project(self.D.weight))
-
-    @torch.no_grad()
-    def project(self):
-        for m in self.modules():
-            if hasattr(m, "project_"):
-                m.project_()
-
-    def compile_flex(self):
-        """torch.compile every group prox's fused kernel (GPU; call once)."""
-        for m in self.modules():
-            if isinstance(m, GroupThreshold) and m.attn_backend == "flex":
-                m.compile_flex()
-        return self
 
     # -- diagnostics ---------------------------------------------------------
     def residuals(self, codes, k=-1):
