@@ -207,6 +207,20 @@ MODELS = {
     #     sigma before attributing the gap to architecture.
     # It also has ~10x the parameters of the flat LPDSNet; `count_parameters`
     # in each config records it.
+    #
+    # It is scored under the organ mask on both anatomies, which removes an
+    # advantage it would otherwise have for the wrong reason: an RSS magnitude
+    # is non-negative and noise-biased, so its background is a positive floor
+    # by construction, and unmasked that floor is charged to it as error in a
+    # region nobody is reconstructing. If it underperforms, check convergence
+    # before width -- VarNet is usually trained far longer than 300k steps.
+    # `python -m tests.test_e2evarnet` re-checks the vendored code against
+    # upstream and ImMAP's FFT convention against fastMRI's.
+    #
+    # Every torch/exp*.sbatch launcher lists the varnet cell for its own
+    # (anatomy, R); torch/_mg_recon_body.sh launches each cell once however
+    # many launchers list it (LAUNCH-ONCE there). This replaced
+    # baseline_varnet.sbatch.
     "varnet": dict(
         type="E2EVarNet",
         params=dict(num_cascades=12, sens_chans=8, sens_pools=4,
@@ -232,35 +246,43 @@ MODELS = {
 # iteration as `lpdsnet`, with its one clipped dual replaced by one dual per
 # resolution level; `L=1` IS `lpdsnet`.
 #
-# Held against the two LPDS cells: K=30 (lpdsnet's unroll depth), L=3 (mglpds's
-# three grid levels, hence the same pad_stride=8), s=2, P=7, degrees,
-# lam0/tau0/theta0, and everything outside `model`. Dropped: alpha0 (a V-cycle
-# coarse-correction weight) and resize_noise (acts only on spatial noise maps;
-# sigma here is per-image).
+# Held against the two LPDS cells: L=3 (mglpds's three grid levels, hence the
+# same pad_stride=8), s=2, P=7, degrees, lam0/tau0/theta0, and everything
+# outside `model`. Dropped: alpha0 (a V-cycle coarse-correction weight) and
+# resize_noise (acts only on spatial noise maps; sigma here is per-image).
 #
-# CAPACITY-MATCHED TO `mglpds` by solving for M:
+# MATCHED TO `mglpds` ON FLOPs, the offline proxy for inference time. Measured
+# per forward on a 160x160, 16-coil problem with preproc="kspace": conv FLOPs
+# (torch FlopCounterMode) plus 5 n log2 n per FFT inside E^H E, which
+# FlopCounterMode does not count:
 #
-#     mllpds    widen=1  channels 17/17/17   3.50M params (0.97x)  11.9 GFLOP
-#     mllpdsw2  widen=2  channels  8/16/32   3.81M params (1.05x)   8.0 GFLOP
-#     mglpds    K=[6,[4,4,6]], M=169         3.62M                 27.8 GFLOP
-#     lpdsnet   K=30, M=169                  1.00M                 18.8 GFLOP
+#     mllpds    K=6  widen=1  channels 70/70/70    33.5 GFLOP (0.99x)  11.6M params
+#     mllpdsw2  K=6  widen=2  channels 40/80/160   34.3 GFLOP (1.02x)  18.9M params
+#     mglpds    K=[6,[4,4,6]], M=169               33.8 GFLOP          3.62M params
+#     lpdsnet   K=30, M=169                        20.6 GFLOP          1.00M params
 #
-# (FLOPs per forward on a 160x160 image, torch FlopCounterMode.) Parity forces
-# level 1 far below the baselines' 169 atoms: a level-l >= 2 filter bank is a
-# dense M_{l-1} x M_l bank of 7x7 filters, so depth costs parameters
-# quadratically in width, while FLOPs fall 4x per level. K trades depth for
-# width at roughly constant parameters AND FLOPs (K=10 gives 30/30/30 or
-# 14/28/56), so if these arms lose, K is the first knob to question.
+# K=6: one ML-LPDS layer is one gradient step plus one dual step, about 6
+# convolutions at L=3 (3 down, 3 up). At fixed FLOPs K trades iterations for
+# width (K=10 gives 53/53/53 or 30/60/120; K=30 gives 29/29/29 or 16/32/64).
+# Layer 0 is the cold start, so these cells take 5 E^H E steps where lpdsnet
+# takes 29 and mglpds about two dozen on the fine grid alone.
+#
+# FLOPs ARE NOT TIME. mglpds also writes ~5.4 GB per forward in memory-bound
+# elementwise work (prox, restrict/prolong, coarse Grams) against ~0.4 GB here,
+# so at equal FLOPs these cells will probably run faster on a GPU -- time them
+# before reading a result as compute-matched. A constant 169 channels stays out
+# of reach: dense M_{l-1} x M_l level-to-level filters make cost quadratic in
+# width. tau0=0.5 is inside the Condat-Vu bound at init for both cells.
 ML_LPDS_COMMON = dict(
     {k: v for k, v in LPDS_COMMON.items()
      if k not in ("M", "widen", "alpha0", "resize_noise")},
-    K=LPDS_BASELINE_K, L=3)
+    K=6, L=3)
 
 MODELS.update({
     "mllpds":   dict(type="MLLPDSNet",
-                     params=dict(ML_LPDS_COMMON, M=17, widen=1)),
+                     params=dict(ML_LPDS_COMMON, M=70, widen=1)),
     "mllpdsw2": dict(type="MLLPDSNet",
-                     params=dict(ML_LPDS_COMMON, M=8, widen=2)),
+                     params=dict(ML_LPDS_COMMON, M=40, widen=2)),
 })
 
 OPT_IN = ("mllpds", "mllpdsw2")

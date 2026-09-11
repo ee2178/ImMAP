@@ -34,8 +34,11 @@
 # is interpretable alone.
 #
 # VarNet is here as the "is any of this competitive" check, not as part of the
-# hypothesis. It estimates its own coil maps and returns RSS magnitude; see
-# torch/baseline_varnet.sbatch for the three asymmetries that carries.
+# hypothesis. It estimates its own coil maps and returns RSS magnitude; see the
+# `varnet` entry in scripts/make_mg_recon_configs.py for the asymmetries that
+# carries. Like every cell it is launched once: a run dir that already holds an
+# identical launch is skipped, a stale one is refused (LAUNCH-ONCE in
+# torch/_mg_recon_body.sh; FORCE_RESTART=1 overrides).
 #
 # WHAT IS SHARED WITH exp1 / exp2
 # -------------------------------
@@ -62,7 +65,9 @@ ACCELS="16"
 ATTN="flex"
 ORGAN_MASK=1                         # matches every other brain launcher
 CONFIG_ROOT="config"
-SWEEP_EPOCHS=""                      # empty = the config's num_epochs
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs. Settable
+                                     # on the sbatch line; a short run lands in
+                                     # its own run dir, <model>_R16_<N>ep
 REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch runs a COPY of this file from the node's spool dir, so a

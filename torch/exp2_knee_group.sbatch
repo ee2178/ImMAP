@@ -13,14 +13,15 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-1
+#SBATCH --array=0-2
 #
 # EXPERIMENT 2 -- is nonlocal self-similarity a good prior on KNEE?  R = 8.
 #
 #   0   knee  R8  lpdsnet       flat LPDS, K=30
 #   1   knee  R8  mglpds        V-cycle, K=[6,[4,4,6]], local prox
+#   2   knee  R8  varnet        E2E-VarNet baseline
 #
-# THE THIRD CELL LIVES IN torch/exp2_knee_mggroup.sbatch.
+# THE GROUP CELL LIVES IN torch/exp2_knee_mggroup.sbatch.
 # `mggrouplpds` does not fit an L40S -- attention at three grid levels with a
 # 15x15 window is the memory cost -- so it needs an H200, and `--constraint` is
 # a static #SBATCH directive that cannot vary per array index. Splitting the
@@ -28,8 +29,8 @@
 # the SAME experiment and MUST be submitted together; the comparison is
 # meaningless with either half missing:
 #
-#     sbatch torch/exp2_knee_group.sbatch        # cells 0,1  (L40S)
-#     sbatch torch/exp2_knee_mggroup.sbatch      # cell  2    (H200)
+#     sbatch torch/exp2_knee_group.sbatch        # lpdsnet, mglpds, varnet  (L40S)
+#     sbatch torch/exp2_knee_mggroup.sbatch      # mggrouplpds              (H200)
 #
 # THE HYPOTHESIS, AND WHAT WOULD FALSIFY IT
 # -----------------------------------------
@@ -39,15 +40,21 @@
 # much stronger claim than "the group prox helps" -- and a cheaper one to
 # believe, because a prior that helps everywhere is probably just capacity.
 #
-# So cell 2 beating cell 1 here is necessary but NOT sufficient. The test is
-# finished only when the same pair is run on brain and does NOT show it. That
-# run is deliberately not in this file: get the knee numbers first, and only
-# spend the brain compute if there is something to explain.
+# So mggrouplpds beating mglpds here is necessary but NOT sufficient. The test
+# is finished only when the same pair is run on brain and does NOT show it.
+# That run is deliberately not in this file: get the knee numbers first, and
+# only spend the brain compute if there is something to explain.
 #
-# Cell 2 carries more parameters than cell 1 (the attention projections), so if
-# it wins, "it had more capacity" is the competing explanation. The honest
-# controls are (a) the brain arm above, and (b) an mglpds with M raised to
-# match -- neither is in this submit.
+# mggrouplpds carries more parameters than mglpds (the attention projections),
+# so if it wins, "it had more capacity" is the competing explanation. The
+# honest controls are (a) the brain arm above, and (b) an mglpds with M raised
+# to match -- neither is in this submit.
+#
+# VarNet (cell 2) is the "is any of this competitive" check, not part of the
+# hypothesis; its asymmetries are in the `varnet` entry of
+# scripts/make_mg_recon_configs.py. Like every cell it is launched once: a run
+# dir that already holds an identical launch is skipped, a stale one is refused
+# (LAUNCH-ONCE in torch/_mg_recon_body.sh; FORCE_RESTART=1 overrides).
 #
 # WHY window=15 AND NOT 35
 # ------------------------
@@ -55,8 +62,8 @@
 # make that unnecessary: the COARSE levels supply the long range, so each level
 # can stay local. 15x15 on the 160x160 level-0 latent, with the 80x80 and 40x40
 # levels reaching the rest. Attention is O(window^2) per pixel per level, so 35
-# would cost ~5.4x for reach the hierarchy already provides. If cell 2 loses,
-# window is the first knob to question -- not the last.
+# would cost ~5.4x for reach the hierarchy already provides. If the group arm
+# loses, window is the first knob to question -- not the last.
 #
 # sim_fun="distance", NOT "pidistance". The phase-invariant similarities need
 # |<q,k>|, which FlexAttention cannot form on complex features: its score is
@@ -81,17 +88,17 @@
 #   * These numbers are NOT comparable to the brain runs (exp1) or to any
 #     earlier knee run, which were scored over the whole image. Different
 #     region, different quantity. Do not put them in one table.
-#   * The hypothesis is unaffected. It is a claim about cell 2 vs cell 1 WITHIN
-#     this submit, and all three cells are masked identically.
+#   * The hypothesis is unaffected. It is a claim about mggrouplpds vs mglpds
+#     WITHIN this experiment, and every cell is masked identically.
 #   * Masking is likely to FLATTER the nonlocal arm less than the local one, if
 #     anything: self-similarity has more to exploit in a large uniform
-#     background than in the organ. Worth remembering if cell 2's margin here
-#     is smaller than an earlier unmasked probe suggested -- that is expected,
-#     not a regression.
+#     background than in the organ. Worth remembering if the group arm's margin
+#     here is smaller than an earlier unmasked probe suggested -- that is
+#     expected, not a regression.
 #   * SSIM additionally erodes the mask by the 5-pixel window radius, so it
 #     scores the organ interior. See training/metrics.py.
 #
-# COUPLED TO torch/mg_recon_knee.sbatch and torch/baseline_varnet.sbatch.
+# COUPLED TO torch/mg_recon_knee.sbatch and torch/exp2_knee_mggroup.sbatch.
 # Regeneration rewrites EVERY config for the anatomy, not just this submit's
 # cells, so every launcher that touches knee must set this the same way or
 # whichever regenerates last silently wins. All of them are ORGAN_MASK=1, as
@@ -108,16 +115,18 @@
 #
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
-#       --accels 8 --only lpdsnet mglpds
+#       --accels 8 --only lpdsnet mglpds varnet
 
 ANATOMY=knee
-ONLY="lpdsnet mglpds"                # mggrouplpds -> exp2_knee_mggroup.sbatch
+ONLY="lpdsnet mglpds varnet"         # mggrouplpds -> exp2_knee_mggroup.sbatch
 ACCELS="8"
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it
-ORGAN_MASK=1                         # see ORGAN MASK below
+ORGAN_MASK=1                         # see ORGAN MASK above
 CONFIG_ROOT="config"
-SWEEP_EPOCHS=""                      # empty = the config's num_epochs
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs. Settable
+                                     # on the sbatch line; a short run lands in
+                                     # its own run dir, <model>_R8_<N>ep
 REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch runs a COPY of this file from the node's spool dir, so a

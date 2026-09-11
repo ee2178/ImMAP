@@ -46,13 +46,14 @@
 # Probe first: SWEEP_EPOCHS=20 below, then look at the val curves.
 
 ANATOMY=knee
-# MUST match exp2_knee_group.sbatch and baseline_varnet.sbatch cells 0,1.
+# MUST match exp2_knee_group.sbatch and exp2_knee_mggroup.sbatch.
 # REGENERATE rewrites EVERY config for the anatomy, not just the cells this
-# submit runs, so leaving this unset here would silently flip all 12 knee
-# configs to use_organ_mask=false the next time this launcher runs.
+# submit runs, so leaving this unset here would silently flip every knee
+# config to use_organ_mask=false the next time this launcher runs.
 ORGAN_MASK=1
 CONFIG_ROOT="config"
-SWEEP_EPOCHS=""                      # empty = the config's num_epochs
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs; settable
+                                     # on the sbatch line (short runs are tagged)
 REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch does NOT execute this file in place: it copies the script's contents to

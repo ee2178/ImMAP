@@ -15,9 +15,9 @@
             "theta0": 0.0,
             "is_complex": true,
             "preproc": "kspace",
-            "K": 30,
+            "K": 6,
             "L": 3,
-            "M": 17,
+            "M": 70,
             "widen": 1
         }
     },

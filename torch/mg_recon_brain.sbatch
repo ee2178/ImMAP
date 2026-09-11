@@ -42,13 +42,14 @@
 # Probe first: SWEEP_EPOCHS=20 below, then look at the val curves.
 
 ANATOMY=brain
-# MUST match exp1_brain_mglpds.sbatch and baseline_varnet.sbatch cells 2,3.
+# MUST match exp1, exp3 and exp4 (torch/exp*_brain_*.sbatch).
 # REGENERATE rewrites EVERY config for the anatomy, not just the cells this
-# submit runs, so leaving this unset here would silently flip all 12 brain
-# configs to use_organ_mask=false the next time this launcher runs.
+# submit runs, so leaving this unset here would silently flip every brain
+# config to use_organ_mask=false the next time this launcher runs.
 ORGAN_MASK=1
 CONFIG_ROOT="config"
-SWEEP_EPOCHS=""                      # empty = the config's num_epochs
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs; settable
+                                     # on the sbatch line (short runs are tagged)
 REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch does NOT execute this file in place: it copies the script's contents to

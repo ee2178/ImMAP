@@ -13,16 +13,27 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-1
+#SBATCH --array=0-5
 #
 # EXPERIMENT 1 -- does the V-cycle earn its parameters?  fastMRI BRAIN.
 #
-#   0   brain  R8  mglpds
-#   1   brain  R4  mglpds
+#   0   brain  R8  lpdsnet      flat LPDS, K=30
+#   1   brain  R8  mglpds       V-cycle, K=[6,[4,4,6]]
+#   2   brain  R8  varnet       E2E-VarNet baseline
+#   3   brain  R4  lpdsnet
+#   4   brain  R4  mglpds
+#   5   brain  R4  varnet
 #
-# The LPDSNet arm is NOT here: those runs already exist under
-# trained_nets/mg_recon/brain/lpdsnet_R{4,8}. This submits only the missing
-# half, and `scripts/eval_mg_recon.py` pairs them afterwards.
+# Every arm trains here, from scratch: no existing brain run uses the
+# regenerated ESPIRiT maps (torch/espirit_smaps.sbatch, which also rewrites the
+# ground truth), so nothing trained before them is comparable.
+#
+# SHARED CELLS. Brain R8 lpdsnet, mglpds and varnet are also cells of exp4.
+# The body launches each cell once -- in whichever launcher reaches it first --
+# and skips it in the other (LAUNCH-ONCE in torch/_mg_recon_body.sh).
+#
+# VarNet is the "is any of this competitive" check, not part of the hypothesis
+# (its asymmetries are in the `varnet` entry of scripts/make_mg_recon_configs.py).
 #
 # WHAT MAKES THE PAIR A CLEAN ABLATION
 # ------------------------------------
@@ -41,32 +52,32 @@
 # doing LESS work on the finest grid.
 #
 # BEFORE SUBMITTING
-#   * confirm the brain data roots resolve; this grid has only ever run on knee
-#   * one probe cell first:  SWEEP_EPOCHS=20 sbatch --array=0 torch/exp1_brain_mglpds.sbatch
+#   * move the pre-ESPIRiT brain runs aside. If the maps were rewritten under
+#     the same smap_root, an old run's config still matches the generator's and
+#     LAUNCH-ONCE would SKIP it as if it were current:
+#         mv trained_nets/mg_recon/brain trained_nets/mg_recon/brain_pre_espirit
+#   * one probe cell first:  SWEEP_EPOCHS=20 sbatch --array=1 torch/exp1_brain_mglpds.sbatch
+#     (tagged, so it lands in mglpds_R8_20ep; a repeat is skipped -- FORCE_RESTART=1)
 #
 # SUBMIT FROM THE REPO ROOT. `#SBATCH --output=logs/...` resolves against the
 # SUBMIT directory, not this file's location; from torch/ the job dies before
 # the script runs and leaves no log to say why.
 #
 # Check the index map any time:
-#   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain --only mglpds
+#   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
+#       --accels 8 4 --only lpdsnet mglpds varnet
 
 ANATOMY=brain
-# The LPDSNet arm needs rerunning before this experiment can be read. Two
-# things have changed under it since it was trained: sigma (now U[0.01, 0.02])
-# and the brain sensitivity maps (now ESPIRiT, not Walsh -- see
-# torch/espirit_smaps.sbatch, which also rewrites the ground truth).
-#     sbatch --array=0,6 torch/mg_recon_brain.sbatch
-# (cells 0 and 6 of the full brain list are lpdsnet R8 and R4.)
-ONLY="mglpds"
+ONLY="lpdsnet mglpds varnet"
 ACCELS="8 4"                         # PINNED. Was "" (= all), which
                                      # silently grew to include R16 when
                                      # exp3 added it to the global list.
-                                     # R16 mglpds belongs to exp3.
-ORGAN_MASK=1                         # matches mg_recon_brain.sbatch and
-                                     # baseline_varnet cells 2,3
+                                     # R16 belongs to exp3.
+ORGAN_MASK=1                         # matches every other brain launcher
 CONFIG_ROOT="config"
-SWEEP_EPOCHS=""                      # empty = the config's num_epochs
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs. Settable
+                                     # on the sbatch line; a short run lands in
+                                     # its own run dir, <model>_R<r>_<N>ep
 REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch runs a COPY of this file from the node's spool dir, so a

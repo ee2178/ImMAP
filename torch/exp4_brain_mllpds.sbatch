@@ -13,58 +13,88 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-1
+#SBATCH --array=0-4
 #
-# EXPERIMENT 4 -- multilevel LPDS against the V-cycle, fastMRI BRAIN R8.
+# EXPERIMENT 4 -- multilevel LPDS against flat LPDS and the V-cycle, BRAIN R8.
 #
-#   0   brain  R8  mllpds     ML-LPDS, L=3, widen=1, channels 17/17/17
-#   1   brain  R8  mllpdsw2   ML-LPDS, L=3, widen=2, channels  8/16/32
+#   0   brain  R8  lpdsnet    flat LPDS, K=30
+#   1   brain  R8  mglpds     V-cycle, K=[6,[4,4,6]]
+#   2   brain  R8  varnet     E2E-VarNet baseline
+#   3   brain  R8  mllpds     ML-LPDS, K=6, L=3, widen=1, channels 70/70/70
+#   4   brain  R8  mllpdsw2   ML-LPDS, K=6, L=3, widen=2, channels 40/80/160
 #
-# The comparison arms are NOT here: trained_nets/mg_recon/brain/lpdsnet_R8 and
-# mglpds_R8 already exist on this exact setup (data, ESPIRiT maps, mask,
-# sigma ~ U[0.01, 0.02], loss, LR, schedule, organ mask), and every one of
-# those comes from the same generator block as these two cells.
+# Every arm trains here, from scratch: no existing brain run uses the
+# regenerated ESPIRiT maps. Data, mask, sigma ~ U[0.01, 0.02], loss, LR,
+# schedule and organ mask all come from the same generator block.
 #
-# WHAT THE THREE-WAY COMPARISON ISOLATES
-# --------------------------------------
-# All four cells run the same primal-dual iteration (LPDS / Condat-Vu). They
-# differ in how the coarse grids enter:
+# SHARED CELLS. Cells 0-2 are also cells of exp1 (brain R8). The body launches
+# each cell once -- in whichever launcher reaches it first -- and skips it in
+# the other (LAUNCH-ONCE in torch/_mg_recon_body.sh), so submitting both
+# experiments trains each shared arm exactly once.
 #
-#   lpdsnet    one level, no coarse grids                        1.00M params
-#   mglpds     coarse grids as a SOLVER (V-cycle, FAS)           3.62M
-#   mllpds     coarse grids as a PRIOR (one dual per level)      3.50M
-#   mllpdsw2   the same, channels doubling per level             3.81M
+# WHAT THE COMPARISON ISOLATES
+# ----------------------------
+# The four LPDS cells run the same primal-dual iteration (LPDS / Condat-Vu).
+# They differ in how the coarse grids enter:
 #
-# The ML cells are parameter-matched to mglpds, so (mglpds vs mllpds) is
-# solver-vs-prior at equal capacity, and (mllpds vs mllpdsw2) is the widening
-# question at equal capacity. Parity costs them width at level 1 -- 17 and 8
-# atoms against the baselines' 169 -- and FLOPs (~12 and ~8 GFLOP against
-# mglpds's ~28), both of which are part of what a result here means. See the
-# OPT_IN block in scripts/make_mg_recon_configs.py for the arithmetic.
+#                                                          GFLOP   params
+#   lpdsnet    one level, no coarse grids                   20.6    1.00M
+#   mglpds     coarse grids as a SOLVER (V-cycle, FAS)      33.8    3.62M
+#   mllpds     coarse grids as a PRIOR (one dual/level)     33.5   11.6M
+#   mllpdsw2   the same, channels doubling per level        34.3   18.9M
 #
-# OPT-IN CELLS. Neither appears in the default --list-cells output, so the full
-# grid's indices (which mg_recon_brain.sbatch uses) are unchanged. They are
-# listed only when named:
+# The ML cells are FLOP-matched to mglpds (conv + FFT per forward, 160x160,
+# 16 coils) as an offline proxy for inference time, so (mglpds vs mllpds) is
+# solver-vs-prior at equal compute and (mllpds vs mllpdsw2) is the widening
+# question at equal compute. They carry 3-5x mglpds's parameters to get there.
+# VarNet is the "is any of this competitive" check, not part of the question.
+#
+# FLOPs ARE NOT TIME. mglpds also does ~5.4 GB of memory-bound elementwise
+# traffic per forward against ~0.4 GB here, so these cells will probably run
+# faster on a GPU than the FLOP match suggests. Time a few forward passes
+# before calling the comparison compute-matched.
+#
+# K=6: one layer is one gradient step plus one dual step, ~6 convolutions at
+# L=3. Layer 0 is the cold start, so these cells take 5 data-consistency steps
+# against lpdsnet's 29 and mglpds's ~two dozen on the fine grid alone. The
+# arithmetic is in the OPT_IN block of scripts/make_mg_recon_configs.py.
+#
+# OPT-IN CELLS. The ML cells do not appear in the default --list-cells output,
+# so the full grid's indices (which mg_recon_brain.sbatch uses) are unchanged.
+# They are listed only when named:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
-#       --accels 8 --only mllpds mllpdsw2
+#       --accels 8 --only lpdsnet mglpds varnet mllpds mllpdsw2
+#
+# SHORT RUNS AND OTHER ACCELERATIONS
+# ----------------------------------
+# ONLY, ACCELS and SWEEP_EPOCHS below take their value from the sbatch line when
+# one is set. An epoch is 50 steps, so all five arms at R=16 for 50k steps is
+#
+#     ACCELS=16 SWEEP_EPOCHS=1000 sbatch torch/exp4_brain_mllpds.sbatch
+#
+# Same budget and the same 1000-epoch cosine schedule for every arm, so it is a
+# like-for-like look. Each lands in its own tagged run dir and wandb name
+# (<model>_R16_1000ep), so the full-length R16 cells (exp3) are untouched.
 #
 # BEFORE SUBMITTING
-#   * these cells have never run. Probe one first:
-#       SWEEP_EPOCHS=20 sbatch --array=0 torch/exp4_brain_mllpds.sbatch
+#   * move the pre-ESPIRiT brain runs aside -- see exp1's BEFORE SUBMITTING;
+#     LAUNCH-ONCE cannot tell maps rewritten in place from current ones.
+#   * the ML cells have never run. Probe one first:
+#       SWEEP_EPOCHS=20 sbatch --array=3 torch/exp4_brain_mllpds.sbatch
+#     (tagged, so it lands in mllpds_R8_20ep; a repeat is skipped -- FORCE_RESTART=1)
 #   * `python -m tests.test_ml_lpds` on the node is cheap and covers the model.
 #
 # SUBMIT FROM THE REPO ROOT. `#SBATCH --output=logs/...` resolves against the
 # SUBMIT directory; from torch/ the job dies before the script runs.
 
 ANATOMY=brain
-ONLY="mllpds mllpdsw2"
-ACCELS="8"                           # PINNED: only R8 has the comparison arms
-ORGAN_MASK=1                         # matches mg_recon_brain.sbatch, exp1, exp3
-                                     # and baseline_varnet cells 2,3 -- regeneration
-                                     # rewrites every brain config, so a mismatch
-                                     # silently un-masks the whole anatomy
+ONLY="${ONLY:-lpdsnet mglpds varnet mllpds mllpdsw2}"
+ACCELS="${ACCELS:-8}"
+ORGAN_MASK=1                         # matches every other brain launcher --
+                                     # regeneration rewrites every brain config,
+                                     # so a mismatch silently un-masks the anatomy
 CONFIG_ROOT="config"
-SWEEP_EPOCHS=""                      # empty = the config's num_epochs
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs
 REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch runs a COPY of this file from the node's spool dir, so a

@@ -15,15 +15,15 @@
 #SBATCH --error=logs/slurm_%A_%a.err
 #SBATCH --array=0
 #
-# EXPERIMENT 2, CELL 2 -- knee R8 mggrouplpds, on an H200.
+# EXPERIMENT 2, GROUP CELL -- knee R8 mggrouplpds, on an H200.
 #
-# THE OTHER TWO CELLS ARE IN torch/exp2_knee_group.sbatch. This is one
-# experiment split across two files, and both must be submitted -- the claim is
-# a comparison BETWEEN the group cell here and the local cell there, so either
-# half alone says nothing:
+# THE OTHER CELLS ARE IN torch/exp2_knee_group.sbatch (lpdsnet, mglpds and the
+# varnet baseline). This is one experiment split across two files, and both
+# must be submitted -- the claim is a comparison BETWEEN the group cell here and
+# the local cell there, so either half alone says nothing:
 #
-#     sbatch torch/exp2_knee_group.sbatch        # cells 0,1  lpdsnet, mglpds  (L40S)
-#     sbatch torch/exp2_knee_mggroup.sbatch      # cell  2    mggrouplpds      (H200)
+#     sbatch torch/exp2_knee_group.sbatch        # lpdsnet, mglpds, varnet  (L40S)
+#     sbatch torch/exp2_knee_mggroup.sbatch      # mggrouplpds              (H200)
 #
 # WHY A SEPARATE FILE AND NOT AN ARRAY INDEX
 # ------------------------------------------
@@ -83,13 +83,14 @@ ONLY="mggrouplpds"
 ACCELS="8"
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it
-ORGAN_MASK=1                         # MUST match exp2_knee_group.sbatch,
-                                     # mg_recon_knee.sbatch and baseline_varnet
-                                     # cells 0,1 -- regeneration rewrites every
-                                     # knee config, so a mismatch here silently
-                                     # un-masks the whole anatomy
+ORGAN_MASK=1                         # MUST match exp2_knee_group.sbatch and
+                                     # mg_recon_knee.sbatch -- regeneration
+                                     # rewrites every knee config, so a mismatch
+                                     # here silently un-masks the whole anatomy
 CONFIG_ROOT="config"
-SWEEP_EPOCHS=""                      # empty = the config's num_epochs
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs. Settable
+                                     # on the sbatch line; a short run lands in
+                                     # its own run dir, <model>_R8_<N>ep
 REGENERATE=1                         # 1 = regenerate configs before running
 
 # sbatch runs a COPY of this file from the node's spool dir, so a
