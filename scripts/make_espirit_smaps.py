@@ -70,30 +70,54 @@ SMAPS = {
 
 
 # ---------------------------------------------------------------------------
+def _espirit_chunk(kspace, args, device):
+    """(smaps, image) for a block of slices, computed on `device`, returned on CPU."""
+    k = torch.from_numpy(kspace).to(device=device, dtype=torch.complex64)
+
+    sm = espirit(k, acs_size=(args.acs, args.acs),
+                 kernel_size=args.kernel_size,
+                 thresh_rowspace=args.thresh_rowspace,
+                 thresh_eig=args.thresh_eig)
+
+    # The ground truth MUST come from these maps, not the old ones.
+    img = (sm.conj() * ifftc(k)).sum(dim=1, keepdim=True)
+    return sm.cpu(), img.cpu()
+
+
 def maps_for_volume(kspace, args, device):
     """(smaps, image) for one volume, in slice chunks.
 
     ESPIRiT's Hankel SVD and power method are per-slice and independent, so the
     chunking is purely a memory knob and changes no number.
+
+    Memory per slice is dominated by the kernel images -- coils x retained
+    kernels x the full k-space grid, complex -- which is gigabytes per slice on
+    brain's readout-oversampled grid, and the retained-kernel count varies by
+    volume. So a chunk that fits one volume can fail on the next. On CUDA OOM the
+    chunk is halved and the SAME slices retried, down to one slice per call; the
+    reduced value stays in `args.chunk` for the rest of the run, so later volumes
+    do not pay for the same failure again. OOM at one slice is re-raised.
     """
     S, C, H, W = kspace.shape
     smaps = torch.empty((S, C, H, W), dtype=torch.complex64)
     image = torch.empty((S, 1, H, W), dtype=torch.complex64)
 
-    for a in range(0, S, args.chunk):
+    a = 0
+    while a < S:
         b = min(a + args.chunk, S)
-        k = torch.from_numpy(kspace[a:b]).to(device=device, dtype=torch.complex64)
-
-        sm = espirit(k, acs_size=(args.acs, args.acs),
-                     kernel_size=args.kernel_size,
-                     thresh_rowspace=args.thresh_rowspace,
-                     thresh_eig=args.thresh_eig)
-
-        # The ground truth MUST come from these maps, not the old ones.
-        img = (sm.conj() * ifftc(k)).sum(dim=1, keepdim=True)
-
-        smaps[a:b] = sm.cpu()
-        image[a:b] = img.cpu()
+        try:
+            smaps[a:b], image[a:b] = _espirit_chunk(kspace[a:b], args, device)
+            a = b
+            continue
+        except torch.cuda.OutOfMemoryError:
+            if args.chunk == 1:
+                raise
+        # Outside the handler on purpose: until it exits, the traceback keeps
+        # the failed call's tensors alive, and emptying the cache frees nothing.
+        torch.cuda.empty_cache()
+        args.chunk = max(1, args.chunk // 2)
+        print(f"    CUDA OOM on slices {a}:{b} -- retrying with chunk={args.chunk}",
+              flush=True)
 
     return smaps, image
 
@@ -143,7 +167,9 @@ def main():
     p.add_argument("--thresh-eig", type=float, default=0.95)
     p.add_argument("--thresh-rowspace", type=float, default=0.05)
 
-    p.add_argument("--chunk", type=int, default=4, help="slices per ESPIRiT call")
+    p.add_argument("--chunk", type=int, default=4,
+                   help="starting slices per ESPIRiT call; halved on CUDA OOM, "
+                        "down to 1, and kept for the rest of the run")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--redo", action="store_true",
@@ -220,7 +246,7 @@ def main():
 
         print(f"  [{i + 1}/{len(files)}] {fname}  {kspace.shape[0]} sl  "
               f"support {sup:5.1%}  |RSS-1| {rss_err:.1e}  residual {res:.4f}  "
-              f"{time.time() - t:.1f}s")
+              f"{time.time() - t:.1f}s  chunk {args.chunk}")
 
     print(f"\n{done} written, {skipped} already present, "
           f"{time.time() - t0:.0f}s total")

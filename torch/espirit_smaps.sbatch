@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=l40s
+#SBATCH --constraint=a100
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64GB
 #SBATCH --time=08:00:00
@@ -13,20 +13,26 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-8%2
+#SBATCH --array=0-8%1
 #
 # Replace the WALSH sensitivity maps with ESPIRiT.
 #
 #   0      brain  val     (one task -- the val split is small)
 #   1-8    brain  train   (8 shards of the file list)
 #
-# `%2` THROTTLES TO TWO CONCURRENT TASKS = two GPUs, not nine. The sharding is
-# for RESTARTABILITY, not speed: a shard that times out re-runs only its own
-# slice of the file list, and each task skips volumes already written. Holding
-# nine GPUs for a one-off preprocessing pass would queue for longer than it
-# saves. Raise the number after `%` if the queue is empty and you are in a
-# hurry; drop the whole array to `--array=0-1%1` if you would rather it just
-# trickle.
+# `%1` RUNS ONE TASK AT A TIME = one GPU, not nine. The sharding is for
+# RESTARTABILITY, not speed: a shard that times out re-runs only its own slice
+# of the file list, and each task skips volumes already written. Holding nine
+# GPUs for a one-off preprocessing pass would queue for longer than it saves.
+# Raise the number after `%` if the queue is empty and you are in a hurry.
+#
+# A100, AND SLICE BATCHING, BECAUSE OF MEMORY. Per slice, ESPIRiT materialises
+# the kernel images -- coils x retained kernels x the FULL k-space grid,
+# complex -- which on brain's readout-oversampled grid is gigabytes per slice;
+# the L40S ran out of memory at CHUNK=4 every time. CHUNK below is the STARTING
+# number of slices per ESPIRiT call: on CUDA OOM the script halves it and
+# retries the same slices, down to one slice per call, and keeps the smaller
+# value for the rest of the shard. The log line reports the chunk in use.
 #
 # Hyperparameters are the ones chosen in notebooks/espirit_brain.ipynb:
 # acs=(20,20), kernel_size=8, thresh_eig=0.95.
@@ -76,7 +82,8 @@ ACS=20
 KERNEL=8
 THRESH_EIG=0.95
 OVERWRITE=0                          # 1 = write over the Walsh maps in place
-CHUNK=4                              # slices per ESPIRiT call; lower if OOM
+CHUNK=4                              # STARTING slices per ESPIRiT call; halved
+                                     # automatically on CUDA OOM, down to 1
 
 N_TRAIN_SHARDS=8
 

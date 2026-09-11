@@ -99,7 +99,11 @@ def espirit(
 
     # Avoid explicit pad allocation: implicit zero-pad via s=(Nx,Ny)
     Vk = torch.fft.ifft2(Vkernel, s=(Nx, Ny), dim=(-2, -1))
-    Vk = torch.fft.fftshift(Vk, dim=(-2, -1)) * (Nx * Ny)
+    # Scale IN PLACE. `fftshift(Vk) * c` held three full-grid copies at once --
+    # the ifft output, the shift and the product -- and this tensor, coils x
+    # kernels x Nx x Ny, is the memory peak of the whole function.
+    Vk = torch.fft.fftshift(Vk, dim=(-2, -1))
+    Vk.mul_(Nx * Ny)
 
     # Vk: (B, C, K, Nx, Ny) -> (B, P, C, K)
     Vk = Vk.reshape(B, C, Nbasis, -1).permute(0, 3, 1, 2)
