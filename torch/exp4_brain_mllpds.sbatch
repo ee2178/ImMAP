@@ -13,15 +13,17 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-4
+#SBATCH --array=0-6
 #
-# EXPERIMENT 4 -- multilevel LPDS against flat LPDS and the V-cycle, BRAIN R8.
+# EXPERIMENT 4 -- the multilevel nets against flat LPDS and the V-cycle, BRAIN R8.
 #
 #   0   brain  R8  lpdsnet    flat LPDS, K=30
 #   1   brain  R8  mglpds     V-cycle, K=[6,[4,4,6]]
 #   2   brain  R8  varnet     E2E-VarNet baseline
-#   3   brain  R8  mllpds     ML-LPDS, K=6, L=3, widen=1, channels 70/70/70
-#   4   brain  R8  mllpdsw2   ML-LPDS, K=6, L=3, widen=2, channels 40/80/160
+#   3   brain  R8  mllpds     ML-LPDS,        K=6, L=3, widen=1, channels 70/70/70
+#   4   brain  R8  mllpdsw2   ML-LPDS,        K=6, L=3, widen=2, channels 40/80/160
+#   5   brain  R8  mlcdlw2    ML-CDLNet,      K=6, L=3, widen=2, channels 40/80/160
+#   6   brain  R8  mlsplitw2  MLSplitCDLNet,  K=6, L=3, widen=2, channels 40/80/160
 #
 # Every arm trains here, from scratch: no existing brain run uses the
 # regenerated ESPIRiT maps. Data, mask, sigma ~ U[0.01, 0.02], loss, LR,
@@ -34,41 +36,52 @@
 #
 # WHAT THE COMPARISON ISOLATES
 # ----------------------------
-# The four LPDS cells run the same primal-dual iteration (LPDS / Condat-Vu).
-# They differ in how the coarse grids enter:
+# The four LPDS cells run the same primal-dual iteration (LPDS / Condat-Vu) and
+# differ in how the coarse grids enter. The two CDL cells take the same
+# multilevel dictionaries in SYNTHESIS form -- the codes generate the image
+# instead of penalising it:
 #
 #                                                          GFLOP   params
 #   lpdsnet    one level, no coarse grids                   20.6    1.00M
 #   mglpds     coarse grids as a SOLVER (V-cycle, FAS)      33.8    3.62M
 #   mllpds     coarse grids as a PRIOR (one dual/level)     33.5   11.6M
 #   mllpdsw2   the same, channels doubling per level        34.3   18.9M
+#   mlcdlw2    multilevel SYNTHESIS, ML-ISTA                43.4   18.9M
+#   mlsplitw2  multilevel SYNTHESIS, split (linear. ADMM)  111.1   18.9M
 #
-# The ML cells are FLOP-matched to mglpds (conv + FFT per forward, 160x160,
-# 16 coils) as an offline proxy for inference time, so (mglpds vs mllpds) is
-# solver-vs-prior at equal compute and (mllpds vs mllpdsw2) is the widening
-# question at equal compute. They carry 3-5x mglpds's parameters to get there.
+# The ML-LPDS cells are FLOP-matched to mglpds (conv + FFT per forward,
+# 160x160, 16 coils) as an offline proxy for inference time, so
+# (mglpds vs mllpds) is solver-vs-prior at equal compute and
+# (mllpds vs mllpdsw2) is the widening question at equal compute.
+#
+# The CDL cells are ARCHITECTURE-matched to mllpdsw2 instead -- same K, L,
+# channels, filters and threshold init -- so (mllpdsw2 vs mlcdlw2 vs mlsplitw2)
+# is analysis vs synthesis vs split at the same shape. They are NOT at the same
+# compute: ML-CDLNet costs 1.3x and MLSplitCDLNet 3.3x mglpds per forward. A
+# win by either is bought partly with compute. FLOP parity would need roughly
+# M=36 and M=22; see the OPT_IN block in scripts/make_mg_recon_configs.py.
 # VarNet is the "is any of this competitive" check, not part of the question.
 #
 # FLOPs ARE NOT TIME. mglpds also does ~5.4 GB of memory-bound elementwise
-# traffic per forward against ~0.4 GB here, so these cells will probably run
+# traffic per forward against ~0.4 GB for the ML nets, so they will probably run
 # faster on a GPU than the FLOP match suggests. Time a few forward passes
 # before calling the comparison compute-matched.
 #
-# K=6: one layer is one gradient step plus one dual step, ~6 convolutions at
-# L=3. Layer 0 is the cold start, so these cells take 5 data-consistency steps
-# against lpdsnet's 29 and mglpds's ~two dozen on the fine grid alone. The
-# arithmetic is in the OPT_IN block of scripts/make_mg_recon_configs.py.
+# K=6: one ML-LPDS layer is one gradient step plus one dual step, ~6
+# convolutions at L=3; the first layer (sweep) of every ML net is a cold start.
+# So the ML cells take 5 data-consistency steps against lpdsnet's 29 and
+# mglpds's ~two dozen on the fine grid alone.
 #
 # OPT-IN CELLS. The ML cells do not appear in the default --list-cells output,
 # so the full grid's indices (which mg_recon_brain.sbatch uses) are unchanged.
 # They are listed only when named:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
-#       --accels 8 --only lpdsnet mglpds varnet mllpds mllpdsw2
+#       --accels 8 --only lpdsnet mglpds varnet mllpds mllpdsw2 mlcdlw2 mlsplitw2
 #
 # SHORT RUNS AND OTHER ACCELERATIONS
 # ----------------------------------
 # ONLY, ACCELS and SWEEP_EPOCHS below take their value from the sbatch line when
-# one is set. An epoch is 50 steps, so all five arms at R=16 for 50k steps is
+# one is set. An epoch is 50 steps, so all seven arms at R=16 for 50k steps is
 #
 #     ACCELS=16 SWEEP_EPOCHS=1000 sbatch torch/exp4_brain_mllpds.sbatch
 #
@@ -79,16 +92,18 @@
 # BEFORE SUBMITTING
 #   * move the pre-ESPIRiT brain runs aside -- see exp1's BEFORE SUBMITTING;
 #     LAUNCH-ONCE cannot tell maps rewritten in place from current ones.
-#   * the ML cells have never run. Probe one first:
-#       SWEEP_EPOCHS=20 sbatch --array=3 torch/exp4_brain_mllpds.sbatch
-#     (tagged, so it lands in mllpds_R8_20ep; a repeat is skipped -- FORCE_RESTART=1)
-#   * `python -m tests.test_ml_lpds` on the node is cheap and covers the model.
+#   * the ML cells have never run. Probe one first, e.g. the split net, the
+#     heaviest:
+#       SWEEP_EPOCHS=20 sbatch --array=6 torch/exp4_brain_mllpds.sbatch
+#     (tagged, so it lands in mlsplitw2_R8_20ep; a repeat is skipped -- FORCE_RESTART=1)
+#   * `python -m tests.test_ml_lpds` and `python -m tests.test_ml_cdlnet` on the
+#     node are cheap and cover the models.
 #
 # SUBMIT FROM THE REPO ROOT. `#SBATCH --output=logs/...` resolves against the
 # SUBMIT directory; from torch/ the job dies before the script runs.
 
 ANATOMY=brain
-ONLY="${ONLY:-lpdsnet mglpds varnet mllpds mllpdsw2}"
+ONLY="${ONLY:-lpdsnet mglpds varnet mllpds mllpdsw2 mlcdlw2 mlsplitw2}"
 ACCELS="${ACCELS:-8}"
 ORGAN_MASK=1                         # matches every other brain launcher --
                                      # regeneration rewrites every brain config,

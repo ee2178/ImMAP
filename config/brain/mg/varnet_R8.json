@@ -33,7 +33,7 @@
             "end_slice": 8,
             "scale_fac": 2000.0,
             "kspace_root": "../datasets/fastmri/brain/multicoil_train",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined_espirit/train",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/train_espirit",
             "pad_multiple": 1
         },
         "val": {
@@ -48,7 +48,7 @@
             "end_slice": 1,
             "scale_fac": 2000.0,
             "kspace_root": "../datasets/fastmri/brain/multicoil_val",
-            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined_espirit/val",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/val_espirit",
             "pad_multiple": 1
         }
     },

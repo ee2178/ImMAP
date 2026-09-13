@@ -1,44 +1,27 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "MGGroupLPDS_mg_brain_R4_synth"
+        "name": "MLSplitCDLNet_L3w2_brain_R16_synth"
     },
     "model": {
-        "type": "MGGroupLPDS",
+        "type": "MLSplitCDLNet",
         "params": {
-            "M": 169,
             "C": 1,
             "P": 7,
             "s": 2,
-            "widen": 1,
             "degrees": 1,
-            "lam0": 0.001,
-            "tau0": 0.5,
-            "theta0": 0.0,
-            "alpha0": 1.0,
             "is_complex": true,
             "preproc": "kspace",
-            "resize_noise": true,
-            "K": [
-                6,
-                [
-                    4,
-                    4,
-                    6
-                ]
-            ],
-            "window": 15,
-            "Mh": 64,
-            "dK": 5,
-            "nheads": 1,
-            "sim_fun": "distance",
-            "attn_backend": "flex",
-            "flex_block_size": 128
-        },
-        "_comment": "nonlocal prox at every grid level: GroupThreshold in the LPDS prox slot. window=15 with the V-cycle supplying long range; sim_fun='distance' because flex cannot carry a phase-invariant similarity on complex features."
+            "K": 6,
+            "L": 3,
+            "tau0": 0.001,
+            "readout": "level1",
+            "M": 40,
+            "widen": 2
+        }
     },
     "paths": {
-        "save_dir": "trained_nets/mg_recon/brain/mggrouplpds_R4",
+        "save_dir": "trained_nets/mg_recon/brain/mlsplitw2_R16",
         "ckpt": null
     },
     "data": {
@@ -91,7 +74,7 @@
         "backtrack_factor": 0.9
     },
     "mri": {
-        "R": 4,
+        "R": 16,
         "acs_lines": 20,
         "mask_dist": "uniform",
         "mask_offset": 0,
@@ -101,7 +84,7 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 0.0002
+            "lr": 0.0005
         }
     },
     "scheduler": {

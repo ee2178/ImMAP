@@ -13,18 +13,18 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-8%1
+#SBATCH --array=0-8
 #
 # Replace the WALSH sensitivity maps with ESPIRiT.
 #
 #   0      brain  val     (one task -- the val split is small)
 #   1-8    brain  train   (8 shards of the file list)
 #
-# `%1` RUNS ONE TASK AT A TIME = one GPU, not nine. The sharding is for
-# RESTARTABILITY, not speed: a shard that times out re-runs only its own slice
-# of the file list, and each task skips volumes already written. Holding nine
-# GPUs for a one-off preprocessing pass would queue for longer than it saves.
-# Raise the number after `%` if the queue is empty and you are in a hurry.
+# UNTHROTTLED: all nine tasks may run at once, one A100 each, as the queue
+# allows. The sharding also buys RESTARTABILITY: a shard that times out re-runs
+# only its own slice of the file list, and each task skips volumes already
+# written. To hold fewer GPUs, cap concurrency on the command line:
+#     sbatch --array=0-8%2 torch/espirit_smaps.sbatch
 #
 # A100, AND SLICE BATCHING, BECAUSE OF MEMORY. Per slice, ESPIRiT materialises
 # the kernel images -- coils x retained kernels x the FULL k-space grid,

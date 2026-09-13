@@ -154,6 +154,10 @@ def main():
     p.add_argument("--smap-root", default=None,
                    help="the EXISTING maps; read only, to enumerate the files "
                         "that belong to this split")
+    p.add_argument("--file-list", default=None,
+                   help="the split's .h5 names, one per line, for when "
+                        "--smap-root has been deleted (default: "
+                        "<smap-root>.files beside it)")
     p.add_argument("--out", default=None,
                    help="output directory (default: <smap-root>_espirit)")
     p.add_argument("--overwrite", action="store_true",
@@ -184,13 +188,29 @@ def main():
 
     if os.path.abspath(out) == os.path.abspath(sroot) and not args.overwrite:
         raise SystemExit("--out equals the input maps; pass --overwrite to mean it.")
-    for d in (kroot, sroot):
-        if not os.path.isdir(d):
-            raise SystemExit(f"missing: {d}")
+    if not os.path.isdir(kroot):
+        raise SystemExit(f"missing: {kroot}")
 
     # The existing map directory defines the split. Enumerating the raw kspace
     # root instead would silently pull in volumes this split excludes.
-    files = sorted(f for f in os.listdir(sroot) if f.endswith(".h5"))
+    #
+    # The Walsh maps may have been DELETED to free disk for these ones, so the
+    # split can also come from a file list saved beforehand: `--file-list`, or
+    # `<smap-root>.files` beside the old directory (one .h5 name per line).
+    # ESPIRiT never reads the Walsh maps themselves -- it works from k-space --
+    # so the names are all this needs from them.
+    flist = args.file_list or sroot.rstrip("/") + ".files"
+    if os.path.isdir(sroot):
+        files = sorted(f for f in os.listdir(sroot) if f.endswith(".h5"))
+    elif os.path.isfile(flist):
+        with open(flist) as fh:
+            files = sorted(ln.strip() for ln in fh if ln.strip().endswith(".h5"))
+        print(f"  {sroot} is gone; split taken from {flist}")
+    else:
+        raise SystemExit(
+            f"missing: {sroot}, and no file list at {flist}. The split is defined "
+            f"by the old maps' file names; restore the directory or write the "
+            f"list (one .h5 name per line) and pass --file-list.")
     files = files[args.shard::args.num_shards]
     if not files:
         raise SystemExit(f"no .h5 in {sroot} for shard {args.shard}")

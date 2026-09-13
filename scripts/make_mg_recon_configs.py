@@ -285,7 +285,44 @@ MODELS.update({
                      params=dict(ML_LPDS_COMMON, M=40, widen=2)),
 })
 
-OPT_IN = ("mllpds", "mllpdsw2")
+# MULTILEVEL CDL (models/ml_cdlnet.py), the synthesis-form siblings of ML-LPDS:
+#
+#   mlcdlw2    MLCDLNet       unrolled ML-ISTA -- the only state carried between
+#                             sweeps is the deepest code
+#   mlsplitw2  MLSplitCDLNet  unrolled linearised ADMM -- every code kept, one
+#                             dual per link between levels
+#
+# ARCHITECTURE-MATCHED to `mllpdsw2`, not compute-matched: the same K=6, L=3,
+# channels 40/80/160, s=2, P=7, degrees, dtype and preproc, and the S.T.
+# threshold initialised at ML-LPDS's clip threshold, lam0=1e-3. (`tau0` in these
+# classes IS that threshold; in the LPDS family `tau0` is the primal step.)
+# Widened only, for now. readout='level1' is the default, stated so the config
+# records it.
+#
+# Same shape is not the same cost. Measured as for ML-LPDS above:
+#
+#     mlcdlw2    K=6  widen=2  channels 40/80/160    43.4 GFLOP (1.29x)  18.9M params
+#     mlsplitw2  K=6  widen=2  channels 40/80/160   111.1 GFLOP (3.29x)  18.9M params
+#     mllpdsw2   K=6  widen=2  channels 40/80/160    34.3 GFLOP (1.02x)  18.9M params
+#
+# (ratios against mglpds's 33.8 GFLOP.) ML-ISTA runs a decoder sweep AND an
+# encoder sweep per iteration; the split net runs its blocks up and back down,
+# then a dual ascent, and visits level 1 -- and E^H E -- twice. A win by either
+# is bought partly with compute. FLOP parity would need roughly M=36 for
+# ML-CDLNet and M=22 for MLSplitCDLNet (conv cost is quadratic in M).
+ML_CDL_COMMON = dict(
+    {k: ML_LPDS_COMMON[k]
+     for k in ("C", "P", "s", "degrees", "is_complex", "preproc", "K", "L")},
+    tau0=ML_LPDS_COMMON["lam0"], readout="level1")
+
+MODELS.update({
+    "mlcdlw2":   dict(type="MLCDLNet",
+                      params=dict(ML_CDL_COMMON, M=40, widen=2)),
+    "mlsplitw2": dict(type="MLSplitCDLNet",
+                      params=dict(ML_CDL_COMMON, M=40, widen=2)),
+})
+
+OPT_IN = ("mllpds", "mllpdsw2", "mlcdlw2", "mlsplitw2")
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -311,8 +348,12 @@ ANATOMIES = {
         # and use_organ_mask was a no-op there; and mri_awgn assumes unit-RSS
         # maps, which Walsh is not. knee was already ESPIRiT -- that mismatch
         # confounded every knee-vs-brain comparison. Written by
-        # torch/espirit_smaps.sbatch.
-        smap_root="../datasets/fastmri_preprocessed/brain_T2W_coil_combined_espirit/{split}",
+        # torch/espirit_smaps.sbatch -- which writes each split BESIDE the old
+        # one, as `<split>_espirit` (scripts/make_espirit_smaps.py appends the
+        # suffix to the split directory), so that is the path read here. It
+        # used to say `brain_T2W_coil_combined_espirit/{split}`, a directory
+        # nothing ever wrote. The Walsh `train`/`val` beside it are deleted.
+        smap_root="../datasets/fastmri_preprocessed/brain_T2W_coil_combined/{split}_espirit",
         slices=(0, 8),
     ),
 }
