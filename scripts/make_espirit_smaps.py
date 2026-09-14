@@ -264,7 +264,10 @@ def main():
             f.attrs.update(dict(
                 method="espirit", acs=args.acs, kernel_size=args.kernel_size,
                 thresh_eig=args.thresh_eig, thresh_rowspace=args.thresh_rowspace,
-                source_kspace=os.path.join(kroot, fname)))
+                source_kspace=os.path.join(kroot, fname),
+                # Written by the kernel-flip-corrected espirit(); tells
+                # scripts/fix_espirit_flip.py to leave this file alone.
+                orientation_fixed=True))
         os.replace(tmp, dst)
         done += 1
 

@@ -12,11 +12,11 @@
             "degrees": 1,
             "is_complex": true,
             "preproc": "kspace",
-            "K": 6,
+            "K": 18,
             "L": 3,
             "tau0": 0.001,
             "readout": "level1",
-            "M": 40,
+            "M": 48,
             "widen": 2
         }
     },

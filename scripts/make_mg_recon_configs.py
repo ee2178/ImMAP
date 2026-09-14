@@ -251,38 +251,40 @@ MODELS = {
 # outside `model`. Dropped: alpha0 (a V-cycle coarse-correction weight) and
 # resize_noise (acts only on spatial noise maps; sigma here is per-image).
 #
-# MATCHED TO `mglpds` ON FLOPs, the offline proxy for inference time. Measured
-# per forward on a 160x160, 16-coil problem with preproc="kspace": conv FLOPs
-# (torch FlopCounterMode) plus 5 n log2 n per FFT inside E^H E, which
-# FlopCounterMode does not count:
+# SIZED FOR A WALL-CLOCK BUDGET, NOT MATCHED TO `mglpds`. At K=6 and FLOP
+# parity these cells trained at ~20 it/s, far faster than mglpds: FLOPs are not
+# time, and mglpds spends ~6 GB per forward on memory-bound elementwise work
+# (prox, restrict/prolong, coarse Grams) that the ML nets do not do. So they
+# were grown towards a training-speed ceiling of ~2 it/s -- where the 300k-step
+# schedule still fits a 48 h job -- to see whether a much larger multilevel
+# prior can match mglpds's inference time. Measured per forward on a 160x160,
+# 16-coil problem with preproc="kspace" (conv FLOPs + 5 n log2 n per FFT):
 #
-#     mllpds    K=6  widen=1  channels 70/70/70    33.5 GFLOP (0.99x)  11.6M params
-#     mllpdsw2  K=6  widen=2  channels 40/80/160   34.3 GFLOP (1.02x)  18.9M params
-#     mglpds    K=[6,[4,4,6]], M=169               33.8 GFLOP          3.62M params
-#     lpdsnet   K=30, M=169                        20.6 GFLOP          1.00M params
+#     mllpds    K=18  widen=1  channels 96/96/96     197 GFLOP (5.8x)   65.4M params
+#     mllpdsw2  K=18  widen=2  channels 48/96/192    156 GFLOP (4.6x)   81.5M params
+#     mglpds    K=[6,[4,4,6]], M=169                  34 GFLOP          3.62M params
+#     lpdsnet   K=30, M=169                           21 GFLOP          1.00M params
 #
-# K=6: one ML-LPDS layer is one gradient step plus one dual step, about 6
-# convolutions at L=3 (3 down, 3 up). At fixed FLOPs K trades iterations for
-# width (K=10 gives 53/53/53 or 30/60/120; K=30 gives 29/29/29 or 16/32/64).
-# Layer 0 is the cold start, so these cells take 5 E^H E steps where lpdsnet
-# takes 29 and mglpds about two dozen on the fine grid alone.
-#
-# FLOPs ARE NOT TIME. mglpds also writes ~5.4 GB per forward in memory-bound
-# elementwise work (prox, restrict/prolong, coarse Grams) against ~0.4 GB here,
-# so at equal FLOPs these cells will probably run faster on a GPU -- time them
-# before reading a result as compute-matched. A constant 169 channels stays out
-# of reach: dense M_{l-1} x M_l level-to-level filters make cost quadratic in
-# width. tau0=0.5 is inside the Condat-Vu bound at init for both cells.
+# K went up first: at K=6 these cells took only 5 E^H E steps (layer 0 is the
+# cold start) against lpdsnet's 29 and mglpds's ~two dozen on the fine grid,
+# and no width buys back data consistency. K=18 gives 17. Width second, on
+# multiples of 8, since level-to-level filters are dense M_{l-1} x M_l banks
+# and cost grows quadratically in M. The next step, if a probe shows time to
+# spare, is K=24 rather than more width. GFLOPs are the offline proxy only:
+# read the probe's it/s, and mglpds's on the same node, before calling any pair
+# time-matched. tau0=0.5 stays inside the Condat-Vu bound at init for both
+# cells (tau0 (1/2 + ||A||^2) = 0.82 and 0.86, against 1). Training memory
+# grows with K x width -- watch it in the first probe.
 ML_LPDS_COMMON = dict(
     {k: v for k, v in LPDS_COMMON.items()
      if k not in ("M", "widen", "alpha0", "resize_noise")},
-    K=6, L=3)
+    K=18, L=3)
 
 MODELS.update({
     "mllpds":   dict(type="MLLPDSNet",
-                     params=dict(ML_LPDS_COMMON, M=70, widen=1)),
+                     params=dict(ML_LPDS_COMMON, M=96, widen=1)),
     "mllpdsw2": dict(type="MLLPDSNet",
-                     params=dict(ML_LPDS_COMMON, M=40, widen=2)),
+                     params=dict(ML_LPDS_COMMON, M=48, widen=2)),
 })
 
 # MULTILEVEL CDL (models/ml_cdlnet.py), the synthesis-form siblings of ML-LPDS:
@@ -292,34 +294,37 @@ MODELS.update({
 #   mlsplitw2  MLSplitCDLNet  unrolled linearised ADMM -- every code kept, one
 #                             dual per link between levels
 #
-# ARCHITECTURE-MATCHED to `mllpdsw2`, not compute-matched: the same K=6, L=3,
-# channels 40/80/160, s=2, P=7, degrees, dtype and preproc, and the S.T.
+# ARCHITECTURE-MATCHED to `mllpdsw2`, not compute-matched: the same K=18, L=3,
+# channels 48/96/192, s=2, P=7, degrees, dtype and preproc, and the S.T.
 # threshold initialised at ML-LPDS's clip threshold, lam0=1e-3. (`tau0` in these
 # classes IS that threshold; in the LPDS family `tau0` is the primal step.)
 # Widened only, for now. readout='level1' is the default, stated so the config
-# records it.
+# records it. K comes from ML_LPDS_COMMON and M/widen from `mllpdsw2`, so
+# resizing ML-LPDS resizes these too.
 #
 # Same shape is not the same cost. Measured as for ML-LPDS above:
 #
-#     mlcdlw2    K=6  widen=2  channels 40/80/160    43.4 GFLOP (1.29x)  18.9M params
-#     mlsplitw2  K=6  widen=2  channels 40/80/160   111.1 GFLOP (3.29x)  18.9M params
-#     mllpdsw2   K=6  widen=2  channels 40/80/160    34.3 GFLOP (1.02x)  18.9M params
+#     mlcdlw2    K=18  widen=2  channels 48/96/192   221 GFLOP (6.5x)   81.5M params
+#     mlsplitw2  K=18  widen=2  channels 48/96/192   477 GFLOP (14.1x)  81.5M params
+#     mllpdsw2   K=18  widen=2  channels 48/96/192   156 GFLOP (4.6x)   81.5M params
 #
-# (ratios against mglpds's 33.8 GFLOP.) ML-ISTA runs a decoder sweep AND an
+# (ratios against mglpds's 34 GFLOP.) ML-ISTA runs a decoder sweep AND an
 # encoder sweep per iteration; the split net runs its blocks up and back down,
-# then a dual ascent, and visits level 1 -- and E^H E -- twice. A win by either
-# is bought partly with compute. FLOP parity would need roughly M=36 for
-# ML-CDLNet and M=22 for MLSplitCDLNet (conv cost is quadratic in M).
+# then a dual ascent, and visits level 1 -- and E^H E -- twice. MLSplitCDLNet is
+# therefore the cell most likely to miss the ~2 it/s training ceiling: probe it
+# first, and if it does, lower its K rather than its channels, so it stays
+# matched in width.
 ML_CDL_COMMON = dict(
     {k: ML_LPDS_COMMON[k]
      for k in ("C", "P", "s", "degrees", "is_complex", "preproc", "K", "L")},
     tau0=ML_LPDS_COMMON["lam0"], readout="level1")
+_W2_SHAPE = {k: MODELS["mllpdsw2"]["params"][k] for k in ("M", "widen")}
 
 MODELS.update({
     "mlcdlw2":   dict(type="MLCDLNet",
-                      params=dict(ML_CDL_COMMON, M=40, widen=2)),
+                      params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
     "mlsplitw2": dict(type="MLSplitCDLNet",
-                      params=dict(ML_CDL_COMMON, M=40, widen=2)),
+                      params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
 })
 
 OPT_IN = ("mllpds", "mllpdsw2", "mlcdlw2", "mlsplitw2")

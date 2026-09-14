@@ -20,10 +20,10 @@
 #   0   brain  R8  lpdsnet    flat LPDS, K=30
 #   1   brain  R8  mglpds     V-cycle, K=[6,[4,4,6]]
 #   2   brain  R8  varnet     E2E-VarNet baseline
-#   3   brain  R8  mllpds     ML-LPDS,        K=6, L=3, widen=1, channels 70/70/70
-#   4   brain  R8  mllpdsw2   ML-LPDS,        K=6, L=3, widen=2, channels 40/80/160
-#   5   brain  R8  mlcdlw2    ML-CDLNet,      K=6, L=3, widen=2, channels 40/80/160
-#   6   brain  R8  mlsplitw2  MLSplitCDLNet,  K=6, L=3, widen=2, channels 40/80/160
+#   3   brain  R8  mllpds     ML-LPDS,        K=18, L=3, widen=1, channels 96/96/96
+#   4   brain  R8  mllpdsw2   ML-LPDS,        K=18, L=3, widen=2, channels 48/96/192
+#   5   brain  R8  mlcdlw2    ML-CDLNet,      K=18, L=3, widen=2, channels 48/96/192
+#   6   brain  R8  mlsplitw2  MLSplitCDLNet,  K=18, L=3, widen=2, channels 48/96/192
 #
 # Every arm trains here, from scratch: no existing brain run uses the
 # regenerated ESPIRiT maps. Data, mask, sigma ~ U[0.01, 0.02], loss, LR,
@@ -42,35 +42,30 @@
 # instead of penalising it:
 #
 #                                                          GFLOP   params
-#   lpdsnet    one level, no coarse grids                   20.6    1.00M
-#   mglpds     coarse grids as a SOLVER (V-cycle, FAS)      33.8    3.62M
-#   mllpds     coarse grids as a PRIOR (one dual/level)     33.5   11.6M
-#   mllpdsw2   the same, channels doubling per level        34.3   18.9M
-#   mlcdlw2    multilevel SYNTHESIS, ML-ISTA                43.4   18.9M
-#   mlsplitw2  multilevel SYNTHESIS, split (linear. ADMM)  111.1   18.9M
+#   lpdsnet    one level, no coarse grids                     21    1.00M
+#   mglpds     coarse grids as a SOLVER (V-cycle, FAS)        34    3.62M
+#   mllpds     coarse grids as a PRIOR (one dual/level)      197   65.4M
+#   mllpdsw2   the same, channels doubling per level         156   81.5M
+#   mlcdlw2    multilevel SYNTHESIS, ML-ISTA                 221   81.5M
+#   mlsplitw2  multilevel SYNTHESIS, split (linear. ADMM)    477   81.5M
 #
-# The ML-LPDS cells are FLOP-matched to mglpds (conv + FFT per forward,
-# 160x160, 16 coils) as an offline proxy for inference time, so
-# (mglpds vs mllpds) is solver-vs-prior at equal compute and
-# (mllpds vs mllpdsw2) is the widening question at equal compute.
-#
-# The CDL cells are ARCHITECTURE-matched to mllpdsw2 instead -- same K, L,
-# channels, filters and threshold init -- so (mllpdsw2 vs mlcdlw2 vs mlsplitw2)
-# is analysis vs synthesis vs split at the same shape. They are NOT at the same
-# compute: ML-CDLNet costs 1.3x and MLSplitCDLNet 3.3x mglpds per forward. A
-# win by either is bought partly with compute. FLOP parity would need roughly
-# M=36 and M=22; see the OPT_IN block in scripts/make_mg_recon_configs.py.
+# NOT COMPUTE-MATCHED, ON PURPOSE. The ML cells are sized for wall-clock time,
+# not FLOPs: at FLOP parity with mglpds they trained at ~20 it/s, because mglpds
+# spends its time on memory-bound elementwise work (~6 GB per forward) that the
+# ML nets do not do. So they carry 5-14x mglpds's FLOPs and 18-22x its
+# parameters, aimed at a ~2 it/s training ceiling (300k steps inside a 48 h
+# job). The claim to test is that a much larger multilevel prior can still
+# match mglpds's INFERENCE TIME -- which means timing both on the same node,
+# not reading this table. (mllpds vs mllpdsw2) remains the widening question at
+# roughly equal cost; (mllpdsw2 vs mlcdlw2 vs mlsplitw2) is analysis vs
+# synthesis vs split at the same shape, where the split net costs 3x ML-LPDS.
 # VarNet is the "is any of this competitive" check, not part of the question.
 #
-# FLOPs ARE NOT TIME. mglpds also does ~5.4 GB of memory-bound elementwise
-# traffic per forward against ~0.4 GB for the ML nets, so they will probably run
-# faster on a GPU than the FLOP match suggests. Time a few forward passes
-# before calling the comparison compute-matched.
-#
-# K=6: one ML-LPDS layer is one gradient step plus one dual step, ~6
+# K=18: one ML-LPDS layer is one gradient step plus one dual step, ~6
 # convolutions at L=3; the first layer (sweep) of every ML net is a cold start.
-# So the ML cells take 5 data-consistency steps against lpdsnet's 29 and
-# mglpds's ~two dozen on the fine grid alone.
+# So the ML cells take 17 data-consistency steps against lpdsnet's 29 and
+# mglpds's ~two dozen on the fine grid alone. The arithmetic is in the OPT_IN
+# block of scripts/make_mg_recon_configs.py.
 #
 # OPT-IN CELLS. The ML cells do not appear in the default --list-cells output,
 # so the full grid's indices (which mg_recon_brain.sbatch uses) are unchanged.
@@ -90,10 +85,13 @@
 # (<model>_R16_1000ep), so the full-length R16 cells (exp3) are untouched.
 #
 # BEFORE SUBMITTING
+#   * a run dir left by the old K=6 ML cells (mllpds_R8, ...) makes LAUNCH-ONCE
+#     refuse this launch, naming K and M. Move it aside, or resubmit with
+#     FORCE_RESTART=1.
 #   * move the pre-ESPIRiT brain runs aside -- see exp1's BEFORE SUBMITTING;
 #     LAUNCH-ONCE cannot tell maps rewritten in place from current ones.
-#   * the ML cells have never run. Probe one first, e.g. the split net, the
-#     heaviest:
+#   * the ML cells have never run at this size. Probe the split net first -- the
+#     heaviest, and the one most likely to miss ~2 it/s or run out of memory:
 #       SWEEP_EPOCHS=20 sbatch --array=6 torch/exp4_brain_mllpds.sbatch
 #     (tagged, so it lands in mlsplitw2_R8_20ep; a repeat is skipped -- FORCE_RESTART=1)
 #   * `python -m tests.test_ml_lpds` and `python -m tests.test_ml_cdlnet` on the
