@@ -40,6 +40,9 @@
 # identical launch is skipped, a stale one is refused (LAUNCH-ONCE in
 # torch/_mg_recon_body.sh; FORCE_RESTART=1 overrides).
 #
+# SHARED WITH exp4. All three cells here are also exp4's cells 0-2 (brain R16,
+# the multilevel-net experiment), so submitting both trains each exactly once.
+#
 # WHAT IS SHARED WITH exp1 / exp2
 # -------------------------------
 # Everything except R: same data, same mask family, sigma ~ U[0.01, 0.02], same

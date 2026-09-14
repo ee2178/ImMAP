@@ -254,31 +254,31 @@ MODELS = {
 # SIZED FOR A WALL-CLOCK BUDGET, NOT MATCHED TO `mglpds`. At K=6 and FLOP
 # parity these cells trained at ~20 it/s, far faster than mglpds: FLOPs are not
 # time, and mglpds spends ~6 GB per forward on memory-bound elementwise work
-# (prox, restrict/prolong, coarse Grams) that the ML nets do not do. So they
-# were grown towards a training-speed ceiling of ~2 it/s -- where the 300k-step
-# schedule still fits a 48 h job -- to see whether a much larger multilevel
-# prior can match mglpds's inference time. Measured per forward on a 160x160,
-# 16-coil problem with preproc="kspace" (conv FLOPs + 5 n log2 n per FFT):
+# (prox, restrict/prolong, coarse Grams) that the ML nets do not do. At K=18 and
+# the widths below they still trained at ~5 it/s with the GPU near 100%, against
+# ~2 it/s for this grid's fastest other nets. So K went to 30:
 #
-#     mllpds    K=18  widen=1  channels 96/96/96     197 GFLOP (5.8x)   65.4M params
-#     mllpdsw2  K=18  widen=2  channels 48/96/192    156 GFLOP (4.6x)   81.5M params
-#     mglpds    K=[6,[4,4,6]], M=169                  34 GFLOP          3.62M params
-#     lpdsnet   K=30, M=169                           21 GFLOP          1.00M params
+#     mllpds    K=30  widen=1  channels 96/96/96     ~329 GFLOP (9.7x)  109.0M params
+#     mllpdsw2  K=30  widen=2  channels 48/96/192    ~260 GFLOP (7.7x)  135.8M params
+#     mglpds    K=[6,[4,4,6]], M=169                   34 GFLOP          3.62M params
+#     lpdsnet   K=30, M=169                            21 GFLOP          1.00M params
 #
-# K went up first: at K=6 these cells took only 5 E^H E steps (layer 0 is the
-# cold start) against lpdsnet's 29 and mglpds's ~two dozen on the fine grid,
-# and no width buys back data consistency. K=18 gives 17. Width second, on
-# multiples of 8, since level-to-level filters are dense M_{l-1} x M_l banks
-# and cost grows quadratically in M. The next step, if a probe shows time to
-# spare, is K=24 rather than more width. GFLOPs are the offline proxy only:
-# read the probe's it/s, and mglpds's on the same node, before calling any pair
-# time-matched. tau0=0.5 stays inside the Condat-Vu bound at init for both
-# cells (tau0 (1/2 + ||A||^2) = 0.82 and 0.86, against 1). Training memory
-# grows with K x width -- watch it in the first probe.
+# (GFLOPs per forward on a 160x160, 16-coil problem with preproc="kspace", conv +
+# 5 n log2 n per FFT; measured at K=18 and scaled by 30/18 -- every term is per
+# layer. Parameters are exact.)
+#
+# K=30 IS lpdsnet's K: layer 0 is the cold start in both, so both take 29 E^H E
+# steps, and (lpdsnet vs mllpds) no longer differs in iteration count -- only in
+# the prior. Width stays where K=18 put it, on multiples of 8: level-to-level
+# filters are dense M_{l-1} x M_l banks, so width costs quadratically and buys no
+# data consistency. Expect ~3 it/s if time scales with K -- read the probe, and
+# watch training memory, which also grows with K. tau0=0.5 stays inside the
+# Condat-Vu bound at init for both cells (tau0 (1/2 + ||A||^2) = 0.82 and 0.86,
+# against 1; the bound depends on the filters, not K).
 ML_LPDS_COMMON = dict(
     {k: v for k, v in LPDS_COMMON.items()
      if k not in ("M", "widen", "alpha0", "resize_noise")},
-    K=18, L=3)
+    K=30, L=3)
 
 MODELS.update({
     "mllpds":   dict(type="MLLPDSNet",
@@ -294,30 +294,29 @@ MODELS.update({
 #   mlsplitw2  MLSplitCDLNet  unrolled linearised ADMM -- every code kept, one
 #                             dual per link between levels
 #
-# ARCHITECTURE-MATCHED to `mllpdsw2`, not compute-matched: the same K=18, L=3,
-# channels 48/96/192, s=2, P=7, degrees, dtype and preproc, and the S.T.
-# threshold initialised at ML-LPDS's clip threshold, lam0=1e-3. (`tau0` in these
-# classes IS that threshold; in the LPDS family `tau0` is the primal step.)
-# Widened only, for now. readout='level1' is the default, stated so the config
-# records it. K comes from ML_LPDS_COMMON and M/widen from `mllpdsw2`, so
-# resizing ML-LPDS resizes these too.
+# Matched to `mllpdsw2` in WIDTH -- channels 48/96/192, L=3, s=2, P=7, degrees,
+# dtype and preproc -- and the S.T. threshold initialised at ML-LPDS's clip
+# threshold, lam0=1e-3. (`tau0` in these classes IS that threshold; in the LPDS
+# family `tau0` is the primal step.) readout='level1' is stated so the config
+# records it. M/widen come from `mllpdsw2`, so re-widening ML-LPDS re-widens these.
 #
-# Same shape is not the same cost. Measured as for ML-LPDS above:
+# K IS PINNED AT 18, not taken from ML_LPDS_COMMON. Both nets were unstable at
+# K=18 -- MLSplitCDLNet tripped the loss backtrack almost immediately, and
+# MLCDLNet was unstable too -- so they stay at the size that was observed rather
+# than silently growing to K=30 with ML-LPDS. Neither is matched to ML-LPDS in K
+# any more. MLSplitCDLNet is out of exp4 for now; its configs are still written.
 #
-#     mlcdlw2    K=18  widen=2  channels 48/96/192   221 GFLOP (6.5x)   81.5M params
-#     mlsplitw2  K=18  widen=2  channels 48/96/192   477 GFLOP (14.1x)  81.5M params
-#     mllpdsw2   K=18  widen=2  channels 48/96/192   156 GFLOP (4.6x)   81.5M params
+#     mlcdlw2    K=18  widen=2  channels 48/96/192   221 GFLOP   81.5M params
+#     mlsplitw2  K=18  widen=2  channels 48/96/192   477 GFLOP   81.5M params
 #
-# (ratios against mglpds's 34 GFLOP.) ML-ISTA runs a decoder sweep AND an
-# encoder sweep per iteration; the split net runs its blocks up and back down,
-# then a dual ascent, and visits level 1 -- and E^H E -- twice. MLSplitCDLNet is
-# therefore the cell most likely to miss the ~2 it/s training ceiling: probe it
-# first, and if it does, lower its K rather than its channels, so it stays
-# matched in width.
+# A suspect for the instability, not yet tested: `uball_project` bounds each
+# (out, in) 7x7 slice, not each atom, so a level-l atom may grow to norm
+# sqrt(M_{l-1}) (~8-10 at levels 2-3). ML-ISTA's unit step and the split net's mu
+# clamp both assume ||B_l A_l|| <= 1, which that does not keep.
 ML_CDL_COMMON = dict(
     {k: ML_LPDS_COMMON[k]
-     for k in ("C", "P", "s", "degrees", "is_complex", "preproc", "K", "L")},
-    tau0=ML_LPDS_COMMON["lam0"], readout="level1")
+     for k in ("C", "P", "s", "degrees", "is_complex", "preproc", "L")},
+    K=18, tau0=ML_LPDS_COMMON["lam0"], readout="level1")
 _W2_SHAPE = {k: MODELS["mllpdsw2"]["params"][k] for k in ("M", "widen")}
 
 MODELS.update({

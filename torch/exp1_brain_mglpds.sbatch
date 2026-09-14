@@ -28,9 +28,10 @@
 # regenerated ESPIRiT maps (torch/espirit_smaps.sbatch, which also rewrites the
 # ground truth), so nothing trained before them is comparable.
 #
-# SHARED CELLS. Brain R8 lpdsnet, mglpds and varnet are also cells of exp4.
-# The body launches each cell once -- in whichever launcher reaches it first --
-# and skips it in the other (LAUNCH-ONCE in torch/_mg_recon_body.sh).
+# Every cell is launched once, however many launchers list it: a run dir that
+# already holds an identical launch is skipped, a stale one is refused
+# (LAUNCH-ONCE in torch/_mg_recon_body.sh). exp4 runs at R=16 by default; with
+# ACCELS=8 its lpdsnet / mglpds / varnet cells are these.
 #
 # VarNet is the "is any of this competitive" check, not part of the hypothesis
 # (its asymmetries are in the `varnet` entry of scripts/make_mg_recon_configs.py).
