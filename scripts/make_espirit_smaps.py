@@ -256,7 +256,11 @@ def main():
         tmp = dst + ".partial"
         with h5py.File(tmp, "w") as f:
             f.create_dataset("smaps", data=smaps.numpy())
-            f.create_dataset("image", data=image.numpy())
+            # (S, H, W), the layout of the original coil-combined files and the
+            # one every reader indexes -- NOT the (S, 1, H, W) computed above.
+            # See datasets/fastmri/loader.py::_as_image_slice for what the
+            # extra axis did.
+            f.create_dataset("image", data=image[:, 0].numpy())
             f.attrs.update(dict(
                 method="espirit", acs=args.acs, kernel_size=args.kernel_size,
                 thresh_eig=args.thresh_eig, thresh_rowspace=args.thresh_rowspace,

@@ -31,6 +31,27 @@ FASTMRI_PATHS = {
 # Filtering helpers
 # ============================================================
 
+def _as_image_slice(image, path):
+    """One slice of the stored ground truth as `(1, H, W)`.
+
+    Two on-disk layouts exist. The original coil-combined files store `image`
+    as `(S, H, W)`; `scripts/make_espirit_smaps.py` briefly wrote `(S, 1, H, W)`.
+    Read the second as-is and a slice comes out `(1, 1, H, W)`, the batch gains
+    an axis, and simulated k-space `smaps * image` grows a stray singleton
+    BEFORE the coil axis -- so `Sense.adjoint`'s sum over dim 1 reduces nothing
+    and y~ reaches the network as `(B, 1, C, H, W)`. Every check that compares
+    only the last two dims passes, and it surfaces as a 5-D conv input deep in
+    the model. `scripts/fix_espirit_image_shape.py` rewrites old files.
+    """
+    if image.dim() == 4 and image.shape[1] == 1:
+        image = image[:, 0]
+    if image.dim() != 3 or image.shape[0] != 1:
+        raise ValueError(
+            f"expected one slice of `image` as (1, H, W) or (1, 1, H, W), got "
+            f"{tuple(image.shape)} in {path}.")
+    return image
+
+
 def is_pd_scan(fname):
     with h5py.File(fname, "r") as f:
         return f.attrs.get("acquisition", "") == "CORPD_FBK"
@@ -232,7 +253,7 @@ class FastMRIDataset(Dataset):
             with h5py.File(smap_path, "r") as f:
                 image = f["image"][sl]
 
-            image = torch.from_numpy(image)
+            image = _as_image_slice(torch.from_numpy(image), smap_path)
             # Treat complex valued image as two channel
             image_2ch = torch.cat(
                 [image.real, image.imag],
@@ -269,7 +290,7 @@ class FastMRIDataset(Dataset):
                 
             kspace = torch.from_numpy(kspace).squeeze() * self.scale_fac
             smaps = torch.from_numpy(smaps).squeeze()
-            image = torch.from_numpy(image) * self.scale_fac
+            image = _as_image_slice(torch.from_numpy(image), smap_path) * self.scale_fac
             
             #For some reason these come out with a batch dimension, we should squeeze everything
 
