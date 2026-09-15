@@ -123,7 +123,7 @@ class MLLPDSLayer(nn.Module):
 
     def __init__(self, C, M, L, widen=1, P=7, s=1, Mh=None, window=1,
                  lam0=1e-2, tau0=1e-1, theta0=1e-1, degrees=0, is_complex=True,
-                 prox_kws=None, spectral_init=True, init_norm="level",
+                 prox_kws=None, spectral_init=True, init_norm="cascade",
                  proj_mode="slice"):
         super().__init__()
         self.C, self.L = int(C), int(L)
@@ -295,10 +295,17 @@ class MLLPDSLayer(nn.Module):
         Halve `tau0` when switching this on -- the levels are now doing
         something, and the step size has to pay for it.
 
-        NOTE the interaction with `project_`: scaling level l up by 1/g also
-        scales its filter norms by 1/g, so a large correction can push slices
-        past the unit ball and be partly undone by the first projection.
-        `cascade_norm` after a `project()` is the check; see the init notebook.
+        THIS REQUIRES proj_mode="slice", and that is why "slice" is the default.
+        Scaling level l up by 1/g scales its filter norms by 1/g too, and the
+        per-ATOM ball is tight enough to claw that straight back. Measured on
+        the 48/96/192 config, cascade norms before -> after one `project()`:
+
+            proj_mode="slice"   0.999 1.001 1.005  ->  0.998 1.001 1.006
+            proj_mode="atom"    0.999 1.001 1.005  ->  0.998 0.599 0.377
+
+        So the two options are not independent: per-atom undoes the cascade
+        rescale, and the looseness of the per-slice ball is exactly the headroom
+        this needs. Pair them only if you have re-measured.
         """
         for l in range(1, self.L + 1):
             g = self.cascade_norm(l, size=size, num_iter=num_iter)
@@ -354,7 +361,7 @@ class MLLPDSNet(_MLIO):
                  nheads=1, rho0=1.0, gamma0=0.8, init_strategy="spectral_norm",
                  subgrad_mode="rigorous", attn_backend="gather",
                  flex_block_size=128, preproc="kspace", spectral_init=True,
-                 init_norm="level", proj_mode="slice"):
+                 init_norm="cascade", proj_mode="slice"):
         super().__init__()
         self.K, self.L = int(K), int(L)
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)

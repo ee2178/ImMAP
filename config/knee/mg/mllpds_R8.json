@@ -1,7 +1,7 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "MLLPDSNet_L3w1_knee_R8_synth"
+        "name": "MLLPDSNet_L3w1M96K30_knee_R8_synth"
     },
     "model": {
         "type": "MLLPDSNet",
@@ -11,7 +11,7 @@
             "s": 2,
             "degrees": 1,
             "lam0": 0.001,
-            "tau0": 0.5,
+            "tau0": 0.25,
             "theta0": 0.0,
             "is_complex": true,
             "preproc": "kspace",
@@ -70,7 +70,7 @@
         "val_seed": 1234,
         "loss_type": "magnitude-nl1-nl2",
         "clip_grad": 1.0,
-        "use_organ_mask": true,
+        "use_organ_mask": false,
         "backtrack_thresh": null,
         "backtrack_factor": 0.9
     },

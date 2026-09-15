@@ -275,58 +275,78 @@ MODELS = {
 # watch training memory, which also grows with K. tau0=0.5 stays inside the
 # Condat-Vu bound at init for both cells (tau0 (1/2 + ||A||^2) = 0.82 and 0.86,
 # against 1; the bound depends on the filters, not K).
+# tau0 IS HALVED RELATIVE TO `lpdsnet`, and that is not a tuning choice.
+# `MLLPDSNet` now defaults to `init_norm="cascade"`, which rescales each level so
+# `||A_(1,l)||_2 = 1` instead of `||A_l||_2 = 1`. Per-level normalisation leaves
+# the cascade collapsed -- measured at init on the 48/96/192 shape:
+#
+#     init_norm="level"     ||A_(1,l)|| = 0.998, 0.394, 0.164
+#     init_norm="cascade"   ||A_(1,l)|| = 0.999, 1.001, 1.005
+#
+# so level 3's dual was receiving 16% of level 1's gain while `lam0` clipped
+# both against the same threshold, and its push back into the primal carried
+# that factor a second time. Fixing it means paying the depth tax the Condat-Vu
+# bound always implied: `||A||^2` rises from ~1.1 toward L, so the admissible
+# primal step `1/(1/2 + ||A||^2)` falls from ~0.61 to ~0.29. At tau0=0.5 these
+# cells would now start OUTSIDE the bound; 0.25 lands at ~0.76 of it.
+#
+# The cascade rescale requires proj_mode="slice" (the default). Per-atom
+# projection is tight enough to undo it -- 1.001/1.005 -> 0.599/0.377 after one
+# `project()` -- so the two options are not independent. See
+# `MLLPDSLayer.normalize_cascade`.
 ML_LPDS_COMMON = dict(
     {k: v for k, v in LPDS_COMMON.items()
      if k not in ("M", "widen", "alpha0", "resize_noise")},
-    K=30, L=3)
+    K=30, L=3, tau0=2.5e-1)
 
+# WIDTH AND DEPTH. P STAYS AT 7 IN EVERY CELL -- the 7x7 atom is the model, not
+# a hyperparameter to trade away. Capacity is bought with channels and paid for
+# with K, since
+#
+#     params, FLOPs  ~  K * P^2 * sum_l M_{l-1} M_l
+#
+# is linear in K and quadratic in width. Dropping K therefore funds width at
+# constant cost, and these four cells walk that trade one step at a time:
+#
+#                     channels      K     params   vs w2   rel FLOP   DC steps
+#     mllpdsw2       48/96/192     30     135.8M   1.00x     1.00x       29
+#     mllpds64       64/128/256    30     241.2M   1.78x     1.77x       29
+#     mllpds64k20    64/128/256    20     160.8M   1.18x     1.18x       19
+#     mllpds128k20   128/256/512   20     642.8x   4.73x     4.68x       19
+#
+# K IS NOT A FREE PARAMETER. Layer 0 is the cold start, so K=30 takes 29 `E^H E`
+# steps and K=20 takes 19. ML_LPDS_COMMON's K=30 exists precisely so ML-LPDS and
+# `lpdsnet` take the SAME number, leaving the prior as the only difference. At
+# R=16 -- ~6% of k-space -- data consistency is the scarce resource, which is
+# why `mllpds64` holds K at 30 while widening: it is the only cell that changes
+# width WITHOUT also changing how much data consistency the net gets.
+#
+# The chain reads in three adjacent pairs, each changing exactly one thing:
+#
+#     mllpdsw2     vs mllpds64      WIDTH, at K = 30
+#     mllpds64     vs mllpds64k20   K, at 64/128/256
+#     mllpds64k20  vs mllpds128k20  WIDTH, at K = 20
+#
+# 128/256/512 at K=30 would be 964.1M parameters and 7.02x the FLOPs -- 7x a
+# model that currently loses to 1.00M-parameter `lpdsnet`. K=20 is what makes
+# that width affordable at all.
 MODELS.update({
-    "mllpds":   dict(type="MLLPDSNet",
-                     params=dict(ML_LPDS_COMMON, M=96, widen=1)),
-    "mllpdsw2": dict(type="MLLPDSNet",
-                     params=dict(ML_LPDS_COMMON, M=48, widen=2)),
+    "mllpds":       dict(type="MLLPDSNet",
+                         params=dict(ML_LPDS_COMMON, M=96, widen=1)),
+    "mllpdsw2":     dict(type="MLLPDSNet",
+                         params=dict(ML_LPDS_COMMON, M=48, widen=2)),
+    "mllpds64":     dict(type="MLLPDSNet",
+                         params=dict(ML_LPDS_COMMON, M=64, widen=2)),
+    "mllpds64k20":  dict(type="MLLPDSNet",
+                         params=dict(ML_LPDS_COMMON, M=64, widen=2, K=20)),
+    "mllpds128k20": dict(type="MLLPDSNet",
+                         params=dict(ML_LPDS_COMMON, M=128, widen=2, K=20)),
 })
 
-# MULTILEVEL CDL (models/ml_cdlnet.py), the synthesis-form siblings of ML-LPDS:
-#
-#   mlcdlw2    MLCDLNet       unrolled ML-ISTA -- the only state carried between
-#                             sweeps is the deepest code
-#   mlsplitw2  MLSplitCDLNet  unrolled linearised ADMM -- every code kept, one
-#                             dual per link between levels
-#
-# Matched to `mllpdsw2` in WIDTH -- channels 48/96/192, L=3, s=2, P=7, degrees,
-# dtype and preproc -- and the S.T. threshold initialised at ML-LPDS's clip
-# threshold, lam0=1e-3. (`tau0` in these classes IS that threshold; in the LPDS
-# family `tau0` is the primal step.) readout='level1' is stated so the config
-# records it. M/widen come from `mllpdsw2`, so re-widening ML-LPDS re-widens these.
-#
-# K IS PINNED AT 18, not taken from ML_LPDS_COMMON. Both nets were unstable at
-# K=18 -- MLSplitCDLNet tripped the loss backtrack almost immediately, and
-# MLCDLNet was unstable too -- so they stay at the size that was observed rather
-# than silently growing to K=30 with ML-LPDS. Neither is matched to ML-LPDS in K
-# any more. MLSplitCDLNet is out of exp4 for now; its configs are still written.
-#
-#     mlcdlw2    K=18  widen=2  channels 48/96/192   221 GFLOP   81.5M params
-#     mlsplitw2  K=18  widen=2  channels 48/96/192   477 GFLOP   81.5M params
-#
-# A suspect for the instability, not yet tested: `uball_project` bounds each
-# (out, in) 7x7 slice, not each atom, so a level-l atom may grow to norm
-# sqrt(M_{l-1}) (~8-10 at levels 2-3). ML-ISTA's unit step and the split net's mu
-# clamp both assume ||B_l A_l|| <= 1, which that does not keep.
-ML_CDL_COMMON = dict(
-    {k: ML_LPDS_COMMON[k]
-     for k in ("C", "P", "s", "degrees", "is_complex", "preproc", "L")},
-    K=18, tau0=ML_LPDS_COMMON["lam0"], readout="level1")
-_W2_SHAPE = {k: MODELS["mllpdsw2"]["params"][k] for k in ("M", "widen")}
-
-MODELS.update({
-    "mlcdlw2":   dict(type="MLCDLNet",
-                      params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
-    "mlsplitw2": dict(type="MLSplitCDLNet",
-                      params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
-})
-
-OPT_IN = ("mllpds", "mllpdsw2", "mlcdlw2", "mlsplitw2")
+OPT_IN = ("mllpds", "mllpdsw2", "mlcdlw2", "mlsplitw2",
+          # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
+          # not renumber exp1-exp4, whose arrays index the default list.
+          "mllpds64", "mllpds64k20", "mllpds128k20")
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -485,6 +505,24 @@ def _display_name(spec_type, params):
     """The run's name. Falls back to `<class>_<variant>` for an unmapped model
     so a new cell stays distinguishable instead of silently colliding."""
     variant = _variant(params)
+    if spec_type == "MLLPDSNet":
+        # L and widen do not separate this grid's ML-LPDS cells: every one of
+        # them is L3w2 and they differ in M, P and init_norm. Without this a
+        # width/depth sweep collides on one wandb name, which the check
+        # below catches -- but the fix belongs here, not in a lookup table that
+        # would need an entry per size.
+        #
+        # These names DID change when init_norm's default became "cascade".
+        # That is deliberate: the cascade rescale makes it a different network
+        # from the one already trained under the old name, and mixing the two
+        # under one run name is exactly the confusion the rename avoids.
+        # `save_dir` is keyed on the CELL name, so checkpoints are untouched.
+        tag = "%sM%dK%s" % (variant, params.get("M", 0), params.get("K", "?"))
+        if params.get("P") not in (None, 7):
+            tag += "P%d" % params["P"]
+        if params.get("init_norm", "cascade") != "cascade":
+            tag += "-lvl"
+        return "%s_%s" % (spec_type, tag)
     return _DISPLAY_NAME.get((spec_type, variant), f"{spec_type}_{variant}")
 
 
