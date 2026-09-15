@@ -1,0 +1,283 @@
+% ml_split_init.tex -- how MLSplitCDLNet initialises (models/ml_cdlnet.py)
+% Compile: pdflatex ml_split_init.tex   (or paste into Overleaf)
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.15in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=accent,urlcolor=accent]{hyperref}
+
+\definecolor{accent}{HTML}{1A5C7A}
+\definecolor{flag}{HTML}{8A4B1F}
+\definecolor{faint}{HTML}{59626E}
+\definecolor{codebg}{HTML}{F2F4F7}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  commentstyle=\color{faint}\itshape,
+  frame=leftline, framerule=1pt, rulecolor=\color{accent},
+  framesep=8pt, xleftmargin=10pt,
+  columns=fullflexible, keepspaces=true,
+  breaklines=true, showstringspaces=false,
+  morecomment=[l]{//}
+}
+
+\newcommand{\ST}{\mathrm{S.T.}}
+\newcommand{\G}{\mathcal{G}}
+
+\title{\textbf{ML-Split-CDLNet Initialization}}
+\author{\texttt{models/ml\_cdlnet.py}}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\noindent\textit{Two different things are called initialization in this network. One happens once, at
+construction; the other happens on every forward pass -- and only the second is what the encoder-init
+proposal is about.}
+
+\vspace{0.5em}
+\noindent\textcolor{faint}{\small All figures measured at $L=4$, $M=6$, \texttt{widen}$=2$, $P=3$, $s=1$,
+\texttt{sweep='descending'}, \texttt{readout='level1'}.}
+
+\section*{A. Parameter init --- once, at construction}
+
+What \texttt{MLSplitSweep.\_\_init\_\_} does before any data arrives.
+
+\begin{enumerate}\itemsep2pt
+  \item \texttt{LISTALayer.init\_filters()} draws $W \sim \mathcal{CN}(0,1)$ of shape
+        $(M_\ell, M_{\ell-1}, P, P)$ and sets $A_\ell = W$, $B_\ell = \overline{W}$ --- so every level starts
+        as a genuine adjoint pair. Training unties them.
+  \item \texttt{spectral\_normalize()} runs the power method and divides both factors by
+        $\sqrt{|\lambda|}$, giving $\|B_\ell A_\ell\|_2 = 1$. The estimate uses a $128/64/32/32$ grid for
+        levels 1--4, since a convolution's spectral norm does not depend on the grid it is measured on.
+  \item $\mu_\ell = 0.5$, $\rho_\ell = 1.0$, $\tau_\ell = 0.01$ as the constant term, with
+        \texttt{degrees=1} --- so the $\sigma$-slope of every threshold starts at zero and training grows it.
+  \item The read-out $D$ is copied from level 1's synthesis.
+  \item \textbf{One prototype sweep, deep-copied $K$ times.} All $K$ sweeps are identical at construction
+        and untied thereafter --- the same convention \texttt{LISTA} uses.
+  \item \texttt{MLSplitCDLNet.\_\_init\_\_} then calls \texttt{project()}.
+\end{enumerate}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+Level & $A$ shape & $\|B A\|_2$ & $\mu$ & $\rho$ & $\tau(0)$ \\
+\midrule
+1 & \texttt{(6, 1, 3, 3)}   & 0.9883 & 0.500 & 1.000 & 0.0100 \\
+2 & \texttt{(12, 6, 3, 3)}  & 0.9949 & 0.500 & 1.000 & 0.0100 \\
+3 & \texttt{(24, 12, 3, 3)} & 0.9962 & 0.500 & 1.000 & 0.0100 \\
+4 & \texttt{(48, 24, 3, 3)} & 0.9989 & 0.500 & ---   & 0.0100 \\
+\bottomrule
+\end{tabular}
+\caption*{\footnotesize $\|BA\|_2$ falls just short of 1 because the power method is truncated, not because
+the scaling is wrong.}
+\end{table}
+
+\subsection*{Worth knowing}
+
+With \texttt{mu0 = 0.5} and \texttt{coupling0 = 1.0}, $\mu$ lands \emph{exactly} on the majorisation bound
+\[
+  \mu_\ell \;\le\; \frac{1}{\rho_{\ell-1} + \rho_\ell} \;=\; \frac{1}{1+1} \;=\; 0.5
+\]
+for levels $1,\dots,L-1$, and under it at level $L$ (0.5 against a bound of 1.0, since $\rho_L = 0$). So a
+default net starts at the largest admissible step on every coupled level. Valid, but with zero margin --- if
+training oscillates in the first few hundred steps, this is the first knob to look at.
+
+\section*{B. State init --- every forward pass}
+
+\texttt{\_zeros(y\_tilde)} sets $\gamma_\ell = 0$ for $\ell = 1,\dots,L$ on grids $H/s,\ H/2s,\ H/4s,\dots$,
+and $u_\ell = 0$ for $\ell = 1,\dots,L-1$. A supplied \texttt{z0} overwrites $\gamma_L$ only. Then $K$
+descending sweeps run. Here is what sweep 0 does with that, visiting $L \to 1$:
+
+\begin{lstlisting}
+level L        Pi_L  = B_L*0 = 0
+               resid = 0 - g_{L-1}(=0) - u_{L-1}(=0) = 0
+               step  = A_L(0) = 0          // no coupling arm, rho_L = 0
+               g_L   = S.T.(0 - mu*0) = 0  // stays zero
+
+levels L-1..2  identical -- every term is zero   // stay zero
+
+level 1        resid = 0 - y~ = -y~         // the data finally enters
+               step  = A_1(-y~)
+               coupling arm = rho_1(0 - B_2*0 + 0) = 0
+               g_1   = S.T.(mu_1 * A_1 y~) = S.T.(0.5 * A_1 y~)
+
+duals          u_1 = g_1 - B_2*0 = g_1 ;  u_2..u_{L-1} = 0
+\end{lstlisting}
+
+So the behaviour is not mysterious: \textbf{the data is injected only at level 1}, because that is the only
+block whose target is $\tilde y$ rather than a still-zero neighbour. Each later sweep lets it climb exactly
+one more level. With the default soft threshold, $|x| < \tau$ at zero means levels $2,\dots,L$ contribute
+\emph{exactly zero gradient} in sweep 0 --- present in the autograd graph, but inert.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{llrrrr}
+\toprule
+Init & $K$ & lvl 1 & lvl 2 & lvl 3 & lvl 4 \\
+\midrule
+zeros   & 1 & 0.1206 & \textcolor{flag}{0.0000} & \textcolor{flag}{0.0000} & \textcolor{flag}{0.0000} \\
+zeros   & 3 & 0.0546 & 0.0625 & 0.0226 & \textcolor{flag}{0.0000} \\
+zeros   & 6 & 0.0037 & 0.0043 & 0.0110 & 0.0298 \\
+\midrule
+encoder & 1 & 0.1910 & 0.1025 & 0.0460 & 0.0240 \\
+encoder & 3 & 0.0395 & 0.0399 & 0.0409 & 0.0454 \\
+encoder & 6 & 0.0038 & 0.0124 & 0.0261 & 0.0795 \\
+\bottomrule
+\end{tabular}
+\caption*{\footnotesize Per-level $\|\gamma_\ell\|$ after $K$ descending sweeps, $L=4$. At $K=3$ the zeros
+init still leaves level 4 untouched; the encoder init has all four levels live after a single sweep, and
+near-uniform by $K=3$.}
+\end{table}
+
+
+\section*{C. Encoder init + descending sweeps}
+
+One ascending traversal to fill every level, then $K$ descending traversals to refine --- \emph{encode once,
+decode $K$ times}.
+
+\begin{figure}[h]\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  blk/.style={draw, rounded corners=1pt, minimum width=38mm, minimum height=9mm,
+              align=center, inner sep=2pt},
+  init/.style={blk, draw=accent, fill=accent!7, text=accent},
+  swp/.style={blk, draw=black!70},
+  lvl/.style={font=\scriptsize\ttfamily, text=black!55, anchor=east},
+  ar/.style={-{Latex[length=2mm]}, thin},
+  ara/.style={ar, draw=accent},
+  step/.style={font=\scriptsize\ttfamily}
+]
+% ---------- panel 1: init pass ----------
+\node[anchor=west, text=accent, font=\scriptsize\ttfamily]
+  at (0,1.05) {1 $\cdot$ INIT PASS --- ONE ASCENDING TRAVERSAL, FROM $\gamma=0$};
+
+\node[init] (i1) at (2.6, 0.0)  {\texttt{S.T.($\mu_1 A_1 \tilde y$)}\\[-1pt]
+                                 {\tiny\color{black!70}analyse the measurement}};
+\node[init] (i2) at (7.0,-1.15) {\texttt{S.T.($\mu_2\rho_1 A_2 \gamma_1$)}\\[-1pt]
+                                 {\tiny\color{black!70}analyse the level-1 code}};
+\node[init] (i3) at (11.4,-2.3) {\texttt{S.T.($\mu_3\rho_2 A_3 \gamma_2$)}\\[-1pt]
+                                 {\tiny\color{black!70}analyse the level-2 code}};
+\node[init] (i4) at (15.8,-3.45){\texttt{S.T.($\mu_4\rho_3 A_4 \gamma_3$)}\\[-1pt]
+                                 {\tiny\color{black!70}analyse the level-3 code}};
+
+\node[lvl] at (0.4, 0.0)   {lvl 1};
+\node[lvl] at (0.4,-1.15)  {lvl 2};
+\node[lvl] at (0.4,-2.3)   {lvl 3};
+\node[lvl] at (0.4,-3.45)  {lvl 4};
+
+\draw[ara] (i1.east) -| node[step, pos=0.75, left, text=accent] {$\gamma_1$} (i2.north);
+\draw[ara] (i2.east) -| node[step, pos=0.75, left, text=accent] {$\gamma_2$} (i3.north);
+\draw[ara] (i3.east) -| node[step, pos=0.75, left, text=accent] {$\gamma_3$} (i4.north);
+
+\draw[black!20] (-0.3,-4.1) -- (18.0,-4.1);
+
+% ---------- panel 2: descending sweep ----------
+\node[anchor=west, font=\scriptsize\ttfamily]
+  at (0,-4.6) {2 $\cdot$ DESCENDING SWEEP --- REPEATED $K$ TIMES};
+
+\node[swp] (s1) at (2.6, -9.05){encoder arm only\\[-1pt]
+                                {\tiny\color{black!70}how badly $B_4\gamma_4$ fits $\gamma_3$}};
+\node[swp] (s2) at (7.0, -7.9) {encoder + coupling\\[-1pt]
+                                {\tiny\color{black!70}fit to $\gamma_2$ + pull to $B_4\gamma_4$}};
+\node[swp] (s3) at (11.4,-6.75){encoder + coupling\\[-1pt]
+                                {\tiny\color{black!70}fit to $\gamma_1$ + pull to $B_3\gamma_3$}};
+\node[swp] (s4) at (15.8,-5.6) {data + coupling\\[-1pt]
+                                {\tiny\color{black!70}$E^{\mathsf H}\!E$ fit to $\tilde y$ + pull to $B_2\gamma_2$}};
+
+\node[lvl] at (0.4,-5.6)  {lvl 1};
+\node[lvl] at (0.4,-6.75) {lvl 2};
+\node[lvl] at (0.4,-7.9)  {lvl 3};
+\node[lvl] at (0.4,-9.05) {lvl 4};
+
+\draw[ar] (s1.east) -| node[step, pos=0.75, left] {$\gamma_4$} (s2.south);
+\draw[ar] (s2.east) -| node[step, pos=0.75, left] {$\gamma_3$} (s3.south);
+\draw[ar] (s3.east) -| node[step, pos=0.75, left] {$\gamma_2$} (s4.south);
+\draw[ar] (s4.east) -- ++(1.4,0)
+  node[above, pos=0.55, font=\scriptsize\ttfamily] {$\hat x = D\gamma_1$}
+  node[below, pos=0.55, font=\tiny, text=black!60] {after sweep $K$};
+
+% dual strip
+\node[draw, dashed, black!60, rounded corners=1pt, minimum width=155mm,
+      minimum height=8mm, align=left, inner sep=3pt, anchor=west] (du) at (1.05,-10.1)
+  {{\scriptsize\ttfamily\color{black!60}DUAL ASCENT}\hspace{4mm}
+   \texttt{u$_\ell$ $\leftarrow$ u$_\ell$ + ( $\gamma_\ell - B_{\ell+1}\gamma_{\ell+1}$ )}
+   \hfill {\tiny\color{black!70}records how far the model was violated}};
+
+% loop back
+\draw[ar, dashed, black!55] (du.east) -| ++(0.5,-0.75) -| (0.75,-9.05)
+  node[pos=0.93, above, font=\scriptsize\ttfamily] {$\times K$} -- (s1.west);
+\end{tikzpicture}
+\caption*{\footnotesize\textbf{Encode once, decode $K$ times.} The init pass (top) walks \emph{down} the
+hierarchy once, each block analysing the level above it, so every code is populated before any sweep runs.
+Each descending sweep (bottom) then walks \emph{up}, every block combining a fit to the finer level with a
+pull toward the coarser level's synthesis --- the skip. The dual strip runs after the whole primal pass, and
+the read-out takes $\gamma_1$ from the final sweep.}
+\end{figure}
+
+\subsection*{Why the init blocks are so much simpler}
+
+No new formula is needed --- an ascending block starting from zero already \emph{is} the feed-forward
+encoder. The level-$\ell$ block, in full, is
+\[
+  \gamma_\ell \;\gets\; \ST_{\mu_\ell \tau_\ell(\sigma)}\!\Big(
+    \gamma_\ell - \mu_\ell\big[\,
+      \underbrace{A_\ell\big(\rho_{\ell-1}(\G_\ell B_\ell\gamma_\ell - \gamma_{\ell-1} - u_{\ell-1})\big)}_{\text{encoder arm}}
+      \;+\;
+      \underbrace{\rho_\ell\big(\gamma_\ell - B_{\ell+1}\gamma_{\ell+1} + u_\ell\big)}_{\text{coupling arm}}
+    \big]\Big).
+\]
+Set $\gamma = 0$ and $u = 0$ and visit the levels \emph{ascending}, so that $\gamma_{\ell-1}$ is already
+fresh when level $\ell$ runs. Every term containing $\gamma_\ell$ or $\gamma_{\ell+1}$ vanishes, and the
+update collapses to
+\[
+  \gamma_\ell \;=\; \ST_{\mu_\ell\tau_\ell(\sigma)}\!\big(\mu_\ell\,\rho_{\ell-1}\,A_\ell\,\gamma_{\ell-1}\big),
+  \qquad \gamma_0 := \tilde y,
+\]
+which is precisely a strided feed-forward CNN encoder --- and is exactly what the top row of
+the figure shows. So the implementation is: run
+\texttt{visit\_order("ascending", iters)} once, then the $K$ descending sweeps. That inherits the correct
+$\mu$, $\rho$, $\sigma$ and prox --- group prox and its adjacency cache included --- for free, with no
+special-casing, and it makes the network literally \textbf{encode once, decode $K$ times}.
+
+\subsection*{Correction to the numbers above}
+
+\textcolor{flag}{The prototype that produced the \texttt{encoder} rows was ad hoc}: it used
+$\ST(A_\ell \gamma_{\ell-1})$, dropping $\mu_\ell\rho_{\ell-1}$ and passing \texttt{sigma=None}, so the
+threshold's $\sigma$ term was ignored. The magnitudes are therefore off by the $\mu\rho = 0.5$ scale factor.
+The qualitative result --- every level live after one sweep instead of one level per sweep --- is what the
+derivation above predicts and does not depend on that scale.
+
+\section*{D. Two choices it forces}
+
+\paragraph{Does the init pass update the duals?}
+I would say no. $u_\ell$ is the \emph{accumulated} constraint violation and should start empty, and this is
+initialisation of $\gamma$ rather than an iteration --- which is why the dual strip appears only in the
+second panel of the figure. The alternative reading --- ``$K+1$ sweeps, the first
+one ascending'' --- is arguably cleaner, because it makes the whole thing a schedule rather than a special
+case. But it changes what $K$ means in every config and every checkpoint already written.
+
+\paragraph{Whose weights does it use?}
+Reusing \texttt{sweeps[0]} costs no parameters and matches \texttt{MLSweep}'s cold start, but makes those
+dictionaries serve two roles --- init encoder and first decoder --- with potentially conflicting gradients.
+A dedicated init sweep avoids that at the cost of one more level-stack of parameters.
+
+\vspace{0.5em}
+\noindent My recommendation is primal-only plus reuse of \texttt{sweeps[0]}: both are the cheaper and more
+conventional choice, with the parameter-sharing concern flagged in the docstring rather than pre-solved. It
+would go in behind \texttt{init='zeros'|'encoder'}, defaulting to \texttt{'zeros'} until there is a trained
+measurement rather than an init-time one.
+
+\vspace{1em}
+\hrule
+\vspace{0.5em}
+\noindent\textcolor{faint}{\footnotesize The per-level norms are init-time signal propagation, not trained
+accuracy.}
+
+\end{document}

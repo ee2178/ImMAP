@@ -78,6 +78,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from models.base import set_weight
 from models.lista import LISTALayer, gram
 from models.lpds import LPDSStack
 from models.ml_cdlnet import _MLIO, _init_size, level_channels, level_strides
@@ -122,7 +123,8 @@ class MLLPDSLayer(nn.Module):
 
     def __init__(self, C, M, L, widen=1, P=7, s=1, Mh=None, window=1,
                  lam0=1e-2, tau0=1e-1, theta0=1e-1, degrees=0, is_complex=True,
-                 prox_kws=None, spectral_init=True):
+                 prox_kws=None, spectral_init=True, init_norm="level",
+                 proj_mode="slice"):
         super().__init__()
         self.C, self.L = int(C), int(L)
         self.is_complex = bool(is_complex)
@@ -137,12 +139,20 @@ class MLLPDSLayer(nn.Module):
             lev = MLLPDSLevel(self.Mch[l - 1], self.Mch[l], P=P,
                               stride=self.strides[l], tau0=lam0,
                               degrees=degrees, is_complex=is_complex,
-                              window=window, Mh=Mh_l, prox_kws=prox_kws)
+                              window=window, Mh=Mh_l, prox_kws=prox_kws,
+                              proj_mode=proj_mode)
             lev.init_filters()
             if spectral_init:
                 lev.spectral_normalize(size=_init_size(l))
             levels.append(lev)
         self.levels = nn.ModuleList(levels)
+
+        if init_norm not in ("level", "cascade"):
+            raise ValueError(
+                "init_norm must be 'level' or 'cascade'; got %r" % (init_norm,))
+        self.init_norm = init_norm
+        if spectral_init and init_norm == "cascade":
+            self.normalize_cascade()
 
         # Per-PRIMAL-channel and noise-adaptive, exactly as in `LPDSLayer`.
         # There is one primal, on the image grid, so they are not per level.
@@ -224,6 +234,80 @@ class MLLPDSLayer(nn.Module):
         self.tau.project_(lo=0.0)
         self.theta.project_(lo=0.0, hi=1.0)
 
+    # -- initialisation ------------------------------------------------------
+    def _grid(self, size):
+        """A grid every level divides exactly, at least `size` across."""
+        m = self.strides[1] * 2 ** (self.L - 1)
+        size = max(int(size), 4 * m)
+        return size - size % m
+
+    @torch.no_grad()
+    def cascade_norm(self, l, size=64, num_iter=100):
+        """`||A_(1,l)||_2` -- the gain of the cascade the algorithm applies.
+
+        Exact while `B_j = A_j^H` (i.e. at init), since the power iteration
+        uses the synthesis as the adjoint.  Afterwards it is the spectral
+        radius of the learned pair, which is a diagnostic and nothing more.
+        """
+        w = self.levels[0].analysis.weight
+        x0 = torch.rand(1, self.C, self._grid(size), self._grid(size),
+                        dtype=w.dtype, device=w.device)
+
+        def AtA(v):
+            for j in range(1, l + 1):
+                v = self.levels[j - 1].analysis(v)
+            for j in range(l, 0, -1):
+                v = self.levels[j - 1].synthesis(v)
+            return v
+
+        lam = power_method(AtA, x0, num_iter=num_iter, verbose=False)[0]
+        return float(abs(lam)) ** 0.5
+
+    @torch.no_grad()
+    def normalize_cascade(self, size=64, num_iter=100):
+        """Rescale each level so that `||A_(1,l)||_2 = 1` for every l.
+
+        `spectral_normalize` sets `||A_l|| = 1` measured on GENERIC level-(l-1)
+        input.  The operator this algorithm actually applies is the cascade
+        `A_(1,l) = A_l ... A_1`, and for independently normalised factors that
+        product is far BELOW 1, for two compounding reasons: the top singular
+        directions of independently drawn operators do not align, and `A_l` is
+        normalised against inputs it never receives (it only ever sees
+        `A_(1,l-1) x`, which lives in the range of the previous cascade).
+
+        Measured at init on the `mllpdsw2` shape (48/96/192, P=7, s=2), with
+        every `||A_l|| ~ 0.99`:
+
+            ||A_(1,1)|| = 0.99      ||A_(1,2)|| = 0.48      ...
+
+        so level 2's dual already receives half the gain level 1's does, while
+        `lam0` clips both against the same threshold -- and the level's push
+        back into the primal carries `||A_(1,l)||` a second time.  The deep
+        levels are near-inert before training starts.
+
+        This walks the levels in order and divides level l by the cascade norm
+        measured with levels 1..l-1 already fixed, so one pass makes every
+        cascade unit gain.  Both `A_l` and `B_l` are scaled, which preserves
+        `B_l = A_l^H`.
+
+        The cost is the depth tax: `||A||^2` rises from ~1.1 to ~L, so the
+        admissible Condat-Vu step falls from `1/(1/2 + 1.1)` to `1/(1/2 + L)`.
+        Halve `tau0` when switching this on -- the levels are now doing
+        something, and the step size has to pay for it.
+
+        NOTE the interaction with `project_`: scaling level l up by 1/g also
+        scales its filter norms by 1/g, so a large correction can push slices
+        past the unit ball and be partly undone by the first projection.
+        `cascade_norm` after a `project()` is the check; see the init notebook.
+        """
+        for l in range(1, self.L + 1):
+            g = self.cascade_norm(l, size=size, num_iter=num_iter)
+            if not (g > 0) or g != g:                      # 0, inf or nan
+                continue
+            lev = self.levels[l - 1]
+            set_weight(lev.analysis, lev.analysis.weight / g)
+            set_weight(lev.synthesis, lev.synthesis.weight / g)
+
     # -- step-size diagnostics ----------------------------------------------
     @torch.no_grad()
     def op_norm2(self, size=64, num_iter=100):
@@ -269,7 +353,8 @@ class MLLPDSNet(_MLIO):
                  is_complex=True, window=1, Mh=None, dK=1, sim_fun="distance",
                  nheads=1, rho0=1.0, gamma0=0.8, init_strategy="spectral_norm",
                  subgrad_mode="rigorous", attn_backend="gather",
-                 flex_block_size=128, preproc="kspace", spectral_init=True):
+                 flex_block_size=128, preproc="kspace", spectral_init=True,
+                 init_norm="level", proj_mode="slice"):
         super().__init__()
         self.K, self.L = int(K), int(L)
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)
@@ -285,6 +370,7 @@ class MLLPDSNet(_MLIO):
                 "or 'identity'; got %r" % (preproc,))
         self.preproc = preproc
         self.attn_backend = attn_backend
+        self.init_norm, self.proj_mode = str(init_norm), str(proj_mode)
 
         self.Mch = level_channels(C, M, self.L, widen)
         self.strides = level_strides(s, self.L)
@@ -303,7 +389,8 @@ class MLLPDSNet(_MLIO):
             C, M, self.L, widen=widen, P=P, s=s, Mh=Mh, window=window,
             lam0=lam0, tau0=tau0, theta0=theta0, degrees=degrees,
             is_complex=is_complex, prox_kws=prox_kws,
-            spectral_init=spectral_init))
+            spectral_init=spectral_init, init_norm=init_norm,
+            proj_mode=proj_mode))
 
     # -- forward -------------------------------------------------------------
     def forward(self, y, E=None, sigma=None, state=None):
@@ -323,6 +410,18 @@ class MLLPDSNet(_MLIO):
     def step_bound(self, k=-1, **kws):
         """Condat-Vu's primal step bound for layer k.  See `MLLPDSLayer.step_bound`."""
         return self.layer(k).step_bound(**kws)
+
+    @torch.no_grad()
+    def cascade_norms(self, k=-1, **kws):
+        """`[||A_(1,1)||, ..., ||A_(1,L)||]` for layer k.
+
+        Under `init_norm='cascade'` these are all 1 at init; under `'level'`
+        they decay with depth, which is the collapse `normalize_cascade`
+        exists to fix.  After training they are a diagnostic only (`B` is no
+        longer `A^H`).
+        """
+        lay = self.layer(k)
+        return [lay.cascade_norm(l, **kws) for l in range(1, self.L + 1)]
 
     @torch.no_grad()
     def level_contributions(self, z, k=-1):

@@ -1,0 +1,252 @@
+% ml_lpds.tex -- Multilevel Learned Primal-Dual Splitting (ML-LPDS)
+% Derived against models/lpds.py.  Nothing here is implemented or measured.
+% Compile: pdflatex ml_lpds.tex   (or paste into Overleaf)
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.15in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=accent,urlcolor=accent]{hyperref}
+
+\definecolor{accent}{HTML}{1A5C7A}
+\definecolor{flag}{HTML}{8A4B1F}
+\definecolor{faint}{HTML}{59626E}
+
+\newcommand{\ST}{\mathrm{S.T.}}
+\newcommand{\clip}{\mathrm{clip}}
+\newcommand{\bA}{\mathcal{A}}
+\newcommand{\bZ}{\mathcal{Z}}
+\newcommand{\bG}{\mathcal{G}}
+\newcommand{\adj}{{\mathsf H}}
+\newcommand{\Aell}{A_{(1,\ell)}}
+
+\title{\textbf{ML-LPDS}\\[2pt]
+       \large Multilevel Learned Primal--Dual Splitting}
+\author{\texttt{derived against models/lpds.py}}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.2em}
+
+\noindent\textit{One penalty per resolution level, one dual per penalty. The levels decouple in the dual
+step, which removes the sweep-ordering problem entirely --- and the primal stays a free full-resolution
+image, which removes the deepest-code bottleneck.}
+
+\section{The problem}
+
+Analysis form: the multilevel dictionaries \emph{penalise} the image rather than generate it.
+\begin{equation}\label{eq:primal}
+  \min_{x}\ \underbrace{\tfrac12\big\|Ex-y\big\|_2^2}_{f(x)}
+  \;+\; \sum_{\ell=1}^{L} g_\ell\!\big(\Aell\,x\big),
+  \qquad \Aell := A_\ell A_{\ell-1}\cdots A_1 .
+\end{equation}
+$A_\ell$ is a strided convolution taking level $\ell-1$ to level $\ell$; level 0 is the image ($C$
+channels), level $\ell$ carries $M_\ell$ channels on a grid coarsened by $s_\ell$. Take
+$g_\ell = \lambda_\ell\|\cdot\|_1$ throughout; a group penalty changes only which prox appears in
+Step~\ref{step:prox}. The case $L=1$ is exactly what \texttt{models/lpds.py} already solves.
+
+\section{Derivation of the classical steps}
+
+\paragraph{Step 1 --- stack the operators.}
+Collect the $L$ analyses into one operator into the product space $\bZ := \bigoplus_\ell \bZ_\ell$,
+\[
+  \bA x := \big(A_{(1,1)}x,\ A_{(1,2)}x,\ \dots,\ A_{(1,L)}x\big),
+  \qquad
+  \bG(v_1,\dots,v_L) := \sum_{\ell=1}^{L} g_\ell(v_\ell),
+\]
+so that \eqref{eq:primal} reads $\min_x f(x) + \bG(\bA x)$ --- the canonical primal--dual form.
+
+\paragraph{Step 2 --- conjugate, and take the saddle point.}
+Writing $\bG(v) = \sup_z \langle v,z\rangle - \bG^*(z)$ gives
+$\min_x \max_{z\in\bZ} f(x) + \langle \bA x, z\rangle - \bG^*(z)$. A separable penalty has a separable
+conjugate, so $\bG^*(z) = \sum_\ell g_\ell^*(z_\ell)$ and
+$\langle \bA x, z\rangle = \sum_\ell \langle \Aell x, z_\ell\rangle$:
+\begin{equation}\label{eq:saddle}
+  \min_{x}\ \max_{\{z_\ell\}}\ \tfrac12\|Ex-y\|^2
+  + \sum_{\ell=1}^{L}\Big[\big\langle \Aell x,\, z_\ell\big\rangle - g_\ell^*(z_\ell)\Big].
+\end{equation}
+
+\begin{quote}\color{accent}
+\textbf{This is the crux.} No term couples $z_\ell$ to $z_{\ell'}$. The duals interact only through $x$, so
+they can all be updated from the same $x$ --- simultaneously, in any order or none. Every ordering pathology
+in the Gauss--Seidel formulations comes from couplings that are simply not present here.
+\end{quote}
+
+\paragraph{Step 3 --- Condat--V\~u, not plain Chambolle--Pock.}
+Chambolle--Pock assumes both blocks are proximable. Here $f$ is smooth and we take a \emph{gradient} step on
+it --- which is what \texttt{LPDSLayer} already does (\texttt{residual = Ex - y\_tilde + synthesis(z)} is
+$\nabla f(x) + A^\adj z$, not a prox). That is the Condat--V\~u iteration:
+\begin{align}
+  x^{k+1}      &= x^{k} - \tau\big(\nabla f(x^{k}) + \bA^\adj z^{k}\big),
+                  &\nabla f(x) &= E^\adj E x - E^\adj y, \label{eq:cv-primal}\\
+  \bar x^{k+1} &= x^{k+1} + \theta\,(x^{k+1} - x^{k}), & &\text{(over-relaxation)}\\
+  z^{k+1}      &= \mathrm{prox}_{\sigma \bG^*}\big(z^{k} + \sigma \bA \bar x^{k+1}\big). &&
+\end{align}
+
+\paragraph{Step 4 --- both stacked operators are one cascade each.}
+Evaluating $\bA x$ level by level would cost $O(L^2)$ convolutions. Set $t_0 = \bar x$ and
+$t_\ell = A_\ell t_{\ell-1}$; then $t_\ell = \Aell \bar x$ by construction, so \textbf{one downward cascade
+produces every tap}. The adjoint factors just as well: since
+$\Aell^\adj = A_1^\adj A_2^\adj \cdots A_\ell^\adj$,
+\begin{equation}\label{eq:horner}
+  \bA^\adj z \;=\; \sum_{\ell=1}^{L} \Aell^\adj z_\ell
+  \;=\; A_1^\adj\Big(z_1 + A_2^\adj\big(z_2 + \cdots + A_L^\adj z_L\big)\Big),
+\end{equation}
+a Horner factorisation. Set $r_L = z_L$, $r_\ell = z_\ell + A_{\ell+1}^\adj r_{\ell+1}$ downward from
+$\ell = L-1$, and $\bA^\adj z = A_1^\adj r_1$: \textbf{one upward cascade, with each dual injected at its own
+level}. An iteration therefore costs $L$ analyses down, $L$ adjoints up, and one Gram $E^\adj E$ at the image
+grid --- $2L$ convolutions, no Galerkin coarsening, $E$ applied once.
+
+\paragraph{Step 5 --- the dual prox is a clip, and it does not see $\sigma$.}\label{step:prox}
+Separability makes $\mathrm{prox}_{\sigma\bG^*}$ act block-wise, so it is $L$ independent proxes. For
+$g_\ell = \lambda_\ell\|\cdot\|_1$ the conjugate is the indicator of the $\ell_\infty$ ball of radius
+$\lambda_\ell$, and the prox of an indicator is the projection:
+\[
+  \mathrm{prox}_{\sigma_\ell g_\ell^*}(v)
+  \;=\; \Pi_{\|\cdot\|_\infty\le\lambda_\ell}(v)
+  \;=\; \clip_{\lambda_\ell}(v) \;=\; v - \ST_{\lambda_\ell}(v),
+\]
+independent of $\sigma$, because the conjugate of a $1$-homogeneous function is an indicator. The last
+identity is Moreau's, and it is exactly \texttt{CLIP(z,t) = z - ST(z,t)} in
+\texttt{models/components.py}, which \texttt{build\_prox(dual=True)} already wires up through
+\texttt{FenchelProx}.
+
+\paragraph{Step 6 --- step sizes.}
+Condat--V\~u converges when $\tfrac1\tau - \sigma\|\bA\|^2 \ge \tfrac{L_f}{2}$ with
+$L_f = \|E^\adj E\|_2 = \|E\|^2$. Allowing a step per level and using
+$\|\bA\|^2 \le \sum_\ell\|\Aell\|^2$,
+\begin{equation}\label{eq:step}
+  \tau\Big(\tfrac{\|E\|^2}{2} + \sum_{\ell=1}^{L}\sigma_\ell\,\|\Aell\|^2\Big) \le 1
+  \qquad\Longrightarrow\qquad
+  \tau\Big(\tfrac12 + \sum_{\ell=1}^{L}\sigma_\ell\Big) \le 1
+\end{equation}
+under the repository's conventions $\|E\|\le1$, $\|A_\ell\|\le1$.
+
+\begin{quote}\color{flag}
+\textbf{The one real cost of depth.} With a single shared $\sigma$ this reads $\sigma\tau \lesssim 1/L$:
+stacking penalties buys expressiveness and pays in step size. Per-level $\sigma_\ell$ is the standard remedy
+(Pock--Chambolle diagonal preconditioning) and fits naturally, since each dual already has its own scale ---
+it lets the budget $\sum_\ell\sigma_\ell$ be spent where it earns most rather than split evenly.
+\end{quote}
+
+\section{The classical algorithm}
+
+\begin{algorithm}[H]
+\caption{ML-LPDS, classical form (Condat--V\~u)}
+\begin{algorithmic}[1]
+\Statex \textbf{Input}\quad $y$; operator $E$; analyses $\{A_\ell\}_{\ell=1}^L$; weights $\{\lambda_\ell\}$
+\Statex \textbf{Steps}\quad $\tau>0$, $\{\sigma_\ell>0\}$, $\theta\in[0,1]$ satisfying \eqref{eq:step}
+\Statex \textbf{Output}\quad $x$ --- the reconstruction is the primal variable itself
+\Statex\hrulefill
+\State $\tilde y \gets E^\adj y$;\quad $x \gets \tilde y$;\quad $z_\ell \gets 0$ \Comment{$\ell = 1{:}L$}
+\Repeat
+  \Statex \hspace{\algorithmicindent}\textit{up --- accumulate the adjoint, injecting each dual at its level}
+  \State $r_L \gets z_L$
+  \State $r_\ell \gets z_\ell + A_{\ell+1}^\adj r_{\ell+1}$ \Comment{$\ell = L\!-\!1$ \textbf{down to} $1$}
+  \Statex \hspace{\algorithmicindent}\textit{primal --- one gradient step, then over-relax}
+  \State $x^{+} \gets x - \tau\big(E^\adj E x - \tilde y + A_1^\adj r_1\big)$
+  \State $\bar x \gets x^{+} + \theta\,(x^{+} - x)$
+  \Statex \hspace{\algorithmicindent}\textit{down --- one cascade, tapped at every level}
+  \State $t_0 \gets \bar x$;\quad $t_\ell \gets A_\ell t_{\ell-1}$ \Comment{$\ell = 1{:}L$}
+  \Statex \hspace{\algorithmicindent}\textit{duals --- all $L$ in parallel, no ordering}
+  \State $z_\ell \gets \clip_{\lambda_\ell}\!\big(z_\ell + \sigma_\ell t_\ell\big)$ \Comment{$\ell = 1{:}L$}
+  \State $x \gets x^{+}$
+\Until{converged}
+\end{algorithmic}
+\end{algorithm}
+
+\noindent Lines 3--4 and 7 are the two cascades of Step 4; line 9 is $L$ independent clips. The only place
+the levels meet is line 5, where their accumulated adjoint enters the primal gradient.
+
+\section{Unrolling}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{lll}
+\toprule
+Classical & Learned & Note \\
+\midrule
+$A_\ell$        & $A_\ell^{(k)}$ & strided \texttt{Conv2d}, untied across the $K$ iterations \\
+$A_\ell^\adj$   & $B_\ell^{(k)}$ & \texttt{ConvTranspose2d}, initialised at the adjoint, freed by training \\
+$\lambda_\ell$  & $\lambda_\ell^{(k)}(\sigma)$ & per-channel \texttt{Polynomial} in the noise level \\
+$\tau,\ \theta$ & $\tau^{(k)}(\sigma),\ \theta^{(k)}(\sigma)$ & per-primal-channel, as \texttt{LPDSLayer} has them \\
+$\sigma_\ell$   & absorbed & folded into $\|A_\ell\|$ by spectral normalisation \\
+iterate to conv.& $K$ untied layers & one prototype deep-copied $K$ times, as \texttt{LPDSStack} does \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{quote}\color{flag}
+\textbf{What untying costs.} Once $B_\ell \ne A_\ell^\adj$, the iteration is no longer a primal--dual
+algorithm for \emph{any} saddle-point problem, and \eqref{eq:step} stops being a guarantee. It remains a good
+initialisation and a sane projection target --- the same status it already has in \texttt{LPDSNet}, and the
+same status $\|BA\|_2 = 1$ has in \texttt{CDLNet}.
+\end{quote}
+
+\begin{algorithm}[H]
+\caption{ML-LPDS, unrolled --- $K$ layers over $L$ levels}
+\begin{algorithmic}[1]
+\Statex \textbf{Input}\quad $y$, operator $E$, noise level $\sigma$
+\Statex \textbf{Learned}\quad $A_\ell^{(k)},\ B_\ell^{(k)},\ \lambda_\ell^{(k)}(\cdot)$ for $\ell=1{:}L$;\;
+        $\tau^{(k)}(\cdot),\ \theta^{(k)}(\cdot)$
+\Statex \textbf{Output}\quad $\hat x$ --- no read-out dictionary; the primal \emph{is} the image
+\Statex\hrulefill
+\State $\tilde y \gets E^\adj y$
+\Statex \textit{cold start --- the down cascade already fills every dual}
+\State $x \gets \tilde y$;\quad $t_0 \gets x$;\quad $t_\ell \gets A_\ell^{(0)} t_{\ell-1}$,\quad
+       $z_\ell \gets \clip_{\lambda_\ell^{(0)}(\sigma)}(t_\ell)$ \Comment{$\ell = 1{:}L$}
+\For{$k = 0$ \textbf{to} $K-1$}
+  \Statex \hspace{\algorithmicindent}\textit{up --- adjoint cascade with dual injections}
+  \State $r_L \gets z_L$
+  \State $r_\ell \gets z_\ell + B_{\ell+1}^{(k)} r_{\ell+1}$ \Comment{$\ell = L\!-\!1$ \textbf{down to} $1$}
+  \Statex \hspace{\algorithmicindent}\textit{primal --- gradient step and over-relaxation}
+  \State $x^{+} \gets x - \tau^{(k)}(\sigma)\big(E^\adj E x - \tilde y + B_1^{(k)} r_1\big)$
+  \State $\bar x \gets x^{+} + \theta^{(k)}(\sigma)\,(x^{+} - x)$
+  \Statex \hspace{\algorithmicindent}\textit{down --- analysis cascade, tapped at every level}
+  \State $t_0 \gets \bar x$;\quad $t_\ell \gets A_\ell^{(k)} t_{\ell-1}$ \Comment{$\ell = 1{:}L$}
+  \Statex \hspace{\algorithmicindent}\textit{duals --- parallel over $\ell$}
+  \State $z_\ell \gets \clip_{\lambda_\ell^{(k)}(\sigma)}\!\big(z_\ell + t_\ell\big)$ \Comment{$\ell = 1{:}L$}
+  \State $x \gets x^{+}$
+\EndFor
+\State $\hat x \gets x$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Three consequences worth flagging}
+
+\paragraph{The cold start populates every dual.}
+Line 2 is one analysis cascade from $\tilde y$, so $z_\ell \ne 0$ at every level before the first iteration.
+The warm-up problem that forced the \texttt{init='encoder'} question in the split formulation does not arise
+--- the encoder pass is part of the iteration anyway, so the cold start gets it for free.
+
+\paragraph{There is no read-out dictionary.}
+$\hat x$ is the primal variable, already on the image grid. No $D$, no
+\texttt{readout='level1'|'cascade'} choice, and therefore none of the sweep/read-out pairing constraints ---
+the whole class of failure disappears along with the variable it was about.
+
+\paragraph{Every level's parameters are live in every layer.}
+$A_\ell^{(k)}$ feeds $z_\ell$ at layer $k$, which feeds $r_1$ and hence $x$ at layer $k+1$ --- one hop,
+independent of $\ell$. Contrast the split formulation, where information climbed one level per outer
+iteration and level $\ell$ was dead in every sweep $k > K-1-d(\ell)$.
+
+\begin{quote}\color{accent}
+\textbf{What still needs deciding.} The analysis form makes the multilevel dictionaries a \emph{co-sparse
+prior} rather than a generative parameterisation --- nothing coarse sits on the reconstruction path. That
+dissolves the deepest-code bottleneck, but it also rewrites the argument for channel widening: no longer
+``deeper levels are more complex molecules on the reconstruction path'', but ``deeper levels annihilate more
+complex structures, so more atoms there means a prior that knows about more of them''. Still an argument for
+widening, still immune to the multigrid objection --- but a different one, and it should be settled before
+the code is written.
+\end{quote}
+
+\vspace{1em}
+\hrule
+\vspace{0.5em}
+\noindent\textcolor{faint}{\footnotesize Derived against \texttt{models/lpds.py}
+(\texttt{LPDSLayer}, \texttt{LPDSStack}). The $L=1$ case reduces to that layer exactly.
+Nothing here has been implemented or measured.}
+
+\end{document}

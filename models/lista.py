@@ -33,7 +33,7 @@ from models.base import set_weight
 from models.components import Conv2d, ConvTranspose2d
 from models.prox import Polynomial, build_prox
 from operators.identity import Identity
-from operators.projections import uball_project
+from operators.projections import proj_dims, uball_project
 from solvers.eigen import power_method
 
 
@@ -51,10 +51,18 @@ class LISTALayer(nn.Module):
 
     def __init__(self, C, M, P=7, stride=1, tau0=1e-2, degrees=0,
                  is_complex=True, multigrid=False, eta0=1e-1, eta_degrees=0,
-                 window=1, Mh=None, dual=False, prox_kws=None):
+                 window=1, Mh=None, dual=False, prox_kws=None,
+                 proj_mode="slice"):
         super().__init__()
         self.C, self.M, self.P, self.stride = int(C), int(M), int(P), int(stride)
         self.is_complex = bool(is_complex)
+        # Which unit-ball `project_` enforces; see `operators.projections`.
+        # "slice" is the historical behaviour and the only one that matches
+        # Sljiva.  It is IDENTICAL to "atom" whenever C == 1, which is every
+        # conv in this repo outside the multilevel nets -- so the default is a
+        # no-op change for CDLNet, LPDSNet and the multigrid families.
+        self.proj_mode = str(proj_mode)
+        self.proj_dims = proj_dims(self.proj_mode)
 
         self.analysis = Conv2d(C, M, P, stride=stride, bias=False, complex=is_complex)
         self.synthesis = ConvTranspose2d(M, C, P, stride=stride, bias=False,
@@ -83,8 +91,9 @@ class LISTALayer(nn.Module):
     # -- constraints --------------------------------------------------------
     @torch.no_grad()
     def project_(self):
-        set_weight(self.analysis, uball_project(self.analysis.weight))
-        set_weight(self.synthesis, uball_project(self.synthesis.weight))
+        d = self.proj_dims
+        set_weight(self.analysis, uball_project(self.analysis.weight, dim=d))
+        set_weight(self.synthesis, uball_project(self.synthesis.weight, dim=d))
         if self.eta is not None:
             self.eta.project_(lo=0.0)
 

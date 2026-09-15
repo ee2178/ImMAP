@@ -16,8 +16,8 @@ import sys
 import torch
 
 from models.lista import gram
-from models.ml_cdlnet import (MLCDLNet, MLSplitCDLNet, level_channels,
-                              level_strides)
+from models.ml_cdlnet import (MLCDLNet, MLSplitCDLNet, check_iters,
+                              level_channels, level_strides, visit_order)
 from operators import FFT2D, Identity, Mask, Sense
 
 torch.manual_seed(0)
@@ -34,37 +34,35 @@ def rel(a, b):
     return (a - b).abs().max().item() / (b.abs().max().item() + 1e-12)
 
 
-def dead_params(cls, K, L, warm):
-    """Parameters that legitimately receive no gradient, for `readout='level1'`.
-
-    Two separate causes, both structural rather than bugs:
-
-    1. COLD START.  `z0 = None` means g_L = 0, so the whole first sweep takes
-       `LISTALayer`'s cold-start shortcut and never calls a synthesis.  Same
-       property as `LISTA` / `MGCDLNet`, whose first layer cold-starts
-       identically.  A warm start removes it.  `MLSplitCDLNet` materialises its
-       state at zero instead of using `None`, so it never has this gap.
-
-    2. THE readout='level1' TAIL.  ML-ISTA updates level 1 FIRST in its
-       ascending sweep, so under `D g_1` everything the final sweep does above
-       level 1 is downstream of the output -- the analysis and prox of levels
-       2..L in sweep K-1 are unreachable no matter how the forward is written.
-       `MLSweep`'s `stop=1` avoids paying for them; it cannot make them live.
-       `MLSplitCDLNet` has no such tail: its descending half updates level 1
-       LAST, so every level feeds g_1 within the same sweep.
-
-    Both vanish under `readout='cascade'`, where g_L is the output path.
+def cold_start_dead(cls, L):
+    """`z0=None` means g_L = 0, so `MLCDLNet`'s whole first sweep takes
+    `LISTALayer`'s cold-start shortcut and never calls a synthesis -- those B
+    filters get no gradient.  Same property as `LISTA` / `MGCDLNet`, whose first
+    layer cold-starts identically, and it is what DDP's unused-parameter check
+    trips on.  `MLSplitCDLNet` materialises its state at zero, so it has no gap.
     """
-    dead = set()
-    if cls is not MLSplitCDLNet and not warm:
-        dead |= {f"sweeps.0.levels.{i}.synthesis.conv_{p}.weight"
-                 for i in range(L) for p in ("real", "imag")}
-    if cls is not MLSplitCDLNet and L > 1 and K > 1:
-        dead |= {f"sweeps.{K - 1}.levels.{i}.analysis.conv_{p}.weight"
-                 for i in range(1, L) for p in ("real", "imag")}
-        dead |= {f"sweeps.{K - 1}.levels.{i}.prox.tau.weight"
-                 for i in range(1, L)}
-    return dead
+    if cls is MLSplitCDLNet:
+        return set()
+    return {f"sweeps.0.levels.{i}.synthesis.conv_{p}.weight"
+            for i in range(L) for p in ("real", "imag")}
+
+
+def in_last_sweep_tail(cls, name, K, L):
+    """Is `name` a parameter of levels 2..L of the FINAL sweep?
+
+    `MLCDLNet` ends its analysis sweep at level L while `readout='level1'` reads
+    g_1, so the last sweep's work above level 1 is downstream of the output.
+    `MLSplitCDLNet` pairs its sweep with its read-out (see `_check_reachable`)
+    and so has NO tail at all -- any dead parameter there is a real regression.
+
+    Asserting the dead set is a SUBSET of this, rather than pinning it exactly,
+    keeps the test robust to which sub-parameters happen to be reached while
+    still failing loudly if a live level ever goes dead.
+    """
+    if cls is MLSplitCDLNet:
+        return False
+    return any(name.startswith(f"sweeps.{K - 1}.levels.{i}.")
+               for i in range(1, L))
 
 
 def mri_operator(B=1, coils=4, n=32):
@@ -93,32 +91,37 @@ def test_shapes_and_grads():
 
     for cls in (MLCDLNet, MLSplitCDLNet):
         nm = cls.__name__
+        K = 3
         for L in (1, 2, 3):
-            net = cls(K=2, L=L, M=8, C=1, P=3, s=1, widen=2)
+            net = cls(K=K, L=L, M=8, C=1, P=3, s=1, widen=2)
             x, z = net(y, E=Identity(), sigma=sigma)
             check(f"{nm} L={L} round-trips the grid", x.shape == y.shape,
                   str(tuple(x.shape)))
             x.abs().sum().backward()
-            missing = [n for n, p in net.named_parameters()
-                       if p.requires_grad and p.grad is None]
-            check(f"{nm} L={L} gradients reach exactly the live parameters",
-                  set(missing) == dead_params(cls, K=2, L=L, warm=False),
-                  f"delta={sorted(set(missing) ^ dead_params(cls, 2, L, False))[:3]}")
+            missing = {n for n, p in net.named_parameters()
+                       if p.requires_grad and p.grad is None}
+            unexplained = missing - cold_start_dead(cls, L)
+            unexplained = {m for m in unexplained
+                           if not in_last_sweep_tail(cls, m, K, L)}
+            check(f"{nm} L={L} no parameter dies outside the known causes",
+                  not unexplained, str(sorted(unexplained)[:3]))
 
         # A warm start removes the cold-start gap; the readout='level1' tail
         # stays, because it is structural rather than an artefact of g_L = 0.
-        net = cls(K=2, L=2, M=8, C=1, P=3, s=1, widen=2)
+        net = cls(K=3, L=2, M=8, C=1, P=3, s=1, widen=2)
         z0 = torch.randn(2, net.Mch[2], 16, 16, dtype=torch.complex64)
         x, _ = net(y, E=Identity(), sigma=sigma, z0=z0)
         x.abs().sum().backward()
         missing = {n for n, p in net.named_parameters()
                    if p.requires_grad and p.grad is None}
         check(f"{nm} warm start closes the cold-start gap",
-              missing == dead_params(cls, K=2, L=2, warm=True),
-              f"delta={sorted(missing ^ dead_params(cls, 2, 2, True))[:3]}")
+              all(in_last_sweep_tail(cls, m, 3, 2) for m in missing),
+              str(sorted(missing)[:3]))
 
-        # readout='cascade' puts every level on the output path: no dead tail.
-        net = cls(K=2, L=3, M=6, C=1, P=3, s=1, widen=2, readout="cascade")
+        # readout='cascade' puts every level on the output path: no dead tail --
+        # paired with the sweep that ENDS at level L (see _check_reachable).
+        kw = {} if cls is MLCDLNet else dict(sweep="ascending")
+        net = cls(K=2, L=3, M=6, C=1, P=3, s=1, widen=2, readout="cascade", **kw)
         z0 = torch.randn(2, net.Mch[3], 8, 8, dtype=torch.complex64)
         x, _ = net(y, E=Identity(), sigma=sigma, z0=z0)
         x.abs().sum().backward()
@@ -255,14 +258,21 @@ def test_ml_ista_matches_algorithm():
           f"rel={rel(x, x_ref):.2e}")
 
 
-def test_split_matches_algorithm():
-    """One outer iteration, re-implemented from the ML-ADMM algorithm block."""
+def test_split_matches_algorithm(sweep="ascending", iters=None):
+    """One outer iteration, re-implemented from the algorithm block.
+
+    Recomputes every synthesis from scratch, so this doubles as the regression
+    test for the `Pi` memo in `MLSplitSweep.forward`: if the cache ever hands
+    back a stale tensor, this diverges.
+    """
     n, L, K = 32, 3, 2
     y = torch.randn(1, 1, n, n, dtype=torch.complex64)
     sigma = torch.full((1, 1, 1, 1), 0.05)
     E = Identity()
+    readout = "cascade" if sweep == "ascending" else "level1"
     net = MLSplitCDLNet(K=K, L=L, M=6, C=1, P=3, s=1, widen=2, W=1,
-                        preproc="identity", readout="level1")
+                        preproc="identity", readout=readout, sweep=sweep,
+                        iters=iters)
 
     with torch.no_grad():
         g, u = net._zeros(y)
@@ -284,21 +294,150 @@ def test_split_matches_algorithm():
 
         for k in range(K):
             lev = net.sweeps[k].levels
-            for l in range(1, L + 1):             # encoder half-sweep
-                g[l] = block(lev, l, g, u)
-            for l in range(L - 1, 0, -1):         # decoder half-sweep
-                g[l] = block(lev, l, g, u)
-            for l in range(1, L):                 # dual ascent
+            for l, reps in net.sweeps[k].visits:   # primal Gauss-Seidel pass
+                for _ in range(reps):
+                    g[l] = block(lev, l, g, u)
+            for l in range(1, L):                  # dual ascent
                 u[l] = u[l] + (g[l] - lev[l].synthesis(g[l + 1]))
-        x_ref = net.D(g[1])
+        code = g[1] if readout == "level1" else \
+            net.sweeps[K - 1].synthesize(g[L], stop=1)
+        x_ref = net.D(code)
 
         x, _ = net(y, E=E, sigma=sigma)
 
-    check("ML-ADMM sweep matches the algorithm block", rel(x, x_ref) < 1e-5,
-          f"rel={rel(x, x_ref):.2e}")
+    check(f"split sweep={sweep} iters={iters} matches the algorithm block",
+          rel(x, x_ref) < 1e-5, f"rel={rel(x, x_ref):.2e}")
+
+
+def test_split_all_schedules():
+    """Every visit order and depth, against the same from-scratch reference."""
+    for sweep, iters in (("ascending", None), ("descending", None),
+                         ("symmetric", 2), ("ascending", [3, 2, 1]),
+                         ("symmetric", [4, 2, 3])):
+        test_split_matches_algorithm(sweep=sweep, iters=iters)
+
+
+def test_schedule_helpers():
+    check("iters=None is one step per level", check_iters(None, 3) == [1, 1, 1])
+    check("an int broadcasts", check_iters(2, 3) == [2, 2, 2])
+    check("ascending visits 1..L once",
+          visit_order("ascending", [1, 1, 1]) == [(1, 1), (2, 1), (3, 1)])
+    check("descending visits L..1 once",
+          visit_order("descending", [1, 1, 1]) == [(3, 1), (2, 1), (1, 1)])
+    check("symmetric is a V-cycle traversal, coarsest visited once",
+          visit_order("symmetric", [2, 2, 3]) ==
+          [(1, 1), (2, 1), (3, 3), (2, 1), (1, 1)],
+          str(visit_order("symmetric", [2, 2, 3])))
+    for bad, why in (((None, 3, "symmetric"), "odd iters under symmetric"),
+                     (([1, 1], 3, "ascending"), "wrong length"),
+                     (((0, 1, 1), 3, "ascending"), "zero iters")):
+        try:
+            check_iters(*bad)
+            check(f"check_iters rejects {why}", False)
+        except ValueError:
+            check(f"check_iters rejects {why}", True)
+    try:
+        visit_order("sideways", [1, 1])
+        check("visit_order rejects an unknown sweep", False)
+    except ValueError:
+        check("visit_order rejects an unknown sweep", True)
 
 
 # ---------------------------------------------------------------------------
+def test_ml_ista_iters():
+    """nu_l = 1 is Algorithm 2; nu_l > 1 is a warm-started inner solve."""
+    y = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+    sigma = torch.full((1, 1, 1, 1), 0.05)
+    a = MLCDLNet(K=2, L=3, M=6, C=1, P=3, s=1, widen=2, W=1, preproc="identity")
+    b = MLCDLNet(K=2, L=3, M=6, C=1, P=3, s=1, widen=2, W=1, preproc="identity",
+                 iters=[2, 2, 2])
+    b.load_state_dict(a.state_dict())
+    with torch.no_grad():
+        xa, _ = a(y, E=Identity(), sigma=sigma)
+        xb, _ = b(y, E=Identity(), sigma=sigma)
+    check("MLCDLNet iters>1 changes the map", rel(xa, xb) > 1e-4,
+          f"rel={rel(xa, xb):.2e}")
+    check("MLCDLNet iters>1 adds no parameters",
+          sum(p.numel() for p in a.parameters()) ==
+          sum(p.numel() for p in b.parameters()))
+    with torch.no_grad():
+        _, codes = b.forward_codes(y, E=Identity(), sigma=sigma)
+    check("MLCDLNet iters>1 still fills every level",
+          all(codes[l] is not None for l in range(1, 4)))
+
+
+def test_reachability_guard():
+    """The sweep must end at the level the read-out reads."""
+    try:
+        MLSplitCDLNet(K=2, L=3, M=6, C=1, P=3, s=1, sweep="ascending")
+        check("split refuses ascending + level1", False)
+    except ValueError as e:
+        check("split refuses ascending + level1",
+              "away from the read-out" in str(e), str(e)[:60])
+    try:
+        MLSplitCDLNet(K=2, L=3, M=6, C=1, P=3, s=1, sweep="descending",
+                      readout="cascade")
+        check("split refuses descending + cascade (the mirror case)", False)
+    except ValueError as e:
+        check("split refuses descending + cascade (the mirror case)",
+              "away from the read-out" in str(e), str(e)[:60])
+    for kw in (dict(K=2, L=3),                                  # descending
+               dict(K=2, L=3, sweep="ascending", readout="cascade"),
+               dict(K=2, L=3, sweep="symmetric", iters=2),
+               dict(K=2, L=3, sweep="symmetric", iters=2, readout="cascade"),
+               dict(K=1, L=4, sweep="descending"),
+               dict(K=1, L=1, sweep="ascending")):              # L=1 is exempt
+        MLSplitCDLNet(M=6, C=1, P=3, s=1, **kw)
+        check(f"split accepts {kw}", True)
+    # MLCDLNet is exempt: its decode reaches level 1 in one hop
+    MLCDLNet(K=2, L=4, M=6, C=1, P=3, s=1)
+    check("MLCDLNet is exempt (decode is a one-hop shortcut)", True)
+
+    # and the paired configs really do leave nothing dead
+    y = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+    sigma = torch.full((1, 1, 1, 1), 0.05)
+    for kw in (dict(sweep="descending"), dict(sweep="symmetric", iters=2),
+               dict(sweep="ascending", readout="cascade")):
+        net = MLSplitCDLNet(K=3, L=3, M=6, C=1, P=3, s=1, widen=2, **kw)
+        x, _ = net(y, E=Identity(), sigma=sigma)
+        x.abs().sum().backward()
+        missing = [n for n, p in net.named_parameters()
+                   if p.requires_grad and p.grad is None]
+        check(f"split {kw} leaves no dead parameter", not missing,
+              str(missing[:3]))
+
+
+def test_memo_counts():
+    """Pin the synthesis-application counts the `Pi` memo claims to achieve.
+
+    `test_split_all_schedules` already proves the memo returns the RIGHT values
+    (it compares against a reference that recomputes everything); this proves it
+    actually avoids the work, so the docstring's arithmetic cannot drift.
+    """
+    y = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+    sigma = torch.full((1, 1, 1, 1), 0.05)
+    for L in (2, 3, 4):
+        for sweep, iters, want in (("descending", None, 2 * L - 1),
+                                   ("ascending", None, 2 * L - 1),
+                                   ("symmetric", 2, 3 * L - 1)):
+            readout = "cascade" if sweep == "ascending" else "level1"
+            net = MLSplitCDLNet(K=1, L=L, M=4, C=1, P=3, s=1, sweep=sweep,
+                                iters=iters, readout=readout,
+                                preproc="identity")
+            n = [0]
+            hs = [lev.synthesis.register_forward_hook(
+                      lambda *a: n.__setitem__(0, n[0] + 1))
+                  for lev in net.sweeps[0].levels]
+            with torch.no_grad():
+                net(y, E=Identity(), sigma=sigma)
+            for h in hs:
+                h.remove()
+            # the read-out's own cascade synthesis is outside the sweep
+            obs = n[0] - (L - 1 if readout == "cascade" else 0)
+            check(f"L={L} {sweep}: B applied {want}x per sweep", obs == want,
+                  f"observed {obs}")
+
+
 def test_degeneracies():
     n = 32
     y = torch.randn(1, 1, n, n, dtype=torch.complex64)
@@ -399,8 +538,11 @@ def test_readout_and_diagnostics():
 
     for cls in (MLCDLNet, MLSplitCDLNet):
         nm = cls.__name__
-        a = cls(K=2, L=2, M=8, C=1, P=3, s=1, widen=2, W=1, readout="level1")
-        b = cls(K=2, L=2, M=8, C=1, P=3, s=1, widen=2, W=1, readout="cascade")
+        # symmetric is the only order legal with BOTH read-outs, so it is what
+        # lets this compare them with everything else held fixed.
+        kw = {} if cls is MLCDLNet else dict(sweep="symmetric", iters=2)
+        a = cls(K=2, L=2, M=8, C=1, P=3, s=1, widen=2, W=1, readout="level1", **kw)
+        b = cls(K=2, L=2, M=8, C=1, P=3, s=1, widen=2, W=1, readout="cascade", **kw)
         b.load_state_dict(a.state_dict())
         xa, _ = a(y, E=Identity(), sigma=sigma)
         xb, _ = b(y, E=Identity(), sigma=sigma)
@@ -408,8 +550,8 @@ def test_readout_and_diagnostics():
               f"rel={rel(xa, xb):.2e}")
 
         # at L=1 the model has no intermediate code, so they must coincide
-        a1 = cls(K=2, L=1, M=8, C=1, P=3, s=1, W=1, readout="level1")
-        b1 = cls(K=2, L=1, M=8, C=1, P=3, s=1, W=1, readout="cascade")
+        a1 = cls(K=2, L=1, M=8, C=1, P=3, s=1, W=1, readout="level1", **kw)
+        b1 = cls(K=2, L=1, M=8, C=1, P=3, s=1, W=1, readout="cascade", **kw)
         b1.load_state_dict(a1.state_dict())
         x1a, _ = a1(y, E=Identity(), sigma=sigma)
         x1b, _ = b1(y, E=Identity(), sigma=sigma)
@@ -441,8 +583,11 @@ def test_tie_outer():
 
 if __name__ == "__main__":
     for fn in (test_schedule, test_shapes_and_grads, test_mri,
-               test_preconditions, test_ml_ista_matches_algorithm,
-               test_split_matches_algorithm, test_degeneracies,
+               test_preconditions, test_schedule_helpers,
+               test_ml_ista_matches_algorithm, test_ml_ista_iters,
+               test_split_matches_algorithm, test_split_all_schedules,
+               test_reachability_guard, test_memo_counts,
+               test_degeneracies,
                test_constraints, test_readout_and_diagnostics, test_tie_outer):
         print(f"\n--- {fn.__name__} ---")
         fn()
