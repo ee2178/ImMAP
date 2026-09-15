@@ -116,7 +116,11 @@ class LISTALayer(nn.Module):
         `layer.analysis.weight.data /= s` is a silent no-op on complex convs.
         """
         w = self.analysis.weight
-        x0 = torch.rand(1, self.C, size, size, dtype=w.dtype)
+        # `device=w.device`: this is only ever called at construction today, on
+        # the CPU, but nothing stops it running on a moved net -- and then a
+        # CPU probe into GPU convs fails. Same reason `power_method` puts its
+        # convergence scalar on the iterate's device.
+        x0 = torch.rand(1, self.C, size, size, dtype=w.dtype, device=w.device)
         L = power_method(lambda x: self.synthesis(self.analysis(x)), x0,
                          num_iter=num_iter, verbose=verbose)[0]
         scale = float(np.sqrt(np.abs(L)))

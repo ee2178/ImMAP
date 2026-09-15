@@ -66,7 +66,8 @@ class BaseUnrolledModel(nn.Module):
         DDt = lambda x: self.B[0](self.A[0](x))
         L = power_method(
             DDt,
-            torch.rand(1, self.C, 128, 128, dtype=self.A[0].weight.dtype),
+            torch.rand(1, self.C, 128, 128, dtype=self.A[0].weight.dtype,
+                       device=self.A[0].weight.device),
             num_iter=200,
             verbose=False,
         )[0]
