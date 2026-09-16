@@ -128,23 +128,41 @@ def validate(ops, loader, device, enh_q, panel_idx=0):
     return res, panel
 
 
-def panel_figure(panel, step):
+def panel_figure(panel, step, res):
+    """One val slice, one row per operator. Columns:
+
+      1  image      gray, ONE window taken from T1 (the target) for every row -- E(CT1) should look
+                    like the T1 row; the CT1 (identity) row saturates where it is enhanced
+      2  left over  E(CT1) - T1: the error. White = perfect; red = E too bright (enhancement
+                    not removed); blue = E too dark
+      3  removed    CT1 - E(CT1): what E subtracted from CT1
+
+    Columns 2 and 3 share ONE diverging colormap, sign and fixed window (99th pct of |CT1 - T1| in
+    the brain), and columns 2 + 3 = CT1 - T1 on every row. So the identity row's column 2 is the
+    total to remove, and a perfect operator has a white column 2 and a column 3 that matches it.
+    """
     x, y, m, outs = panel
-    rows = [[y, None, None], [x, y - x, None]]
-    labels = ["T1 (target)", "identity"]
+    rows = [[y, None, None], [x, x - y, x - x]]
+    labels = ["T1 (target)", "identity: E(CT1)=CT1"]
+    xlab = [[None, None, None],
+            [f"rmse {res['identity']['rmse']:.3f}", None, None]]
     for name, e in outs.items():
-        rows.append([e, y - e, x - e])
+        rows.append([e, e - y, x - e])
         labels.append(name)
-    # residual scale fixed from the identity residual, so every rung is read on the same window
-    inb = (y - x)[m > 0.5]
+        r = res[name]
+        xlab.append([f"rmse {r['rmse']:.3f}  gain {r['gain']:.2f}", None,
+                     f"removed {r['enh_removed']:.2f}"])
+    inb = (x - y)[m > 0.5]
     v = float(torch.quantile(inb.abs().float(), 0.99)) if inb.numel() else 1.0
     fig, _ = subplot_images(
-        rows, row_labels=labels,
-        col_titles=["image", "T1 - E(CT1)", "CT1 - E(CT1)  (removed)"],
+        rows, row_labels=labels, xlabels=xlab,
+        col_titles=["image (T1 window)", "left over: E(CT1) - T1", "removed: CT1 - E(CT1)"],
         cmap=["gray", "RdBu_r", "RdBu_r"],
         vmin=[None, -v, -v], vmax=[None, v, v],
-        p=(1, 99), mask=m, apply_mask=True, magnitude=False,
-        suptitle=f"CT1 -> T1 forward operators, step {step}", show=False)
+        window_from=[y], p=(1, 99), mask=m, apply_mask=True, magnitude=False,
+        colorbar="each", panel_size=(3.0, 2.9),
+        suptitle=f"CT1 -> T1 forward operators, val step {step}  "
+                 f"(cols 2+3 = CT1 - T1; red = brighter)", show=False)
     return fig
 
 
@@ -303,7 +321,7 @@ def main(config_path):
             res, panel = validate(ops, val_loader, device, enh_q)
             wandb.log({f"{n}/val_{k}": v for n, r in res.items() for k, v in r.items()}, step=step)
             if panel is not None:
-                fig = panel_figure(panel, step)
+                fig = panel_figure(panel, step, res)
                 wandb.log({"val/panel": wandb.Image(fig)}, step=step)
                 plt.close(fig)
             for name, E in ops.items():

@@ -1,13 +1,15 @@
 {
     "experiment": {
-        "name": "NYUMets_forward_ladder_CT1_to_T1"
+        "name": "NYUMets_forward_ladder_unet_CT1_to_T1"
     },
     "rungs": [
-        {"name": "affine",       "kind": "affine"},
-        {"name": "linear5",      "kind": "linear", "kernel": 5},
-        {"name": "mlp_w32_d3",   "kind": "mlp",    "width": 32, "depth": 3},
-        {"name": "conv3_w16_d3", "kind": "conv",   "width": 16, "depth": 3, "kernel": 3},
-        {"name": "conv3_w32_d5", "kind": "conv",   "width": 32, "depth": 5, "kernel": 3}
+        {"name": "unet_w8_l2_c1",  "kind": "unet", "width": 8,  "levels": 2, "convs": 1},
+        {"name": "unet_w8_l2",     "kind": "unet", "width": 8,  "levels": 2, "convs": 2},
+        {"name": "unet_w8_l3",     "kind": "unet", "width": 8,  "levels": 3, "convs": 2},
+        {"name": "unet_w16_l3",    "kind": "unet", "width": 16, "levels": 3, "convs": 2},
+        {"name": "unet_w16_l4",    "kind": "unet", "width": 16, "levels": 4, "convs": 2},
+        {"name": "unet_w32_l4",    "kind": "unet", "width": 32, "levels": 4, "convs": 2},
+        {"name": "unet_w64_l4",    "kind": "unet", "width": 64, "levels": 4, "convs": 2}
     ],
     "data": {
         "train": {
@@ -39,8 +41,8 @@
         }
     },
     "training": {
-        "steps": 20000,
-        "lr": 1.0e-3,
+        "steps": 40000,
+        "lr": 5.0e-4,
         "eta_min": 1.0e-5,
         "clip_grad": 1.0,
         "log_every": 100,
@@ -60,7 +62,7 @@
         ]
     },
     "paths": {
-        "save_dir": "trained_nets/nyumets/forward_ladder_CT1_to_T1"
+        "save_dir": "trained_nets/nyumets/forward_ladder_unet_CT1_to_T1"
     },
     "wandb": {
         "project": "schrodinger-bridge",

@@ -34,7 +34,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=ee2178@nyu.edu
+#SBATCH --mail-user=EE2178@nyulangone.org
 #SBATCH --chdir=/gpfs/scratch/ee2178/ImMAP
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.err

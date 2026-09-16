@@ -12,8 +12,8 @@
 #   sbatch --dependency=after:<jobid> ...
 # (`after`, not `afterok`: the split happens in the first minutes of a multi-day training job).
 #
-# Results: wandb (project schrodinger-bridge, run NYUMets_forward_ladder_CT1_to_T1: per-rung
-# curves, val panels, a `summary` table) and trained_nets/nyumets/forward_ladder_CT1_to_T1/
+# Results: wandb (project schrodinger-bridge, run NYUMets_forward_ladder_unet_CT1_to_T1: per-rung
+# curves, val panels, a `summary` table) and trained_nets/nyumets/forward_ladder_unet_CT1_to_T1/
 # (E_<rung>.pt, loadable with models.forward_ops.load_forward_op, and ladder_results.json).
 
 #SBATCH --partition=radiology
@@ -25,7 +25,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=ee2178@nyu.edu
+#SBATCH --mail-user=EE2178@nyulangone.org
 #SBATCH --chdir=/gpfs/scratch/ee2178/ImMAP
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%j.err
