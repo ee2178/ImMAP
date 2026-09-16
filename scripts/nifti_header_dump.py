@@ -25,6 +25,7 @@ ANALYZE 7.5 had `exp_date`/`exp_time`, but NIfTI-1 reused those bytes. What rema
 """
 
 import os
+import re
 import glob
 import argparse
 
@@ -32,6 +33,25 @@ import numpy as np
 import nibabel as nib
 
 TEXT_FIELDS = ("descrip", "aux_file", "db_name", "intent_name")
+
+# REDACTION. NYUMets carries an AFNI (code 4) extension whose HISTORY_NOTE preserves the
+# PRE-de-identification file paths -- source-side numeric identifiers, a username and a
+# hostname -- because the extension was written before the de-id step and passed through it
+# untouched. Printing it verbatim would copy those identifiers into terminals and SLURM logs,
+# so extension text is redacted before display. Timestamps are kept: they are processing
+# times, and they are what this script exists to evaluate.
+_REDACT = (
+    (re.compile(r"(?:/[\w.\-]+){2,}"), "<path>"),
+    (re.compile(r"\b[\w.\-]+@[\w.\-]+"), "<user@host>"),
+    (re.compile(r"\b\d{6,}\b"), "<id>"),
+)
+_AFNI_ATR = re.compile(r'atr_name="([^"]+)"')
+
+
+def redact(text):
+    for rx, sub in _REDACT:
+        text = rx.sub(sub, text)
+    return text
 
 
 def _txt(hdr, key):
@@ -41,6 +61,16 @@ def _txt(hdr, key):
     except Exception:
         return ""
     return raw.decode("latin-1").replace("\x00", "").strip()
+
+
+def _ext_text(e):
+    try:
+        content = e.get_content()
+    except Exception as err:
+        return f"<unreadable: {err}>"
+    if isinstance(content, (bytes, bytearray)):
+        content = content.decode("latin-1", "replace")
+    return str(content)
 
 
 def dump_one(path):
@@ -73,14 +103,18 @@ def dump_one(path):
     if not exts:
         print("  NONE -- no extension blocks at all")
     for i, e in enumerate(exts):
-        try:
-            content = e.get_content()
-        except Exception as err:
-            content = f"<unreadable: {err}>"
-        if isinstance(content, (bytes, bytearray)):
-            content = content.decode("latin-1", "replace")
-        print(f"  [{i}] code={e.get_code()}  len={len(str(content))}")
-        print(f"      {str(content)[:600]}")
+        content = _ext_text(e)
+        code = e.get_code()
+        print(f"  [{i}] code={code}{'  (AFNI XML attributes)' if code == 4 else ''}"
+              f"  len={len(content)}")
+        names = _AFNI_ATR.findall(content)
+        if names:
+            print(f"      AFNI attributes: {', '.join(names)}")
+        for m in re.finditer(r'atr_name="(HISTORY_NOTE|IDCODE_DATE)"\s*>\s*(.*?)</AFNI_atr>',
+                             content, re.S):
+            print(f"      {m.group(1)} (redacted): {redact(m.group(2).strip())[:400]}")
+        if not names:
+            print(f"      (redacted) {redact(content)[:400]}")
 
     sidecar = path
     for suf in (".nii.gz", ".nii"):
@@ -104,6 +138,10 @@ def sweep(root, limit):
 
     seen = {k: {} for k in TEXT_FIELDS}
     n_ext, n_sidecar, bad = 0, 0, 0
+    codes, atr_names = {}, {}
+    date_like = re.compile(r"(acqui|study.?date|series.?date|content.?date|datetime|scan.?date)",
+                           re.I)
+    date_hits = {}
     for p in sel:
         try:
             hdr = nib.load(p).header
@@ -113,8 +151,18 @@ def sweep(root, limit):
         for k in TEXT_FIELDS:
             v = _txt(hdr, k)
             seen[k][v] = seen[k].get(v, 0) + 1
-        if getattr(hdr, "extensions", []):
+        exts = getattr(hdr, "extensions", [])
+        if exts:
             n_ext += 1
+        for e in exts:
+            c = e.get_code()
+            codes[c] = codes.get(c, 0) + 1
+            text = _ext_text(e)
+            for name in set(_AFNI_ATR.findall(text)):
+                atr_names[name] = atr_names.get(name, 0) + 1
+            # any DICOM-style acquisition/study date key, in ANY extension type
+            for m in set(date_like.findall(text)):
+                date_hits[m.lower()] = date_hits.get(m.lower(), 0) + 1
         base = p[:-7] if p.endswith(".nii.gz") else p[:-4]
         if os.path.exists(base + ".json"):
             n_sidecar += 1
@@ -129,9 +177,29 @@ def sweep(root, limit):
             print(f"      {n:>5}  {v!r}")
     print(f"\n  files with a header extension : {n_ext}/{len(sel)}")
     print(f"  files with a JSON sidecar     : {n_sidecar}/{len(sel)}")
-    if nonempty == 0 and n_ext == 0 and n_sidecar == 0:
-        print("\n  => the imaging carries NO acquisition timestamp anywhere. Ordering studies"
-              "\n     requires the release's CSV tables joined on image_id (time_from_gk_days).")
+
+    print("\n  extension codes (2=DICOM, 4=AFNI, 6=comment/text, 44=JSON-ish):")
+    for c, n in sorted(codes.items()):
+        print(f"      code {c:<4} x{n}")
+    if atr_names:
+        print("\n  AFNI attribute names, across the sweep:")
+        for name, n in sorted(atr_names.items(), key=lambda kv: (-kv[1], kv[0])):
+            flag = "   <-- processing timestamp, NOT acquisition" \
+                if name in ("HISTORY_NOTE", "IDCODE_DATE") else ""
+            print(f"      {n:>5}  {name}{flag}")
+
+    print("\n  DICOM-style acquisition/study-date keys found in any extension:")
+    if date_hits:
+        for k, n in sorted(date_hits.items()):
+            print(f"      {n:>5}  {k!r}   <-- INSPECT: this could be a real acquisition date")
+    else:
+        print("      none")
+
+    any_text = any(v for k in TEXT_FIELDS for v in seen[k] if v)
+    if not any_text and not date_hits and n_sidecar == 0:
+        print("\n  => no ACQUISITION timestamp anywhere: text fields blank, no sidecars, and the"
+              "\n     extensions carry only processing dates. Ordering studies still requires the"
+              "\n     release's CSV tables joined on image_id (time_from_gk_days).")
 
 
 def main():
