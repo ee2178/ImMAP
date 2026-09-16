@@ -18,6 +18,7 @@ from .guided_prox import GuidedFenchelProx, GuidedGroupThreshold
 from .ladmm import AltSplitCDLNet
 from .sb_cdlnet import SBCDLNet
 from .sb_groupcdl import SBGroupCDL
+from .sb_guided_groupcdl import SBGuidedGroupCDL
 from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
 
@@ -65,6 +66,13 @@ def build_model(cfg):
     # prox in place of the soft threshold. Its schedule params must match cfg["i2sb"] too.
     elif model_type == "SBGroupCDL":
         return SBGroupCDL(**params)
+
+    # SBGroupCDL's bridge scaffold with LGGCDL's GUIDED group threshold: guides (same-session
+    # contrasts, or a CT1 from another study) shape the adjacency only, never the intensities.
+    # Real-valued ISTA form (an LPDS/LGGS bridge variant is also viable on real data). Schedule params
+    # must match cfg["i2sb"], and the loader must actually deliver guides (train_i2sb checks).
+    elif model_type in ("SBGuidedGroupCDL", "SBLGGCDL"):
+        return SBGuidedGroupCDL(**params)
 
     # The same two-fidelity bridge scaffold, solved by multigrid V-cycles: the two fidelities
     # collapse into one CDL problem under a channel-gain operator (operators/gain.py), so the
@@ -216,13 +224,12 @@ def build_model(cfg):
                 f"W_theta/W_phi, which only exist when Mh is set.")
         return LGGSNet(**params)
 
-    # LGGS's ISTA sibling, for REAL-valued data: the same guided group threshold,
-    # applied as SHRINKAGE rather than through its Fenchel conjugate. Clipping
-    # (what the LPDS dual step applies) pins the modulus at tau for every
-    # |z| > tau, so on real features the gradient there is exactly zero and the
-    # iterate stops learning wherever the prox is active; complex features keep
-    # a live gradient through the phase, which is why LGGS is the complex-valued
-    # member of the pair and this is the real-valued one.
+    # LGGS's ISTA sibling: the same guided group threshold, applied as SHRINKAGE
+    # rather than through its Fenchel conjugate (clipping). Clipping has zero
+    # radial derivative for |z| > tau, but that does NOT stop a real-valued LGGS
+    # from learning -- measured: no parameter family is dead in real-weight LGGS
+    # that is alive in complex-weight LGGS. Both LGGS and LGGCDL are valid on real
+    # data; see models/guided_cdl.py.
     elif model_type in ("GuidedGroupCDL", "LGGCDL", "LGGCDLNet"):
         params = dict(params)
         if params.get("guide_window", 1) <= 1:
@@ -239,11 +246,9 @@ def build_model(cfg):
                 f"W_theta/W_phi, which only exist when Mh is set.")
         if params.get("is_complex"):
             raise ValueError(
-                f"{model_type} is the REAL-valued member of the guided family "
-                f"and was given is_complex=true. On complex data use LGGS "
-                f"(model type 'LGGS'), whose primal-dual iteration has the "
-                f"better-conditioned data term; the clipping pathology this "
-                f"class exists to avoid does not bite there.")
+                f"{model_type} does not support is_complex=true. For a complex "
+                f"guided net use LGGS (model type 'LGGS'), whose primal-dual "
+                f"iteration is built for complex data.")
         return GuidedGroupCDL(**params)
 
     # unrolled linearized ADMM with a learned CDL prox (+ optional joint coils)

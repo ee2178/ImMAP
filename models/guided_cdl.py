@@ -5,9 +5,18 @@ Guided GroupCDL -- the ISTA-unrolled sibling of LGGS, for REAL-valued data.
 which applies its FENCHEL conjugate: `prox_{g*}(z) = z - prox_g(z)`, i.e.
 clipping.  For soft-thresholding that map is `z min(1, tau/|z|)`, whose modulus
 is pinned at `tau` for every `|z| > tau` -- so d|out|/d|z| = 0 there, and the
-group version saturates the same way.  On complex data the phase still carries
-gradient through that region and the unrolling trains; on real data it does not,
-and the dual iterate stops learning wherever it is active.
+group version saturates the same way.
+
+That LOCAL Jacobian fact is true, but it does NOT mean a real-valued LGGS stops
+learning -- an earlier version of this docstring said so, and measurement
+(2026-09-16) contradicts it. Probing LGGSNet on real input with real vs complex
+weights, identical otherwise: every parameter family receives gradient in both;
+dictionary gradients differ by ~1.15x and scale together; and NO family is dead
+in the real net but alive in the complex one, even with the input scaled 1e4x
+into the clipped regime. What deep saturation DOES kill is the adjacency
+(W_theta, W_phi, gamma, rho) -- identically in BOTH, because once everything is
+clipped the output no longer depends on xi. So real vs complex is an empirical
+choice for LGGS, not a correctness constraint.
 
 This module keeps the guided prox and swaps the algorithm underneath it:
 proximal gradient descent (ISTA) on the convolutional BPDN problem, where the
@@ -17,8 +26,9 @@ prox is applied DIRECTLY as shrinkage,
     x_hat   = D z^(K) + mu
 
 `GT(z) = z relu(1 - tau/xi)` has gain -> 1 as `xi >> tau`, so large coefficients
-keep unit gradient.  That is the whole reason this class exists, and it is why
-`CDLNet` / `GroupCDL` are the real-valued members of this family.
+keep unit gradient through the prox output itself. That is a genuine difference
+from clipping, and a reason to prefer the ISTA form -- but see above: it is not
+a requirement for real data.
 
 Everything guide-related is unchanged and shared with LGGS: the same
 `GuidedGroupThreshold` builds `Phi` from the latent to itself and one `Omega_g`
@@ -169,8 +179,13 @@ class GuidedGroupCDL(nn.Module):
                  rho_inv=True, init_strategy="semi_orthogonal",
                  attn_backend="gather", flex_block_size=128, is_complex=False,
                  preproc="image", resize_noise=False, share_attention=True,
-                 spectral_init=True):
+                 spectral_init=True, tau_floor=None):
         super().__init__()
+        # Opt-in lower bound on each layer's threshold CONSTANT term, applied in project().
+        # The prox's own projection clamps it at 0, and at tau = 0 the group threshold is the
+        # identity: xi drops out and the attention weights get no gradient for as long as the
+        # loss keeps pushing tau down. None (default) keeps the historical behaviour exactly.
+        self.tau_floor = None if tau_floor is None else float(tau_floor)
         self.K, self.M, self.C = int(K), int(M), int(C)
         self.P, self.s = int(P), int(s)
         self.is_complex = bool(is_complex)
@@ -288,6 +303,8 @@ class GuidedGroupCDL(nn.Module):
     def project(self):
         for layer in self.layers:
             layer.project_()
+            if self.tau_floor is not None:
+                layer.prox.tau.weight.data[0].clamp_(min=self.tau_floor)
         set_weight(self.D, uball_project(self.D.weight))
 
     def extra_repr(self):

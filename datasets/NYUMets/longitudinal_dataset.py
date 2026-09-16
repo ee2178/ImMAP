@@ -1,44 +1,63 @@
 # -*- coding: utf-8 -*-
 """
-NYUMets guided-I2SB dataset: the usual bridge endpoints plus a GUIDE image.
+NYUMets guided-I2SB dataset: the usual bridge endpoints plus GUIDE images.
 
-Reads the same per-session h5 files as datasets/BraTS/i2sb_dataset.py (written by
-preprocessing/nyumets_h5.py), one directory per (patient, study):
+Reads the per-session h5 files written by preprocessing/nyumets_h5.py, one directory per
+(patient, study):
 
     x0    (1, H, W)          target contrast            default CT1  (stored idx 2)
     x1    (1, H, W)          bridge prior               default T1   (stored idx 1)
-    cond  (n_cond, H, W)     conditioning stack         default FLAIR, T1, T2
+    cond  (n_cond, H, W)     conditioning stack
     mask  (1, H, W)          brain mask
-    guide (n_guides, H, W)   the guide -- ONLY when guide_mode != "none"
+    guide (G, 1, H, W)       guide planes -- ONLY when guide_mode != "none"
 
-The guide is APPENDED rather than always returned, following the `et_mask` precedent in
-I2SBDataset: `train_i2sb` and several notebooks unpack the 4-tuple positionally, so an
-unconditional fifth element would break them. guide_mode="none" is therefore byte-identical
-to the plain synthesis dataset.
+`guide_as_cond=True` instead APPENDS the guide planes to cond (after cond_idx, in guide order)
+and returns the 4-TUPLE: for regressors with no guided prox, e.g. an SBUnet whose C grows by G.
+Unlike the guided prox, input channels CAN carry intensities straight into the prediction.
 
-GUIDE MODES
------------
-    none            no guide; plain contrast synthesis (the 4-tuple)
-    far_slice       same study, same contrast, at least `min_slice_gap` slices away
-    central_slice   same study, same contrast, the volume's central slice
-    other_study     a DIFFERENT study of the SAME patient, same contrast
-    same_slice      the target slice itself -- an ORACLE, for sanity checks only
+RETURN LAYOUT. guide_mode="none" returns the plain 4-TUPLE, byte-identical to the BraTS "i2sb"
+loader. Any guided mode returns a DICT {"x0","x1","cond","mask","guide"}. It is a dict and not a
+5-tuple on purpose: train_i2sb reads tuple position 4 as the ET mask, so a guide there would be
+consumed as `et` and, under et_weight != 1, would weight the loss by the guide image. Keys cannot
+collide, and training/i2sb.py::_batch_parts accepts both layouts.
 
-`min_slice_gap` exists because an adjacent slice is nearly the answer: neighbouring slices of
-the same contrast are so correlated that the guide branch would let the network copy rather
-than synthesise. Default 5.
+GUIDE MODES -- a string, or a LIST of them whose guide planes are concatenated in order:
 
-WHAT THE GUIDE IS NOT ALIGNED TO. `other_study` guides come from a separate acquisition with
-its own affine, so they are NOT registered to the target. They carry the patient's enhancement
-morphology, not voxel correspondence. Slice indices across studies mean nothing in common,
-which is why `guide_slice` defaults to the guide volume's centre rather than the target's index.
-Prior-vs-later ordering is deliberately NOT modelled: NYUMets study ids are random 10-digit
-`image_id`s carrying no time, and ordering needs the release's CSV tables joined on image_id
-(`time_from_gk_days`). Until those are on disk, "any other study" is the honest formulation.
+    none            no guide; plain contrast synthesis
+    same_session    other contrasts of the SAME slice (`guide_contrasts`, default T1, T2, FLAIR).
+                    Co-registered by construction -- same session, common acquisition support.
+    other_study     `guide_idx` (default CT1) from a DIFFERENT study of the SAME patient
+    far_slice       `guide_idx`, same study, >= `min_slice_gap` slices away
+    central_slice   `guide_idx`, same study, the volume's central slice
+    same_slice      `guide_idx` at the target slice itself -- an ORACLE, for sanity checks only
 
-Scaling matches I2SBDataset exactly: each stored contrast is DIVIDED by `scales[c]`, and no
-channel normalization is applied. The guide is divided by `scales[guide_idx]`, so it shares a
-scale with whichever contrast it is drawn from.
+So ["same_session", "other_study"] gives G = len(guide_contrasts) + n_guides planes: the session
+contrasts first, then the longitudinal CT1(s). That combination is what makes a longitudinal run
+comparable to a session-only one -- the difference between them is then the CT1 guide and nothing
+else.
+
+`other_study` AND ITS LIMITS. Study ids are random 10-digit `image_id`s with no time, and the
+imaging carries no acquisition date, so "prior" vs "later" cannot be told apart. Any other study
+of the patient is used. Those studies are NOT registered to the target: separate sessions,
+separate patient positioning. `guide_slice` picks which slice of the guide volume to use:
+
+    matched   (default) the same RELATIVE depth: z_g = round(z / (n - 1) * (n_g - 1)). Both volumes'
+              stored slices were selected by brain fraction, so each spans the brain from inferior
+              to superior and relative depth lands near the same anatomical level. This is an
+              approximation, not registration -- slice spacing, coverage and head tilt all differ.
+    central   the guide volume's central slice
+    random    any slice
+
+In-plane misalignment is left to the model: the guided prox searches a nonlocal `guide_window`.
+
+`min_slice_gap` exists because an adjacent slice of the same contrast is nearly the answer.
+
+SAMPLING uses torch's RNG, which DataLoader seeds per worker. numpy's is not seeded per worker, so
+np.random here would hand every worker the identical guide stream. `deterministic=True` derives
+every choice from the sample index instead, so val/test see the same guide every epoch.
+
+Scaling matches I2SBDataset exactly: each stored contrast is DIVIDED by `scales[c]`; each guide
+plane is divided by the scale of the contrast it was drawn from.
 """
 
 import os
@@ -51,7 +70,8 @@ from torchvision import transforms
 
 import h5py
 
-GUIDE_MODES = ("none", "far_slice", "central_slice", "other_study", "same_slice")
+GUIDE_MODES = ("none", "same_session", "other_study", "far_slice", "central_slice", "same_slice")
+GUIDE_SLICES = ("matched", "central", "random")
 
 
 def index_sessions(root):
@@ -66,8 +86,9 @@ def index_sessions(root):
             continue
         with h5py.File(hits[0], "r") as f:
             n = int(f["img"].shape[0])
-            # written by nyumets_h5; the directory prefix is the fallback for older files
             pid = f.attrs.get("patient", sub.split("_", 1)[0])
+        if isinstance(pid, bytes):
+            pid = pid.decode()
         paths.append(hits[0])
         n_slices.append(n)
         patients.append(str(pid))
@@ -76,26 +97,41 @@ def index_sessions(root):
     return paths, n_slices, patients
 
 
+def _as_modes(guide_mode):
+    modes = [guide_mode] if isinstance(guide_mode, str) else list(guide_mode)
+    bad = [m for m in modes if m not in GUIDE_MODES]
+    if bad:
+        raise ValueError(f"guide_mode entries must be in {GUIDE_MODES}; got {bad}")
+    if "none" in modes and len(modes) > 1:
+        raise ValueError(f"'none' cannot be combined with other guide modes: {modes}")
+    return [m for m in modes if m != "none"]
+
+
 class NYUMetsGuidedDataset(Dataset):
     def __init__(self, cfg):
         self.x0_idx = int(getattr(cfg, "x0_idx", 2))            # CT1
         self.x1_idx = int(getattr(cfg, "x1_idx", 1))            # T1
-        self.cond_idx = list(getattr(cfg, "cond_idx", [0, 1, 3]))
+        self.cond_idx = list(getattr(cfg, "cond_idx", [1]))
         self.image_key = str(getattr(cfg, "image_key", "img_median_mad"))
 
-        self.guide_mode = str(getattr(cfg, "guide_mode", "none"))
-        if self.guide_mode not in GUIDE_MODES:
-            raise ValueError(f"guide_mode must be one of {GUIDE_MODES}, got {self.guide_mode!r}")
-        # default: guide with the same contrast as the target (CT1 -> the enhancement pattern)
+        self.modes = _as_modes(getattr(cfg, "guide_mode", "none"))
         self.guide_idx = int(getattr(cfg, "guide_idx", self.x0_idx))
+        gc = getattr(cfg, "guide_contrasts", None)
+        self.guide_contrasts = [1, 3, 0] if gc is None else [int(c) for c in gc]   # T1, T2, FLAIR
         self.n_guides = int(getattr(cfg, "n_guides", 1))
         self.min_slice_gap = int(getattr(cfg, "min_slice_gap", 5))
-        self.guide_slice = str(getattr(cfg, "guide_slice", "central"))   # other_study only
-        if self.guide_slice not in ("central", "random"):
-            raise ValueError(f"guide_slice must be 'central' or 'random', got {self.guide_slice!r}")
-        # deterministic guides make val/test reproducible: the choice is derived from the sample
-        # index instead of an RNG, so the same item yields the same guide on every epoch.
+        self.guide_slice = str(getattr(cfg, "guide_slice", "matched"))
+        if self.guide_slice not in GUIDE_SLICES:
+            raise ValueError(f"guide_slice must be one of {GUIDE_SLICES}, got {self.guide_slice!r}")
+        if "same_session" in self.modes and not self.guide_contrasts:
+            raise ValueError("guide_mode 'same_session' needs a non-empty guide_contrasts")
         self.deterministic = bool(getattr(cfg, "deterministic", False))
+        # Append the guide planes to `cond` instead of returning them separately. For regressors
+        # with no guided prox (SBUnet, SBCDLNet): the guide becomes ordinary input channels, the
+        # batch stays the plain 4-tuple, and the model's C must grow by n_guide_planes.
+        self.guide_as_cond = bool(getattr(cfg, "guide_as_cond", False))
+        if self.guide_as_cond and not self.modes:
+            raise ValueError("guide_as_cond=True needs a guide_mode other than 'none'")
 
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
@@ -114,31 +150,31 @@ class NYUMetsGuidedDataset(Dataset):
             raise ValueError("NYUMetsGuidedDataset needs cfg.root")
         paths, n_slices, patients = index_sessions(root)
 
-        # ---- drop files that cannot supply the requested guide, and say so --------------
+        # ---- drop sessions that cannot supply a requested guide, and say how many ----
         keep = list(range(len(paths)))
-        if self.guide_mode == "far_slice":
-            # a partner at distance >= gap exists for EVERY z iff the volume has more than
-            # `gap` slices; below that the mode is undefined for at least the middle slices
+        if "far_slice" in self.modes:
+            before = len(keep)
+            # a partner at distance >= gap exists for EVERY z iff the volume has > gap slices
             keep = [i for i in keep if n_slices[i] > self.min_slice_gap]
-            if len(keep) < len(paths):
-                print(f"[NYUMetsGuided] far_slice: dropped {len(paths)-len(keep)}/{len(paths)} "
-                      f"session(s) with <= min_slice_gap={self.min_slice_gap} slices")
-        elif self.guide_mode == "other_study":
+            if len(keep) < before:
+                print(f"[NYUMetsGuided] far_slice: dropped {before-len(keep)}/{before} session(s) "
+                      f"with <= min_slice_gap={self.min_slice_gap} slices")
+        if "other_study" in self.modes:
+            before = len(keep)
             n_by_pat = {}
             for i in keep:
                 n_by_pat[patients[i]] = n_by_pat.get(patients[i], 0) + 1
             keep = [i for i in keep if n_by_pat[patients[i]] >= 2]
-            if len(keep) < len(paths):
-                print(f"[NYUMetsGuided] other_study: dropped {len(paths)-len(keep)}/{len(paths)} "
+            if len(keep) < before:
+                print(f"[NYUMetsGuided] other_study: dropped {before-len(keep)}/{before} "
                       f"session(s) whose patient has only one study in this split")
         if not keep:
-            raise RuntimeError(f"guide_mode={self.guide_mode!r} left no usable sessions under {root}")
+            raise RuntimeError(f"guide_mode={self.modes} left no usable sessions under {root}")
 
         self.img_paths = [paths[i] for i in keep]
         self.n_slices = [n_slices[i] for i in keep]
         self.patients = [patients[i] for i in keep]
 
-        # file indices of the OTHER studies of the same patient, for other_study
         by_pat = {}
         for i, p in enumerate(self.patients):
             by_pat.setdefault(p, []).append(i)
@@ -152,6 +188,14 @@ class NYUMetsGuidedDataset(Dataset):
         self.local = np.asarray(local, dtype=np.int64)
         self._img_h = {}                                  # lazy per-worker handles
 
+    @property
+    def n_guide_planes(self):
+        """G, the number of guide planes per sample -- fixed for a given configuration."""
+        n = 0
+        for m in self.modes:
+            n += len(self.guide_contrasts) if m == "same_session" else self.n_guides
+        return n
+
     def __len__(self):
         return self.file_id.shape[0]
 
@@ -163,34 +207,43 @@ class NYUMetsGuidedDataset(Dataset):
         return h
 
     def _pick(self, n, idx, salt):
-        """One index in [0, n). Uses torch's RNG, which DataLoader seeds per worker -- numpy's
-        is not seeded per worker, so np.random here would hand every worker the same stream."""
+        """One index in [0, n) -- torch RNG (seeded per worker), or index-derived if deterministic."""
         if n <= 0:
             raise ValueError("nothing to pick from")
         if self.deterministic:
-            return int((idx * 1103515245 + salt * 12345) % n)      # stable, index-derived
+            return int((idx * 1103515245 + salt * 12345) % n)
         return int(torch.randint(n, (1,)).item())
 
-    def _guide_slices(self, fi, li, idx):
-        """-> list of (file_index, slice_index) of length n_guides."""
+    def _guide_planes(self, fi, li, idx):
+        """-> list of (file_index, slice_index, stored_contrast), in guide order."""
         out = []
-        for g in range(self.n_guides):
-            if self.guide_mode == "same_slice":
-                out.append((fi, li))
-            elif self.guide_mode == "central_slice":
-                out.append((fi, self.n_slices[fi] // 2))
-            elif self.guide_mode == "far_slice":
-                n = self.n_slices[fi]
-                far = [z for z in range(n) if abs(z - li) >= self.min_slice_gap]
-                out.append((fi, far[self._pick(len(far), idx, g + 1)]))
-            elif self.guide_mode == "other_study":
-                sib = self.siblings[fi]
-                gf = sib[self._pick(len(sib), idx, g + 1)]
-                gn = self.n_slices[gf]
-                gz = gn // 2 if self.guide_slice == "central" else self._pick(gn, idx, g + 101)
-                out.append((gf, gz))
-            else:
-                raise AssertionError(self.guide_mode)
+        for mi, mode in enumerate(self.modes):
+            salt0 = 1000 * (mi + 1)
+            if mode == "same_session":
+                out += [(fi, li, c) for c in self.guide_contrasts]
+                continue
+            for g in range(self.n_guides):
+                salt = salt0 + g
+                if mode == "same_slice":
+                    out.append((fi, li, self.guide_idx))
+                elif mode == "central_slice":
+                    out.append((fi, self.n_slices[fi] // 2, self.guide_idx))
+                elif mode == "far_slice":
+                    far = [z for z in range(self.n_slices[fi]) if abs(z - li) >= self.min_slice_gap]
+                    out.append((fi, far[self._pick(len(far), idx, salt)], self.guide_idx))
+                elif mode == "other_study":
+                    sib = self.siblings[fi]
+                    gf = sib[self._pick(len(sib), idx, salt)]
+                    n, gn = self.n_slices[fi], self.n_slices[gf]
+                    if self.guide_slice == "matched":
+                        gz = int(round(li / max(n - 1, 1) * (gn - 1)))
+                    elif self.guide_slice == "central":
+                        gz = gn // 2
+                    else:
+                        gz = self._pick(gn, idx, salt + 500)
+                    out.append((gf, min(max(gz, 0), gn - 1), self.guide_idx))
+                else:
+                    raise AssertionError(mode)
         return out
 
     def _read(self, fi, li):
@@ -219,17 +272,16 @@ class NYUMetsGuidedDataset(Dataset):
         mask = chw(mask)
 
         guide = None
-        if self.guide_mode != "none":
+        if self.modes:
             planes = []
-            for gf, gz in self._guide_slices(fi, li, idx):
-                gimg, _ = self._read(gf, gz)
-                planes.append(gimg[..., self.guide_idx])
-            guide = chw(np.stack(planes, axis=-1))        # (n_guides, H, W)
+            for gf, gz, gc in self._guide_planes(fi, li, idx):
+                gimg = img if (gf == fi and gz == li) else self._read(gf, gz)[0]
+                planes.append(gimg[..., gc])
+            guide = chw(np.stack(planes, axis=-1))        # (G, H, W)
 
-        # joint geometric transform: stack -> transform -> split (keeps alignment).
-        # The guide rides the SAME crop/flip. For within-volume guides that preserves spatial
-        # correspondence with the target, which is what a guided prox needs; for other_study
-        # there is no correspondence to preserve either way.
+        # Joint geometric transform: stack -> transform -> split. The guide rides the SAME
+        # crop/flip -- for same-session guides that preserves exact registration with the target,
+        # which the guided prox depends on; for other_study it is harmless.
         if self.transform is not None:
             n0, n1, ncond = x0.shape[0], x1.shape[0], cond.shape[0]
             parts = [x0, x1, cond, mask] + ([guide] if guide is not None else [])
@@ -241,4 +293,13 @@ class NYUMetsGuidedDataset(Dataset):
             if guide is not None:
                 guide = stacked[n0 + n1 + ncond + 1:]
 
-        return (x0, x1, cond, mask) if guide is None else (x0, x1, cond, mask, guide)
+        if guide is None:
+            return x0, x1, cond, mask
+        if self.guide_as_cond:
+            # guide planes go AFTER cond_idx, in guide order: cond = [cond_idx..., guides...]
+            return x0, x1, torch.cat([cond, guide], dim=0), mask
+        # (G, H, W) -> (G, 1, H, W), so a batch collates to (B, G, 1, H, W): the stacked layout
+        # models/guided_prox.as_guide_list documents. A (B, G, H, W) batch is AMBIGUOUS there --
+        # as_guide_list reads any 4-D tensor as ONE guide with G channels, which a C=1 analysis
+        # conv then rejects (or, at G=1, silently accepts for the wrong reason).
+        return {"x0": x0, "x1": x1, "cond": cond, "mask": mask, "guide": guide.unsqueeze(1)}

@@ -168,7 +168,7 @@ def forward_sample(sched, step, x0, x1, deterministic=False):
 # ---------------------------------------------------------------------------
 # regressor call (shared by training and sampling)
 # ---------------------------------------------------------------------------
-def predict_x0(net, xt, sigma, cond=None, target_channels=1):
+def predict_x0(net, xt, sigma, cond=None, target_channels=1, guide=None):
     """Run the regressor on the bridge state `xt` (+ optional conditioning) and return its endpoint
     (x0) estimate for the target channel(s). Net-agnostic: works for any denoiser with the
     (input, E, sigma) signature (CDLNet, GroupCDL, ...).
@@ -176,9 +176,17 @@ def predict_x0(net, xt, sigma, cond=None, target_channels=1):
     Conditioning is concatenated onto xt (the net sees C = target_channels + n_cond in/out); we
     keep the first `target_channels` channels as the estimate. E is passed BY KEYWORD: CDLNet.forward
     is (y, E, sigma) but GroupCDL.forward is (y, sigma, E), so a positional Identity() would collide
-    with GroupCDL's sigma -- the keyword works for both."""
+    with GroupCDL's sigma -- the keyword works for both.
+
+    `guide` is forwarded ONLY when it is not None. Every pre-existing regressor lacks a `guide`
+    parameter, so passing `guide=None` unconditionally would TypeError on all of them; the
+    conditional keeps unguided runs bit-identical to before. Guides do NOT enter net_in -- a guided
+    net routes them into its prox, never into the fidelity terms."""
     net_in = xt if (cond is None or cond.shape[1] == 0) else torch.cat([xt, cond], dim=1)
-    out, _ = net(net_in, E=Identity(), sigma=sigma)
+    if guide is None:
+        out, _ = net(net_in, E=Identity(), sigma=sigma)
+    else:
+        out, _ = net(net_in, E=Identity(), sigma=sigma, guide=guide)
     return out[:, :target_channels]
 
 

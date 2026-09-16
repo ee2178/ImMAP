@@ -1,0 +1,135 @@
+{
+    "task": "i2sb",
+    "experiment": {
+        "name": "I2SB_SBGuidedCDL_NYUMets_CT1_from_T1_guided_otherstudy"
+    },
+    "model": {
+        "type": "SBGuidedGroupCDL",
+        "params": {
+            "K": 30,
+            "M": 169,
+            "P": 7,
+            "s": 2,
+            "Mh": 32,
+            "window": 1,
+            "guide_window": 15,
+            "joint_softmax": true,
+            "attn_backend": "gather",
+            "sim_fun": "distance",
+            "dK": 5,
+            "share_attention": true,
+            "nheads": 1,
+            "rho0": 1.0,
+            "gamma0": 0.8,
+            "init_strategy": "semi_orthogonal",
+            "C": 2,
+            "prior_idx": 0,
+            "t0": 0.001,
+            "deg_eta": 0,
+            "deg_tau": 1,
+            "kind": "i2sb",
+            "tau": 0.19,
+            "n_points": 1000,
+            "beta_max": 0.3
+        }
+    },
+    "i2sb": {
+        "kind": "i2sb",
+        "tau": 0.19,
+        "n_points": 1000,
+        "beta_max": 0.3,
+        "deterministic": false,
+        "posterior": "ddpm",
+        "clip_denoise": false,
+        "val_mode": "single_pass",
+        "val_seed": 0,
+        "val_nfe": 20,
+        "target_channels": 1
+    },
+    "data": {
+        "train": {
+            "name": "nyumets_guided",
+            "root": "../datasets/NYUMets_h5_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                1
+            ],
+            "image_key": "img_median_mad",
+            "scales": [
+                3.0,
+                3.0,
+                3.0,
+                3.0
+            ],
+            "guide_mode": "other_study",
+            "guide_idx": 2,
+            "n_guides": 1,
+            "guide_slice": "matched",
+            "random_flips": true,
+            "deterministic": false,
+            "batch_size": 4,
+            "num_workers": 8,
+            "crop_size": 128
+        },
+        "val": {
+            "name": "nyumets_guided",
+            "root": "../datasets/NYUMets_h5_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                1
+            ],
+            "image_key": "img_median_mad",
+            "scales": [
+                3.0,
+                3.0,
+                3.0,
+                3.0
+            ],
+            "guide_mode": "other_study",
+            "guide_idx": 2,
+            "n_guides": 1,
+            "guide_slice": "matched",
+            "random_flips": false,
+            "deterministic": true,
+            "batch_size": 1,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 3000,
+        "steps_per_epoch": 100,
+        "val_every_epochs": 50,
+        "clip_grad": 0.05,
+        "backtrack_thresh": 1000,
+        "backtrack_factor": 0.9,
+        "use_mask": true,
+        "loss_type": "complex-mse",
+        "loss_weight": "uniform",
+        "et_weight": 1.0,
+        "psnr_only": false,
+        "data_range": 2.0
+    },
+    "paths": {
+        "save_dir": "trained_nets/nyumets/I2SB_SBGuidedCDL_NYUMets_CT1_from_T1_guided_otherstudy",
+        "ckpt": null
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0001
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1e-06,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "schrodinger-bridge",
+        "id": null
+    }
+}

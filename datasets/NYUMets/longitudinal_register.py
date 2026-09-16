@@ -11,7 +11,8 @@ is dispatched here by build_loader(cfg["data"][split], ...).
 Both NYUMets dataset types come from this one class:
   * plain contrast synthesis -> guide_mode "none"  (returns the same 4-tuple as the
     BraTS "i2sb" loader, which also still works against these h5 files)
-  * guided synthesis         -> any other guide_mode (appends a 5th item, `guide`)
+  * guided synthesis         -> any other guide_mode (returns a DICT with a `guide` key;
+                                NOT a 5-tuple, which train_i2sb would read as the ET mask)
 
 Every keyword the dataset understands is named explicitly below. Adding a dataset knob
 without adding it here silently drops it: **unused swallows the leftovers.
@@ -32,12 +33,14 @@ def build_nyumets_guided_loader(root=None,
                                 image_key="img_median_mad",
                                 scales=None,
                                 # --- guide ---
-                                guide_mode="none",        # see GUIDE_MODES
-                                guide_idx=None,           # default: same contrast as x0
-                                n_guides=1,
+                                guide_mode="none",        # str or list; see GUIDE_MODES
+                                guide_idx=None,           # other_study/*_slice contrast; default x0
+                                guide_contrasts=None,     # same_session contrasts; default T1,T2,FLAIR
+                                n_guides=1,               # planes per non-session mode
                                 min_slice_gap=5,          # far_slice: adjacent is too easy
-                                guide_slice="central",    # other_study: "central" | "random"
+                                guide_slice="matched",    # other_study: matched | central | random
                                 deterministic=False,      # set True for val/test
+                                guide_as_cond=False,      # append guides to cond (plain nets)
                                 # --- geometry ---
                                 center_crop=None,
                                 crop_size=None,
@@ -56,8 +59,9 @@ def build_nyumets_guided_loader(root=None,
         image_key=image_key, scales=scales,
         guide_mode=guide_mode,
         guide_idx=x0_idx if guide_idx is None else guide_idx,
+        guide_contrasts=guide_contrasts,
         n_guides=n_guides, min_slice_gap=min_slice_gap, guide_slice=guide_slice,
-        deterministic=deterministic,
+        deterministic=deterministic, guide_as_cond=guide_as_cond,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
     )
     dataset = NYUMetsGuidedDataset(ds_cfg)

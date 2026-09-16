@@ -175,11 +175,27 @@ def _val_lpips_sum(gt, pred):
         return None
 
 
-def _split_batch(batch, device):
-    """Batch is (x0, x1, cond, mask) or (x0, x1, cond, mask, et) when the loader has et_mask=True.
-    cond may have 0 channels (conditioning off) -> None; et is None when absent."""
+def _batch_parts(batch):
+    """-> (x0, x1, cond, mask, et, guide) on the CPU, from either batch layout.
+
+    TUPLE  (x0, x1, cond, mask) or (x0, x1, cond, mask, et) -- every pre-existing loader.
+    DICT   {"x0","x1","cond","mask"} plus optional "et" and "guide" -- guided loaders.
+
+    The dict exists because a guide cannot safely ride as a fifth tuple element: position 4 is
+    already the ET mask, so a guide there would be consumed as `et` and, under et_weight != 1,
+    would weight the loss by the guide image -- silently. Keys cannot collide."""
+    if isinstance(batch, dict):
+        return (batch["x0"], batch["x1"], batch["cond"], batch["mask"],
+                batch.get("et"), batch.get("guide"))
     x0, x1, cond, mask = batch[:4]
     et = batch[4] if len(batch) > 4 else None
+    return x0, x1, cond, mask, et, None
+
+
+def _split_batch(batch, device):
+    """-> (x0, x1, cond, mask, et, guide) on `device`. cond with 0 channels -> None; et and guide
+    are None when the loader does not provide them. See `_batch_parts` for the two layouts."""
+    x0, x1, cond, mask, et, guide = _batch_parts(batch)
     x0 = x0.to(device, non_blocking=True)
     x1 = x1.to(device, non_blocking=True)
     mask = mask.to(device, non_blocking=True)
@@ -188,7 +204,9 @@ def _split_batch(batch, device):
         cond = None
     if et is not None:
         et = et.to(device, non_blocking=True)
-    return x0, x1, cond, mask, et
+    if guide is not None:
+        guide = guide.to(device, non_blocking=True)
+    return x0, x1, cond, mask, et, guide
 
 
 def train_i2sb(
@@ -316,7 +334,7 @@ def train_i2sb(
             except StopIteration:
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
-            x0, x1, cond, mask, et = _split_batch(batch, device)
+            x0, x1, cond, mask, et, guide = _split_batch(batch, device)
 
             # ----- sample a bridge point and regress the clean endpoint x0 -----
             b = x0.shape[0]
@@ -325,7 +343,8 @@ def train_i2sb(
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])   # (B,1,1,1) noise level
 
             opt.zero_grad()
-            pred_x0 = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
+            pred_x0 = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels,
+                                 guide=guide)
             if report_balance:
                 report_balance = False
                 _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params)
@@ -415,11 +434,37 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
     is not returning ET masks (which would train the ordinary objective under an ET config)."""
     batch = None
     n_cond = 0
+    b_et = b_guide = None
     try:
         batch = next(iter(loader))
-        n_cond = int(batch[2].shape[1])
+        _, _, b_cond, _, b_et, b_guide = _batch_parts(batch)
+        n_cond = int(b_cond.shape[1])
     except Exception:
         pass
+
+    # GUIDE / MODEL AGREEMENT. Both mismatches are silent without this: a guided net whose loader
+    # yields no guides runs its prox's self-only branch and trains an ordinary UNGUIDED net under a
+    # guided config; and guides handed to a net with no `guide` parameter would crash only deep in
+    # the first forward. Detected from the forward signature, so it covers any future guided net.
+    import inspect
+    try:
+        takes_guide = "guide" in inspect.signature(net.forward).parameters
+    except (TypeError, ValueError):
+        takes_guide = False
+    if batch is not None:
+        if takes_guide and b_guide is None:
+            raise ValueError(
+                f"{type(net).__name__} is a GUIDED model but the loader returned no guides, so it "
+                f"would silently train unguided. Use a guided loader (data name "
+                f"'nyumets_guided') with guide_mode != 'none' in BOTH data.train and data.val.")
+        if b_guide is not None and not takes_guide:
+            raise ValueError(
+                f"The loader returns guides but {type(net).__name__}.forward has no `guide` "
+                f"parameter, so they would be ignored. Use a guided model (e.g. SBGuidedGroupCDL) "
+                f"or set guide_mode: 'none'.")
+        if b_guide is not None:
+            print(f"[i2sb] guided run: {int(b_guide.shape[1])} guide(s) per sample, "
+                  f"shape {tuple(b_guide.shape)}")
 
     expected_C = target_channels + n_cond
     model_C = getattr(net, "C", None)
@@ -436,11 +481,11 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
         raise ValueError(
             f"et_weight={et_weight} needs a per-pixel loss, but loss_type {loss_type!r} is not "
             f"one. Use one of {sorted(POINTWISE_REGISTRY)}, or set et_weight: 1.")
-    if batch is not None and len(batch) < 5:
+    if batch is not None and b_et is None:
         raise ValueError(
-            f"et_weight={et_weight} but the loader returned a {len(batch)}-tuple (no ET mask). "
+            f"et_weight={et_weight} but the loader returned no ET mask. "
             f"Set et_mask: true in BOTH data.train and data.val, or set et_weight: 1.")
-    if batch is not None and float(batch[4].sum()) == 0:
+    if batch is not None and float(b_et.sum()) == 0:
         print(f"[i2sb] WARNING: et_weight={et_weight} but the first batch's ET mask is entirely "
               f"zero. That is normal for a batch of tumor-free slices, but if it persists check "
               f"the h5 'et' dataset.")
@@ -471,14 +516,14 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
     else:
         gen = None
     for batch in val_loader:
-        x0, x1, cond, mask, et = _split_batch(batch, device)
+        x0, x1, cond, mask, et, guide = _split_batch(batch, device)
         bs = x0.shape[0]
 
         if val_mode == "full_recon":
             pred, _, _ = i2sb_sample(
                 net, x1, bridge, cond=cond, nfe=val_nfe, deterministic=deterministic,
                 posterior=posterior, clip_denoise=clip_denoise,
-                target_channels=target_channels, log_count=1, verbose=False,
+                target_channels=target_channels, log_count=1, verbose=False, guide=guide,
             )
             # end-to-end: there is no single step, so no t-weighting either (sigma is 0 and the
             # per-sample weight would be meaningless) -- but ET weighting still applies.
@@ -490,7 +535,8 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             step = torch.randint(0, interval, (bs,), generator=gen, device=device)
             xt = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
-            pred = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels)
+            pred = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels,
+                              guide=guide)
             loss = _bridge_loss(loss_fn, loss_type, x0, pred, mask, use_mask, et, et_weight,
                                 std_fwd, loss_weight, loss_params)
 
