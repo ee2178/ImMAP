@@ -49,13 +49,13 @@ class SmallUNet(nn.Module):
     2x2 convs down, transposed 2x2 convs up, concatenating skips, zero-initialised 1x1 readout.
     Any H, W: the input is replicate-padded to a multiple of 2^levels and the output cropped."""
 
-    def __init__(self, width=16, levels=3, convs=2, max_mult=8, act="silu"):
+    def __init__(self, width=16, levels=3, convs=2, max_mult=8, act="silu", in_channels=1):
         super().__init__()
         if levels < 1 or convs < 1:
             raise ValueError("unet needs levels >= 1 and convs >= 1")
         self.levels, self.convs = int(levels), int(convs)
         ch = [width * min(2 ** l, max_mult) for l in range(levels + 1)]
-        self.inc = _stage(1, ch[0], convs, act)
+        self.inc = _stage(in_channels, ch[0], convs, act)
         self.down = nn.ModuleList(nn.Conv2d(ch[l], ch[l + 1], 2, stride=2) for l in range(levels))
         self.enc = nn.ModuleList(_stage(ch[l + 1], ch[l + 1], convs, act) for l in range(levels))
         self.up = nn.ModuleList(nn.ConvTranspose2d(ch[l + 1], ch[l], 2, stride=2)
@@ -92,17 +92,35 @@ class SmallUNet(nn.Module):
 
 
 class ForwardOp(nn.Module):
+    """E(x; c): x = CT1 (1 channel), c = optional side information (e.g. T2, FLAIR) that is KNOWN,
+    never optimised -- data_grad differentiates w.r.t. x only.
+
+    cond_channels  number of side-information channels, concatenated after x (mlp/conv/unet only)
+    use_x          False builds the c-ONLY reference E(c): no x input and no residual skip. It is
+                   pure T1 synthesis from c, the ceiling a conditioned E can reach while ignoring x;
+                   its data_grad is identically zero.
+    """
+
     def __init__(self, kind="conv", width=16, depth=3, kernel=3, act="silu", residual=True,
-                 levels=3, convs=2, max_mult=8):
+                 levels=3, convs=2, max_mult=8, cond_channels=0, use_x=True):
         super().__init__()
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+        self.cond_channels, self.use_x = int(cond_channels), bool(use_x)
+        if not self.use_x:
+            if self.cond_channels == 0:
+                raise ValueError("use_x=False needs cond_channels > 0 (the operator would have no input)")
+            residual = False                       # no x to add back
+        if self.cond_channels and kind in ("affine", "linear"):
+            raise ValueError(f"{kind} is 1 -> 1; conditioning needs kind mlp/conv/unet")
         self.kind, self.residual = kind, bool(residual)
+        in_ch = int(self.use_x) + self.cond_channels
 
         if kind == "unet":
-            if not self.residual:
+            if not self.residual and self.use_x:
                 raise ValueError("residual=False is only supported for affine/linear")
-            self.net = SmallUNet(width=width, levels=levels, convs=convs, max_mult=max_mult, act=act)
+            self.net = SmallUNet(width=width, levels=levels, convs=convs, max_mult=max_mult, act=act,
+                                 in_channels=in_ch)
             nn.init.zeros_(self.net.out.weight)
             nn.init.zeros_(self.net.out.bias)
             return
@@ -115,7 +133,7 @@ class ForwardOp(nn.Module):
             if depth < 2:
                 raise ValueError(f"{kind} needs depth >= 2 (depth 1 is 'affine'/'linear')")
             k = 1 if kind == "mlp" else kernel
-            chans = [1] + [width] * (depth - 1) + [1]
+            chans = [in_ch] + [width] * (depth - 1) + [1]
             layers = []
             for i in range(depth):
                 layers.append(nn.Conv2d(chans[i], chans[i + 1], k, padding=k // 2,
@@ -127,7 +145,7 @@ class ForwardOp(nn.Module):
         last = self.net[-1]
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
-        if not self.residual:          # without the skip, start at identity through the weights
+        if not self.residual and self.use_x:   # no skip: start at identity through the weights
             with torch.no_grad():
                 if kind in ("affine", "linear"):
                     last.weight[0, 0, last.kernel_size[0] // 2, last.kernel_size[1] // 2] = 1.0
@@ -144,22 +162,33 @@ class ForwardOp(nn.Module):
             return self.net.receptive_field
         return 1 + sum(m.kernel_size[0] - 1 for m in self.net if isinstance(m, nn.Conv2d))
 
-    def forward(self, x):
-        out = self.net(x)
+    def forward(self, x, c=None):
+        if self.cond_channels:
+            if c is None or c.shape[1] != self.cond_channels:
+                got = None if c is None else c.shape[1]
+                raise ValueError(f"operator expects {self.cond_channels} cond channel(s), got {got}")
+            inp = torch.cat([x, c], dim=1) if self.use_x else c
+        else:
+            inp = x
+        out = self.net(inp)
         return x + out if self.residual else out
 
-    def data_grad(self, x, y, create_graph=False):
-        """J_E(x)^T (E(x) - y): the gradient of 1/2 ||y - E(x)||^2 w.r.t. x.
+    def data_grad(self, x, y, c=None, create_graph=False):
+        """J_x E(x; c)^T (E(x; c) - y): the gradient of 1/2 ||y - E(x; c)||^2 w.r.t. x ONLY.
 
         create_graph=False  sampling-time correction; x is treated as a leaf.
         create_graph=True   inside an unrolled net that is being trained -- keeps x's graph so the
                             loss can differentiate through this step (second order in E).
         """
+        if not self.use_x:                    # E(c) does not see x: the x-gradient is exactly zero
+            return torch.zeros_like(x)
         with torch.enable_grad():
             xin = x if (create_graph and x.requires_grad) else x.detach().requires_grad_(True)
-            r = self(xin) - y
-            (g,) = torch.autograd.grad(r, xin, grad_outputs=r, create_graph=create_graph)
-        return g
+            cin = None if c is None else c.detach()
+            r = self(xin, cin) - y
+            (g,) = torch.autograd.grad(r, xin, grad_outputs=r, create_graph=create_graph,
+                                       allow_unused=True)
+        return torch.zeros_like(x) if g is None else g
 
 
 def load_forward_op(path, map_location="cpu", freeze=True):

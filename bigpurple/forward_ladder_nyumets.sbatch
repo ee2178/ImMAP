@@ -5,7 +5,12 @@
 # the timing only means something on the GPU the bridge nets actually run on.
 #
 #   sbatch bigpurple/forward_ladder_nyumets.sbatch
-#   CFG=config/NYUMets/forward_ladder.json sbatch bigpurple/forward_ladder_nyumets.sbatch
+#   CFG=config/NYUMets/forward_ladder_cond.json sbatch bigpurple/forward_ladder_nyumets.sbatch
+#
+#   forward_ladder.json       UNet size sweep, E(CT1) only
+#   forward_ladder_cond.json  3 UNet sizes x {E(CT1), E(CT1, T2, FLAIR), E(T2, FLAIR)}; read
+#                             x_swap_ratio: ~1 means the conditioned E ignores CT1
+# The two are independent runs (own wandb run, own save_dir) and can go in parallel.
 #
 # PREREQUISITE: the train/val split (../datasets/NYUMets_h5_{train,val}). This script does NOT
 # split -- run i2sb_unet_nyumets.sbatch or the array once first, or chain after it with

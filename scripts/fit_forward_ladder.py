@@ -22,6 +22,16 @@ Validation, on a fixed random subset of val slices, inside the brain mask:
     gain          rmse(identity) / rmse(E)                  -- > 1 means E beats T1 ~ CT1
     enh_removed   <CT1 - E(CT1), CT1 - T1> / ||CT1 - T1||^2 on the enhancement pixels
                   1 = E removes exactly the CT1/T1 difference there, 0 = leaves it untouched
+    x_swap_rmse   rmse of T1 - E(CT1', c) with CT1' taken from ANOTHER val slice (the batch rolled
+                  by one; the val subset is in random order, so partners are unrelated slices),
+                  while c (T2, FLAIR) and the target stay those of the true slice
+    x_swap_ratio  x_swap_rmse / rmse. ~1 means E IGNORES x -- it is synthesising T1 from c, its
+                  x-Jacobian is ~0, and it is useless as a data-consistency operator however low
+                  its rmse. Large means the output really depends on CT1.
+
+Operators may be conditioned on side information c (the loader's cond_idx, e.g. T2 + FLAIR) by
+giving a rung `cond_channels`; `use_x: false` makes the c-only reference E(c). Rungs without
+`cond_channels` ignore c, so x-only and conditioned rungs share one run and one data order.
 
 Timing (ms, median, at the val frame size): E forward, VJP, VJP with create_graph + backward
 (the cost of training through a DC step), and a forward of each reference bridge net.
@@ -49,6 +59,12 @@ from visualization.image import subplot_images
 
 
 # ---------------------------------------------------------------------------------------------
+def _inputs(E):
+    if not E.cond_channels:
+        return "x"
+    return "x+c" if E.use_x else "c"
+
+
 def masked_mse(a, b, m):
     return ((a - b) ** 2 * m).sum() / m.sum().clamp(min=1.0)
 
@@ -69,7 +85,11 @@ def enh_region(x, y, m, q):
 class ValStats:
     def __init__(self):
         self.s = dict(sse=0., n=0., sse_enh=0., n_enh=0., sse_rest=0., n_rest=0., ssy=0.,
-                      proj=0., dd=0.)
+                      proj=0., dd=0., sse_swap=0., n_swap=0.)
+
+    def add_swap(self, y, e_swap, m):
+        self.s["sse_swap"] += float(((y - e_swap) ** 2 * m).sum())
+        self.s["n_swap"] += float(m.sum())
 
     def add(self, x, y, e, m, enh):
         r2 = (y - e) ** 2
@@ -92,14 +112,16 @@ class ValStats:
             "rmse_rest": math.sqrt(s["sse_rest"] / s["n_rest"]) if s["n_rest"] else nan,
             "rel_err": math.sqrt(s["sse"] / s["ssy"]) if s["ssy"] else nan,
             "enh_removed": s["proj"] / s["dd"] if s["dd"] else nan,
+            "x_swap_rmse": math.sqrt(s["sse_swap"] / s["n_swap"]) if s["n_swap"] else nan,
         }
 
 
-def batch_xy(batch, device):
-    x0, x1, _cond, mask = batch[:4]
-    # x = CT1 (the bridge unknown), y = T1 (the measurement)
-    return x0.to(device, non_blocking=True), x1.to(device, non_blocking=True), \
-        mask.to(device, non_blocking=True)
+def batch_xyc(batch, device):
+    x0, x1, cond, mask = batch[:4]
+    # x = CT1 (the bridge unknown), y = T1 (the measurement), c = side information (cond_idx)
+    to = lambda t: t.to(device, non_blocking=True)
+    c = to(cond) if cond.shape[1] else None
+    return to(x0), to(x1), c, to(mask)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -110,13 +132,19 @@ def validate(ops, loader, device, enh_q, panel_idx=0):
     stats = {name: ValStats() for name in ["identity", *ops]}
     panel = None
     for bi, batch in enumerate(loader):
-        x, y, m = batch_xy(batch, device)
+        x, y, c, m = batch_xyc(batch, device)
         enh = enh_region(x, y, m, enh_q)
+        swap = x.shape[0] > 1                 # a final batch of one has no partner
+        xs = x.roll(1, dims=0) if swap else None
         stats["identity"].add(x, y, x, m, enh)
+        if swap:
+            stats["identity"].add_swap(y, xs, m)
         outs = {}
         for name, E in ops.items():
-            outs[name] = E(x)
+            outs[name] = E(x, c)
             stats[name].add(x, y, outs[name], m, enh)
+            if swap:
+                stats[name].add_swap(y, E(xs, c), m)
         if bi == panel_idx:
             panel = (x[:1].cpu(), y[:1].cpu(), m[:1].cpu(), {k: v[:1].cpu() for k, v in outs.items()})
     for E in ops.values():
@@ -125,6 +153,7 @@ def validate(ops, loader, device, enh_q, panel_idx=0):
     base = res["identity"]["rmse"]
     for r in res.values():
         r["gain"] = base / r["rmse"] if r["rmse"] else float("nan")
+        r["x_swap_ratio"] = r["x_swap_rmse"] / r["rmse"] if r["rmse"] else float("nan")
     return res, panel
 
 
@@ -192,17 +221,20 @@ def time_ops(ops, shape, device, warmup, reps):
     for name, E in ops.items():
         E.eval()
         xg = x.clone().requires_grad_(True)
+        c = (torch.randn(shape[0], E.cond_channels, *shape[2:], device=device)
+             if E.cond_channels else None)
 
         def fwd():
             with torch.no_grad():
-                E(x)
+                E(x, c)
 
         def vjp():
-            E.data_grad(x, y)
+            E.data_grad(x, y, c)
 
         def vjp2():
-            g = E.data_grad(xg, y, create_graph=True)
-            g.sum().backward()
+            g = E.data_grad(xg, y, c, create_graph=True)
+            if g.requires_grad:                  # a c-only E has an identically zero x-gradient
+                g.sum().backward()
             xg.grad = None
             for p in E.parameters():
                 p.grad = None
@@ -261,11 +293,15 @@ def main(config_path):
     full_val = build_loader(cfg["data"]["val"], shuffle=False, drop_last=False)
     n_val = len(full_val.dataset)
     k = min(int(tr.get("val_slices", 4000)), n_val)
+    # RANDOM order, not sorted: x_swap pairs each slice with its batch neighbour, and in sorted
+    # order that neighbour is usually the adjacent slice of the same volume -- nearly the same CT1,
+    # which would make every operator look like it ignores x.
     idx = np.random.default_rng(int(tr.get("val_seed", 0))).choice(n_val, size=k, replace=False)
-    val_loader = DataLoader(Subset(full_val.dataset, sorted(idx.tolist())),
+    val_loader = DataLoader(Subset(full_val.dataset, idx.tolist()),
                             batch_size=full_val.batch_size, shuffle=False,
                             num_workers=full_val.num_workers, pin_memory=True)
     print(f"train slices {len(train_loader.dataset)}  |  val subset {k}/{n_val}")
+    n_cond = len(cfg["data"]["train"].get("cond_idx", []) or [])
 
     ops, opts, scheds = {}, {}, {}
     for spec in cfg["rungs"]:
@@ -274,10 +310,14 @@ def main(config_path):
         if name in ops or name == "identity":
             raise ValueError(f"duplicate/reserved rung name {name!r}")
         ops[name] = ForwardOp(**spec).to(device)
+        if ops[name].cond_channels not in (0, n_cond):
+            raise ValueError(f"rung {name}: cond_channels={ops[name].cond_channels} but the loader "
+                             f"supplies {n_cond} (data.train.cond_idx)")
         opts[name] = torch.optim.Adam(ops[name].parameters(), lr=float(tr["lr"]))
         scheds[name] = torch.optim.lr_scheduler.CosineAnnealingLR(
             opts[name], T_max=int(tr["steps"]), eta_min=float(tr.get("eta_min", 0.0)))
-        print(f"  {name:>16s}  params {sum(p.numel() for p in ops[name].parameters()):>7d}  "
+        print(f"  {name:>22s}  inputs {_inputs(ops[name]):>3s}  "
+              f"params {sum(p.numel() for p in ops[name].parameters()):>8d}  "
               f"receptive field {ops[name].receptive_field}")
 
     wandb.init(project=cfg["wandb"]["project"], name=cfg["experiment"]["name"],
@@ -297,12 +337,12 @@ def main(config_path):
         except StopIteration:
             it = iter(train_loader)
             batch = next(it)
-        x, y, m = batch_xy(batch, device)
+        x, y, c, m = batch_xyc(batch, device)
         with torch.no_grad():
             run["identity"] += float(masked_mse(x, y, m))
         for name, E in ops.items():
             opts[name].zero_grad(set_to_none=True)
-            loss = masked_mse(E(x), y, m)
+            loss = masked_mse(E(x, c), y, m)
             loss.backward()
             if clip > 0:
                 torch.nn.utils.clip_grad_norm_(E.parameters(), clip)
@@ -347,22 +387,24 @@ def main(config_path):
     B0 = int(tm.get("batch_sizes", [1, 8])[-1])
     t_ops, t_ref = timing[B0]
     ref_ms = {n: r["fwd_ms"] for n, r in t_ref.items()}
-    cols = ["rung", "kind", "params", "receptive_field", "rmse", "rmse_enh", "rmse_rest",
-            "rel_err", "gain", "enh_removed", f"fwd_ms_b{B0}", f"vjp_ms_b{B0}", f"vjp2_ms_b{B0}"]
+    cols = ["rung", "kind", "inputs", "params", "receptive_field", "rmse", "rmse_enh", "rmse_rest",
+            "rel_err", "gain", "enh_removed", "x_swap_rmse", "x_swap_ratio",
+            f"fwd_ms_b{B0}", f"vjp_ms_b{B0}", f"vjp2_ms_b{B0}"]
     cols += [f"vjp_over_{n}" for n in ref_ms]
     table = wandb.Table(columns=cols)
     rows = []
     for name in ["identity", *ops]:
         r = res[name]
         if name == "identity":
-            meta = ["identity", 0, 1]
+            meta = ["identity", "x", 0, 1]
             t = {"fwd_ms": 0.0, "vjp_ms": 0.0, "vjp2_ms": 0.0}
         else:
             E = ops[name]
-            meta = [E.kind, sum(p.numel() for p in E.parameters()), E.receptive_field]
+            meta = [E.kind, _inputs(E), sum(p.numel() for p in E.parameters()), E.receptive_field]
             t = t_ops[name]
         row = [name, *meta, r["rmse"], r["rmse_enh"], r["rmse_rest"], r["rel_err"], r["gain"],
-               r["enh_removed"], t["fwd_ms"], t["vjp_ms"], t["vjp2_ms"]]
+               r["enh_removed"], r["x_swap_rmse"], r["x_swap_ratio"],
+               t["fwd_ms"], t["vjp_ms"], t["vjp2_ms"]]
         row += [t["vjp_ms"] / ms if ms else float("nan") for ms in ref_ms.values()]
         table.add_data(*row)
         rows.append(dict(zip(cols, row)))
@@ -375,13 +417,14 @@ def main(config_path):
         json.dump({"rows": rows, "reference_fwd_ms": ref_ms, "batch": B0,
                    "frame": [int(H), int(W)]}, f, indent=2)
 
-    print(f"\n{'rung':>16s} {'params':>7s} {'RF':>3s} {'rmse':>7s} {'enh':>7s} {'rest':>7s} "
-          f"{'gain':>6s} {'removed':>7s} {'fwd':>7s} {'vjp':>7s} {'vjp2':>7s}   (ms, B={B0})")
+    print(f"\n{'rung':>22s} {'in':>3s} {'params':>8s} {'RF':>3s} {'rmse':>7s} {'enh':>7s} "
+          f"{'rest':>7s} {'gain':>6s} {'removed':>7s} {'swap':>7s} {'swap/rm':>7s} "
+          f"{'fwd':>7s} {'vjp':>7s} {'vjp2':>7s}   (ms, B={B0})")
     for rw in rows:
-        print(f"{rw['rung']:>16s} {rw['params']:>7d} {rw['receptive_field']:>3d} "
+        print(f"{rw['rung']:>22s} {rw['inputs']:>3s} {rw['params']:>8d} {rw['receptive_field']:>3d} "
               f"{rw['rmse']:7.4f} {rw['rmse_enh']:7.4f} {rw['rmse_rest']:7.4f} {rw['gain']:6.3f} "
-              f"{rw['enh_removed']:7.3f} {rw[f'fwd_ms_b{B0}']:7.2f} {rw[f'vjp_ms_b{B0}']:7.2f} "
-              f"{rw[f'vjp2_ms_b{B0}']:7.2f}")
+              f"{rw['enh_removed']:7.3f} {rw['x_swap_rmse']:7.4f} {rw['x_swap_ratio']:7.2f} "
+              f"{rw[f'fwd_ms_b{B0}']:7.2f} {rw[f'vjp_ms_b{B0}']:7.2f} {rw[f'vjp2_ms_b{B0}']:7.2f}")
     for n, ms in ref_ms.items():
         print(f"  reference {n}: forward {ms:.2f} ms")
     wandb.finish()
