@@ -10,17 +10,17 @@
 #    3   i2sb_sbcdlnet_all.json               SBCDLNet          FLAIR, T1, T2
 #    4   i2sb_sbguidedcdl_session.json        SBGuidedGroupCDL  T1; guides T1, T2, FLAIR
 #    5   i2sb_sbguidedcdl_otherstudy.json     SBGuidedGroupCDL  T1; guide other-study CT1
-#    6   i2sb_sbguidedcdl_longitudinal.json   SBGuidedGroupCDL  T1; guides T1, T2, FLAIR + other CT1
-#    7   i2sb_lggcdl_session.json             LGGCDL   C=1      guides T1, T2, FLAIR
-#    8   i2sb_lggs_session.json               LGGS     C=1      guides T1, T2, FLAIR
+#    6   i2sb_lggcdl_session.json             LGGCDL   C=1      guides T1, T2, FLAIR
+#    7   i2sb_lggs_session.json               LGGS     C=1      guides T1, T2, FLAIR
 #
-# Paired comparisons: 1 vs 2 and 4 vs 6 isolate the other-study CT1; 3 vs 4 is conditioning
-# channels vs guided prox; 5 isolates the longitudinal guide alone.
+# Paired comparisons: 1 vs 2 isolates the other-study CT1 channel; 3 vs 4 is conditioning
+# channels vs guided prox; 4 vs 5 swaps same-session guides for the other-study CT1.
+# (SB-LGGCDL with all 3 guides + other CT1 was dropped: it OOMs on one A100.)
 #
 # Submit all (at most 4 GPUs at once):
 #   sbatch bigpurple/i2sb_nyumets_array.sbatch
 # A subset (the --array on the command line overrides the #SBATCH line):
-#   sbatch --array=2,5,6 bigpurple/i2sb_nyumets_array.sbatch
+#   sbatch --array=2,4,5 bigpurple/i2sb_nyumets_array.sbatch
 # After the h5 build:
 #   sbatch --dependency=afterok:<h5 jobid> --kill-on-invalid-dep=yes \
 #          bigpurple/i2sb_nyumets_array.sbatch
@@ -32,7 +32,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-8%4
+#SBATCH --array=0-7%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -45,10 +45,10 @@
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.err
 
-# --time is 7 days (radiology allows 28): the unrolled nets (3-8) are far slower per step
+# --time is 7 days (radiology allows 28): the unrolled nets (3-7) are far slower per step
 # than SBUnet, and the guided ones pay for 15x15 guide-window attention on top.
 # Mail is for the array as a whole (BEGIN when the first task starts, END/FAIL when all are
-# done). Add ARRAY_TASKS to --mail-type for one mail per task (27 mails for 9 tasks).
+# done). Add ARRAY_TASKS to --mail-type for one mail per task (24 mails for 8 tasks).
 # No `set -euo pipefail` -- it breaks conda activate (unset $PS1 / $CONDA_SHLVL under -u).
 
 CONFIGS=(
@@ -58,7 +58,6 @@ CONFIGS=(
     config/NYUMets/i2sb_sbcdlnet_all.json
     config/NYUMets/i2sb_sbguidedcdl_session.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy.json
-    config/NYUMets/i2sb_sbguidedcdl_longitudinal.json
     config/NYUMets/i2sb_lggcdl_session.json
     config/NYUMets/i2sb_lggs_session.json
 )
