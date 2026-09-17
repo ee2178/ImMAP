@@ -168,7 +168,7 @@ def forward_sample(sched, step, x0, x1, deterministic=False):
 # ---------------------------------------------------------------------------
 # regressor call (shared by training and sampling)
 # ---------------------------------------------------------------------------
-def predict_x0(net, xt, sigma, cond=None, target_channels=1, guide=None):
+def predict_x0(net, xt, sigma, cond=None, target_channels=1, guide=None, dc=None, x1=None):
     """Run the regressor on the bridge state `xt` (+ optional conditioning) and return its endpoint
     (x0) estimate for the target channel(s). Net-agnostic: works for any denoiser with the
     (input, E, sigma) signature (CDLNet, GroupCDL, ...).
@@ -181,12 +181,21 @@ def predict_x0(net, xt, sigma, cond=None, target_channels=1, guide=None):
     `guide` is forwarded ONLY when it is not None. Every pre-existing regressor lacks a `guide`
     parameter, so passing `guide=None` unconditionally would TypeError on all of them; the
     conditional keeps unguided runs bit-identical to before. Guides do NOT enter net_in -- a guided
-    net routes them into its prox, never into the fidelity terms."""
+    net routes them into its prox, never into the fidelity terms.
+
+    `dc` (sb.learned_dc.LearnedBridgeDC) switches to LEARNED data consistency: the net gets the
+    per-batch nonlinear operator dc.bind(sigma, x1, cond) instead of Identity(), and `cond` is E's
+    side information rather than net input (unless dc.feed_cond). `x1` is then required."""
+    E = Identity()
+    if dc is not None:
+        E = dc.bind(sigma, x1, cond)
+        if not dc.feed_cond:
+            cond = None
     net_in = xt if (cond is None or cond.shape[1] == 0) else torch.cat([xt, cond], dim=1)
     if guide is None:
-        out, _ = net(net_in, E=Identity(), sigma=sigma)
+        out, _ = net(net_in, E=E, sigma=sigma)
     else:
-        out, _ = net(net_in, E=Identity(), sigma=sigma, guide=guide)
+        out, _ = net(net_in, E=E, sigma=sigma, guide=guide)
     return out[:, :target_channels]
 
 

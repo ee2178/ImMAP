@@ -4,7 +4,12 @@ from __future__ import annotations
 class Operator:
     """
     Base linear operator class.
+
+    `nonlinear = True` marks an operator with no point-free adjoint (operators/learned.py). Such
+    operators provide `data_grad(x, y)` instead, and models branch on this flag.
     """
+
+    nonlinear = False
 
     def forward(self, x):
         raise NotImplementedError

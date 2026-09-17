@@ -257,6 +257,10 @@ def train_i2sb(
     val_seed=None,
     val_nfe=20,                      # only used when val_mode == "full_recon"
     target_channels=1,
+    learned_dc=None,                 # {"ckpt": ..., "sigma_E": null|float, "feed_cond": false}:
+                                     # a frozen learned operator E supplies data consistency and the
+                                     # net gets a nonlinear operator instead of Identity(). See
+                                     # sb/learned_dc.py; needs a net with a nonlinear branch (CDLNet).
     # ---- paths (cfg["paths"]) ----
     save_dir=None,
     ckpt=None,                       # signature parity; model resume handled in main()
@@ -307,8 +311,14 @@ def train_i2sb(
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
 
+    dc = None
+    if learned_dc:
+        from sb.learned_dc import LearnedBridgeDC
+        dc = LearnedBridgeDC(bridge, device, **learned_dc)
+
     # sanity: conditioning width vs the model, and that an ET run actually has ET masks
-    _assert_batch_matches_config(net, train_loader, device, target_channels, et_weight, loss_type)
+    _assert_batch_matches_config(net, train_loader, device, target_channels, et_weight, loss_type,
+                                 dc=dc)
 
     # best_loss is a PARAMETER now, carried in from the checkpoint: see
     # the note in the signature.
@@ -344,7 +354,7 @@ def train_i2sb(
 
             opt.zero_grad()
             pred_x0 = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels,
-                                 guide=guide)
+                                 guide=guide, dc=dc, x1=x1)
             if report_balance:
                 report_balance = False
                 _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params)
@@ -419,7 +429,7 @@ def train_i2sb(
                 target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
                 loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
                 data_range=data_range, wandb=wandb, global_step=global_step,
-                loss_params=loss_params, val_lpips=val_lpips,
+                loss_params=loss_params, val_lpips=val_lpips, dc=dc,
             )
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
@@ -428,7 +438,8 @@ def train_i2sb(
     return net
 
 
-def _assert_batch_matches_config(net, loader, device, target_channels, et_weight, loss_type):
+def _assert_batch_matches_config(net, loader, device, target_channels, et_weight, loss_type,
+                                 dc=None):
     """Peek one batch and fail loudly on the two config mismatches that would otherwise be silent:
     the network's input width (C = target_channels + n_cond), and an ET-weighted run whose loader
     is not returning ET masks (which would train the ordinary objective under an ET config)."""
@@ -466,6 +477,20 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
             print(f"[i2sb] guided run: {int(b_guide.shape[1])} guide(s) per sample, "
                   f"shape {tuple(b_guide.shape)}")
 
+    if dc is not None:
+        # learned DC: cond is E's side information and (unless feed_cond) never reaches the net
+        if batch is not None and n_cond != dc.cond_channels:
+            raise ValueError(
+                f"learned_dc: E takes {dc.cond_channels} cond channel(s) but the loader provides "
+                f"{n_cond}. Set data.*.cond_idx to E's side information, in E's order.")
+        if "E" not in inspect.signature(net.forward).parameters:
+            raise ValueError(f"learned_dc needs a net that takes an operator E; "
+                             f"{type(net).__name__}.forward does not")
+        if not dc.feed_cond:
+            n_cond = 0
+        print(f"[i2sb] learned DC: net input C={target_channels + n_cond}, "
+              f"E side information {dc.cond_channels} channel(s)")
+
     expected_C = target_channels + n_cond
     model_C = getattr(net, "C", None)
     if model_C is not None and model_C != expected_C:
@@ -495,7 +520,7 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
 def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
-              data_range, wandb, global_step, loss_params=None, val_lpips=False):
+              data_range, wandb, global_step, loss_params=None, val_lpips=False, dc=None):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -524,6 +549,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
                 net, x1, bridge, cond=cond, nfe=val_nfe, deterministic=deterministic,
                 posterior=posterior, clip_denoise=clip_denoise,
                 target_channels=target_channels, log_count=1, verbose=False, guide=guide,
+                dc=dc,
             )
             # end-to-end: there is no single step, so no t-weighting either (sigma is 0 and the
             # per-sample weight would be meaningless) -- but ET weighting still applies.
@@ -536,7 +562,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             xt = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
             pred = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels,
-                              guide=guide)
+                              guide=guide, dc=dc, x1=x1)
             loss = _bridge_loss(loss_fn, loss_type, x0, pred, mask, use_mask, et, et_weight,
                                 std_fwd, loss_weight, loss_params)
 
