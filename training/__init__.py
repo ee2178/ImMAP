@@ -7,3 +7,4 @@ from .synthesis import train_synthesis
 from .dt_synthesis import train_dt_synthesis
 from .i2sb import train_i2sb
 from .latent_i2sb import train_latent_i2sb
+from .forward_op import train_forward_op

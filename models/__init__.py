@@ -21,6 +21,7 @@ from .sb_groupcdl import SBGroupCDL
 from .sb_guided_groupcdl import SBGuidedGroupCDL
 from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
+from .forward_ops import ForwardOp
 
 
 def build_model(cfg):
@@ -262,5 +263,10 @@ def build_model(cfg):
 
     elif model_type == "AltSplitCDLNet":
         return AltSplitCDLNet(**params)
+
+    # Learned data-consistency operator E(CT1[, T2, FLAIR]) -> T1 (models/forward_ops.py),
+    # trained on its own by task "forward_op".
+    elif model_type == "ForwardOp":
+        return ForwardOp(**params)
 
     raise ValueError
