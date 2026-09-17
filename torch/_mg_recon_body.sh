@@ -188,7 +188,13 @@ try:
         "_mkcfg", "scripts/make_mg_recon_configs.py")
     _gen = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_gen)
-    _expected = tuple(float(v) for v in _gen.NOISE_STD)
+    # NOISE_STD is keyed BY ANATOMY (brain and knee train at different sigmas),
+    # so the range to compare against comes from the config's own anatomy. The
+    # isinstance check keeps this working if it is ever flattened back.
+    _ns = _gen.NOISE_STD
+    if isinstance(_ns, dict):
+        _ns = _ns[cfg["data"]["train"]["anatomy"]]
+    _expected = tuple(float(v) for v in _ns)
 except Exception as _e:                 # noqa: BLE001
     # Do not block the run on a check that cannot be performed -- but say so,
     # because a silently skipped guard is worse than none.

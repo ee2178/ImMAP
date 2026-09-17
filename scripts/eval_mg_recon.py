@@ -132,15 +132,20 @@ def main():
     p.add_argument("--runs", default="trained_nets/mg_recon",
                    help="root of the trained-run tree")
     p.add_argument("--out", default="results/mg_recon.csv")
-    # Brackets the training range U[0.01, 0.02] rather than sitting inside it:
-    # 0.01/0.015/0.02 are the endpoints and centre (the val operating point),
-    # and 0.005/0.04 sit outside it so the table shows how far the sigma
-    # conditioning generalises. A sweep confined to the training range cannot
-    # answer that, and it is the question the noise-adaptive cells exist for.
-    # KEEP THIS IN STEP WITH NOISE_STD -- a sweep left entirely above the
-    # training range reports only extrapolation and reads as a collapse.
+    # Brackets BOTH anatomies' training ranges rather than sitting inside
+    # either: brain trains at U[0.04, 0.06] and knee at U[0.01, 0.02], and this
+    # tree holds runs from both, so one list has to cover both. Per range the
+    # endpoints and centre are present, plus a point either side so the table
+    # shows how far the sigma conditioning generalises:
+    #
+    #     knee   0.005 | 0.01  0.015 0.02 | 0.04
+    #     brain  0.02  | 0.04  0.05  0.06 | 0.10
+    #
+    # KEEP THIS IN STEP WITH make_mg_recon_configs.NOISE_STD -- a sweep left
+    # entirely above a training range reports only extrapolation and reads as a
+    # collapse. Narrow it with --sigmas when evaluating one anatomy.
     p.add_argument("--sigmas", type=float, nargs="*",
-                   default=[0.005, 0.01, 0.015, 0.02, 0.04],
+                   default=[0.005, 0.01, 0.015, 0.02, 0.04, 0.05, 0.06, 0.10],
                    help="noise levels to evaluate at (pinned, not sampled)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

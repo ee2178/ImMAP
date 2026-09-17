@@ -382,20 +382,29 @@ ANATOMIES = {
     ),
 }
 
-# sigma ~ U[0.04, 0.06], added in the COIL-IMAGE domain (operators/noise.py::
-# mri_awgn), on data already divided by the anatomy's scale_fac -- so these are
-# fractions of unit signal scale, ~5%.
+# TRAINING NOISE, PER ANATOMY. sigma is added in the COIL-IMAGE domain
+# (operators/noise.py::mri_awgn) on data already scaled by the anatomy's
+# scale_fac, so these are fractions of unit signal scale.
 #
-# Raised from [0.0, 0.01] because at that level every cell reconstructed almost
-# perfectly and the grid stopped separating the models: a comparison run in a
-# regime where the prior does not have to do any work measures nothing about
-# the prior.
+#     brain   U[0.04, 0.06]   ~5%     val 0.05
+#     knee    U[0.01, 0.02]   ~1.5%   val 0.015
+#
+# PER-ANATOMY AND NOT GLOBAL, because the two were moved independently and a
+# single constant made one of them collateral damage. brain went to [0.01, 0.02]
+# and is now back at [0.04, 0.06]; knee was never asked to move. Anything
+# reading this must index by anatomy -- `noise_std()` below, and the staleness
+# check in torch/_mg_recon_body.sh, both do.
+#
+# brain is at [0.04, 0.06] because at [0.01, 0.02] the grid stopped separating
+# the models: a comparison run in a regime where the prior does not have to do
+# any work measures nothing about the prior. That is the same reason the range
+# was first raised from [0.0, 0.01].
 #
 # HOW THIS RELATES TO THE Sljiva REFERENCE, because it is not a straight copy.
 # `config/synthmri_closure.yaml` TRAINS at noise_level [0.00, 0.001] -- lower
-# than even our old setting -- and the fastMRI eval scripts then EVALUATE at a
+# than either range here -- and the fastMRI eval scripts then EVALUATE at a
 # single pinned 0.05 (`scripts/eval_guidedfastmri.jl:44`). 0.05 is the centre of
-# the range below, so this setup moves the reference's TEST operating point into
+# the brain range, so brain now moves the reference's TEST operating point into
 # TRAINING and matches train to test, rather than reproducing its protocol.
 #
 # That is a defensible design and it is the one asked for, but it is a different
@@ -403,8 +412,39 @@ ANATOMIES = {
 # beat one trained near-noiseless and tested at 0.05, so these numbers are not
 # directly comparable to published ones. Say which protocol produced a number
 # whenever one is quoted.
-NOISE_STD = [0.01, 0.02]
-VAL_NOISE_STD = 0.015          # mean(NOISE_STD): mrireco.jl:277 evaluates there
+#
+# CHANGING A RANGE INVALIDATES THAT ANATOMY'S RUN DIRS. The launch guard in
+# torch/_mg_recon_body.sh compares configs and REFUSES a run dir whose stored
+# config differs on a key like noise_std, rather than silently continuing a net
+# trained at a different sigma. Move the affected dirs aside (or pass
+# FORCE_RESTART=1) before re-submitting.
+NOISE_STD = {
+    "brain": [0.04, 0.06],
+    "knee":  [0.01, 0.02],
+}
+
+# Derived, never written by hand: mrireco.jl:277 evaluates at the MEAN of the
+# training range, and a val point that drifts off-centre silently changes what
+# every val curve in the grid measures.
+VAL_NOISE_STD = {a: round(sum(v) / 2.0, 6) for a, v in NOISE_STD.items()}
+
+
+def noise_std(anatomy):
+    """This anatomy's training sigma range, as a fresh list."""
+    try:
+        return list(NOISE_STD[anatomy])
+    except KeyError:
+        raise ValueError(
+            "no NOISE_STD entry for anatomy %r; known: %s"
+            % (anatomy, sorted(NOISE_STD))) from None
+
+
+def val_noise_std(anatomy):
+    """This anatomy's validation sigma -- the mean of its training range."""
+    noise_std(anatomy)                      # same error for an unknown anatomy
+    return VAL_NOISE_STD[anatomy]
+
+
 VAL_SEED = 1234
 
 
@@ -673,9 +713,9 @@ def make_config(anatomy, r, model, args):
             "num_epochs": args.num_epochs,
             "steps_per_epoch": args.steps_per_epoch,
             "val_every_epochs": args.val_every_epochs,
-            "noise_std": NOISE_STD,
+            "noise_std": noise_std(anatomy),
             "noise_dist": "uniform",
-            "val_noise_std": VAL_NOISE_STD,
+            "val_noise_std": val_noise_std(anatomy),
             "val_seed": VAL_SEED,
             "loss_type": "magnitude-nl1-nl2",
             "clip_grad": 1.0,
