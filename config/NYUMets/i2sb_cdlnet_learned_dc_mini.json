@@ -1,7 +1,7 @@
 {
     "task": "i2sb",
     "experiment": {
-        "name": "I2SB_CDLNet_LearnedDC_w16l3xc_NYUMets_CT1_mini"
+        "name": "I2SB_CDLNet_LearnedDC_w8l3xc_NYUMets_CT1_mini"
     },
     "model": {
         "type": "CDLNet",
@@ -29,7 +29,7 @@
         "val_nfe": 20,
         "target_channels": 1,
         "learned_dc": {
-            "ckpt": "trained_nets/nyumets/forward_ladder_unet_cond_CT1_to_T1/E_unet_w16_l3_xc.pt",
+            "ckpt": "trained_nets/nyumets/forward_ladder_unet_cond_w8_CT1_to_T1/E_unet_w8_l3_xc.pt",
             "sigma_E": null,
             "feed_cond": false
         }
@@ -94,7 +94,7 @@
         "data_range": 2.0
     },
     "paths": {
-        "save_dir": "trained_nets/nyumets/I2SB_CDLNet_LearnedDC_w16l3xc_mini",
+        "save_dir": "trained_nets/nyumets/I2SB_CDLNet_LearnedDC_w8l3xc_mini",
         "ckpt": null
     },
     "optimizer": {

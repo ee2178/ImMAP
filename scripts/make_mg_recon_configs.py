@@ -343,6 +343,46 @@ MODELS.update({
                          params=dict(ML_LPDS_COMMON, M=128, widen=2, K=20)),
 })
 
+# MULTILEVEL CDL (models/ml_cdlnet.py), the synthesis-form siblings of ML-LPDS:
+#
+#   mlcdlw2    MLCDLNet       unrolled ML-ISTA -- the only state carried between
+#                             sweeps is the deepest code
+#   mlsplitw2  MLSplitCDLNet  unrolled linearised ADMM -- every code kept, one
+#                             dual per link between levels
+#
+# Matched to `mllpdsw2` in WIDTH -- channels 48/96/192, L=3, s=2, P=7, degrees,
+# dtype and preproc -- and the S.T. threshold initialised at ML-LPDS's clip
+# threshold, lam0=1e-3. (`tau0` in these classes IS that threshold; in the LPDS
+# family `tau0` is the primal step.) readout='level1' is stated so the config
+# records it. M/widen come from `mllpdsw2`, so re-widening that cell re-widens
+# these -- they deliberately do NOT follow exp4's ML-LPDS arm (mllpds64).
+#
+# K IS PINNED AT 18, not taken from ML_LPDS_COMMON. Both nets were unstable at
+# K=18 -- MLSplitCDLNet tripped the loss backtrack almost immediately, and
+# MLCDLNet was unstable too -- so they stay at the size that was observed rather
+# than silently growing to K=30 with ML-LPDS. Neither is matched to ML-LPDS in K
+# any more. MLSplitCDLNet is out of exp4 for now; its configs are still written.
+#
+#     mlcdlw2    K=18  widen=2  channels 48/96/192   221 GFLOP   81.5M params
+#     mlsplitw2  K=18  widen=2  channels 48/96/192   477 GFLOP   81.5M params
+#
+# A suspect for the instability, not yet tested: `uball_project` bounds each
+# (out, in) 7x7 slice, not each atom, so a level-l atom may grow to norm
+# sqrt(M_{l-1}) (~8-10 at levels 2-3). ML-ISTA's unit step and the split net's mu
+# clamp both assume ||B_l A_l|| <= 1, which that does not keep.
+ML_CDL_COMMON = dict(
+    {k: ML_LPDS_COMMON[k]
+     for k in ("C", "P", "s", "degrees", "is_complex", "preproc", "L")},
+    K=18, tau0=ML_LPDS_COMMON["lam0"], readout="level1")
+_W2_SHAPE = {k: MODELS["mllpdsw2"]["params"][k] for k in ("M", "widen")}
+
+MODELS.update({
+    "mlcdlw2":   dict(type="MLCDLNet",
+                      params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
+    "mlsplitw2": dict(type="MLSplitCDLNet",
+                      params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
+})
+
 OPT_IN = ("mllpds", "mllpdsw2", "mlcdlw2", "mlsplitw2",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
           # not renumber exp1-exp4, whose arrays index the default list.
