@@ -45,7 +45,7 @@
 #
 # WHAT IS SHARED WITH exp1 / exp2
 # -------------------------------
-# Everything except R: same data, same mask family, sigma ~ U[0.01, 0.02], same
+# Everything except R: same data, same mask family, sigma ~ U[0.04, 0.06], same
 # loss, LR, schedule and step budget, all from the same generator block. The
 # organ mask is ON (brain now has ESPIRiT maps, so it selects the head rather
 # than the whole field -- see torch/espirit_smaps.sbatch).

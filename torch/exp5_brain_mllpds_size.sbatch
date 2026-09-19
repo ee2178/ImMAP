@@ -62,7 +62,7 @@
 # cost scales with K, parameter cost with width^2.
 #
 # EVERYTHING ELSE IS HELD FIXED by the shared generator block: data, ESPIRiT
-# maps, mask, sigma ~ U[0.01, 0.02], loss, LR, schedule, organ mask, R=16.
+# maps, mask, sigma ~ U[0.04, 0.06], loss, LR, schedule, organ mask, R=16.
 #
 # HOW TO RUN
 # ----------
