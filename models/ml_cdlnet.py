@@ -213,7 +213,7 @@ class _SweepBase(nn.Module):
 class MLSweep(_SweepBase):
     """One outer ML-ISTA iteration over `L` levels."""
 
-    def __init__(self, C, M, L, widen=1, P=7, s=1, Mh=None, spectral_init=True,
+    def __init__(self, C, M, L, widen=2, P=7, s=1, Mh=None, spectral_init=True,
                  **layer_kws):
         super().__init__()
         self.L = int(L)
@@ -341,7 +341,7 @@ class MLSplitSweep(_SweepBase):
     `readout='level1'` -- every level already feeds g_1 within the same sweep.
     """
 
-    def __init__(self, C, M, L, widen=1, P=7, s=1, Mh=None, mu0=0.5,
+    def __init__(self, C, M, L, widen=2, P=7, s=1, Mh=None, mu0=0.5,
                  coupling0=1.0, spectral_init=True, **layer_kws):
         super().__init__()
         self.L = int(L)
@@ -523,7 +523,7 @@ class _MLBase(_MLIO):
 
     sweep_cls = None                      # set by the subclasses
 
-    def __init__(self, K=5, L=2, M=32, C=1, P=7, s=1, widen=1, Mh=None, W=1,
+    def __init__(self, K=5, L=2, M=32, C=1, P=7, s=1, widen=2, Mh=None, W=1,
                  tau0=1e-2, degrees=1, is_complex=True, preproc="image",
                  readout="level1", tie_outer=False, dK=1, sim_fun="distance",
                  nheads=1, rho0=1.0, gamma0=0.8, init_strategy="spectral_norm",

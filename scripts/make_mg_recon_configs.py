@@ -258,7 +258,6 @@ MODELS = {
 # the widths below they still trained at ~5 it/s with the GPU near 100%, against
 # ~2 it/s for this grid's fastest other nets. So K went to 30:
 #
-#     mllpds    K=30  widen=1  channels 96/96/96     ~329 GFLOP (9.7x)  109.0M params
 #     mllpdsw2  K=30  widen=2  channels 48/96/192    ~260 GFLOP (7.7x)  135.8M params
 #     mglpds    K=[6,[4,4,6]], M=169                   34 GFLOP          3.62M params
 #     lpdsnet   K=30, M=169                            21 GFLOP          1.00M params
@@ -268,7 +267,7 @@ MODELS = {
 # layer. Parameters are exact.)
 #
 # K=30 IS lpdsnet's K: layer 0 is the cold start in both, so both take 29 E^H E
-# steps, and (lpdsnet vs mllpds) no longer differs in iteration count -- only in
+# steps, and (lpdsnet vs mllpdsw2) no longer differs in iteration count -- only in
 # the prior. Width stays where K=18 put it, on multiples of 8: level-to-level
 # filters are dense M_{l-1} x M_l banks, so width costs quadratically and buys no
 # data consistency. Expect ~3 it/s if time scales with K -- read the probe, and
@@ -312,7 +311,7 @@ ML_LPDS_COMMON = dict(
 #     mllpdsw2       48/96/192     30     135.8M   1.00x     1.00x       29
 #     mllpds64       64/128/256    30     241.2M   1.78x     1.77x       29
 #     mllpds64k20    64/128/256    20     160.8M   1.18x     1.18x       19
-#     mllpds128k20   128/256/512   20     642.8x   4.73x     4.68x       19
+#     mllpds128k20   128/256/512   20     642.8M   4.73x     4.68x       19
 #
 # K IS NOT A FREE PARAMETER. Layer 0 is the cold start, so K=30 takes 29 `E^H E`
 # steps and K=20 takes 19. ML_LPDS_COMMON's K=30 exists precisely so ML-LPDS and
@@ -331,8 +330,6 @@ ML_LPDS_COMMON = dict(
 # model that currently loses to 1.00M-parameter `lpdsnet`. K=20 is what makes
 # that width affordable at all.
 MODELS.update({
-    "mllpds":       dict(type="MLLPDSNet",
-                         params=dict(ML_LPDS_COMMON, M=96, widen=1)),
     "mllpdsw2":     dict(type="MLLPDSNet",
                          params=dict(ML_LPDS_COMMON, M=48, widen=2)),
     "mllpds64":     dict(type="MLLPDSNet",
@@ -343,6 +340,31 @@ MODELS.update({
                          params=dict(ML_LPDS_COMMON, M=128, widen=2, K=20)),
 })
 
+# DEPTH INSTEAD OF WIDTH (exp6). exp5 said cutting K costs more than width buys:
+# 64/128/256 beat itself at K=20, and 128/256/512 at K=20 lost to it despite
+# 2.7x the parameters. These cells spend the budget on K instead:
+#
+#                     channels      K     params   rel FLOP   DC steps
+#     mllpds64       64/128/256    30     241.2M    1.00x        29   (exp4 arm)
+#     mllpds48k54    48/96/192     54     244.4M    1.01x        53
+#     mllpds64k40    64/128/256    40     321.7M    1.33x        39
+#
+# mllpds48k54 is ISO-BUDGET with mllpds64 -- same parameters and FLOPs, spent
+# on depth rather than width -- so that pair is the clean width-vs-depth
+# question. mllpds64k40 asks whether the winner keeps improving with K.
+#
+# There is deliberately NO lpdsnet control at matched K: the claim under test is
+# that the multilevel formulation packs in parameters without costing time, not
+# that the prior beats a flat one at equal iteration count.
+#
+# tau0 is unchanged: the Condat-Vu bound depends on the filters, not K.
+MODELS.update({
+    "mllpds48k54": dict(type="MLLPDSNet",
+                        params=dict(ML_LPDS_COMMON, M=48, widen=2, K=54)),
+    "mllpds64k40": dict(type="MLLPDSNet",
+                        params=dict(ML_LPDS_COMMON, M=64, widen=2, K=40)),
+})
+
 # MULTILEVEL CDL (models/ml_cdlnet.py), the synthesis-form siblings of ML-LPDS:
 #
 #   mlcdlw2    MLCDLNet       unrolled ML-ISTA -- the only state carried between
@@ -350,12 +372,12 @@ MODELS.update({
 #   mlsplitw2  MLSplitCDLNet  unrolled linearised ADMM -- every code kept, one
 #                             dual per link between levels
 #
-# Matched to `mllpdsw2` in WIDTH -- channels 48/96/192, L=3, s=2, P=7, degrees,
+# Matched to `mllpds64` in WIDTH -- channels 64/128/256, L=3, s=2, P=7, degrees,
 # dtype and preproc -- and the S.T. threshold initialised at ML-LPDS's clip
 # threshold, lam0=1e-3. (`tau0` in these classes IS that threshold; in the LPDS
 # family `tau0` is the primal step.) readout='level1' is stated so the config
-# records it. M/widen come from `mllpdsw2`, so re-widening that cell re-widens
-# these -- they deliberately do NOT follow exp4's ML-LPDS arm (mllpds64).
+# records it. M/widen come from `mllpds64` -- exp4's ML-LPDS arm -- so
+# re-widening that cell re-widens these, and exp4 stays width-matched.
 #
 # K IS PINNED AT 18, not taken from ML_LPDS_COMMON. Both nets were unstable at
 # K=18 -- MLSplitCDLNet tripped the loss backtrack almost immediately, and
@@ -363,8 +385,10 @@ MODELS.update({
 # than silently growing to K=30 with ML-LPDS. Neither is matched to ML-LPDS in K
 # any more. MLSplitCDLNet is out of exp4 for now; its configs are still written.
 #
-#     mlcdlw2    K=18  widen=2  channels 48/96/192   221 GFLOP   81.5M params
-#     mlsplitw2  K=18  widen=2  channels 48/96/192   477 GFLOP   81.5M params
+#     mlcdlw2    K=18  widen=2  channels 64/128/256  ~393 GFLOP  144.8M params
+#     mlsplitw2  K=18  widen=2  channels 64/128/256  ~848 GFLOP  144.8M params
+#
+# (Were 48/96/192 at 221/477 GFLOP and 81.5M; scaled by sum M_{l-1} M_l.)
 #
 # A suspect for the instability, not yet tested: `uball_project` bounds each
 # (out, in) 7x7 slice, not each atom, so a level-l atom may grow to norm
@@ -374,7 +398,7 @@ ML_CDL_COMMON = dict(
     {k: ML_LPDS_COMMON[k]
      for k in ("C", "P", "s", "degrees", "is_complex", "preproc", "L")},
     K=18, tau0=ML_LPDS_COMMON["lam0"], readout="level1")
-_W2_SHAPE = {k: MODELS["mllpdsw2"]["params"][k] for k in ("M", "widen")}
+_W2_SHAPE = {k: MODELS["mllpds64"]["params"][k] for k in ("M", "widen")}
 
 MODELS.update({
     "mlcdlw2":   dict(type="MLCDLNet",
@@ -383,10 +407,12 @@ MODELS.update({
                       params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
 })
 
-OPT_IN = ("mllpds", "mllpdsw2", "mlcdlw2", "mlsplitw2",
+OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
           # not renumber exp1-exp4, whose arrays index the default list.
-          "mllpds64", "mllpds64k20", "mllpds128k20")
+          "mllpds64", "mllpds64k20", "mllpds128k20",
+          # depth instead of width (exp6)
+          "mllpds48k54", "mllpds64k40")
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.

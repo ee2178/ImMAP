@@ -13,16 +13,15 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-5
+#SBATCH --array=0-4
 #
 # EXPERIMENT 4 -- the multilevel nets against flat LPDS and the V-cycle, BRAIN R16.
 #
 #   0   brain  R16 lpdsnet    flat LPDS, K=30
 #   1   brain  R16 mglpds     V-cycle, K=[6,[4,4,6]]
 #   2   brain  R16 varnet     E2E-VarNet baseline
-#   3   brain  R16 mllpds     ML-LPDS,        K=30, L=3, widen=1, channels 96/96/96
-#   4   brain  R16 mllpds64   ML-LPDS,        K=30, L=3, widen=2, channels 64/128/256
-#   5   brain  R16 mlcdlw2    ML-CDLNet,      K=18, L=3, widen=2, channels 48/96/192
+#   3   brain  R16 mllpds64   ML-LPDS,        K=30, L=3, widen=2, channels 64/128/256
+#   4   brain  R16 mlcdlw2    ML-CDLNet,      K=18, L=3, widen=2, channels 64/128/256
 #
 # Every arm trains here, from scratch: no existing brain run uses the
 # regenerated ESPIRiT maps. Data, mask, sigma ~ U[0.04, 0.06], loss, LR,
@@ -40,7 +39,7 @@
 #
 # WHAT THE COMPARISON ISOLATES
 # ----------------------------
-# The four LPDS cells run the same primal-dual iteration (LPDS / Condat-Vu) and
+# The three LPDS cells run the same primal-dual iteration (LPDS / Condat-Vu) and
 # differ in how the coarse grids enter. The CDL cell takes the same
 # multilevel dictionaries in SYNTHESIS form -- the codes generate the image
 # instead of penalising it:
@@ -48,9 +47,9 @@
 #                                                          GFLOP   params
 #   lpdsnet    one level, no coarse grids                     21    1.00M
 #   mglpds     coarse grids as a SOLVER (V-cycle, FAS)        34    3.62M
-#   mllpds     coarse grids as a PRIOR (one dual/level)     ~329  109.0M
-#   mllpds64   the same, channels doubling per level        ~460  241.2M
-#   mlcdlw2    multilevel SYNTHESIS, ML-ISTA (K=18)          221   81.5M
+#   mllpds64   coarse grids as a PRIOR (one dual/level),
+#              channels doubling per level                 ~460  241.2M
+#   mlcdlw2    multilevel SYNTHESIS, ML-ISTA (K=18)         ~393  144.8M
 #
 # NOT COMPUTE-MATCHED, ON PURPOSE. The ML cells are sized for wall-clock time,
 # not FLOPs. At K=18 ML-LPDS trained at ~5 it/s with the GPU near 100%, against
@@ -59,20 +58,20 @@
 # beat mglpds's INFERENCE TIME -- which means timing both on the same node, not
 # reading this table.
 #
-# K=30 IS lpdsnet's K, so (lpdsnet vs mllpds) takes the same 29 data-consistency
-# steps and differs only in the prior; (mllpds vs mllpds64) is the widening
-# question.
+# K=30 IS lpdsnet's K, so (lpdsnet vs mllpds64) takes the same 29
+# data-consistency steps and differs only in the prior. VarNet is the "is any
+# of this competitive" check, not part of the question.
 #
-# CELL 4 IS mllpds64, the winner of exp5's width/depth sweep (64/128/256, K=30,
+# CELL 3 IS mllpds64, the winner of exp5's width/depth sweep (64/128/256, K=30,
 # cascade init). It replaced mllpdsw2 (48/96/192), which stays generated and
 # runs by name: ONLY=mllpdsw2 sbatch --array=0 torch/exp4_brain_mllpds.sbatch.
+# The unwidened cell (mllpds, 96/96/96) is gone -- widen=2 is now the default.
 # A mllpds64 run dir exp5 already trained at this R and SWEEP_EPOCHS is picked
-# up by LAUNCH-ONCE and skipped, not retrained. VarNet is the "is any of this competitive"
-# check, not part of the question.
+# up by LAUNCH-ONCE and skipped, not retrained.
 #
 # THE SYNTHESIS NETS. mlcdlw2 stays at K=18: it was unstable there, and is kept
-# at the size that was observed rather than grown with ML-LPDS -- so it matches
-# mllpdsw2 in width but not in K (so it is narrower than mllpds64).
+# at the depth that was observed rather than grown with ML-LPDS -- so it matches
+# mllpds64 in WIDTH (64/128/256, tracked from that cell) but not in K.
 # MLSplitCDLNet (mlsplitw2) is out of this experiment for now: it tripped the
 # loss backtrack almost immediately. Its configs are still generated; run it by naming it,
 #     ONLY=mlsplitw2 sbatch --array=0 torch/exp4_brain_mllpds.sbatch
@@ -83,12 +82,12 @@
 # so the full grid's indices (which mg_recon_brain.sbatch uses) are unchanged.
 # They are listed only when named:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
-#       --accels 16 --only lpdsnet mglpds varnet mllpds mllpds64 mlcdlw2
+#       --accels 16 --only lpdsnet mglpds varnet mllpds64 mlcdlw2
 #
 # SHORT RUNS AND OTHER ACCELERATIONS
 # ----------------------------------
 # ONLY, ACCELS and SWEEP_EPOCHS below take their value from the sbatch line when
-# one is set. An epoch is 50 steps, so all six arms for 50k steps is
+# one is set. An epoch is 50 steps, so all five arms for 50k steps is
 #
 #     SWEEP_EPOCHS=1000 sbatch torch/exp4_brain_mllpds.sbatch
 #
@@ -105,7 +104,7 @@
 #     LAUNCH-ONCE cannot tell maps rewritten in place from current ones.
 #   * probe the widest ML-LPDS cell first and watch memory, which grows with K
 #     and width (mllpds64 is 241M params):
-#       SWEEP_EPOCHS=20 sbatch --array=4 torch/exp4_brain_mllpds.sbatch
+#       SWEEP_EPOCHS=20 sbatch --array=3 torch/exp4_brain_mllpds.sbatch
 #     (tagged, so it lands in mllpds64_R16_20ep; a repeat is skipped -- FORCE_RESTART=1)
 #   * `python -m tests.test_ml_lpds` and `python -m tests.test_ml_cdlnet` on the
 #     node are cheap and cover the models.
@@ -114,7 +113,7 @@
 # SUBMIT directory; from torch/ the job dies before the script runs.
 
 ANATOMY=brain
-ONLY="${ONLY:-lpdsnet mglpds varnet mllpds mllpds64 mlcdlw2}"
+ONLY="${ONLY:-lpdsnet mglpds varnet mllpds64 mlcdlw2}"
 ACCELS="${ACCELS:-16}"
 ORGAN_MASK=1                         # matches every other brain launcher --
                                      # regeneration rewrites every brain config,

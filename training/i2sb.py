@@ -26,6 +26,7 @@ import math
 
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn.functional as F
 import torchvision.utils as vutils
 from tqdm import tqdm
@@ -611,8 +612,8 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         # clip_frac ~ 0 means the mask is empty. Cheap scalars, logged every validation.
         inb = x0_m[:1][mask[:1] > 0.5]
         wandb.log({
-            "val/example": wandb.Image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
-            "val/residual": wandb.Image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
+            "val/example": wandb_image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
+            "val/residual": wandb_image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
             "val/display_clip_frac": (float(((inb < lo) | (inb > hi)).float().mean())
                                       if inb.numel() else float("nan")),
             "val/display_grid_mean": float(grid.mean()),

@@ -2,6 +2,7 @@ import os
 import math
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn as nn
 import torchvision.utils as vutils
 
@@ -434,11 +435,11 @@ def train_joint_denoising_recon(
                     res = res / res.max().clamp(min=1e-8)
                     
                     wandb.log({
-                        "val/jdr_example": wandb.Image(
+                        "val/jdr_example": wandb_image(
                             vutils.make_grid(grid, nrow=3),
                             caption=f"sigma={sigma_t_v.flatten()[0].item():.2f}"
                         ),
-                        "val/jdr_residual": wandb.Image(
+                        "val/jdr_residual": wandb_image(
                             vutils.make_grid(res, nrow=1),
                             caption="GT - Recon"
                         ),

@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn as nn
 import torchvision.utils as vutils
 import math
@@ -250,7 +251,7 @@ def train_denoiser(
                     grid = grid / grid.max()
 
                     wandb.log({
-                        "val/denoising_example": wandb.Image(
+                        "val/denoising_example": wandb_image(
                             vutils.make_grid(grid, nrow=3),
                             caption=f"Gnd Truth | Noisy sigma={sigma_v.flatten()[0].item():.2f} | Output"
                         ),

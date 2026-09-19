@@ -61,6 +61,7 @@ import math
 
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn as nn
 import torchvision.utils as vutils
 from tqdm import tqdm
@@ -399,9 +400,9 @@ def train_synthesis(
 
                 in_cap = f"T1 anchor(ch{residual_src_idx})" if residual_mode else "Input(ch0)"
                 log = {
-                    "val/example": wandb.Image(vutils.make_grid(grid, nrow=3),
+                    "val/example": wandb_image(vutils.make_grid(grid, nrow=3),
                                                caption=f"{in_cap} | T1ce GT | Predicted"),
-                    "val/residual": wandb.Image(vutils.make_grid(res, nrow=1),
+                    "val/residual": wandb_image(vutils.make_grid(res, nrow=1),
                                                 caption="| GT - Pred |"),
                     **{f"val/{k}": v for k, v in mean_metrics.items()},
                 }
@@ -420,7 +421,7 @@ def train_synthesis(
                                        diverging_rgb(d_pred, vmax),
                                        diverging_rgb(etv[:1], 1.0)], dim=0)
                     rr = mean_metrics.get("resid_ratio", float("nan"))
-                    log["val/delta"] = wandb.Image(
+                    log["val/delta"] = wandb_image(
                         vutils.make_grid(delta, nrow=3),
                         caption=f"residual (T1ce - T1): GT | Pred | ET mask  "
                                 f"[bwr, white=0, ±{float(vmax):.3f}] "

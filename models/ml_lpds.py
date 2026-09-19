@@ -121,7 +121,7 @@ class MLLPDSLayer(nn.Module):
     1-indexed list `[None, z_1, ..., z_L]`, as in `models/ml_cdlnet.py`.
     """
 
-    def __init__(self, C, M, L, widen=1, P=7, s=1, Mh=None, window=1,
+    def __init__(self, C, M, L, widen=2, P=7, s=1, Mh=None, window=1,
                  lam0=1e-2, tau0=1e-1, theta0=1e-1, degrees=0, is_complex=True,
                  prox_kws=None, spectral_init=True, init_norm="cascade",
                  proj_mode="slice"):
@@ -355,7 +355,7 @@ class MLLPDSNet(_MLIO):
     `MLLPDSNet(K=K, L=1)` and `MGLPDSNet(K=K)` are the same network.
     """
 
-    def __init__(self, K=30, L=2, M=169, C=1, P=7, s=2, widen=1,
+    def __init__(self, K=30, L=2, M=169, C=1, P=7, s=2, widen=2,
                  lam0=1e-2, tau0=1e-1, theta0=1e-1, degrees=0,
                  is_complex=True, window=1, Mh=None, dK=1, sim_fun="distance",
                  nheads=1, rho0=1.0, gamma0=0.8, init_strategy="spectral_norm",

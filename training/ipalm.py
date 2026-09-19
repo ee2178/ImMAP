@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn as nn
 import torchvision.utils as vutils
 
@@ -287,7 +288,7 @@ def train_ipalm(
                     
                     wandb.log(
                     {
-                        "val/recon_example": wandb.Image(
+                        "val/recon_example": wandb_image(
                             vutils.make_grid(grid, nrow=2)
                         )
                     },

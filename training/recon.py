@@ -2,6 +2,7 @@ import os
 import math
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn as nn
 
 from tqdm import tqdm
@@ -401,7 +402,7 @@ def train_recon(
                     )
 
                     wandb.log(
-                        {"val/recon_example": wandb.Image(panel, caption=caption)},
+                        {"val/recon_example": wandb_image(panel, caption=caption)},
                         step=global_step,
                     )
 

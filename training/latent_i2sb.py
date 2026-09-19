@@ -33,6 +33,7 @@ import math
 
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn.functional as F
 import torchvision.utils as vutils
 from tqdm import tqdm
@@ -456,8 +457,8 @@ def _validate(D_joint, R, D_t1ce, bridge, val_loader, device, *, M, interval, lo
         grid = mask[:1] * torch.cat([((c - lo) / (hi - lo)).clamp(0, 1) for c in cols], dim=0)
         res = (x0_m[:1] - pred_m[:1]).abs(); res = res / res.max().clamp(min=1e-8)
         wandb.log({
-            "val/example": wandb.Image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
-            "val/residual": wandb.Image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
+            "val/example": wandb_image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
+            "val/residual": wandb_image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
             **{f"val/{k}": v for k, v in mean_metrics.items()},
         }, step=global_step)
         # learned latent dictionary R (real-valued GroupCDL); no-op if R has no filter banks

@@ -35,6 +35,7 @@ import math
 
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 import torch.nn as nn
 import torchvision.utils as vutils
 from tqdm import tqdm
@@ -256,17 +257,17 @@ def train_dt_synthesis(
                 dS_show = dS_img / dS_img.max().clamp(min=1e-8)
 
                 wandb.log({
-                    "val/example": wandb.Image(
+                    "val/example": wandb_image(
                         vutils.make_grid(grid, nrow=4),
                         caption="Source(ch0) | base D_x z | Pred (base + dS) | Target GT"),
-                    "val/residual": wandb.Image(vutils.make_grid(res, nrow=1),
+                    "val/residual": wandb_image(vutils.make_grid(res, nrow=1),
                                                 caption="| GT - Pred |"),
-                    "val/dS": wandb.Image(
+                    "val/dS": wandb_image(
                         vutils.make_grid(dS_show, nrow=1),
                         caption=f"enhancement map dS  (max={float(dS_img.max()):.3f})"),
                     # ET mask next to dS: the question this panel answers is whether the
                     # enhancement the model produces lands where the tumor actually is.
-                    "val/et": wandb.Image(vutils.make_grid(etv[:1], nrow=1),
+                    "val/et": wandb_image(vutils.make_grid(etv[:1], nrow=1),
                                           caption="ET mask"),
                     **{f"val/{k}": v for k, v in mean_metrics.items()},
                 }, step=global_step)

@@ -16,6 +16,7 @@ the joint dict's D (C=4 = [x_t, FLAIR, T1, T2]) logs as a single 4-panel figure.
 import os
 import numpy as np
 import torch
+from visualization.wandb_image import wandb_image
 from torchvision.utils import make_grid, save_image
 
 
@@ -153,7 +154,7 @@ def get_filter_grids(net, scale_each=False, max_channels=4):
 
     filters = extract_lpds_filters(net)
     grids = render_lpds_filters(filters, scale_each=scale_each, max_channels=max_channels)
-    return {f"filters/{k}": wandb.Image(img.permute(1, 2, 0).numpy())
+    return {f"filters/{k}": wandb_image(img.permute(1, 2, 0).numpy())
             for k, img in grids.items()}
 
 
