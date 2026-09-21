@@ -15,8 +15,17 @@ Reads the per-session h5 files written by preprocessing/nyumets_h5.py, one direc
 and returns the 4-TUPLE: for regressors with no guided prox, e.g. an SBUnet whose C grows by G.
 Unlike the guided prox, input channels CAN carry intensities straight into the prediction.
 
+`x1_source="other_study"` makes the BRIDGE START another study's image instead: x1 = contrast
+`x1_other_idx` (default CT1) of a different study of the same patient, slice picked by
+`guide_slice` ("matched" / "world" / "central" / "random"). The batch is then a DICT that also
+carries
+
+    y     (1, H, W)          this session's contrast `y_idx` (default T1) -- the MEASUREMENT for
+                             sb.immap_sb, now distinct from the bridge start
+
 RETURN LAYOUT. guide_mode="none" returns the plain 4-TUPLE, byte-identical to the BraTS "i2sb"
-loader. Any guided mode returns a DICT {"x0","x1","cond","mask","guide"}. It is a dict and not a
+loader. Any guided mode returns a DICT {"x0","x1","cond","mask","guide"} (plus "y" under
+x1_source="other_study", which also returns a dict without a guide). It is a dict and not a
 5-tuple on purpose: train_i2sb reads tuple position 4 as the ET mask, so a guide there would be
 consumed as `et` and, under et_weight != 1, would weight the loss by the guide image. Keys cannot
 collide, and training/i2sb.py::_batch_parts accepts both layouts.
@@ -69,9 +78,11 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 import h5py
+from datasets.slice_filter import filter_by_brain_frac
 
 GUIDE_MODES = ("none", "same_session", "other_study", "far_slice", "central_slice", "same_slice")
-GUIDE_SLICES = ("matched", "central", "random")
+GUIDE_SLICES = ("matched", "central", "random", "world")
+X1_SOURCES = ("contrast", "other_study")
 
 
 def index_sessions(root):
@@ -133,6 +144,20 @@ class NYUMetsGuidedDataset(Dataset):
         if self.guide_as_cond and not self.modes:
             raise ValueError("guide_as_cond=True needs a guide_mode other than 'none'")
 
+        # Where the bridge STARTS. "contrast": x1 = stored contrast x1_idx of this session (T1).
+        # "other_study": x1 = contrast x1_other_idx (default CT1) of ANOTHER study of the same
+        # patient, slice picked by `guide_slice` like an other_study guide. Then the batch is a
+        # dict that also carries "y" = this session's contrast y_idx (default x1_idx, i.e. T1):
+        # the MEASUREMENT for sb.immap_sb, which is no longer the bridge start.
+        self.x1_source = str(getattr(cfg, "x1_source", "contrast"))
+        if self.x1_source not in X1_SOURCES:
+            raise ValueError(f"x1_source must be one of {X1_SOURCES}, got {self.x1_source!r}")
+        x1o = getattr(cfg, "x1_other_idx", None)
+        self.x1_other_idx = self.x0_idx if x1o is None else int(x1o)
+        yi = getattr(cfg, "y_idx", None)
+        self.y_idx = self.x1_idx if yi is None else int(yi)
+        self._geom = {}                                   # per-file (affine, slice_index, hw)
+
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
 
@@ -159,7 +184,7 @@ class NYUMetsGuidedDataset(Dataset):
             if len(keep) < before:
                 print(f"[NYUMetsGuided] far_slice: dropped {before-len(keep)}/{before} session(s) "
                       f"with <= min_slice_gap={self.min_slice_gap} slices")
-        if "other_study" in self.modes:
+        if "other_study" in self.modes or self.x1_source == "other_study":
             before = len(keep)
             n_by_pat = {}
             for i in keep:
@@ -186,6 +211,10 @@ class NYUMetsGuidedDataset(Dataset):
             local.extend(range(n))
         self.file_id = np.asarray(file_id, dtype=np.int64)
         self.local = np.asarray(local, dtype=np.int64)
+        # drop mostly-background slices (vertex, skull base): datasets/slice_filter.py
+        self.file_id, self.local = filter_by_brain_frac(
+            self.img_paths, self.file_id, self.local,
+            float(getattr(cfg, "min_brain_frac", 0.0) or 0.0), tag="NYUMetsGuided")
         self._img_h = {}                                  # lazy per-worker handles
 
     @property
@@ -232,19 +261,55 @@ class NYUMetsGuidedDataset(Dataset):
                     far = [z for z in range(self.n_slices[fi]) if abs(z - li) >= self.min_slice_gap]
                     out.append((fi, far[self._pick(len(far), idx, salt)], self.guide_idx))
                 elif mode == "other_study":
-                    sib = self.siblings[fi]
-                    gf = sib[self._pick(len(sib), idx, salt)]
-                    n, gn = self.n_slices[fi], self.n_slices[gf]
-                    if self.guide_slice == "matched":
-                        gz = int(round(li / max(n - 1, 1) * (gn - 1)))
-                    elif self.guide_slice == "central":
-                        gz = gn // 2
-                    else:
-                        gz = self._pick(gn, idx, salt + 500)
-                    out.append((gf, min(max(gz, 0), gn - 1), self.guide_idx))
+                    gf, gz = self._other_study_slice(fi, li, idx, salt)
+                    out.append((gf, gz, self.guide_idx))
                 else:
                     raise AssertionError(mode)
         return out
+
+    def _other_study_slice(self, fi, li, idx, salt):
+        """-> (file index, local slice) of the matching slice in ANOTHER study of this patient.
+
+        guide_slice:
+          matched  same RELATIVE position among the kept slices (cheap; shifted by any
+                   difference in which end slices the h5 build dropped)
+          world    same scanner-space z: this slice's original index -> world coordinate via
+                   this volume's affine -> the other volume's index via its inverse affine ->
+                   the nearest KEPT slice. Right only if the two studies share a world frame.
+          central  the other volume's middle kept slice
+          random   any kept slice
+        """
+        sib = self.siblings[fi]
+        gf = sib[self._pick(len(sib), idx, salt)]
+        n, gn = self.n_slices[fi], self.n_slices[gf]
+        if self.guide_slice == "matched":
+            gz = int(round(li / max(n - 1, 1) * (gn - 1)))
+        elif self.guide_slice == "central":
+            gz = gn // 2
+        elif self.guide_slice == "world":
+            gz = self._world_slice(fi, li, gf)
+        else:
+            gz = self._pick(gn, idx, salt + 500)
+        return gf, min(max(gz, 0), gn - 1)
+
+    def _geometry(self, fi):
+        g = self._geom.get(fi)
+        if g is None:
+            h = self._handle(self.img_paths[fi])
+            if "affine" not in h.attrs or "slice_index" not in h:
+                raise KeyError(f"guide_slice='world' needs the affine attr and slice_index in "
+                               f"{self.img_paths[fi]}")
+            hw = np.asarray(h.attrs.get("native_size", h[self.image_key].shape[1:3]), dtype=float)
+            g = (np.asarray(h.attrs["affine"], dtype=float), np.asarray(h["slice_index"]), hw)
+            self._geom[fi] = g
+        return g
+
+    def _world_slice(self, fi, li, gf):
+        A, zi, hw = self._geometry(fi)
+        Ag, zg, _ = self._geometry(gf)
+        p = A @ np.array([hw[0] / 2.0, hw[1] / 2.0, float(zi[li]), 1.0])   # in-plane centre
+        k = (np.linalg.inv(Ag) @ p)[2]                                     # other volume's z
+        return int(np.argmin(np.abs(zg.astype(float) - k)))
 
     def _read(self, fi, li):
         h = self._handle(self.img_paths[fi])
@@ -267,7 +332,13 @@ class NYUMetsGuidedDataset(Dataset):
                 np.ascontiguousarray(np.transpose(a, (2, 0, 1)), dtype=np.float32))
 
         x0 = chw(img[..., [self.x0_idx]])
-        x1 = chw(img[..., [self.x1_idx]])
+        y = None
+        if self.x1_source == "other_study":
+            gf, gz = self._other_study_slice(fi, li, idx, 777)
+            x1 = chw(self._read(gf, gz)[0][..., [self.x1_other_idx]])
+            y = chw(img[..., [self.y_idx]])
+        else:
+            x1 = chw(img[..., [self.x1_idx]])
         cond = chw(img[..., self.cond_idx]) if self.cond_idx else torch.zeros(0, *img.shape[:2])
         mask = chw(mask)
 
@@ -284,8 +355,11 @@ class NYUMetsGuidedDataset(Dataset):
         # which the guided prox depends on; for other_study it is harmless.
         if self.transform is not None:
             n0, n1, ncond = x0.shape[0], x1.shape[0], cond.shape[0]
-            parts = [x0, x1, cond, mask] + ([guide] if guide is not None else [])
+            parts = ([x0, x1, cond, mask] + ([guide] if guide is not None else [])
+                     + ([y] if y is not None else []))
             stacked = self.transform(torch.cat(parts, dim=0))
+            if y is not None:
+                y, stacked = stacked[-1:], stacked[:-1]
             x0 = stacked[:n0]
             x1 = stacked[n0:n0 + n1]
             cond = stacked[n0 + n1:n0 + n1 + ncond]
@@ -293,13 +367,18 @@ class NYUMetsGuidedDataset(Dataset):
             if guide is not None:
                 guide = stacked[n0 + n1 + ncond + 1:]
 
-        if guide is None:
-            return x0, x1, cond, mask
-        if self.guide_as_cond:
+        if guide is not None and self.guide_as_cond:
             # guide planes go AFTER cond_idx, in guide order: cond = [cond_idx..., guides...]
-            return x0, x1, torch.cat([cond, guide], dim=0), mask
+            cond, guide = torch.cat([cond, guide], dim=0), None
+        if guide is None and y is None:
+            return x0, x1, cond, mask
+        if guide is None:
+            return {"x0": x0, "x1": x1, "cond": cond, "mask": mask, "y": y}
         # (G, H, W) -> (G, 1, H, W), so a batch collates to (B, G, 1, H, W): the stacked layout
         # models/guided_prox.as_guide_list documents. A (B, G, H, W) batch is AMBIGUOUS there --
         # as_guide_list reads any 4-D tensor as ONE guide with G channels, which a C=1 analysis
         # conv then rejects (or, at G=1, silently accepts for the wrong reason).
-        return {"x0": x0, "x1": x1, "cond": cond, "mask": mask, "guide": guide.unsqueeze(1)}
+        out = {"x0": x0, "x1": x1, "cond": cond, "mask": mask, "guide": guide.unsqueeze(1)}
+        if y is not None:
+            out["y"] = y
+        return out

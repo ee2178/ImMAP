@@ -248,6 +248,8 @@ def train_i2sb(
                                      # (same slices every time; val_seed picks them). None = the
                                      # whole split -- which for the guided nets at batch 1, full
                                      # frame, is hours per validation.
+    val_min_brain_frac=0.0,          # keep only val slices whose brain mask covers >= this
+                                     # fraction of the frame (0 = no filter, old selection)
     display_window=None,             # [vmin, vmax] for the val panels; None = [DISPLAY_VMIN,
                                      # DISPLAY_VMAX], the med/MAD window. [0, 1] for raw/scale data.
     data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
@@ -323,7 +325,8 @@ def train_i2sb(
         from training.forward_op import fixed_val_subset
         n_full = len(val_loader.dataset)
         val_loader = fixed_val_subset(val_loader, int(val_slices),
-                                      0 if val_seed is None else int(val_seed))
+                                      0 if val_seed is None else int(val_seed),
+                                      float(val_min_brain_frac or 0.0))
         print(f"[i2sb] validating on a fixed subset: {len(val_loader.dataset)}/{n_full} val slices")
     elif val_loader is not None:
         print(f"[i2sb] validating on the whole val split: {len(val_loader.dataset)} slices "
@@ -622,10 +625,10 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         x1, xt, x0_m, pred_m, mask, step = last
         if val_mode == "single_pass":
             cols = [x1[:1], xt[:1], pred_m[:1], x0_m[:1]]
-            cap = f"T1 prior | x_t (step={int(step[0])}) | single-pass pred_x0 | T1ce GT"
+            cap = f"x1 (bridge start) | x_t (step={int(step[0])}) | single-pass pred_x0 | T1ce GT"
         else:
             cols = [x1[:1], pred_m[:1], x0_m[:1]]
-            cap = f"T1 prior | I2SB recon (nfe={val_nfe}) | T1ce GT"
+            cap = f"x1 (bridge start) | I2SB recon (nfe={val_nfe}) | T1ce GT"
         # Every panel is drawn on the FIXED window [DISPLAY_VMIN, DISPLAY_VMAX] -- see the
         # module-level constants for why it is a constant rather than a derived quantity.
         lo, hi = ((DISPLAY_VMIN, DISPLAY_VMAX) if display_window is None

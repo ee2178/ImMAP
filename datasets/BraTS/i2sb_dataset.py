@@ -39,6 +39,7 @@ from torch.utils.data import Dataset
 import h5py
 
 from datasets.BraTS.synth_dataset import filter_by_key
+from datasets.slice_filter import filter_by_brain_frac
 
 
 def index_img_from_root(root):
@@ -149,6 +150,10 @@ class I2SBDataset(Dataset):
             local.extend(range(n))
         self.file_id = np.asarray(file_id, dtype=np.int64)
         self.local = np.asarray(local, dtype=np.int64)
+        # drop mostly-background slices (vertex, skull base): datasets/slice_filter.py
+        self.file_id, self.local = filter_by_brain_frac(
+            self.img_paths, self.file_id, self.local,
+            float(getattr(cfg, "min_brain_frac", 0.0) or 0.0), tag="I2SBDataset")
         self._img_h = {}                                  # lazy per-worker handles
 
     def __len__(self):

@@ -9,7 +9,8 @@ is replaced, before the ordinary posterior update, by
 
     x_tilde = argmin_x  1/2 ||x - x_hat||^2 / gamma_t  +  1/2 ||M (y - A(x))||^2 / sigma_A^2
 
-with y = T1 (the bridge's own start, x1), A the frozen learned operator CT1 -> T1
+with y = this session's T1 (the bridge start x1 for the T1 bridge; passed separately when the bridge
+starts elsewhere, e.g. another study's CT1), A the frozen learned operator CT1 -> T1
 (models/forward_ops.py) and M an optional fidelity mask. Under p(x0 | z_t) ~ N(x_hat, gamma_t I)
 and A linearized, x_tilde is E[x0 | z_t, y]: the posterior mean given the measurement too.
 
@@ -103,14 +104,18 @@ def _rms(t, mask=None):
 
 
 @torch.no_grad()
-def immap_sb(net, x1, sched, prox, cond=None, a_cond=None, mask=None, nfe=None,
-                     deterministic=False, posterior="ddpm", clip_denoise=False, target_channels=1,
-                     log_count=1, verbose=True, guide=None):
+def immap_sb(net, x1, sched, prox, y=None, cond=None, a_cond=None, mask=None, nfe=None,
+             deterministic=False, posterior="ddpm", clip_denoise=False, target_channels=1,
+             log_count=1, verbose=True, guide=None):
     """sb.i2sb.i2sb_sample with the data prox between the regressor and the posterior update.
 
-    x1 is T1: the bridge's start AND the measurement y. `cond` goes to the regressor (its own
-    conditioning channels), `a_cond` to A (its side information; None for a CT1-only A). `mask`
-    is the fidelity region M, or None for the whole frame.
+    x1 is the bridge's START; y is the MEASUREMENT the prox enforces, y ~ A(x0) -- this session's
+    T1. For the T1 -> CT1 bridge they are the same image and y may be left None (y = x1). For a
+    bridge that starts somewhere else -- another study's CT1 (x1_source="other_study") -- pass
+    this session's T1 as y explicitly, or the prox enforces consistency with the WRONG image.
+    `cond` goes to the regressor (its own conditioning channels), `a_cond` to A (its side
+    information; None for a CT1-only A). `mask` is the fidelity region M, or None for the whole
+    frame.
 
     Returns (recon, xs, pred_x0s, stats); `pred_x0s` logs x_tilde (the prox output), and `stats`
     has one dict per visited step.
@@ -119,6 +124,9 @@ def immap_sb(net, x1, sched, prox, cond=None, a_cond=None, mask=None, nfe=None,
         raise ValueError("the DC prox is defined for a single target channel")
     device = sched.std_fwd.device
     x1 = x1.to(device)
+    y = x1 if y is None else y.to(device)
+    if y.shape != x1.shape:
+        raise ValueError(f"y {tuple(y.shape)} and x1 {tuple(x1.shape)} must match")
     cond = None if cond is None else cond.to(device)
     a_cond = None if a_cond is None else a_cond.to(device)
     mask = None if mask is None else mask.to(device)
@@ -130,7 +138,7 @@ def immap_sb(net, x1, sched, prox, cond=None, a_cond=None, mask=None, nfe=None,
         sigma = forward_std(sched, step_t, xdim=x_t.shape[1:])
         x_hat = predict_x0(net, x_t, sigma, cond=cond, target_channels=target_channels,
                            guide=guide)
-        x_tilde, st = prox(x_hat, x1, step, cond=a_cond, mask=mask)
+        x_tilde, st = prox(x_hat, y, step, cond=a_cond, mask=mask)
         stats.append(st)
         return x_tilde
 

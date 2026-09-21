@@ -59,6 +59,8 @@ def main():
                     help="fidelity region M for the prox")
     ap.add_argument("--nfe", type=int, default=None, help="default: the run's val_nfe")
     ap.add_argument("--n-slices", type=int, default=200)
+    ap.add_argument("--min-brain-frac", type=float, default=0.2,
+                    help="skip slices whose brain mask covers less of the frame (0 = no filter)")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--enh-q", type=float, default=0.98)
@@ -93,7 +95,7 @@ def main():
     net_sel, a_sel = list(range(len(run_cond))), [all_cond.index(c) for c in a_cond]
     vcfg.update(cond_idx=all_cond, batch_size=args.batch)
     loader = fixed_val_subset(build_loader(vcfg, shuffle=False, drop_last=False),
-                              args.n_slices, args.seed)
+                              args.n_slices, args.seed, args.min_brain_frac)
 
     print(f"denoiser {type(net).__name__} ({ckpt}) | A {args.a_ckpt} sigma_A={sigma_A:.4g}")
     print(f"{len(loader.dataset)} val slices, nfe={nfe}, c={args.c}, t_max={args.t_max}, "
@@ -105,10 +107,13 @@ def main():
     panel = {}
     for bi, batch in enumerate(loader):
         x0, x1, cond, mask, _, _ = _split_batch(batch, device)
+        # the MEASUREMENT: this session's T1. The loader returns it as "y" when the bridge starts
+        # elsewhere (x1_source="other_study"); for the T1 bridge it IS x1.
+        y = batch["y"].to(device) if isinstance(batch, dict) and "y" in batch else x1
         c_net = None if (cond is None or not net_sel) else cond[:, net_sel]
         c_A = None if not a_sel else cond[:, a_sel]
         m = (mask > 0.5).float()
-        enh = enh_region(x0, x1, m, args.enh_q)
+        enh = enh_region(x0, y, m, args.enh_q)
         rest = m * (1 - enh)
         M = m if args.mask == "brain" else None
         for c in cs:
@@ -117,7 +122,7 @@ def main():
             torch.manual_seed(args.seed * 100003 + bi)         # same noise for every c
             t0 = time.time()
             recon, _, _, stats = immap_sb(
-                net, x1, sched, prox, cond=c_net, a_cond=c_A, mask=M, nfe=nfe,
+                net, x1, sched, prox, y=y, cond=c_net, a_cond=c_A, mask=M, nfe=nfe,
                 deterministic=bool(i2.get("deterministic", False)),
                 posterior=i2.get("posterior", "ddpm"), clip_denoise=bool(i2.get("clip_denoise", False)),
                 verbose=False)
@@ -136,10 +141,10 @@ def main():
             a["sse_e"] += float((e2 * enh).sum()); a["npx_e"] += float(enh.sum())
             a["sse_r"] += float((e2 * rest).sum()); a["npx_r"] += float(rest.sum())
             with torch.no_grad():
-                a["t1_sse"] += float(((x1 - A(recon, c_A)) ** 2 * m).sum())
+                a["t1_sse"] += float(((y - A(recon, c_A)) ** 2 * m).sum())
             a["deltas"] += [s["delta_rms"] for s in stats if s.get("active")]
             if bi == 0:
-                panel[c] = (recon[0, 0].cpu(), x0[0, 0].cpu(), x1[0, 0].cpu(), m[0, 0].cpu())
+                panel[c] = (recon[0, 0].cpu(), x0[0, 0].cpu(), y[0, 0].cpu(), m[0, 0].cpu())
         print(f"batch {bi + 1}/{len(loader)} done")
 
     sq = lambda s, n: math.sqrt(s / n) if n else float("nan")

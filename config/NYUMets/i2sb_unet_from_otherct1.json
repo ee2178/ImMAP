@@ -1,31 +1,41 @@
 {
     "task": "i2sb",
     "experiment": {
-        "name": "I2SB_SBCDLNet_NYUMets_CT1_from_all"
+        "name": "I2SB_Unet_NYUMets_CT1_from_otherCT1"
     },
     "model": {
-        "type": "SBCDLNet",
+        "type": "SBUnet",
         "params": {
-            "K": 30,
-            "M": 169,
-            "P": 7,
-            "s": 2,
             "C": 4,
-            "prior_idx": 1,
-            "t0": 0.0,
-            "deg_eta": 2,
-            "deg_tau": 2,
+            "out_channels": 1,
+            "model_channels": 64,
+            "num_res_blocks": 2,
+            "channel_mult": [
+                1,
+                2,
+                3,
+                4
+            ],
+            "attention_resolutions": [
+                32,
+                16
+            ],
+            "image_size": 128,
+            "num_heads": 4,
+            "num_head_channels": 32,
+            "dropout": 0.0,
+            "use_scale_shift_norm": true,
+            "resblock_updown": false,
+            "conv_resample": true,
             "kind": "i2sb",
-            "tau": 0.19,
             "n_points": 1000,
             "beta_max": 0.3,
-            "init": true,
-            "complex": false
+            "t0": 1.0e-4,
+            "T": 1.0
         }
     },
     "i2sb": {
         "kind": "i2sb",
-        "tau": 0.19,
         "n_points": 1000,
         "beta_max": 0.3,
         "deterministic": false,
@@ -36,13 +46,9 @@
         "val_nfe": 20,
         "target_channels": 1
     },
-    "paths": {
-        "save_dir": "trained_nets/nyumets/I2SB_SBCDLNet_NYUMets_CT1_from_all",
-        "ckpt": null
-    },
     "data": {
         "train": {
-            "name": "i2sb",
+            "name": "nyumets_guided",
             "root": "../datasets/NYUMets_h5_train",
             "x0_idx": 2,
             "x1_idx": 1,
@@ -53,7 +59,6 @@
             ],
             "image_key": "img_median_mad",
             "min_brain_frac": 0.2,
-            "et_mask": false,
             "scales": [
                 3.0,
                 3.0,
@@ -63,10 +68,16 @@
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 8,
-            "num_workers": 8
+            "num_workers": 8,
+            "x1_source": "other_study",
+            "x1_other_idx": 2,
+            "y_idx": 1,
+            "guide_mode": "none",
+            "guide_slice": "matched",
+            "deterministic": false
         },
         "val": {
-            "name": "i2sb",
+            "name": "nyumets_guided",
             "root": "../datasets/NYUMets_h5_val",
             "x0_idx": 2,
             "x1_idx": 1,
@@ -77,7 +88,6 @@
             ],
             "image_key": "img_median_mad",
             "min_brain_frac": 0.2,
-            "et_mask": false,
             "scales": [
                 3.0,
                 3.0,
@@ -86,14 +96,20 @@
             ],
             "random_flips": false,
             "batch_size": 8,
-            "num_workers": 8
+            "num_workers": 8,
+            "x1_source": "other_study",
+            "x1_other_idx": 2,
+            "y_idx": 1,
+            "guide_mode": "none",
+            "guide_slice": "matched",
+            "deterministic": true
         }
     },
     "training": {
-        "num_epochs": 3000,
-        "steps_per_epoch": 100,
-        "val_every_epochs": 50,
-        "clip_grad": 0.05,
+        "num_epochs": 1500,
+        "steps_per_epoch": 200,
+        "val_every_epochs": 25,
+        "clip_grad": 1.0,
         "backtrack_thresh": 1000,
         "backtrack_factor": 0.9,
         "use_mask": true,
@@ -104,10 +120,14 @@
         "data_range": 2.0,
         "val_slices": 1000
     },
+    "paths": {
+        "save_dir": "trained_nets/nyumets/I2SB_Unet_NYUMets_CT1_from_otherCT1",
+        "ckpt": null
+    },
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 0.0001
+            "lr": 1.0e-4
         }
     },
     "scheduler": {

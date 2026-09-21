@@ -25,6 +25,7 @@
                 0
             ],
             "image_key": "img_median_mad",
+            "min_brain_frac": 0.2,
             "guide_mode": "none",
             "scales": [
                 3.0,
@@ -47,6 +48,7 @@
                 0
             ],
             "image_key": "img_median_mad",
+            "min_brain_frac": 0.2,
             "guide_mode": "none",
             "scales": [
                 3.0,
