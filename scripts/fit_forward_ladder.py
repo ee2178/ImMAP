@@ -46,9 +46,7 @@ import numpy as np
 import torch
 import yaml
 import wandb
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt       # backend is chosen in main(), never at import
 from torch.utils.data import DataLoader, Subset
 
 import datasets                                   # noqa: F401  (registers loaders)
@@ -142,6 +140,7 @@ def time_references(paths, shape, device, warmup, reps):
 
 # ---------------------------------------------------------------------------------------------
 def main(config_path):
+    plt.switch_backend("Agg")                 # headless figures for wandb; only when RUN, not imported
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

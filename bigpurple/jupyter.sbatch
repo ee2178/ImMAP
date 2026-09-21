@@ -74,10 +74,10 @@ PY
 PORT=$(( 8888 + SLURM_JOB_ID % 1000 ))
 NODE=$(hostname -s)
 
-# The host you ssh into from your laptop -- exactly what you type after `ssh user@`. The login
-# nodes moved from BigPurple to UltraViolet, so `bigpurple.nyumc.org` no longer resolves. Set it
-# once here, or per job with `LOGIN_HOST=... sbatch bigpurple/jupyter.sbatch`.
-LOGIN_HOST="${LOGIN_HOST:-ultraviolet.nyumc.org}"
+# The host you ssh into from your laptop -- exactly what you type after `ssh user@`. It only
+# resolves on the NYU Langone VPN (not the one used for Torch). Override per job with
+# `LOGIN_HOST=... sbatch bigpurple/jupyter.sbatch`.
+LOGIN_HOST="${LOGIN_HOST:-bigpurple.nyumc.org}"
 
 cat <<EOF
 
@@ -86,8 +86,7 @@ cat <<EOF
 
       ssh -N -L ${PORT}:${NODE}:${PORT} ${USER}@${LOGIN_HOST}
 
-  (submitted from login node: ${SLURM_SUBMIT_HOST:-unknown}. If ${LOGIN_HOST} is not what
-   you ssh into, use your usual login address -- the -L part stays the same.)
+  (on the NYU Langone VPN; submitted from login node ${SLURM_SUBMIT_HOST:-unknown})
 
   then browse to the 127.0.0.1 URL printed below.
 =======================================================================

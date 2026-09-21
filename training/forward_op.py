@@ -23,8 +23,9 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import matplotlib
-matplotlib.use("Agg")
+# NO matplotlib.use() here: this module is imported (via training/__init__) by notebooks, and
+# switching the backend at import silently turns their plt.show() into a no-op. Headless jobs
+# fall back to Agg on their own.
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
