@@ -15,6 +15,8 @@ Jacobians taken at different points.
 
     LearnedOperator      E(x; c): a frozen models.forward_ops.ForwardOp with its side information
                          (e.g. T2, FLAIR) bound for one batch.
+    LinearizedOperator   its Jacobian at a fixed point: a true linear operator with an exact
+                         adjoint, for Gauss-Newton / CG (sb/immap_sb.py).
     BridgeDCOperator     the I2SB regression problem at one bridge step: the debiased bridge state
                          AND a learned-operator measurement, as one weighted data term.
 """
@@ -58,6 +60,47 @@ class LearnedOperator(Operator):
         loss differentiates through the VJP -- second order in E, first order in its frozen
         weights. Under torch.no_grad (validation, sampling) the result is a plain tensor."""
         return self.net.data_grad(x, y, self.cond, create_graph=torch.is_grad_enabled())
+
+
+class LinearizedOperator(Operator):
+    """The Jacobian J of a learned operator at a FIXED point x_bar -- a genuine LINEAR Operator.
+
+        forward(v)  = J v        adjoint(u) = J^T u        gram(v) = J^T J v
+
+    Because the JVP and VJP are taken at the same x_bar, J^T J is exactly symmetric and PSD
+    (<u, J^T J v> = <J u, J v>), so it can go straight into CG. It passes the dot-product test,
+    unlike the nonlinear operator it came from, whose adjoint only exists at a point.
+
+    Built with the double-VJP trick rather than torch.func, so it runs on any torch: ONE forward of
+    the net at x_bar, and then every J v / J^T u reuses that graph -- no further forwards. `value`
+    holds A(x_bar), which the Gauss-Newton residual needs anyway.
+
+    Inference only: results are detached. (Training THROUGH the solve would differentiate
+    implicitly around the CG call, not through these graphs.)
+    """
+
+    def __init__(self, net, x_bar, cond=None):
+        with torch.enable_grad():
+            self._x = x_bar.detach().requires_grad_(True)
+            self._out = net(self._x, cond)
+            self._u = torch.zeros_like(self._out, requires_grad=True)
+            # J^T u as a function of u, kept differentiable: grad of <J^T u, v> w.r.t. u is J v
+            (self._jtu,) = torch.autograd.grad(self._out, self._x, grad_outputs=self._u,
+                                               create_graph=True)
+        self.value = self._out.detach()
+
+    def forward(self, v):
+        with torch.enable_grad():
+            (jv,) = torch.autograd.grad(self._jtu, self._u, grad_outputs=v, retain_graph=True)
+        return jv.detach()
+
+    def adjoint(self, u):
+        with torch.enable_grad():
+            (jtu,) = torch.autograd.grad(self._out, self._x, grad_outputs=u, retain_graph=True)
+        return jtu.detach()
+
+    def gram(self, v):
+        return self.adjoint(self.forward(v))
 
 
 class BridgeDCOperator(Operator):

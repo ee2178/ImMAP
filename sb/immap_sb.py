@@ -1,114 +1,141 @@
 """
-sb/immap_sb.py -- ImMAP-SB: self-paced annealed Tweedie ascent (ImMAP counterpart to i2sb_sample).
+sb/immap_sb.py -- ImMAP-SB: I2SB sampling with a learned data-consistency prox.
 
-STATUS: WORK IN PROGRESS. This is relocated as-is from the old diffusion/i2sb.py so it is not lost
-during the sb/ refactor; it has only been mechanically ported to the sb.base helpers (and pinned to
-the x0 parameterization, now the only one). The algorithm itself is still being iterated on and is
-NOT part of the cleanup's polish scope -- expect it to change.
+Structurally ImMAP (denoise, then a data prox, at every step of an annealed schedule) on a
+Schrodinger bridge. (The earlier self-paced variant lives in sb/immap_sb_ascent.py.)
 
-It anneals toward argmax_x log p(x | y) with an I2SB regressor r(x_t, t, y) ~ E[x0 | x_t, y]. Unlike
-i2sb_sample's fixed discrete reverse schedule, the bridge level t is SELF-ESTIMATED each step and the
-loop runs until t < t_L (cf. the self-estimated sigma_t in diffusion/immap.py:immap2).
+At every reverse step the trained regressor's endpoint estimate x_hat = D(z_t, t) ~ E[x0 | z_t]
+is replaced, before the ordinary posterior update, by
+
+    x_tilde = argmin_x  1/2 ||x - x_hat||^2 / gamma_t  +  1/2 ||M (y - A(x))||^2 / sigma_A^2
+
+with y = T1 (the bridge's own start, x1), A the frozen learned operator CT1 -> T1
+(models/forward_ops.py) and M an optional fidelity mask. Under p(x0 | z_t) ~ N(x_hat, gamma_t I)
+and A linearized, x_tilde is E[x0 | z_t, y]: the posterior mean given the measurement too.
+
+Solved by Gauss-Newton: linearize A at x_bar (J = dA/dx there), then CG on
+
+    (lam_t I + J^T M J) delta = J^T M (y - A(x_bar)) - lam_t (x_bar - x_hat),   lam_t = sigma_A^2/gamma_t
+
+and x_bar <- x_bar + delta, `gn_iters` times (x_bar starts at x_hat, so the second term vanishes on
+the first pass). lam_t I + J^T M J is symmetric positive definite for lam_t > 0 by construction.
+
+    gamma_t = c * sigma_eff(t)^2,     sigma_eff = std_sb / mu_x0
+
+the uncertainty of x0 implied by the bridge state. So lam_t is LARGE near t = 0 (the denoiser is
+trusted, the prox ~ identity) and SMALL toward t = 1 (the data term dominates). c = 0 disables the
+prox exactly, reproducing sb.i2sb.i2sb_sample bit for bit.
+
+The noise schedule belongs entirely to sb.base.reverse_sample: the prox only replaces x_hat. It
+cannot stop the sampler reaching sigma = 0 at t = 0.
+
+Plug-and-play: the regressor is used as trained and A is frozen; nothing here trains.
 """
 
 import torch
-from tqdm import tqdm
 
-from sb.base import n_steps, forward_std, predict_x0, bridge_coeffs
-from utils.tensor import unsqueeze_xdim
+from operators.learned import LinearizedOperator
+from sb.base import bridge_coeffs, forward_std, n_steps, predict_x0, reverse_sample
+from solvers.cg import batched_cg
+
+
+class ImMAPProx:
+    """The learned data-consistency prox, bound to one bridge schedule.
+
+    A          frozen ForwardOp (CT1 -> T1), eval mode
+    sigma_A    A's residual std on held-out data (the ladder checkpoint stores it)
+    c          prior-variance scale: gamma_t = c * sigma_eff(t)^2. 0 disables the prox.
+    t_max      apply the prox only for t = step / (n - 1) <= t_max
+    cg_iters   CG iterations per Gauss-Newton pass;  cg_tol  their relative-residual stop
+    gn_iters   Gauss-Newton re-linearizations (1 = linearize once, at x_hat)
+    """
+
+    def __init__(self, sched, A, sigma_A, c=1.0, t_max=1.0, cg_iters=10, gn_iters=1, cg_tol=1e-4):
+        if not sigma_A > 0:
+            raise ValueError(f"sigma_A must be > 0, got {sigma_A}")
+        if c < 0:
+            raise ValueError(f"c must be >= 0, got {c}")
+        self.A, self.sigma_A = A, float(sigma_A)
+        self.c, self.t_max = float(c), float(t_max)
+        self.cg_iters, self.gn_iters, self.cg_tol = int(cg_iters), int(gn_iters), float(cg_tol)
+        mu0, _, std_sb = bridge_coeffs(sched)
+        self.sigma_eff = (std_sb / mu0.clamp_min(1e-12)).to(sched.std_fwd.device)
+        self.n = n_steps(sched)
+
+    def active(self, step):
+        return self.c > 0 and step / max(self.n - 1, 1) <= self.t_max
+
+    def lam(self, step):
+        """lam_t = sigma_A^2 / (c * sigma_eff(t)^2)."""
+        gamma = self.c * float(self.sigma_eff[step]) ** 2
+        return self.sigma_A ** 2 / max(gamma, 1e-30)
+
+    @torch.no_grad()
+    def __call__(self, x_hat, y, step, cond=None, mask=None):
+        """-> (x_tilde, stats). `step` is the reverse loop's integer step index."""
+        if not self.active(step):
+            return x_hat, {"step": int(step), "active": False}
+        if x_hat.is_complex():
+            raise TypeError("ImMAPProx expects a REAL x_hat (use magnitude_output for complex nets)")
+        lam = self.lam(step)
+        M = 1.0 if mask is None else mask
+        x_bar = x_hat
+        res0 = None
+        for _ in range(self.gn_iters):
+            J = LinearizedOperator(self.A, x_bar, cond)
+            r = M * (y - J.value)
+            if res0 is None:
+                res0 = _rms(r, mask)
+            b = J.adjoint(r) - lam * (x_bar - x_hat)
+            delta = batched_cg(lambda v: lam * v + J.adjoint(M * J.forward(v)), b,
+                               tol=self.cg_tol, max_iter=self.cg_iters)
+            x_bar = x_bar + delta
+        res1 = _rms(M * (y - self.A(x_bar, cond)), mask)
+        return x_bar, {"step": int(step), "active": True, "lam": lam,
+                       "res_before": res0, "res_after": res1,
+                       "delta_rms": _rms(x_bar - x_hat, mask)}
+
+
+def _rms(t, mask=None):
+    if mask is None:
+        return float(t.pow(2).mean().sqrt())
+    return float((t.pow(2) * mask).sum().div(mask.sum().clamp_min(1)).sqrt())
 
 
 @torch.no_grad()
-def immap_sb(net, y, sched, cond=None, tau=0.19, beta=0.05, t_L=0.01, h_0=0.01,
-             init_t=0.99, monotone=False, warm_start=False, warm_start_noise=True,
-             target_channels=1, max_iter=1000, log_every=None, verbose=True):
-    """Per iteration (the provided algorithm):
+def immap_sb(net, x1, sched, prox, cond=None, a_cond=None, mask=None, nfe=None,
+                     deterministic=False, posterior="ddpm", clip_denoise=False, target_channels=1,
+                     log_count=1, verbose=True, guide=None):
+    """sb.i2sb.i2sb_sample with the data prox between the regressor and the posterior update.
 
-        x_hat0 = r(x_k, t, y)                                  # predicted endpoint
-        t      = ||x_hat0 - x_k|| / ||x_hat0 - y||             # self-estimated bridge level
-        mu     = (1 - t) x_hat0 + t y                          # predicted bridge mean
-        h_k    = h_0 k / (1 + h_0 (k - 1))
-        g^2    = t(1-t) tau ((1 - beta h_k)^2 - (1 - h_k)^2)   # noise injection
-        x_{k+1}= x_k + h_k (mu - x_k) + g * eps                # Tweedie ascent
+    x1 is T1: the bridge's start AND the measurement y. `cond` goes to the regressor (its own
+    conditioning channels), `a_cond` to A (its side information; None for a CT1-only A). `mask`
+    is the fidelity region M, or None for the whole frame.
 
-    Geometry is the t(1-t) (Brownian) bridge, so this is most consistent with a net trained on the
-    constant Brownian schedule; a net trained on the i2sb schedule still works (the regressor is just
-    a denoiser), with a mild geometric mismatch in the annealing.
-
-    `sched` is used only to map the continuous t to the sigma the net was conditioned on (nearest
-    discrete step). Pass the SAME schedule the network was trained on.
-
-    Caveats
-    -------
-    * The literal start x_1 = y is a STATIONARY fixed point (t=1 -> mu=y, g=0 -> no update). Two
-      escapes: (a) `init_t` (< 1) seeds the first t but leaves x at y, so a tiny h_0 step can still
-      let noise bounce t back to 1; (b) `warm_start=True` (recommended) jumps x directly to the
-      bridge interpolant (1-init_t) r(y,t=1) + init_t y, so the self-estimated t equals init_t and
-      x never sits at y. `warm_start_noise` adds std_sb(init_t) so the regressor input is
-      in-distribution. `monotone=True` additionally forces t non-increasing.
-
-    Returns
-    -------
-    x_star : (B, target_channels, H, W)   annealed-ascent estimate
-    ts     : list[float]                  max self-estimated t per iteration (diagnostic)
-    xs     : list[Tensor]                 logged iterates on cpu if log_every else [x_star]
+    Returns (recon, xs, pred_x0s, stats); `pred_x0s` logs x_tilde (the prox output), and `stats`
+    has one dict per visited step.
     """
+    if target_channels != 1:
+        raise ValueError("the DC prox is defined for a single target channel")
     device = sched.std_fwd.device
-    y = y.to(device)
-    if cond is not None:
-        cond = cond.to(device)
-    N = n_steps(sched)
-    _, _, std_sb = bridge_coeffs(sched)                           # bridge-noise std per step
+    x1 = x1.to(device)
+    cond = None if cond is None else cond.to(device)
+    a_cond = None if a_cond is None else a_cond.to(device)
+    mask = None if mask is None else mask.to(device)
+    guide = None if guide is None else guide.to(device)
+    stats = []
 
-    x = y.clone()                                                 # x_1 <- y
-    t = torch.full((x.shape[0],), float(init_t), device=device)   # seed < 1 to bootstrap
+    def pred_x0_fn(x_t, step):
+        step_t = torch.full((x_t.shape[0],), step, device=device, dtype=torch.long)
+        sigma = forward_std(sched, step_t, xdim=x_t.shape[1:])
+        x_hat = predict_x0(net, x_t, sigma, cond=cond, target_channels=target_channels,
+                           guide=guide)
+        x_tilde, st = prox(x_hat, x1, step, cond=a_cond, mask=mask)
+        stats.append(st)
+        return x_tilde
 
-    if warm_start:
-        # Escape the y-endpoint fixed point by doing the FIRST reverse step I2SB-style: take the
-        # (trusted) endpoint regression x_hat0 = r(y, t=1) and jump straight to the bridge
-        # interpolant at init_t. Then the self-estimated t is ~init_t (< 1), not 1.
-        step1 = torch.full((x.shape[0],), N - 1, device=device, dtype=torch.long)   # t = 1 endpoint
-        sig1 = forward_std(sched, step1, xdim=y.shape[1:])
-        x0_init = predict_x0(net, y, sig1, cond=cond, target_channels=target_channels)
-        tb0 = unsqueeze_xdim(t, y.shape[1:])
-        x = (1.0 - tb0) * x0_init + tb0 * y                       # x <- bridge mean at init_t
-        if warm_start_noise:
-            step_it = (t.clamp(0.0, 1.0) * (N - 1)).round().long()
-            x = x + unsqueeze_xdim(std_sb[step_it], y.shape[1:]) * torch.randn_like(x)
-    k = 1
-    ts, xs = [], []
-    pbar = tqdm(total=max_iter, desc="ImMAP-SB", disable=not verbose)
-
-    while float(t.max()) > t_L and k <= max_iter:
-        # x_hat0 = r(x_k, t, y): map continuous t -> nearest discrete step -> sigma conditioning
-        step = (t.clamp(0.0, 1.0) * (N - 1)).round().long()
-        sigma = forward_std(sched, step, xdim=x.shape[1:])
-        x_hat0 = predict_x0(net, x, sigma, cond=cond, target_channels=target_channels)
-
-        # self-estimated bridge level (first iter keeps the init_t seed)
-        num = (x_hat0 - x).flatten(1).norm(dim=1)
-        den = (x_hat0 - y).flatten(1).norm(dim=1).clamp_min(1e-8)
-        t_est = (num / den).clamp(0.0, 1.0)
-        # Remove this safeguard for testing.
-        # if k > 1:
-        #     t = torch.minimum(t_est, t) if monotone else t_est
-
-        ts.append(float(t.max()))
-        tb = unsqueeze_xdim(t, x.shape[1:])
-
-        mu = (1.0 - tb) * x_hat0 + tb * y                         # predicted bridge mean
-        h_k = h_0 * k / (1.0 + h_0 * (k - 1))
-        inj = (1.0 - beta * h_k) ** 2 - (1.0 - h_k) ** 2
-        gamma = (tb * (1.0 - tb) * tau * max(inj, 0.0)).sqrt()
-        x = x + h_k * (mu - x) + gamma * torch.randn_like(x)      # Tweedie ascent
-
-        if log_every and (k % log_every == 0):
-            xs.append(x.detach().cpu())
-        k += 1
-        pbar.update(1)
-        pbar.set_postfix(t=f"{float(t.max()):.4f}")
-
-    pbar.close()
-    if not xs:
-        xs = [x.detach().cpu()]
-    return x, ts, xs
+    recon, xs, pred_x0s = reverse_sample(sched, pred_x0_fn, x1, nfe=nfe,
+                                         deterministic=deterministic, posterior=posterior,
+                                         clip_denoise=clip_denoise, log_count=log_count,
+                                         verbose=verbose)
+    return recon, xs, pred_x0s, stats
