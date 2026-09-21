@@ -12,13 +12,13 @@
 # lines below:
 #
 #   sbatch --partition=gl40s_short --gres=gpu:l40s:1 bigpurple/gpu_cmd.sbatch ...
-#   sbatch --partition=a100_short --exclusive --time=00:30:00 bigpurple/gpu_cmd.sbatch ...
+#   sbatch --time=00:30:00 bigpurple/gpu_cmd.sbatch ...
 #
 # Output lands in bigpurple/logs/<job-name>_<jobid>.out; pass --job-name to make it findable.
 # For TRAINING use the task's own script (i2sb_unet_nyumets.sbatch with CFG=...), which also
 # handles the split and the data-root checks.
 
-#SBATCH --partition=a100_short
+#SBATCH --partition=radiology
 #SBATCH --job-name=gpu-cmd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -83,8 +83,7 @@ if [ "$gpu_ok" -ne 1 ]; then
     echo "PREFLIGHT FAILED after $PREFLIGHT_TRIES attempts on $(hostname) (job $SLURM_JOB_ID)" >&2
     nvidia-smi --query-gpu=index,name,compute_mode,memory.used --format=csv 2>&1 >&2
     nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 >&2
-    echo "a100_short hands out cards held in Exclusive_Process mode; resubmit, add --exclusive," >&2
-    echo "or use --partition=radiology / gl40s_short." >&2
+    echo "another process holds the card (Exclusive_Process); resubmit and report the host above" >&2
     exit 1
 fi
 

@@ -99,7 +99,8 @@
         "loss_weight": "uniform",
         "et_weight": 1.0,
         "psnr_only": false,
-        "data_range": 2.0
+        "data_range": 2.0,
+        "val_slices": 1000
     },
     "optimizer": {
         "type": "Adam",

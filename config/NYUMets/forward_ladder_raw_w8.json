@@ -1,0 +1,67 @@
+{
+    "experiment": {
+        "name": "NYUMets_forward_ladder_unet_raw_CT1_to_T1"
+    },
+    "rungs": [
+        {"name": "unet_w8_l2_x",  "kind": "unet", "width": 8,  "levels": 2, "convs": 2},
+        {"name": "unet_w8_l3_x",  "kind": "unet", "width": 8,  "levels": 3, "convs": 2},
+        {"name": "unet_w16_l3_x", "kind": "unet", "width": 16, "levels": 3, "convs": 2}
+    ],
+    "data": {
+        "train": {
+            "name": "nyumets_guided",
+            "root": "../datasets/NYUMets_h5_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [],
+            "image_key": "img_raw",
+            "scales": [4000.0, 4000.0, 4000.0, 6000.0],
+            "guide_mode": "none",
+            "crop_size": 128,
+            "random_flips": true,
+            "batch_size": 32,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "nyumets_guided",
+            "root": "../datasets/NYUMets_h5_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [],
+            "image_key": "img_raw",
+            "scales": [4000.0, 4000.0, 4000.0, 6000.0],
+            "guide_mode": "none",
+            "random_flips": false,
+            "batch_size": 16,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "steps": 40000,
+        "lr": 5.0e-4,
+        "eta_min": 1.0e-5,
+        "clip_grad": 1.0,
+        "log_every": 100,
+        "val_every": 5000,
+        "val_slices": 4000,
+        "val_seed": 0,
+        "enh_quantile": 0.98,
+        "seed": 0
+    },
+    "timing": {
+        "batch_sizes": [1, 8],
+        "warmup": 10,
+        "reps": 50,
+        "reference_configs": [
+            "config/NYUMets/i2sb_unet_all.json",
+            "config/NYUMets/i2sb_sbcdlnet_all.json"
+        ]
+    },
+    "paths": {
+        "save_dir": "trained_nets/nyumets/forward_ladder_unet_raw_CT1_to_T1"
+    },
+    "wandb": {
+        "project": "schrodinger-bridge",
+        "id": null
+    }
+}

@@ -106,7 +106,8 @@
         "loss_weight": "uniform",
         "et_weight": 1.0,
         "psnr_only": false,
-        "data_range": 2.0
+        "data_range": 2.0,
+        "val_slices": 1000
     },
     "paths": {
         "save_dir": "trained_nets/nyumets/I2SB_LGGCDL_NYUMets_CT1_from_T1_guided_session",

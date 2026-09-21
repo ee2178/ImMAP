@@ -22,6 +22,7 @@ Two optional loss weightings compose on top of the plain objective (see `_bridge
 """
 
 import os
+import time
 import math
 
 import numpy as np
@@ -243,6 +244,12 @@ def train_i2sb(
                                      # objective is perceptual -- PSNR alone cannot rank those
                                      # runs, because trading distortion for perceptual quality is
                                      # exactly what they are doing.
+    val_slices=None,                 # validate on a FIXED random subset of this many val slices
+                                     # (same slices every time; val_seed picks them). None = the
+                                     # whole split -- which for the guided nets at batch 1, full
+                                     # frame, is hours per validation.
+    display_window=None,             # [vmin, vmax] for the val panels; None = [DISPLAY_VMIN,
+                                     # DISPLAY_VMAX], the med/MAD window. [0, 1] for raw/scale data.
     data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
                                      # data in [-1, 1]. Must match the loader's actual scaling or
                                      # every reported dB is offset by 20*log10(data_range).
@@ -311,6 +318,16 @@ def train_i2sb(
 
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
+
+    if val_loader is not None and val_slices:
+        from training.forward_op import fixed_val_subset
+        n_full = len(val_loader.dataset)
+        val_loader = fixed_val_subset(val_loader, int(val_slices),
+                                      0 if val_seed is None else int(val_seed))
+        print(f"[i2sb] validating on a fixed subset: {len(val_loader.dataset)}/{n_full} val slices")
+    elif val_loader is not None:
+        print(f"[i2sb] validating on the whole val split: {len(val_loader.dataset)} slices "
+              f"(set training.val_slices to cap it)")
 
     dc = None
     if learned_dc:
@@ -423,6 +440,7 @@ def train_i2sb(
 
         # ---- validation ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
+            t_val = time.time()
             val_loss = _validate(
                 net, bridge, val_loader, device, interval=interval, val_mode=val_mode,
                 val_seed=val_seed, use_mask=use_mask, deterministic=deterministic,
@@ -430,8 +448,14 @@ def train_i2sb(
                 target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
                 loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
                 data_range=data_range, wandb=wandb, global_step=global_step,
+                display_window=display_window,
                 loss_params=loss_params, val_lpips=val_lpips, dc=dc,
             )
+            # wall-clock cost of this validation, next to the training throughput it competes with
+            val_sec = time.time() - t_val
+            print(f"[epoch {epoch}] validation took {val_sec:.0f}s on {len(val_loader.dataset)} slices")
+            if wandb:
+                wandb.log({"val/seconds": val_sec}, step=global_step)
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
 
@@ -521,7 +545,8 @@ def _assert_batch_matches_config(net, loader, device, target_channels, et_weight
 def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
-              data_range, wandb, global_step, loss_params=None, val_lpips=False, dc=None):
+              data_range, wandb, global_step, loss_params=None, val_lpips=False, dc=None,
+              display_window=None):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -603,7 +628,8 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             cap = f"T1 prior | I2SB recon (nfe={val_nfe}) | T1ce GT"
         # Every panel is drawn on the FIXED window [DISPLAY_VMIN, DISPLAY_VMAX] -- see the
         # module-level constants for why it is a constant rather than a derived quantity.
-        lo, hi = DISPLAY_VMIN, DISPLAY_VMAX
+        lo, hi = ((DISPLAY_VMIN, DISPLAY_VMAX) if display_window is None
+                  else (float(display_window[0]), float(display_window[1])))
         grid = mask[:1] * torch.cat([((c - lo) / (hi - lo)).clamp(0, 1) for c in cols], dim=0)
         res = (x0_m[:1] - pred_m[:1]).abs(); res = res / res.max().clamp(min=1e-8)
         # How much of the BRAIN falls outside that window, and how bright the panel came out.

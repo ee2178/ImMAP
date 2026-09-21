@@ -1,20 +1,19 @@
 {
     "task": "i2sb",
     "experiment": {
-        "name": "I2SB_CDLNet_LearnedDC_w8l3x_NYUMets_CT1_mini"
+        "name": "I2SB_LPDSNet_LearnedDC_w8l3x_raw_NYUMets_CT1_mini"
     },
     "model": {
-        "type": "CDLNet",
+        "type": "LPDSNet",
         "params": {
             "K": 30,
             "M": 169,
             "P": 7,
             "s": 2,
             "C": 1,
-            "t0": 0.0,
             "adaptive": true,
             "init": true,
-            "complex": false
+            "magnitude_output": true
         }
     },
     "i2sb": {
@@ -29,7 +28,7 @@
         "val_nfe": 20,
         "target_channels": 1,
         "learned_dc": {
-            "ckpt": "trained_nets/nyumets/forward_ladder_unet_cond_w8_CT1_to_T1/E_unet_w8_l3_x.pt",
+            "ckpt": "trained_nets/nyumets/forward_ladder_unet_raw_CT1_to_T1/E_unet_w8_l3_x.pt",
             "sigma_E": null,
             "feed_cond": false
         }
@@ -41,13 +40,13 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [],
-            "image_key": "img_median_mad",
+            "image_key": "img_raw",
             "guide_mode": "none",
             "scales": [
-                3.0,
-                3.0,
-                3.0,
-                3.0
+                4000.0,
+                4000.0,
+                4000.0,
+                6000.0
             ],
             "crop_size": 128,
             "random_flips": true,
@@ -60,13 +59,13 @@
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [],
-            "image_key": "img_median_mad",
+            "image_key": "img_raw",
             "guide_mode": "none",
             "scales": [
-                3.0,
-                3.0,
-                3.0,
-                3.0
+                4000.0,
+                4000.0,
+                4000.0,
+                6000.0
             ],
             "random_flips": false,
             "batch_size": 8,
@@ -81,15 +80,19 @@
         "backtrack_thresh": 1000,
         "backtrack_factor": 0.9,
         "use_mask": true,
-        "loss_type": "complex-mse",
+        "loss_type": "magnitude-mse",
         "loss_weight": "uniform",
         "et_weight": 1.0,
         "psnr_only": false,
-        "data_range": 2.0,
-        "val_slices": 1000
+        "data_range": 1.0,
+        "val_slices": 1000,
+        "display_window": [
+            0.0,
+            1.0
+        ]
     },
     "paths": {
-        "save_dir": "trained_nets/nyumets/I2SB_CDLNet_LearnedDC_w8l3x_mini",
+        "save_dir": "trained_nets/nyumets/I2SB_LPDSNet_LearnedDC_w8l3x_raw_mini",
         "ckpt": null
     },
     "optimizer": {
