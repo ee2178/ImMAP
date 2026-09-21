@@ -41,7 +41,7 @@
             "x1_idx": 1,
             "cond_idx": [],
             "image_key": "img_raw",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "guide_mode": "none",
             "scales": [
                 4000.0,
@@ -61,7 +61,7 @@
             "x1_idx": 1,
             "cond_idx": [],
             "image_key": "img_raw",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "guide_mode": "none",
             "scales": [
                 4000.0,

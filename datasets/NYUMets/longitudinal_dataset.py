@@ -17,7 +17,7 @@ Unlike the guided prox, input channels CAN carry intensities straight into the p
 
 `x1_source="other_study"` makes the BRIDGE START another study's image instead: x1 = contrast
 `x1_other_idx` (default CT1) of a different study of the same patient, slice picked by
-`guide_slice` ("matched" / "world" / "central" / "random"). The batch is then a DICT that also
+`guide_slice` ("matched" / "index" / "central" / "random"). The batch is then a DICT that also
 carries
 
     y     (1, H, W)          this session's contrast `y_idx` (default T1) -- the MEASUREMENT for
@@ -47,17 +47,18 @@ else.
 
 `other_study` AND ITS LIMITS. Study ids are random 10-digit `image_id`s with no time, and the
 imaging carries no acquisition date, so "prior" vs "later" cannot be told apart. Any other study
-of the patient is used. Those studies are NOT registered to the target: separate sessions,
-separate patient positioning. `guide_slice` picks which slice of the guide volume to use:
+of the patient is used. The studies of a patient are already REGISTERED to one another (checked
+2026-09 on the h5 data), so no registration is done here. `guide_slice` picks which slice of the
+guide volume to use:
 
-    matched   (default) the same RELATIVE depth: z_g = round(z / (n - 1) * (n_g - 1)). Both volumes'
-              stored slices were selected by brain fraction, so each spans the brain from inferior
-              to superior and relative depth lands near the same anatomical level. This is an
-              approximation, not registration -- slice spacing, coverage and head tilt all differ.
+    matched   (default) the same RELATIVE depth among the KEPT slices:
+              z_g = round(z / (n - 1) * (n_g - 1)). Exact when both studies' h5 builds kept the same
+              slice range; off by the difference when they dropped different end slices
+              (preprocessing/nyumets_h5.py --min-brain-frac acts per study).
+    index     the SAME ORIGINAL slice index (`slice_index`): exact for registered studies, which
+              is what they are; the nearest kept slice if that index was dropped at build.
     central   the guide volume's central slice
     random    any slice
-
-In-plane misalignment is left to the model: the guided prox searches a nonlocal `guide_window`.
 
 `min_slice_gap` exists because an adjacent slice of the same contrast is nearly the answer.
 
@@ -78,10 +79,10 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 import h5py
-from datasets.slice_filter import filter_by_brain_frac
+from datasets.slice_filter import filter_by_slice_range
 
 GUIDE_MODES = ("none", "same_session", "other_study", "far_slice", "central_slice", "same_slice")
-GUIDE_SLICES = ("matched", "central", "random", "world")
+GUIDE_SLICES = ("matched", "index", "central", "random")
 X1_SOURCES = ("contrast", "other_study")
 
 
@@ -156,7 +157,7 @@ class NYUMetsGuidedDataset(Dataset):
         self.x1_other_idx = self.x0_idx if x1o is None else int(x1o)
         yi = getattr(cfg, "y_idx", None)
         self.y_idx = self.x1_idx if yi is None else int(yi)
-        self._geom = {}                                   # per-file (affine, slice_index, hw)
+        self._zidx = {}                                   # per-file original slice indices
 
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
@@ -211,10 +212,11 @@ class NYUMetsGuidedDataset(Dataset):
             local.extend(range(n))
         self.file_id = np.asarray(file_id, dtype=np.int64)
         self.local = np.asarray(local, dtype=np.int64)
-        # drop mostly-background slices (vertex, skull base): datasets/slice_filter.py
-        self.file_id, self.local = filter_by_brain_frac(
+        # one universal range of ORIGINAL slice indices (studies are registered, so one index is
+        # one anatomical level everywhere): datasets/slice_filter.py
+        self.file_id, self.local = filter_by_slice_range(
             self.img_paths, self.file_id, self.local,
-            float(getattr(cfg, "min_brain_frac", 0.0) or 0.0), tag="NYUMetsGuided")
+            getattr(cfg, "slice_range", None), tag="NYUMetsGuided")
         self._img_h = {}                                  # lazy per-worker handles
 
     @property
@@ -273,9 +275,7 @@ class NYUMetsGuidedDataset(Dataset):
         guide_slice:
           matched  same RELATIVE position among the kept slices (cheap; shifted by any
                    difference in which end slices the h5 build dropped)
-          world    same scanner-space z: this slice's original index -> world coordinate via
-                   this volume's affine -> the other volume's index via its inverse affine ->
-                   the nearest KEPT slice. Right only if the two studies share a world frame.
+          index    same ORIGINAL slice index -- exact, since the studies are registered
           central  the other volume's middle kept slice
           random   any kept slice
         """
@@ -284,32 +284,25 @@ class NYUMetsGuidedDataset(Dataset):
         n, gn = self.n_slices[fi], self.n_slices[gf]
         if self.guide_slice == "matched":
             gz = int(round(li / max(n - 1, 1) * (gn - 1)))
+        elif self.guide_slice == "index":
+            zt, zg = self._slice_index(fi), self._slice_index(gf)
+            gz = int(np.argmin(np.abs(zg.astype(np.int64) - int(zt[li]))))
         elif self.guide_slice == "central":
             gz = gn // 2
-        elif self.guide_slice == "world":
-            gz = self._world_slice(fi, li, gf)
         else:
             gz = self._pick(gn, idx, salt + 500)
         return gf, min(max(gz, 0), gn - 1)
 
-    def _geometry(self, fi):
-        g = self._geom.get(fi)
-        if g is None:
+    def _slice_index(self, fi):
+        """Original slice indices of volume `fi` (cached per worker)."""
+        z = self._zidx.get(fi)
+        if z is None:
             h = self._handle(self.img_paths[fi])
-            if "affine" not in h.attrs or "slice_index" not in h:
-                raise KeyError(f"guide_slice='world' needs the affine attr and slice_index in "
-                               f"{self.img_paths[fi]}")
-            hw = np.asarray(h.attrs.get("native_size", h[self.image_key].shape[1:3]), dtype=float)
-            g = (np.asarray(h.attrs["affine"], dtype=float), np.asarray(h["slice_index"]), hw)
-            self._geom[fi] = g
-        return g
-
-    def _world_slice(self, fi, li, gf):
-        A, zi, hw = self._geometry(fi)
-        Ag, zg, _ = self._geometry(gf)
-        p = A @ np.array([hw[0] / 2.0, hw[1] / 2.0, float(zi[li]), 1.0])   # in-plane centre
-        k = (np.linalg.inv(Ag) @ p)[2]                                     # other volume's z
-        return int(np.argmin(np.abs(zg.astype(float) - k)))
+            if "slice_index" not in h:
+                raise KeyError(f"guide_slice='index' needs slice_index in {self.img_paths[fi]}")
+            z = np.asarray(h["slice_index"])
+            self._zidx[fi] = z
+        return z
 
     def _read(self, fi, li):
         h = self._handle(self.img_paths[fi])

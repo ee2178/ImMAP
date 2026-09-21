@@ -1,42 +1,50 @@
 """
-Drop mostly-background slices from a slice-indexed h5 dataset.
+Restrict a slice-indexed h5 dataset to one UNIVERSAL range of original slice indices.
 
 Both slice datasets (datasets/BraTS/i2sb_dataset.I2SBDataset and
 datasets/NYUMets/longitudinal_dataset.NYUMetsGuidedDataset) index a flat list of slices as
-(file_id[i], local[i]) into `img_paths`. `filter_by_brain_frac` shrinks that index to the slices
-whose stored brain `mask` covers at least `min_brain_frac` of the frame.
+(file_id[i], local[i]) into `img_paths`. `filter_by_slice_range` keeps the slices whose ORIGINAL
+index -- the `slice_index` dataset preprocessing/nyumets_h5.py writes, i.e. the z of the canonical
+RAS volume before the build dropped near-empty end slices -- lies in [lo, hi).
 
-This is the SAME quantity preprocessing/nyumets_h5.py thresholds at build time
-(`--min-brain-frac`, default 0.02, applied to the same foreground it saves as `mask`), so raising
-it here is equivalent to having built with a higher value -- without rebuilding the h5 files.
+Why a fixed range rather than a per-slice brain-coverage threshold: a patient's studies are
+registered to each other, so one original index is one anatomical level in EVERY study. A universal
+range therefore keeps the same anatomy everywhere, and the slice of another study that matches a
+target slice is simply the one with the same original index (NYUMetsGuidedDataset guide_slice
+"index"). [40, 110) was chosen from the brain-coverage-vs-index plot over the NYUMets train split.
 
-Cost: every volume's mask is read once, in the main process, when the dataset is constructed.
+Cost: one small `slice_index` read per volume when the dataset is constructed.
 """
 
 import h5py
 import numpy as np
 
 
-def slice_brain_fracs(path, mask_key="mask"):
-    """(n_slices,) fraction of the frame covered by the mask, for one h5 volume."""
+def slice_indices(path):
+    """(n_kept,) original slice index of every stored slice of one h5 volume."""
     with h5py.File(path, "r") as f:
-        m = np.asarray(f[mask_key])                   # (N, H, W, 1) uint8
-    m = m.reshape(m.shape[0], -1)
-    return (m > 0).mean(axis=1)
+        if "slice_index" not in f:
+            raise KeyError(f"slice_range needs a 'slice_index' dataset in {path} "
+                           f"(written by preprocessing/nyumets_h5.py)")
+        return np.asarray(f["slice_index"])
 
 
-def filter_by_brain_frac(img_paths, file_id, local, min_brain_frac, mask_key="mask", tag=""):
-    """-> (file_id, local) restricted to slices with brain frac >= min_brain_frac."""
-    if not min_brain_frac or min_brain_frac <= 0:
+def filter_by_slice_range(img_paths, file_id, local, slice_range, tag=""):
+    """-> (file_id, local) restricted to slices with lo <= original index < hi.
+
+    `slice_range` None (or empty) keeps everything."""
+    if slice_range is None or len(slice_range) == 0:
         return file_id, local
-    fracs = [slice_brain_fracs(p, mask_key) for p in img_paths]
-    per_slice = np.fromiter((fracs[f][z] for f, z in zip(file_id, local)), dtype=np.float64,
-                            count=len(file_id))
-    keep = per_slice >= float(min_brain_frac)
+    if len(slice_range) != 2 or not slice_range[0] < slice_range[1]:
+        raise ValueError(f"slice_range must be [lo, hi) with lo < hi, got {slice_range}")
+    lo, hi = int(slice_range[0]), int(slice_range[1])
+    zi = [slice_indices(p) for p in img_paths]
+    z = np.fromiter((zi[f][l] for f, l in zip(file_id, local)), dtype=np.int64, count=len(file_id))
+    keep = (z >= lo) & (z < hi)
     if not keep.any():
-        raise RuntimeError(f"{tag}min_brain_frac={min_brain_frac} drops every slice "
-                           f"(max brain frac {per_slice.max():.3f})")
-    q = np.percentile(per_slice, [10, 50, 90])
-    print(f"[{tag or 'dataset'}] min_brain_frac={min_brain_frac:g}: kept {int(keep.sum())}/{keep.size} "
-          f"slices ({100 * keep.mean():.0f}%); brain frac p10/p50/p90 = {q[0]:.2f}/{q[1]:.2f}/{q[2]:.2f}")
+        raise RuntimeError(f"{tag + ': ' if tag else ''}slice_range [{lo}, {hi}) keeps no slice "
+                           f"(original indices span {z.min()}..{z.max()})")
+    kept_files = len(set(file_id[keep].tolist()))
+    print(f"[{tag or 'dataset'}] slice_range [{lo}, {hi}): kept {int(keep.sum())}/{keep.size} slices "
+          f"({100 * keep.mean():.0f}%) from {kept_files}/{len(img_paths)} volumes")
     return file_id[keep], local[keep]

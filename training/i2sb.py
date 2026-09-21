@@ -248,8 +248,6 @@ def train_i2sb(
                                      # (same slices every time; val_seed picks them). None = the
                                      # whole split -- which for the guided nets at batch 1, full
                                      # frame, is hours per validation.
-    val_min_brain_frac=0.0,          # keep only val slices whose brain mask covers >= this
-                                     # fraction of the frame (0 = no filter, old selection)
     display_window=None,             # [vmin, vmax] for the val panels; None = [DISPLAY_VMIN,
                                      # DISPLAY_VMAX], the med/MAD window. [0, 1] for raw/scale data.
     data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
@@ -325,8 +323,7 @@ def train_i2sb(
         from training.forward_op import fixed_val_subset
         n_full = len(val_loader.dataset)
         val_loader = fixed_val_subset(val_loader, int(val_slices),
-                                      0 if val_seed is None else int(val_seed),
-                                      float(val_min_brain_frac or 0.0))
+                                      0 if val_seed is None else int(val_seed))
         print(f"[i2sb] validating on a fixed subset: {len(val_loader.dataset)}/{n_full} val slices")
     elif val_loader is not None:
         print(f"[i2sb] validating on the whole val split: {len(val_loader.dataset)} slices "

@@ -48,7 +48,7 @@
             "x1_idx": 1,
             "cond_idx": [],
             "image_key": "img_median_mad",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "scales": [
                 3.0,
                 3.0,
@@ -74,7 +74,7 @@
             "x1_idx": 1,
             "cond_idx": [],
             "image_key": "img_median_mad",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "scales": [
                 3.0,
                 3.0,

@@ -177,49 +177,17 @@ def panel_figure(panel, step, res):
 
 
 # ---------------------------------------------------------------------------------------------
-def _brain_frac(item):
-    """Fraction of the frame the brain mask covers, from one dataset item (tuple or dict)."""
-    mask = item["mask"] if isinstance(item, dict) else item[3]
-    return float((torch.as_tensor(mask) > 0.5).float().mean())
-
-
-def fixed_val_subset(val_loader, n, seed, min_brain_frac=0.0):
+def fixed_val_subset(val_loader, n, seed):
     """A fixed random subset of the val set, in RANDOM order (x_swap pairs batch neighbours, and
     sorted order would make them adjacent slices of one volume). n <= 0 or None: the whole set.
-
-    `min_brain_frac` > 0 keeps only slices whose brain mask covers at least that fraction of the
-    frame -- the end-of-volume slices (vertex, skull base) are mostly background, reconstruct
-    identically under any method, and dilute every metric and figure. Candidates are drawn in a
-    fixed random order and read one at a time until `n` pass, so the cost is ~n / acceptance item
-    reads. With min_brain_frac = 0 the selection is EXACTLY the old one (same slices, same order),
-    so switching this on changes a run's val set but leaving it off never does.
-    """
+    Which slices exist at all is the dataset's business (`slice_range`, datasets/slice_filter.py)."""
     ds = val_loader.dataset
     rng = np.random.default_rng(seed)
-    if not min_brain_frac or min_brain_frac <= 0:
-        if not n or n <= 0 or n >= len(ds):
-            idx = rng.permutation(len(ds))
-        else:
-            idx = rng.choice(len(ds), size=int(n), replace=False)
-        idx = idx.tolist()
+    if not n or n <= 0 or n >= len(ds):
+        idx = rng.permutation(len(ds))
     else:
-        want = len(ds) if (not n or n <= 0) else int(n)
-        idx, fracs, scanned = [], [], 0
-        for i in rng.permutation(len(ds)).tolist():
-            f = _brain_frac(ds[i])
-            scanned += 1
-            fracs.append(f)
-            if f >= min_brain_frac:
-                idx.append(i)
-                if len(idx) >= want:
-                    break
-        q = np.percentile(fracs, [10, 50, 90]) if fracs else [float("nan")] * 3
-        print(f"[val subset] kept {len(idx)} of {scanned} scanned slices with brain frac >= "
-              f"{min_brain_frac:g} ({100 * len(idx) / max(scanned, 1):.0f}% pass; scanned brain frac "
-              f"p10/p50/p90 = {q[0]:.2f}/{q[1]:.2f}/{q[2]:.2f})")
-        if len(idx) < want:
-            print(f"[val subset] only {len(idx)} slices pass (wanted {want}); lower min_brain_frac?")
-    return DataLoader(Subset(ds, idx), batch_size=val_loader.batch_size, shuffle=False,
+        idx = rng.choice(len(ds), size=int(n), replace=False)
+    return DataLoader(Subset(ds, idx.tolist()), batch_size=val_loader.batch_size, shuffle=False,
                       num_workers=val_loader.num_workers, pin_memory=True)
 
 
@@ -243,7 +211,6 @@ def train_forward_op(
     data_range=2.0,
     val_slices=4000,                 # fixed random val subset; 0 / null = the whole val set
     val_seed=0,
-    val_min_brain_frac=0.0,          # drop mostly-background slices from the val subset
     enh_quantile=0.98,
     save_dir=None,
     ckpt=None,                       # signature parity; resume handled in train.py
@@ -256,8 +223,7 @@ def train_forward_op(
 
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
-    val_sub = (fixed_val_subset(val_loader, val_slices, val_seed, val_min_brain_frac)
-               if val_loader is not None else None)
+    val_sub = fixed_val_subset(val_loader, val_slices, val_seed) if val_loader is not None else None
 
     checked = False
     if backtrack_count:

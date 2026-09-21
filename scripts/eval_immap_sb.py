@@ -59,8 +59,9 @@ def main():
                     help="fidelity region M for the prox")
     ap.add_argument("--nfe", type=int, default=None, help="default: the run's val_nfe")
     ap.add_argument("--n-slices", type=int, default=200)
-    ap.add_argument("--min-brain-frac", type=float, default=0.2,
-                    help="skip slices whose brain mask covers less of the frame (0 = no filter)")
+    ap.add_argument("--slice-range", type=int, nargs=2, default=[40, 110], metavar=("LO", "HI"),
+                    help="original slice indices [LO, HI) to evaluate on; overrides the run's "
+                         "config (older runs have none). Pass -1 -1 to keep the run's own setting")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--enh-q", type=float, default=0.98)
@@ -94,8 +95,10 @@ def main():
     all_cond = run_cond + [c for c in a_cond if c not in run_cond]
     net_sel, a_sel = list(range(len(run_cond))), [all_cond.index(c) for c in a_cond]
     vcfg.update(cond_idx=all_cond, batch_size=args.batch)
+    if args.slice_range != [-1, -1]:
+        vcfg["slice_range"] = list(args.slice_range)
     loader = fixed_val_subset(build_loader(vcfg, shuffle=False, drop_last=False),
-                              args.n_slices, args.seed, args.min_brain_frac)
+                              args.n_slices, args.seed)
 
     print(f"denoiser {type(net).__name__} ({ckpt}) | A {args.a_ckpt} sigma_A={sigma_A:.4g}")
     print(f"{len(loader.dataset)} val slices, nfe={nfe}, c={args.c}, t_max={args.t_max}, "

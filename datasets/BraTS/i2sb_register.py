@@ -27,7 +27,7 @@ def build_i2sb_loader(root=None,
                       scales=None,              # per-stored-channel multipliers; None = ones
                       image_key="img",          # "img" (normalized) or "img_raw" (unnormalized)
                       et_mask=False,            # append the enhancing-tumor mask (train_i2sb et_weight)
-                      min_brain_frac=0.0,       # drop slices whose mask covers less of the frame
+                      slice_range=None,         # [lo, hi) of ORIGINAL slice indices to keep
                       center_crop=None,
                       crop_size=None,
                       random_flips=False,
@@ -44,7 +44,7 @@ def build_i2sb_loader(root=None,
         x1_source=x1_source, yhat_key=yhat_key,
         scales=scales, image_key=image_key, et_mask=et_mask,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
-        min_brain_frac=min_brain_frac,
+        slice_range=slice_range,
     )
     dataset = I2SBDataset(ds_cfg)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,

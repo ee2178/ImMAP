@@ -58,7 +58,7 @@
                 3
             ],
             "image_key": "img_median_mad",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "et_mask": false,
             "scales": [
                 3.0,
@@ -82,7 +82,7 @@
                 3
             ],
             "image_key": "img_median_mad",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "et_mask": false,
             "scales": [
                 3.0,

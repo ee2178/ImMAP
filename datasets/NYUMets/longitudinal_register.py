@@ -38,10 +38,10 @@ def build_nyumets_guided_loader(root=None,
                                 guide_contrasts=None,     # same_session contrasts; default T1,T2,FLAIR
                                 n_guides=1,               # planes per non-session mode
                                 min_slice_gap=5,          # far_slice: adjacent is too easy
-                                guide_slice="matched",    # other_study: matched | central | random
+                                guide_slice="matched",    # other_study: matched | index | central | random
                                 deterministic=False,      # set True for val/test
                                 guide_as_cond=False,      # append guides to cond (plain nets)
-                                min_brain_frac=0.0,       # drop slices whose mask covers less of the frame
+                                slice_range=None,         # [lo, hi) of ORIGINAL slice indices to keep
                                 x1_source="contrast",     # "contrast" (x1_idx) | "other_study"
                                 x1_other_idx=None,        # other_study: contrast of the start; default x0
                                 y_idx=None,               # measurement returned as "y"; default x1_idx
@@ -67,7 +67,7 @@ def build_nyumets_guided_loader(root=None,
         n_guides=n_guides, min_slice_gap=min_slice_gap, guide_slice=guide_slice,
         deterministic=deterministic, guide_as_cond=guide_as_cond,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
-        min_brain_frac=min_brain_frac,
+        slice_range=slice_range,
         x1_source=x1_source, x1_other_idx=x1_other_idx, y_idx=y_idx,
     )
     dataset = NYUMetsGuidedDataset(ds_cfg)

@@ -58,7 +58,7 @@
                 3
             ],
             "image_key": "img_median_mad",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "scales": [
                 3.0,
                 3.0,
@@ -73,7 +73,7 @@
             "x1_other_idx": 2,
             "y_idx": 1,
             "guide_mode": "none",
-            "guide_slice": "matched",
+            "guide_slice": "index",
             "deterministic": false
         },
         "val": {
@@ -87,7 +87,7 @@
                 3
             ],
             "image_key": "img_median_mad",
-            "min_brain_frac": 0.2,
+            "slice_range": [40, 110],
             "scales": [
                 3.0,
                 3.0,
@@ -101,7 +101,7 @@
             "x1_other_idx": 2,
             "y_idx": 1,
             "guide_mode": "none",
-            "guide_slice": "matched",
+            "guide_slice": "index",
             "deterministic": true
         }
     },
