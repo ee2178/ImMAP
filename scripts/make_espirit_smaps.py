@@ -90,6 +90,13 @@ def maps_for_volume(kspace, args, device):
     ESPIRiT's Hankel SVD and power method are per-slice and independent, so the
     chunking is purely a memory knob and changes no number.
 
+    That was NOT true before 2026-09-22: `espirit` truncated the row space to
+    the batch-wide maximum retention, so a slice's maps depended on which
+    slices shared its chunk (and therefore on `--chunk`, and on whether an OOM
+    had halved it mid-run), with the support dilated for every slice but the
+    widest. Maps written before that fix are not reproducible from this script
+    and should be regenerated; `tests/test_espirit.py` pins the property.
+
     Memory per slice is dominated by the kernel images -- coils x retained
     kernels x the full k-space grid, complex -- which is gigabytes per slice on
     brain's readout-oversampled grid, and the retained-kernel count varies by

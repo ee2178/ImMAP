@@ -87,9 +87,26 @@ def espirit(
     V = Vh.conj().transpose(-2, -1)
 
     # 4) Row-space truncation (vectorized; 1 sync total)
+    #
+    # PER SAMPLE, THOUGH THE STACK IS SHARED. `counts` differs from slice to
+    # slice, so slicing everything to `counts.max()` gave every slice the
+    # WIDEST retention in its batch -- and retaining extra basis vectors can
+    # only raise the eigenvalue map (keep the complete basis and lam == 1
+    # everywhere), so those slices came out with a DILATED support. It also
+    # made the maps depend on which slices shared a chunk, i.e. on
+    # make_espirit_smaps.py's `--chunk`, which is meant to be a pure memory
+    # knob.
+    #
+    # Zeroing the tail is exactly equivalent to dropping it: every downstream
+    # use of V is a sum over kernels (lam = sum_k |v_k^H q|^2 / ks^2, and
+    # G = sum_k v_k v_k^H), so a zero kernel contributes nothing. Only the
+    # padded width is shared now, not the retention.
     counts = (S >= thresh_rowspace * S[:, :1]).sum(dim=1)   # (B,)
     Nbasis = int(counts.max().clamp_min(1).item())
     V = V[:, :, :Nbasis]
+    keep = (torch.arange(Nbasis, device=device)[None, :]
+            < counts.clamp_min(1)[:, None])                # (B, Nbasis)
+    V = V * keep[:, None, :]
     # 5) Kernels → image domain
     Vkernel = (
         V.permute(0, 2, 1)
@@ -158,7 +175,30 @@ def espirit(
     mask = lam > thresh_eig
     smaps = (mask[..., None] * Q).permute(0, 3, 1, 2).conj()
 
-    ref = smaps[:, :1]
+    # PHASE REFERENCE: THE STRONGEST COIL, not coil 0.
+    #
+    # Maps are defined only up to a per-pixel phase, and this fixes it by
+    # rotating every map so the reference coil's is real and positive. That
+    # choice propagates: the ground truth the nets are trained on is
+    # `x = sum_c conj(s_c) c_c`, so wherever the reference coil is DARK its
+    # phase is noise and x inherits it. A complex-valued unrolled net then has
+    # to reproduce noise; E2E-VarNet, which outputs RSS magnitude, never sees
+    # it -- so a bad reference penalises one side of that comparison only.
+    #
+    # `smaps[:, :1]` (coil 0, a fixed element of the array that is dark over
+    # much of the head) was a porting slip. Sljiva picks the coil with the most
+    # ACS energy -- `src/solver.jl`, `Cref = argmax(...)` -- and so does
+    # `walsh` above, which is why those two agreed with each other and this did
+    # not.
+    #
+    # PER SAMPLE, where Sljiva sums the energy over the batch too. Sharing one
+    # reference across a batch would make a slice's maps depend on which slices
+    # it was chunked with, which is exactly the coupling the row-space mask
+    # above exists to avoid; the two differ only when slices of one volume
+    # disagree on their strongest coil.
+    energy = kspace_acs.abs().pow(2).sum(dim=(-2, -1))          # (B, C)
+    cref = energy.argmax(dim=1)                                 # (B,)
+    ref = smaps[torch.arange(B, device=device), cref][:, None]  # (B, 1, Nx, Ny)
     smaps = smaps * (ref / (ref.abs() + 1e-12)).conj()
     return smaps
 
@@ -195,9 +235,16 @@ def espirit_soft(
     V = Vh.conj().transpose(-2, -1)
 
     # 4) Row-space truncation (vectorized; 1 sync total)
+    # Per sample, with the tail ZEROED rather than the stack sliced to the
+    # batch maximum -- see `espirit` for why sharing the retention dilates the
+    # support of every slice but the widest one. G is a sum over kernels, so a
+    # zero kernel contributes nothing.
     counts = (S >= thresh_rowspace * S[:, :1]).sum(dim=1)   # (B,)
     Nbasis = int(counts.max().clamp_min(1).item())
     V = V[:, :, :Nbasis]
+    keep = (torch.arange(Nbasis, device=device)[None, :]
+            < counts.clamp_min(1)[:, None])                # (B, Nbasis)
+    V = V * keep[:, None, :]
 
     # 5) Kernels → image domain
     Vkernel = (
@@ -239,6 +286,10 @@ def espirit_soft(
     mask = (lams > thresh_eig)                                   # (B, Nx, Ny, M)
     smaps = maps.permute(0, 4, 3, 1, 2).conj()                   # (B, M, C, Nx, Ny)
     smaps = smaps * mask.permute(0, 3, 1, 2)[:, :, None]
-    ref = smaps[:, :, :1]                                        # channel-0 phase ref
+    # Phase referenced to the STRONGEST COIL, per sample, as in `espirit` --
+    # see the note there for why coil 0 put noise into the ground-truth phase.
+    energy = kspace_acs.abs().pow(2).sum(dim=(-2, -1))           # (B, C)
+    cref = energy.argmax(dim=1)                                  # (B,)
+    ref = smaps[torch.arange(B, device=device), :, cref][:, :, None]
     smaps = smaps * (ref / (ref.abs() + 1e-12)).conj()
     return smaps                                                 # (B, M, C, Nx, Ny)

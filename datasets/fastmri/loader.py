@@ -5,7 +5,9 @@ import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 from datasets.registry import register_loader
+from operators.fourier import ifftc
 from operators.truncate import embedded_size
+from physics.object_mask import rss_object_mask
 
 # ============================================================
 # Config
@@ -85,6 +87,8 @@ class FastMRIDataset(Dataset):
         pad_multiple=1,
         enumerate_slices=False,
         volumes=None,
+        organ_mask_source="rss",
+        organ_mask_kws=None,
     ):
 
         if anatomy not in FASTMRI_PATHS:
@@ -104,6 +108,17 @@ class FastMRIDataset(Dataset):
         # See operators/truncate.py for why this beats padding the operator.
         self.pad_multiple = int(pad_multiple)
         self.enumerate_slices = bool(enumerate_slices)
+        # Where the organ mask comes from. "rss" is the object's own boundary
+        # (physics/object_mask.py); "smaps" is the old coil-support test, kept
+        # so a run trained under it can be reproduced exactly; "rss+smaps"
+        # drops pixels the maps cannot represent. `organ_mask_kws` forwards the
+        # radii and threshold knobs.
+        if organ_mask_source not in ("rss", "smaps", "rss+smaps"):
+            raise ValueError(
+                f"organ_mask_source must be 'rss', 'smaps' or 'rss+smaps', "
+                f"got {organ_mask_source!r}")
+        self.organ_mask_source = organ_mask_source
+        self.organ_mask_kws = dict(organ_mask_kws or {})
 
         # ----------------------------------------------------
         # Build filtered file list (IMPORTANT PART)
@@ -295,8 +310,20 @@ class FastMRIDataset(Dataset):
             #For some reason these come out with a batch dimension, we should squeeze everything
 
             # ---------------------------
-            # Mask from coil support
+            # Organ mask
             # ---------------------------
+            # DEFAULT IS THE RSS OBJECT MASK, not the coil-map support. The
+            # support is dilated by construction -- ESPIRiT's eigenvalue map is
+            # band-limited to `kernel_size` k-space samples, so it cannot fall
+            # off faster than ~N/ks pixels and a hard threshold on it lands
+            # tens of pixels outside the skull. Residual panels showed error in
+            # the air around the head because of it. RSS has the object's own
+            # edge and needs no maps, so the metric region no longer moves when
+            # the maps are regenerated. See physics/object_mask.py.
+            #
+            # MASKS FROM THE TWO SOURCES MEASURE DIFFERENT REGIONS, so runs
+            # scored under one cannot share a table with runs scored under the
+            # other -- as with masked vs unmasked.
 
             # dim=0, NOT dim=1: the `.squeeze()` above already dropped the
             # leading singleton slice axis, so smaps is (NC, H, W) and the coil
@@ -313,7 +340,21 @@ class FastMRIDataset(Dataset):
                     f"coil axis away entirely, and the sum below would then "
                     f"run over a spatial axis.")
 
-            mask = (smaps.abs().sum(dim=0, keepdim=True) > 0)
+            if self.organ_mask_source == "smaps":
+                mask = (smaps.abs().sum(dim=0, keepdim=True) > 0)
+            else:
+                # One inverse transform per slice on top of the h5 read. The
+                # coil images are not kept: only their RSS, which is what the
+                # threshold sees.
+                rss = ifftc(kspace).abs().pow(2).sum(dim=0, keepdim=True).sqrt()
+                mask = rss_object_mask(rss, **self.organ_mask_kws)
+                if self.organ_mask_source == "rss+smaps":
+                    # Pixels outside the coil support are structurally
+                    # unrecoverable -- `image` is identically zero there, so no
+                    # net can score anything but zero. Intersecting only ever
+                    # SHRINKS the RSS mask, so it cannot bring the dilation
+                    # back.
+                    mask = mask & (smaps.abs().sum(dim=0, keepdim=True) > 0)
 
             # Cheap, and it is the invariant every consumer relies on: the mask
             # multiplies the image in the loss, the metrics and the val panel,
@@ -357,6 +398,8 @@ def get_fastmri_loader(
     drop_last=True,
     enumerate_slices=False,
     volumes=None,
+    organ_mask_source="rss",
+    organ_mask_kws=None,
     num_workers=8,
 ):
     dataset = FastMRIDataset(
@@ -373,6 +416,8 @@ def get_fastmri_loader(
         pad_multiple=pad_multiple,
         enumerate_slices=enumerate_slices,
         volumes=volumes,
+        organ_mask_source=organ_mask_source,
+        organ_mask_kws=organ_mask_kws,
     )
 
     # Every keyword this function does not name is silently dropped by the

@@ -2,8 +2,17 @@
 """
 Does the organ mask actually select anything?
 
-`datasets/fastmri/loader.py` builds it as `smaps.abs().sum(0) > 0` -- a STRICT
-float test. That is exact only if the preprocessing wrote hard zeros outside the
+SUPERSEDED IN PART (2026-09-22). The loader's DEFAULT mask is now the RSS
+object mask (`physics/object_mask.py`, `organ_mask_source="rss"`), because the
+coil-map support this script measures is dilated by construction: ESPIRiT's
+eigenvalue map is band-limited to `kernel_size` k-space samples, so it cannot
+fall off faster than ~N/ks pixels and a hard threshold on it lands tens of
+pixels past the skull. What follows still applies to runs whose config says
+`organ_mask_source: "smaps"`, and to the question of whether a given map set
+has hard zeros at all.
+
+Under `organ_mask_source="smaps"`, `datasets/fastmri/loader.py` builds the mask
+as `smaps.abs().sum(0) > 0` -- a STRICT float test. That is exact only if the preprocessing wrote hard zeros outside the
 support. ESPIRiT with an eigenvalue threshold does; Walsh does not, and neither
 does anything that smooths, interpolates or resamples the maps afterwards. When
 there are no exact zeros the mask is all-True, masking becomes a no-op, and

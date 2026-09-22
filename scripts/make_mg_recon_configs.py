@@ -750,6 +750,21 @@ def make_config(anatomy, r, model, args):
             # OPERATOR (the old path) resamples the mask. See
             # operators/truncate.py and notebooks/pad_stride_init_gap.ipynb.
             "pad_multiple": pad_multiple,
+            # WHERE THE ORGAN MASK COMES FROM, recorded even though "rss" is
+            # the loader default: it decides which pixels every masked metric
+            # is computed over, so a run that does not state it cannot be
+            # compared with one that does. "rss" thresholds the coil RSS
+            # (physics/object_mask.py); "smaps" is the old coil-support test,
+            # which is DILATED -- ESPIRiT's eigenvalue map is band-limited to
+            # `kernel_size` k-space samples and cannot fall off faster than
+            # ~N/ks pixels, so the support ran tens of pixels past the skull
+            # and masked metrics were scoring air.
+            #
+            # CHANGING IT INVALIDATES EVERY MASKED RUN, exactly like a change
+            # of noise_std: the numbers measure a different region. The launch
+            # guard in torch/_mg_recon_body.sh compares configs and will refuse
+            # the old run dirs, which is the intended behaviour.
+            "organ_mask_source": "rss",
         }
 
     total_steps = args.num_epochs * args.steps_per_epoch
