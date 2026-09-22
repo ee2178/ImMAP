@@ -24,7 +24,7 @@
 #   reference: mllpds64 (exp4 cell 3, exp5 cell 1)
 #                    64/128/256    30    241.2M    1.00x       29
 #
-# P = 7 and L = 3 in every cell; cascade init, slice projection, tau0 = 0.25.
+# P = 7 and L = 3 in every cell; per-filter init, slice projection, tau0 = 0.5.
 #
 # WHY. exp5 said cutting K costs more than width buys: at 64/128/256, K=30 beat
 # K=20, and 128/256/512 at K=20 lost to mllpds64 despite 2.7x the parameters.

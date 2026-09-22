@@ -51,18 +51,26 @@
 # that width affordable at all, and cell 2 is what tells you whether the K you
 # traded away was worth more than the width you bought.
 #
-# THE INIT IS NOT CONTROLLED HERE. Every cell runs `init_norm="cascade"` (the
-# new default) with tau0=0.25. The `level`-init control was dropped from this
-# sweep, so if the numbers move against the existing brain runs, init and
-# width/K moved together. Re-add a cell with `init_norm="level", tau0=0.5` if
-# that separation turns out to matter.
+# THE INIT IS NOT CONTROLLED HERE. Every cell runs PER-FILTER normalisation
+# (`init_norm="level"`, tau0=0.5, the default since 2026-09-22). The earlier
+# exp5 runs used the cascade init (tau0=0.25), so init moved together with the
+# protocol -- another reason those numbers are not comparable.
 #
 # MEMORY. Cell 3 is the largest at 643M params: ~2.6 GB of weights, ~7.7 GB of
 # Adam state, on a 48GB L40S. If it OOMs the lever is K, not width -- activation
 # cost scales with K, parameter cost with width^2.
 #
-# EVERYTHING ELSE IS HELD FIXED by the shared generator block: data, ESPIRiT
-# maps, mask, sigma ~ U[0.04, 0.06], loss, LR, schedule, organ mask, R=16.
+# EVERYTHING ELSE IS HELD FIXED by the shared generator block, which since
+# 2026-09-22 is `--protocol measured`: MEASURED k-space + AWGN at
+# sigma ~ U[0.04, 0.06], Sljiva masks (center_frac 0.04, adjust_accel -- R=16 is
+# the EFFECTIVE rate, where every earlier exp5 run sampled at ~R=8), operator
+# maps estimated per step by ESPIRiT from each measurement's 13-line ACS, the
+# stored SENSE combination as ground truth, NO organ mask, same loss/LR/schedule.
+# None of the pre-2026-09-22 exp5 numbers are comparable to these.
+#
+# ONLINE ESPIRiT COSTS MEMORY AND TIME EVERY STEP, on top of the model. Its
+# bound is ~10 GB per slice (physics/online_smaps.py::estimate_cost_gb) and it
+# has not been measured on this data -- probe cell 3, the largest, first.
 #
 # HOW TO RUN
 # ----------

@@ -282,7 +282,14 @@ def load(spec, volume):
 # Attributes that must agree across the columns of one figure. Sigma, R and the
 # seed change what the network was asked to do; anatomy changes who is in the
 # picture. A figure whose columns disagree on any of them is not a comparison.
-COMPARABLE = ("sigma", "R", "seed", "anatomy", "acs_lines", "mask_dist")
+#
+# center_frac / adjust_accel / kspace_type / online_smaps joined 2026-09-22: they
+# are what separates the measured protocol from the legacy grid (effective vs
+# nominal R, measured vs synthetic k-space, estimated vs given maps). Dumps
+# written before then lack them and are skipped by the `k in both` test -- but
+# they record acs_lines=20, which a measured dump (-1) still contradicts.
+COMPARABLE = ("sigma", "R", "seed", "anatomy", "acs_lines", "mask_dist",
+              "center_frac", "adjust_accel", "kspace_type", "online_smaps")
 
 
 def check_comparable(volume):

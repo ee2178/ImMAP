@@ -96,6 +96,10 @@ class E2EVarNet(nn.Module):
         self.output = output
         if self.use_smaps:
             self.net.sens_net = None
+        # Read by the training/eval loops: a VarNet that estimates its own maps
+        # never looks at the operator's, so estimating them online every step
+        # (ESPIRiT, gigabytes per slice) would be pure waste for this model.
+        self.uses_operator_smaps = self.use_smaps
         # `sense` returns a COMPLEX image, the same quantity the unrolled nets
         # produce and the same one `image` holds, so nothing downstream has to
         # treat this baseline specially. Instance attribute, shadowing the

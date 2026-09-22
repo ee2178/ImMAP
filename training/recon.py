@@ -185,6 +185,7 @@ def train_recon(
                                       acs_lines=resolve_acs_lines(
                                           image.shape[-1], acs_lines,
                                           center_frac)),
+                need_smaps=getattr(net, "uses_operator_smaps", True),
             )
 
             smaps = extra["smaps"]
@@ -350,6 +351,7 @@ def train_recon(
                                               acs_lines=resolve_acs_lines(
                                                   image_v.shape[-1], acs_lines,
                                                   center_frac)),
+                        need_smaps=getattr(net, "uses_operator_smaps", True),
                         generator=val_gen,
                     )
 
@@ -418,7 +420,8 @@ def train_recon(
                     caption = (
                         f"epoch {epoch} | zero-filled | recon | ground truth | "
                         f"|residual| x{pstats['gain']:g}\n"
-                        f"R={R} acs={acs_lines} mask={mask_dist} sigma={sig:.4f} "
+                        f"R={R} acs={resolve_acs_lines(image_v.shape[-1], acs_lines, center_frac)} "
+                        f"mask={mask_dist} sigma={sig:.4f} "
                         f"| this slice{' [organ mask]' if p_mask is not None else ''}: "
                         f"PSNR {float(m1['psnr']):.2f} dB, "
                         f"SSIM {float(m1['ssim']):.4f}, "

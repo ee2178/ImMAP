@@ -320,20 +320,26 @@ MODELS = {
 # watch training memory, which also grows with K. tau0=0.5 stays inside the
 # Condat-Vu bound at init for both cells (tau0 (1/2 + ||A||^2) = 0.82 and 0.86,
 # against 1; the bound depends on the filters, not K).
-# tau0 IS HALVED RELATIVE TO `lpdsnet`, and that is not a tuning choice.
-# `MLLPDSNet` now defaults to `init_norm="cascade"`, which rescales each level so
-# `||A_(1,l)||_2 = 1` instead of `||A_l||_2 = 1`. Per-level normalisation leaves
-# the cascade collapsed -- measured at init on the 48/96/192 shape:
+# PER-FILTER NORMALISATION (init_norm="level"), the default again since
+# 2026-09-22 by the user's decision: each level's filters are spectrally
+# normalised on their own, as in CDLNet/Sljiva, and projected per (out, in)
+# filter slice. tau0 is back at lpdsnet's 0.5, which sits inside the Condat-Vu
+# bound at init because ||A||^2 stays ~1.1 under this init.
+#
+# THE ALTERNATIVE, kept for the record and one flag away (init_norm="cascade"
+# with tau0=0.25): rescale each level so `||A_(1,l)||_2 = 1` instead of
+# `||A_l||_2 = 1`. Per-level normalisation leaves the cascade collapsed --
+# measured at init on the 48/96/192 shape:
 #
 #     init_norm="level"     ||A_(1,l)|| = 0.998, 0.394, 0.164
 #     init_norm="cascade"   ||A_(1,l)|| = 0.999, 1.001, 1.005
 #
 # so level 3's dual was receiving 16% of level 1's gain while `lam0` clipped
 # both against the same threshold, and its push back into the primal carried
-# that factor a second time. Fixing it means paying the depth tax the Condat-Vu
-# bound always implied: `||A||^2` rises from ~1.1 toward L, so the admissible
-# primal step `1/(1/2 + ||A||^2)` falls from ~0.61 to ~0.29. At tau0=0.5 these
-# cells would now start OUTSIDE the bound; 0.25 lands at ~0.76 of it.
+# that factor a second time. The cascade fix pays the depth tax the Condat-Vu
+# bound implies: `||A||^2` rises from ~1.1 toward L, so the admissible primal
+# step `1/(1/2 + ||A||^2)` falls from ~0.61 to ~0.29 -- tau0=0.5 would start
+# OUTSIDE the bound there, which is why that setting needs tau0=0.25.
 #
 # The cascade rescale requires proj_mode="slice" (the default). Per-atom
 # projection is tight enough to undo it -- 1.001/1.005 -> 0.599/0.377 after one
@@ -342,7 +348,7 @@ MODELS = {
 ML_LPDS_COMMON = dict(
     {k: v for k, v in LPDS_COMMON.items()
      if k not in ("M", "widen", "alpha0", "resize_noise")},
-    K=30, L=3, tau0=2.5e-1)
+    K=30, L=3, init_norm="level", tau0=5.0e-1)
 
 # WIDTH AND DEPTH. P STAYS AT 7 IN EVERY CELL -- the 7x7 atom is the model, not
 # a hyperparameter to trade away. Capacity is bought with channels and paid for
@@ -938,7 +944,15 @@ def make_config(anatomy, r, model, args):
         },
         "mri": {
             "R": r,
-            "acs_lines": 20,
+            # A FIXED count only when there is one. Under a centre_frac mask
+            # the ACS is round(N * cf) forced odd -- 13 at N=320 -- and N
+            # varies by volume, so writing 20 here recorded a number nothing
+            # used, which the eval dumps and figures/common.py then trusted:
+            # a 13-line measured run and a 20-line legacy run both read "20"
+            # and passed the comparability check. null says "derived", and
+            # physics/mask.py::resolve_acs_lines is where it is derived.
+            "acs_lines": (None if getattr(args, "center_frac", None) is not None
+                          else 20),
             "mask_dist": "uniform",
             "mask_offset": 0,
             # SAMPLING HEURISTICS (Sljiva/src/mask.jl).

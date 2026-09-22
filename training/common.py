@@ -551,6 +551,7 @@ def prepare_measurement(
     generator=None,
     online_smaps=None,
     online_smaps_kws=None,
+    need_smaps=True,
 ):
     """Build (y, sigma, extra) for one reconstruction batch.
 
@@ -569,6 +570,12 @@ def prepare_measurement(
     the maps on disk and the forward model is deliberately NOT self-consistent
     with it -- which is the situation a real reconstruction is in, and the one
     the reference pipeline trains for. See physics/online_smaps.py.
+
+    `need_smaps=False` is for a model that never reads the operator's maps
+    (E2E-VarNet estimating its own -- `uses_operator_smaps`). The online
+    estimate is then skipped, and `extra["smaps"]` is a PLACEHOLDER: flat
+    unit-RSS maps carrying no information, so `E` can still be built (the model
+    reads its mask) while neither the dataset's maps nor any estimate reach it.
     """
     extra = {}
 
@@ -600,7 +607,7 @@ def prepare_measurement(
         # handing them to the network too would give it maps the scan could
         # not have produced, and make the problem exact again. The operator's
         # maps must come from THIS measurement's ACS.
-        if not online_smaps:
+        if not online_smaps and need_smaps:
             raise ValueError(
                 "kspace_type='measurement_awgn' requires online_smaps "
                 "('espirit' or 'walsh'): the dataset's maps are reserved for "
@@ -634,7 +641,13 @@ def prepare_measurement(
     else:
         raise ValueError(f"Unknown kspace_type: {kspace_type}")
 
-    if online_smaps:
+    if not need_smaps:
+        # The model ignores the operator's maps; hand it ones that carry
+        # nothing, rather than the dataset's (which define the ground truth).
+        extra["smaps_data"] = extra["smaps"]
+        c = extra["smaps"].shape[1]
+        extra["smaps"] = torch.full_like(extra["smaps"], 1.0 / c ** 0.5)
+    elif online_smaps:
         # The maps the NETWORK gets. `extra["smaps"]` is contractually "the
         # maps y is consistent with", and after this it is not -- so the key is
         # overwritten on purpose and the original kept beside it, because a

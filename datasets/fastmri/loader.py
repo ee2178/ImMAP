@@ -87,7 +87,7 @@ class FastMRIDataset(Dataset):
         pad_multiple=1,
         enumerate_slices=False,
         volumes=None,
-        organ_mask_source="rss",
+        organ_mask_source="smaps",
         organ_mask_kws=None,
         target="sense",
     ):
@@ -109,6 +109,13 @@ class FastMRIDataset(Dataset):
         # See operators/truncate.py for why this beats padding the operator.
         self.pad_multiple = int(pad_multiple)
         self.enumerate_slices = bool(enumerate_slices)
+        # DEFAULT "smaps", the ORIGINAL behaviour, so a config that predates
+        # this key -- every old run dir -- is evaluated over the region it was
+        # validated on. The generator always writes the key explicitly.
+        # (Defaulting to "rss" silently changed old runs' metrics, and the RSS
+        # mask came out EMPTY on tests/test_dump_eval.py's synthetic volume,
+        # giving NaN PSNR.)
+        #
         # Where the organ mask comes from. "rss" is the object's own boundary
         # (physics/object_mask.py); "smaps" is the old coil-support test, kept
         # so a run trained under it can be reproduced exactly; "rss+smaps"
@@ -434,7 +441,7 @@ def get_fastmri_loader(
     drop_last=True,
     enumerate_slices=False,
     volumes=None,
-    organ_mask_source="rss",
+    organ_mask_source="smaps",
     organ_mask_kws=None,
     target="sense",
     num_workers=8,

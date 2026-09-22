@@ -113,6 +113,7 @@ def evaluate(model, cfg, sigma, loader, device, seed):
                                   acs_lines=resolve_acs_lines(
                                       image.shape[-1], mri["acs_lines"],
                                       mri.get("center_frac"))),
+            need_smaps=getattr(model, "uses_operator_smaps", True),
             generator=gen,
         )
 

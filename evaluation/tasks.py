@@ -84,6 +84,7 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None):
                               acs_lines=resolve_acs_lines(
                                   image.shape[-1], mri["acs_lines"],
                                   mri.get("center_frac"))),
+        need_smaps=getattr(net, "uses_operator_smaps", True),
         generator=generator,
     )
 

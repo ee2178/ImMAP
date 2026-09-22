@@ -123,7 +123,7 @@ class MLLPDSLayer(nn.Module):
 
     def __init__(self, C, M, L, widen=2, P=7, s=1, Mh=None, window=1,
                  lam0=1e-2, tau0=1e-1, theta0=1e-1, degrees=0, is_complex=True,
-                 prox_kws=None, spectral_init=True, init_norm="cascade",
+                 prox_kws=None, spectral_init=True, init_norm="level",
                  proj_mode="slice"):
         super().__init__()
         self.C, self.L = int(C), int(L)
@@ -361,7 +361,7 @@ class MLLPDSNet(_MLIO):
                  nheads=1, rho0=1.0, gamma0=0.8, init_strategy="spectral_norm",
                  subgrad_mode="rigorous", attn_backend="gather",
                  flex_block_size=128, preproc="kspace", spectral_init=True,
-                 init_norm="cascade", proj_mode="slice"):
+                 init_norm="level", proj_mode="slice"):
         super().__init__()
         self.K, self.L = int(K), int(L)
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)

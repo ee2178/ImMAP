@@ -118,6 +118,41 @@ def test_measurement_awgn_branch():
         check("whitening is refused under measurement_awgn", True)
 
 
+def test_varnet_skips_online_maps():
+    """A VarNet that estimates its own maps must not pay for ESPIRiT per step,
+    and must still never see the dataset's maps."""
+    from training.common import prepare_measurement
+    from models.e2evarnet.adapter import E2EVarNet
+    import physics.online_smaps as om
+
+    B, C, H, W = 1, 4, 32, 32
+    k = torch.randn(B, C, H, W, dtype=torch.complex64)
+    sm = torch.randn(B, C, H, W, dtype=torch.complex64)
+    img = torch.zeros(B, 1, H, W, dtype=torch.complex64)
+    m = make_acc_mask((H, W), accel=4, center_frac=0.25, dim=1, mode="uniform",
+                      adjust_accel=True)
+    kw = dict(num_cascades=1, chans=4, pools=2, sens_chans=4, sens_pools=2)
+    check("varnet declares it does not read the operator's maps",
+          E2EVarNet(**kw).uses_operator_smaps is False)
+    check("varnetmaps declares that it does",
+          E2EVarNet(**kw, use_smaps=True, output="sense").uses_operator_smaps is True)
+
+    calls, real = [], om.online_smaps
+    om.online_smaps = lambda y, mask, method="espirit", **kw: (calls.append(1),
+                                                               torch.randn_like(y))[1]
+    try:
+        _, _, extra = prepare_measurement(
+            image=img, kspace=k, mask=m, smaps=sm, kspace_type="measurement_awgn",
+            noise_std=[0.05, 0.05], noise_dist="uniform", whiten_kspace=False,
+            online_smaps="espirit", need_smaps=False)
+    finally:
+        om.online_smaps = real
+    check("need_smaps=False skips the online estimate", not calls)
+    check("... and hands the operator a flat placeholder, not the dataset's maps",
+          torch.allclose(extra["smaps"], torch.full_like(extra["smaps"], C ** -0.5))
+          and not torch.equal(extra["smaps"], sm))
+
+
 def _fake_volume(root, C=4, S=3, H=32, W=24, seed=0):
     """A kspace file + a coil-combined file, laid out like the real ones."""
     rng = np.random.default_rng(seed)
@@ -191,6 +226,24 @@ def test_generator_protocols():
     check("measured: operator maps estimated online with ESPIRiT",
           mri.get("online_smaps") == "espirit")
 
+    check("measured: acs_lines is null -- derived from center_frac, not a fixed 20",
+          mri.get("acs_lines", "absent") is None, f"acs_lines={mri.get('acs_lines')!r}")
+
+    # null must build the Julia mask, and a null WITHOUT center_frac must fail
+    # loudly rather than fall back to some default count
+    from physics.mask import get_mask_cached, make_acc_mask, resolve_acs_lines
+    from physics.online_smaps import acs_line_count
+    m = get_mask_cached(torch.zeros(1, 1, 640, 320), 16, None, "uniform",
+                        center_frac=0.04, adjust_accel=True)
+    check("acs_lines=None + center_frac builds the 13-line ACS",
+          acs_line_count(m) == 13 and resolve_acs_lines(320, None, 0.04) == 13,
+          f"counted {acs_line_count(m)}")
+    try:
+        make_acc_mask((640, 320), accel=8, acs_lines=None, dim=1, mode="uniform")
+        check("acs_lines=None without center_frac fails loudly", False, "no error")
+    except TypeError:
+        check("acs_lines=None without center_frac fails loudly", True)
+
     rss = _dry_run("--target", "rss")
     check("--target rss switches only the ground truth",
           rss["data"]["train"].get("target") == "rss"
@@ -206,6 +259,7 @@ def test_generator_protocols():
     leg = _dry_run("--protocol", "legacy")
     mri, data = leg["mri"], leg["data"]["train"]
     check("legacy: synthetic k-space", mri["kspace_type"] == "simulated")
+    check("legacy: acs_lines stays 20", mri.get("acs_lines") == 20)
     off = subprocess.run(
         [sys.executable, "scripts/make_mg_recon_configs.py", "--dry-run",
          "--only", "lpdsnet", "--online-smaps", "off"],
@@ -225,6 +279,7 @@ def test_generator_protocols():
 
 def main():
     for fn in (test_noise_convention_matches_mri_awgn, test_measurement_awgn_branch,
+               test_varnet_skips_online_maps,
                test_loader_target_is_rss, test_generator_protocols):
         print(f"\n--- {fn.__name__}")
         fn()

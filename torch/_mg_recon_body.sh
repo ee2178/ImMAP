@@ -282,7 +282,10 @@ if os.path.exists(out) and not force:
 
 write_config(cfg, out)
 
-print(f"[grid] {cfg['model']['type']} R={mri['R']} acs={mri['acs_lines']} "
+_acs = (f"cf{mri['center_frac']}" if mri.get("center_frac") is not None
+        else mri.get("acs_lines"))
+_r = f"{mri['R']}{'(eff)' if mri.get('adjust_accel') else '(nominal)'}"
+print(f"[grid] {cfg['model']['type']} R={_r} acs={_acs} "
       f"sigma~U{cfg['training']['noise_std']} epochs={cfg['training']['num_epochs']} -> {out}")
 PY
 _rc=$?

@@ -228,7 +228,16 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         "experiment": cfg.get("experiment", {}).get("name", ""),
         "anatomy": val.get("anatomy", ""),
         "R": mri.get("R", 0),
-        "acs_lines": mri.get("acs_lines", 0),
+        # -1 = derived from center_frac (null in the config); HDF5 attributes
+        # cannot hold None. The three keys after it are what, together with R,
+        # decide the sampling pattern and the problem -- a measured run and a
+        # legacy run must never look alike here.
+        "acs_lines": (-1 if mri.get("acs_lines") is None
+                      else int(mri["acs_lines"])),
+        "center_frac": float(mri.get("center_frac") or 0.0),
+        "adjust_accel": bool(mri.get("adjust_accel", False)),
+        "kspace_type": str(mri.get("kspace_type", "simulated")),
+        "online_smaps": str(mri.get("online_smaps") or ""),
         "mask_dist": mri.get("mask_dist", ""),
         "sigma": float(sigma),
         "seed": int(args.seed),
