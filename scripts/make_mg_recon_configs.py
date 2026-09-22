@@ -229,6 +229,33 @@ MODELS = {
               "its own sensitivity maps and returns RSS magnitude, so it is "
               "comparable on PSNR/SSIM/NRMSE and on nothing phase-sensitive."),
     ),
+
+    # THE MAP-ASYMMETRY CONTROL. Same cascades, same size, but handed the
+    # dataset's ESPIRiT maps instead of estimating its own, and returning the
+    # SENSE combination `sum_c conj(s_c) x_c` rather than RSS -- which is
+    # exactly how `image` was built, so this arm is comparable to the ground
+    # truth in phase as well as magnitude, and carries none of RSS's positive
+    # noise bias.
+    #
+    # NOT the published baseline: `varnet` stays the reference number. This
+    # cell exists to answer one question -- how much of the gap to the unrolled
+    # nets is the maps? Those nets are GIVEN the maps, so against `varnetmaps`
+    # they differ only in the prior. Sljiva carries the same switch
+    # (`use_smaps` in `src/networks/e2e_varnet.jl`), so it is a supported
+    # variant rather than a construction invented here.
+    #
+    # It is also SMALLER than `varnet`: dropping SensitivityModel removes its
+    # ~1.1M parameters, so a win here is not a capacity win.
+    "varnetmaps": dict(
+        type="E2EVarNet",
+        params=dict(num_cascades=12, sens_chans=8, sens_pools=4,
+                    chans=18, pools=4, mask_center=True,
+                    use_smaps=True, output="sense"),
+        note=("E2E-VarNet cascades on the dataset's ESPIRiT maps (no "
+              "SensitivityModel), returning the SENSE coil combination. The "
+              "map-asymmetry control for `varnet`, not the published "
+              "baseline."),
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -407,7 +434,7 @@ MODELS.update({
                       params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
 })
 
-OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2",
+OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnetmaps",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
@@ -629,6 +656,12 @@ def _display_name(spec_type, params):
         if params.get("init_norm", "cascade") != "cascade":
             tag += "-lvl"
         return "%s_%s" % (spec_type, tag)
+    if spec_type == "E2EVarNet" and params.get("use_smaps"):
+        # `varnet` and `varnetmaps` are the same class with the same variant,
+        # so the table below cannot separate them -- and two cells under one
+        # wandb name interleave their curves silently. The tag names what
+        # actually differs: given maps, and what the model returns.
+        return "E2EVarNet_smaps_%s" % params.get("output", "rss")
     return _DISPLAY_NAME.get((spec_type, variant), f"{spec_type}_{variant}")
 
 
