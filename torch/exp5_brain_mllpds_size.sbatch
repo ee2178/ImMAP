@@ -98,7 +98,10 @@
 ANATOMY=brain
 ONLY="${ONLY:-mllpdsw2 mllpds64 mllpds64k20 mllpds128k20}"
 ACCELS="${ACCELS:-16}"
-ORGAN_MASK=1                         # matches every other brain launcher --
+# ORGAN MASK OFF (2026-09-22), in EVERY launcher: loss and metrics run over the
+# whole image. Regeneration rewrites every config of an anatomy, so these must
+# all agree -- turn it back on everywhere or nowhere.
+ORGAN_MASK=""                       # matches every other brain launcher --
                                      # regeneration rewrites every brain config,
                                      # so a mismatch silently un-masks the anatomy
 CONFIG_ROOT="config"

@@ -44,7 +44,7 @@ def have_lapack():
 
 
 # ---------------------------------------------------------------------------
-def coil_phantom(C=4, H=48, W=48, smooth=True, noise=0.0, seed=0):
+def coil_phantom(C=4, H=48, W=48, smooth=True, noise=0.0, seed=0, phase=False):
     """`(1, C, H, W)` k-space of a disc seen through smooth coil maps."""
     g = torch.Generator().manual_seed(seed)
     y = torch.arange(H)[:, None] - H / 2
@@ -59,7 +59,13 @@ def coil_phantom(C=4, H=48, W=48, smooth=True, noise=0.0, seed=0):
         s = torch.exp(-d2 / (2 * (0.9 * H) ** 2))
         if not smooth:                            # structured, higher-rank maps
             s = s * (1 + 0.5 * torch.cos(6.28 * (y / H + x / W)))
-        maps.append(s.to(torch.complex64))
+        s = s.to(torch.complex64)
+        if phase:
+            # A DIFFERENT smooth phase per coil. Without it every map shares one
+            # phase, referencing to any coil makes them all real, and a test of
+            # WHICH coil is the reference cannot tell the answers apart.
+            s = s * torch.exp(1j * (0.8 * (c + 1)) * (y / H + 0.6 * x / W))
+        maps.append(s)
     sm = torch.stack(maps)[None]
     sm = sm / sm.abs().pow(2).sum(1, keepdim=True).sqrt().clamp_min(1e-8)
 
@@ -139,7 +145,7 @@ def test_phase_reference_is_the_strongest_coil():
     `physics/smaps.py::walsh` does the same): where the reference coil is dark
     its phase is noise, and the ground truth `x = S^H c` inherits it.
     """
-    k = coil_phantom(C=4, noise=0.0, seed=8)
+    k = coil_phantom(C=4, noise=0.0, seed=8, phase=True)
     # Make coil 0 the WEAKEST, so referencing to it and to the strongest coil
     # cannot coincide.
     k = k.clone()

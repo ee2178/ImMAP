@@ -794,9 +794,15 @@ def make_config(anatomy, r, model, args):
 
     params = dict(spec["params"])
     if spec["type"] == "E2EVarNet":
-        # The mask's ACS width. VarNet's SensitivityModel can infer it, but the
-        # config knows it exactly, and the inference assumes a symmetric centre.
-        params["acs_lines"] = 20
+        # The mask's ACS width, for VarNet's SensitivityModel. Under legacy
+        # the mask's ACS IS acs_lines=20. Under a centre_frac mask it is
+        # round(N * cf) forced odd and N varies by volume, so no config
+        # constant is right: "mask" counts it from each mask at run time -- the
+        # same lines the unrolled nets' online maps calibrate from. Pinning 20
+        # there put 7 unsampled columns (and at R=4 an accelerated line) into
+        # VarNet's calibration band.
+        params["acs_lines"] = ("mask" if getattr(args, "center_frac", None)
+                               is not None else 20)
     # Notes accumulate: a cell can be both an LPDS variant and on a backend
     # that swapped its similarity, and losing either one in the run directory
     # is how a caveat stops travelling with its numbers.
@@ -873,7 +879,11 @@ def make_config(anatomy, r, model, args):
             # of noise_std: the numbers measure a different region. The launch
             # guard in torch/_mg_recon_body.sh compares configs and will refuse
             # the old run dirs, which is the intended behaviour.
-            "organ_mask_source": "rss",
+            # "none" when the grid runs unmasked (the default since
+            # 2026-09-22): the loader then skips the RSS mask entirely instead
+            # of computing one nothing reads.
+            "organ_mask_source": ("rss" if getattr(args, "organ_mask", False)
+                                  else "none"),
             # Ground truth: absent = the stored SENSE combination (default);
             # "rss" only with --target rss.
             **({"target": "rss"} if getattr(args, "target", "sense") == "rss"

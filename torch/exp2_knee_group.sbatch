@@ -122,7 +122,10 @@ ONLY="lpdsnet mglpds varnet"         # mggrouplpds -> exp2_knee_mggroup.sbatch
 ACCELS="8"
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it
-ORGAN_MASK=1                         # see ORGAN MASK above
+# ORGAN MASK OFF (2026-09-22), in EVERY launcher: loss and metrics run over the
+# whole image. Regeneration rewrites every config of an anatomy, so these must
+# all agree -- turn it back on everywhere or nowhere.
+ORGAN_MASK=""                       # see ORGAN MASK above
 CONFIG_ROOT="config"
 SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs. Settable
                                      # on the sbatch line; a short run lands in

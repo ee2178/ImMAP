@@ -101,10 +101,21 @@ class E2EVarNet(nn.Module):
         # treat this baseline specially. Instance attribute, shadowing the
         # class default.
         self.returns_magnitude = (output == "rss")
-        # Handed to SensitivityModel so it does not have to infer the ACS width
-        # from the mask. Its inference is fine for a centre-sampled Cartesian
-        # mask, but the config knows the answer exactly.
-        self.acs_lines = None if acs_lines is None else int(acs_lines)
+        # Handed to SensitivityModel as `num_low_frequencies`: the band it
+        # calibrates from. Three settings:
+        #   int     a fixed count. Right only if it IS the mask's ACS -- a
+        #           pinned 20 against Sljiva's 13-line centre_frac mask put 7
+        #           unsampled columns in the band, and at R=4 one accelerated
+        #           line, whose isolated sample aliases the calibration image.
+        #   "mask"  count the contiguous centre run of THIS mask, per forward.
+        #           The same lines the unrolled nets' online ESPIRiT calibrates
+        #           from, so both sides estimate maps from identical data.
+        #   None    fastMRI's own inference: 2 * min(left, right), i.e. forced
+        #           symmetric -- 12 of a 13-line odd ACS.
+        if acs_lines in (None, "mask"):
+            self.acs_lines = acs_lines
+        else:
+            self.acs_lines = int(acs_lines)
 
     # -- conversions --------------------------------------------------------
     @staticmethod
@@ -145,7 +156,11 @@ class E2EVarNet(nn.Module):
         ks = torch.view_as_real(y.contiguous())            # (B, C, H, W, 2)
 
         if not self.use_smaps:
-            out = self.net(ks, mask, num_low_frequencies=self.acs_lines)
+            nlf = self.acs_lines
+            if nlf == "mask":
+                from physics.online_smaps import acs_line_count
+                nlf = acs_line_count(get_mask(E))
+            out = self.net(ks, mask, num_low_frequencies=nlf)
             # (B, H, W) real RSS -> (B, 1, H, W), the shape the training loop
             # and the metrics expect. Complex is NOT reconstructed; see header.
             return out.unsqueeze(1), {}

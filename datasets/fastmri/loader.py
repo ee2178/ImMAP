@@ -114,10 +114,13 @@ class FastMRIDataset(Dataset):
         # so a run trained under it can be reproduced exactly; "rss+smaps"
         # drops pixels the maps cannot represent. `organ_mask_kws` forwards the
         # radii and threshold knobs.
-        if organ_mask_source not in ("rss", "smaps", "rss+smaps"):
+        # "none" returns an all-true mask and computes nothing -- the grid runs
+        # unmasked (use_organ_mask false), and the RSS mask's morphology then
+        # has no business running on every item where it could only fail.
+        if organ_mask_source not in ("none", "rss", "smaps", "rss+smaps"):
             raise ValueError(
-                f"organ_mask_source must be 'rss', 'smaps' or 'rss+smaps', "
-                f"got {organ_mask_source!r}")
+                f"organ_mask_source must be 'none', 'rss', 'smaps' or "
+                f"'rss+smaps', got {organ_mask_source!r}")
         self.organ_mask_source = organ_mask_source
         self.organ_mask_kws = dict(organ_mask_kws or {})
         # The ground truth: "sense" is the stored coil combination S^H c (the
@@ -350,7 +353,7 @@ class FastMRIDataset(Dataset):
             # by the RSS target and by the RSS organ mask; computed once for
             # both. One inverse transform per slice on top of the h5 read.
             rss = None
-            if self.target == "rss" or self.organ_mask_source != "smaps":
+            if self.target == "rss" or self.organ_mask_source in ("rss", "rss+smaps"):
                 rss = ifftc(kspace).abs().pow(2).sum(dim=0, keepdim=True).sqrt()
 
             # ---------------------------
@@ -375,7 +378,9 @@ class FastMRIDataset(Dataset):
             if self.target == "rss":
                 image = rss.to(torch.complex64)
 
-            if self.organ_mask_source == "smaps":
+            if self.organ_mask_source == "none":
+                mask = torch.ones((1,) + tuple(image.shape[-2:]), dtype=torch.bool)
+            elif self.organ_mask_source == "smaps":
                 mask = (smaps.abs().sum(dim=0, keepdim=True) > 0)
             else:
                 mask = rss_object_mask(rss, **self.organ_mask_kws)
