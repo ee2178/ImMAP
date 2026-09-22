@@ -53,6 +53,7 @@ import datasets                                   # noqa: F401  (registers loade
 from datasets.registry import build_loader
 from models.forward_ops import ForwardOp
 from training.forward_op import _inputs, masked_mse, batch_xyc, validate, panel_figure
+from visualization.image import set_display_orient
 
 
 # ---------------------------------------------------------------------------------------------
@@ -146,6 +147,9 @@ def main(config_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tr, tm = cfg["training"], cfg.get("timing", {})
     torch.manual_seed(int(tr.get("seed", 0)))
+    # DISPLAY ONLY, and this ladder is NYUMets-only: its h5s store canonical-RAS axes, so the
+    # val panels come out with the eyes on the image's right unless they are rotated.
+    set_display_orient(tr.get("display_orient", "radiological"))
 
     save_dir = cfg["paths"]["save_dir"]
     os.makedirs(save_dir, exist_ok=True)

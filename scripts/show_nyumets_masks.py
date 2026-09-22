@@ -16,9 +16,11 @@ Each row is one slice: FLAIR, T1, CT1, T2 and the T1 - CT1 difference, with
                       the forward operator's. Averaging makes it generous: bright orbital fat on
                       T1 clears the threshold on its own, so the eyes are usually inside it.
     orange `support`  the common acquisition support -- the INTERSECTION of all four contrasts'
-                      supports, already multiplied into the pixels by preprocessing/nyumets_h5.py.
-                      It answers "was this voxel acquired", not "does this contrast show tissue",
-                      so orbits inside every FOV stay in.
+                      supports. It answers "was this voxel acquired", not "does this contrast
+                      show tissue", so orbits inside every FOV stay in. Under the current
+                      builder default (`--support store`) it is RECORDED ONLY and the pixels
+                      outside it are intact; h5s built before 2026-09-22 have it multiplied
+                      into every channel instead. The `support_applied` attr says which.
 
 The printed table gives each region's area fraction and, inside `mask`, the share of squared
 T1 - CT1 that falls OUTSIDE an eroded brain mask -- i.e. how much of the fidelity budget the rim
@@ -38,7 +40,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from visualization.image import subplot_images
+from visualization import image as _vis
+from visualization.image import orient_image, set_display_orient, subplot_images
+
+# This viewer only ever draws NYUMets, whose h5s store canonical-RAS axes:
+# without this the eyes come out on the image's right.
+set_display_orient("radiological")
 
 CONTRASTS = ["FLAIR", "T1", "CT1", "T2"]
 
@@ -104,7 +111,12 @@ def mask_panel(root, n=4, seed=0, image_key="img_median_mad", scale=3.0, erode=0
 
     # subplot_images takes ONE overlay colour per call, and these are three different regions,
     # so the extra contours go on afterwards -- same axes, same pixel grid.
+    #
+    # They bypass plot_image, so they do NOT get its display rotation for free: orient them by
+    # hand or every contour lands transposed on top of an already-rotated panel.
+    orient = _vis._DEFAULT_ORIENT
     for i, (mask, sup, er) in enumerate(ovls):
+        mask, sup, er = (None if m is None else orient_image(m, orient) for m in (mask, sup, er))
         for j in range(len(CONTRASTS) + 1):
             ax = axes[i, j]
             for m, col, lw in ((mask, "lime", 0.7), (sup, "orange", 0.7), (er, "cyan", 0.7)):

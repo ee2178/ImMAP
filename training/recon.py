@@ -25,7 +25,7 @@ from training.common import (
 from training.common import backtrack as do_backtrack, resync_schedule
 from visualization.filters import get_filter_grids
 from visualization.image import recon_panel
-from physics.mask import get_mask_cached as get_mask
+from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
 
 
@@ -46,8 +46,19 @@ def train_recon(
     acs_lines=24,
     kspace_type="measurement",
     whiten_kspace=False,
+    # Estimate the coil maps from the ACS of each measurement instead of
+    # taking the dataset's precomputed ones -- what Sljiva's `genobs` does.
+    # None keeps the precomputed maps. See physics/online_smaps.py.
+    online_smaps=None,
+    online_smaps_kws=None,
     mask_dist="uniform",
     mask_offset=0,
+    # Sampling heuristics from Sljiva/src/mask.jl. `adjust_accel=True` makes
+    # the ACS come out of the acceleration budget instead of being added to it
+    # -- without it a nominal R=16 with 20 ACS lines samples at an EFFECTIVE
+    # R of 8.2. `center_frac` is its ACS-as-a-fraction convention.
+    center_frac=None,
+    adjust_accel=False,
     noise_std=(0.0, 0.01),
     noise_dist="uniform",
     # Validation noise. `val_noise_std=None` redraws from `noise_std` like
@@ -153,7 +164,8 @@ def train_recon(
             organ_mask = organ_mask.to(device, non_blocking=True)
 
             mask = get_mask(image, R=R, acs_lines=acs_lines, mode=mask_dist,
-                            offset=mask_offset)
+                            offset=mask_offset, center_frac=center_frac,
+                            adjust_accel=adjust_accel)
 
             # prepare_measurement FIRST, then E from the maps it hands back:
             # the simulated branch RSS-normalizes them and the whitening branch
@@ -168,6 +180,11 @@ def train_recon(
                 noise_std=noise_std,
                 noise_dist=noise_dist,
                 whiten_kspace=whiten_kspace,
+                online_smaps=online_smaps,
+                online_smaps_kws=dict(online_smaps_kws or {},
+                                      acs_lines=resolve_acs_lines(
+                                          image.shape[-1], acs_lines,
+                                          center_frac)),
             )
 
             smaps = extra["smaps"]
@@ -315,7 +332,9 @@ def train_recon(
                     organ_mask_v = organ_mask_v.to(device, non_blocking=True)
 
                     mask_v = get_mask(image_v, R=R, acs_lines=acs_lines,
-                                      mode=mask_dist, offset=mask_offset)
+                                      mode=mask_dist, offset=mask_offset,
+                                      center_frac=center_frac,
+                                      adjust_accel=adjust_accel)
 
                     y_v, sigma_v, extra_v = prepare_measurement(
                         image=image_v,
@@ -326,6 +345,11 @@ def train_recon(
                         noise_std=val_std,
                         noise_dist=noise_dist,
                         whiten_kspace=whiten_kspace,
+                        online_smaps=online_smaps,
+                        online_smaps_kws=dict(online_smaps_kws or {},
+                                              acs_lines=resolve_acs_lines(
+                                                  image_v.shape[-1], acs_lines,
+                                                  center_frac)),
                         generator=val_gen,
                     )
 

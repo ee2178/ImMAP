@@ -45,6 +45,7 @@
         }
     },
     "training": {
+        "display_orient": "radiological",
         "steps": 40000,
         "lr": 5.0e-4,
         "eta_min": 1.0e-5,

@@ -156,3 +156,33 @@ def mri_awgn(image, acceleration_map, smaps, noise_std, noise_dist="uniform",
 
     y_coils = fftc(x_coils + _randn_like(x_coils, generator) * sigma)
     return acceleration_map * y_coils, sigma, smaps
+
+
+def kspace_awgn(kspace, acceleration_map, noise_std, noise_dist="uniform",
+                generator=None, k=1, eps=1e-8):
+    """Accelerated, noisy measurement from FULLY SAMPLED MEASURED k-space.
+
+        y <- mask . (k + sigma . n)
+
+    The measured counterpart of `mri_awgn`: the measurement is the scan itself,
+    not `S x` pushed through the forward model, so the maps the network is
+    given need not reproduce the ground truth exactly -- the situation of a real
+    reconstruction, and of Sljiva's `genobs`, which builds `y` from the stored
+    multicoil data and the reference from stored maps.
+
+    SAME SIGMA CONVENTION AS `mri_awgn`. `fftc` is `norm="ortho"`, so white
+    noise of std sigma in k-space is white noise of std sigma in the coil
+    images; with unit-RSS maps that is sigma in the coil-combined adjoint, the
+    quantity the noise-adaptive thresholds are calibrated against. Same
+    `sample_sigma`, same `_randn_like` (E|z|^2 = 1), so a sigma means the same
+    thing under either kspace_type.
+
+    THE SCANNER'S OWN NOISE IS STILL THERE. Measured k-space already carries it,
+    so the total is sqrt(sigma_0^2 + sigma^2) and the returned sigma is the
+    ADDED part only -- a floor under every level, most visible at small sigma.
+    notebooks/sense_noise_testbench.ipynb section 9 measures sigma_0 on brain.
+    """
+    sigma = sample_sigma(kspace.shape[0], noise_std, dist=noise_dist,
+                         ndim=kspace.dim(), device=kspace.device, k=k,
+                         eps=eps, generator=generator)
+    return acceleration_map * (kspace + _randn_like(kspace, generator) * sigma), sigma

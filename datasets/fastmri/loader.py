@@ -89,6 +89,7 @@ class FastMRIDataset(Dataset):
         volumes=None,
         organ_mask_source="rss",
         organ_mask_kws=None,
+        target="sense",
     ):
 
         if anatomy not in FASTMRI_PATHS:
@@ -119,6 +120,11 @@ class FastMRIDataset(Dataset):
                 f"got {organ_mask_source!r}")
         self.organ_mask_source = organ_mask_source
         self.organ_mask_kws = dict(organ_mask_kws or {})
+        # The ground truth: "sense" is the stored coil combination S^H c (the
+        # old behaviour), "rss" the root-sum-of-squares of the acquired coils.
+        if target not in ("sense", "rss"):
+            raise ValueError(f"target must be 'sense' or 'rss', got {target!r}")
+        self.target = target
 
         # ----------------------------------------------------
         # Build filtered file list (IMPORTANT PART)
@@ -340,13 +346,38 @@ class FastMRIDataset(Dataset):
                     f"coil axis away entirely, and the sum below would then "
                     f"run over a spatial axis.")
 
+            # RSS of the ACQUIRED coils, from the fully sampled k-space. Needed
+            # by the RSS target and by the RSS organ mask; computed once for
+            # both. One inverse transform per slice on top of the h5 read.
+            rss = None
+            if self.target == "rss" or self.organ_mask_source != "smaps":
+                rss = ifftc(kspace).abs().pow(2).sum(dim=0, keepdim=True).sqrt()
+
+            # ---------------------------
+            # Ground truth
+            # ---------------------------
+            # "rss" REPLACES the stored `image`. That one is a SENSE combination
+            # `S^H c` and therefore a function of whichever maps were on disk
+            # -- dilated support, coil-0 phase reference and all. The RSS needs
+            # no maps, is the fastMRI standard target (`reconstruction_rss`),
+            # and is the quantity E2E-VarNet outputs, so the baseline stops
+            # being scored against a target it structurally cannot produce.
+            #
+            # Kept complex (zero imaginary part) so every consumer sees the
+            # dtype it always has; loss and metrics take `.abs()` anyway.
+            #
+            # NOT THE DEFAULT: the grid's ground truth is the stored SENSE
+            # combination (target="sense"). RSS is opt-in via the generator's
+            # --target rss, and only with kspace_type="measurement_awgn" --
+            # under "simulated" the measurement is `M F S image`, and an RSS
+            # image has no phase, so the net would reconstruct a phase-free
+            # phantom rather than the scan. The generator refuses that pairing.
+            if self.target == "rss":
+                image = rss.to(torch.complex64)
+
             if self.organ_mask_source == "smaps":
                 mask = (smaps.abs().sum(dim=0, keepdim=True) > 0)
             else:
-                # One inverse transform per slice on top of the h5 read. The
-                # coil images are not kept: only their RSS, which is what the
-                # threshold sees.
-                rss = ifftc(kspace).abs().pow(2).sum(dim=0, keepdim=True).sqrt()
                 mask = rss_object_mask(rss, **self.organ_mask_kws)
                 if self.organ_mask_source == "rss+smaps":
                     # Pixels outside the coil support are structurally
@@ -400,6 +431,7 @@ def get_fastmri_loader(
     volumes=None,
     organ_mask_source="rss",
     organ_mask_kws=None,
+    target="sense",
     num_workers=8,
 ):
     dataset = FastMRIDataset(
@@ -418,6 +450,7 @@ def get_fastmri_loader(
         volumes=volumes,
         organ_mask_source=organ_mask_source,
         organ_mask_kws=organ_mask_kws,
+        target=target,
     )
 
     # Every keyword this function does not name is silently dropped by the

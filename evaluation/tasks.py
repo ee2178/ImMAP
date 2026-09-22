@@ -35,7 +35,7 @@ import torch
 
 from operators import FFT2D, Identity, Mask, Sense
 from operators.noise import awgn
-from physics.mask import get_mask_cached as get_mask
+from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from training.common import embed_for_net, prepare_measurement
 
 
@@ -65,7 +65,9 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None):
 
     mask = get_mask(image, R=mri["R"], acs_lines=mri["acs_lines"],
                     mode=mri.get("mask_dist", "uniform"),
-                    offset=mri.get("mask_offset", 0))
+                    offset=mri.get("mask_offset", 0),
+                    center_frac=mri.get("center_frac"),
+                    adjust_accel=mri.get("adjust_accel", False))
 
     y, sigma_n, extra = prepare_measurement(
         image=image, kspace=kspace, mask=mask, smaps=smaps,
@@ -73,6 +75,15 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None):
         noise_std=sigma,                        # a number: pinned, not sampled
         noise_dist=cfg["training"].get("noise_dist", "uniform"),
         whiten_kspace=mri.get("whiten_kspace", False),
+        # Must mirror training: a run trained on maps estimated from its own
+        # ACS, evaluated against the dataset's precomputed ones, is a different
+        # forward model at test time and the sweep would not summarise its
+        # curves.
+        online_smaps=mri.get("online_smaps"),
+        online_smaps_kws=dict(mri.get("online_smaps_kws") or {},
+                              acs_lines=resolve_acs_lines(
+                                  image.shape[-1], mri["acs_lines"],
+                                  mri.get("center_frac"))),
         generator=generator,
     )
 

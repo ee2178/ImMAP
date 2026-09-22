@@ -6,6 +6,25 @@ from typing import Union, Tuple
 
 ### Acceleration Mask Generation
 
+def resolve_acs_lines(N, acs_lines, center_frac=None):
+    """The ACS width a mask will actually have -- the ONE place it is decided.
+
+    `center_frac` wins when given: `Sljiva/src/mask.jl::generate_center_mask`
+    takes `Nc = round(N * center_frac)` and forces it ODD so the block is
+    symmetric about DC (13 lines at N=320, center_frac=0.04). Anything that needs
+    the ACS width -- the mask itself, and the online map estimator calibrating
+    from that ACS -- must ask here, or the two disagree: passing the config's
+    `acs_lines=20` to the estimator while the mask holds 13 would calibrate from
+    columns that are not in the ACS at all.
+    """
+    if center_frac is None:
+        return int(acs_lines)
+    nc = int(round(N * float(center_frac)))       # ties-to-even, as Julia's round
+    if nc % 2 == 0:
+        nc -= 1
+    return max(nc, 0)
+
+
 def make_acc_mask(
     shape,
     accel,
@@ -16,6 +35,8 @@ def make_acc_mask(
     offset=0,                # "uniform" only: int phase, or "random"
     seed=None,
     device="cpu",
+    center_frac=None,
+    adjust_accel=False,
 ):
     """
     Generate either a Uniform or Random vertical subsampling mask
@@ -24,17 +45,64 @@ def make_acc_mask(
     counterpart of `uniform_offset` in Sljiva's `synthmri_closure.yaml`. Pass
     "random" to draw it in [0, accel) per call; the default 0 reproduces the
     original fixed pattern.
+
+    THE ACS IS NOT FREE, AND `adjust_accel` IS WHAT PAYS FOR IT.
+
+    With `adjust_accel=False` (the default, and what every run so far used) the
+    outer lines are laid down every `accel` across the WHOLE axis and the ACS
+    block is added on top, so the mask samples more than `N / accel` lines and
+    the acceleration is nominal, not real. Measured on a 320-line axis with 20
+    ACS lines:
+
+        nominal R=4   ->  95 lines  ->  EFFECTIVE R 3.37
+        nominal R=8   ->  57 lines  ->  EFFECTIVE R 5.61
+        nominal R=16  ->  39 lines  ->  EFFECTIVE R 8.21
+
+    `adjust_accel=True` reproduces `Sljiva/src/mask.jl::generate_uniform_mask`,
+    which widens the outer spacing to absorb the ACS,
+
+        adj_accel = round((N - Nc) / (N / accel - Nc))
+
+    so the TOTAL line count is `N / accel` and R means what it says (15.24 at a
+    nominal 16, the remainder being integer spacing). `center_frac` is the same
+    file's ACS convention -- a fraction of the axis, forced odd -- instead of a
+    fixed line count.
+
+    Both default to the old behaviour: flipping them changes the sampling
+    pattern, so runs either side are not comparable. `effective_accel()` below
+    reports what a mask actually did.
     """
     Ny, Nx = shape
     N = shape[dim]
     mask = torch.zeros((Ny, Nx), dtype=torch.float32, device=device)
 
     # ACS region
-    center = N // 2
-    half_acs = acs_lines // 2
+    if center_frac is not None:
+        # generate_center_mask, placed at pad = (N - Nc + 1) // 2.
+        acs_lines = resolve_acs_lines(N, acs_lines, center_frac)
+        acs_start = (N - acs_lines + 1) // 2
+        acs_end = acs_start + acs_lines
+    else:
+        center = N // 2
+        half_acs = acs_lines // 2
+        acs_start = center - half_acs
+        acs_end = center + half_acs
 
-    acs_start = center - half_acs
-    acs_end = center + half_acs
+    # `spacing` is what the UNIFORM branch strides by; `accel` stays the
+    # requested rate so the random branch can size its budget from it. Without
+    # that separation the adjustment is applied twice -- measured: a nominal
+    # R=8 random mask came out at an effective 15.2.
+    budget = N / float(accel)
+    spacing = accel
+    if adjust_accel:
+        if budget <= acs_lines:
+            raise ValueError(
+                f"adjust_accel: the ACS alone is {acs_lines} lines but "
+                f"R={accel} allows only {budget:.1f} of {N} -- there is no "
+                f"budget left for outer lines. Lower acs_lines/center_frac "
+                f"(Sljiva uses center_frac=0.04, i.e. 13 lines at N=320) or "
+                f"lower R.")
+        spacing = max(1, int(round((N - acs_lines) / (budget - acs_lines))))
 
     acs_idx = torch.arange(acs_start, acs_end, device=device)
     # ---------------------------------------------------------
@@ -42,10 +110,10 @@ def make_acc_mask(
     # ---------------------------------------------------------
     if mode == "uniform":
         if offset == "random":
-            off = int(torch.randint(0, int(accel), (1,)).item())
+            off = int(torch.randint(0, int(spacing), (1,)).item())
         else:
-            off = int(offset) % int(accel)
-        outer_idx = torch.arange(off, N, accel, device=device)
+            off = int(offset) % int(spacing)
+        outer_idx = torch.arange(off, N, spacing, device=device)
         # Remove overlap with ACS
         outer_idx = outer_idx[
             (outer_idx < acs_start) | (outer_idx >= acs_end)
@@ -56,7 +124,12 @@ def make_acc_mask(
     # ---------------------------------------------------------
     elif mode == "random":
         n_outer = N - acs_lines
-        n_keep_outer = math.floor(n_outer / accel)
+        # `adjust_accel` here means what it means in generate_random_mask: the
+        # Bernoulli rate is (N/accel - Nc) / (N - Nc), i.e. the ACS is counted
+        # against the budget rather than added to it.
+        n_keep_outer = (math.floor(budget - acs_lines) if adjust_accel
+                        else math.floor(n_outer / accel))
+        n_keep_outer = max(0, min(n_keep_outer, n_outer))
 
         # Sampling PDF
         if variable_density:
@@ -85,6 +158,20 @@ def make_acc_mask(
     mask = mask.unsqueeze(0).unsqueeze(0)
 
     return mask
+
+def effective_accel(mask, dim=-1):
+    """N / (sampled lines): what a mask actually did, as opposed to its label.
+
+    Report this next to any R. With `adjust_accel=False` the two differ by
+    nearly 2x at R=16, which is the difference between a hard problem and a
+    moderate one.
+    """
+    m = mask
+    while m.dim() > 1:
+        m = m.amax(dim=0) if m.shape[0] > 1 else m[0]
+    lines = float((m > 0).sum())
+    return float(m.numel()) / max(lines, 1.0)
+
 
 ### SSDU Utils
 def mask_uniform_subsample(
@@ -316,7 +403,8 @@ def gen_ssdu_mask(shape, base_acs, ssdu_base_accel, ssdu_acs, ssdu_rho, device =
 ### Mask Caching (Useful in training)
 _mask_cache = {}
 
-def get_mask_cached(smaps, R, acs_lines, mode, offset=0):
+def get_mask_cached(smaps, R, acs_lines, mode, offset=0, center_frac=None,
+                    adjust_accel=False):
     """Memoised `make_acc_mask`, keyed on everything that changes the pattern.
 
     The cache is what makes a per-step mask cheap, but it also means a cached
@@ -334,12 +422,18 @@ def get_mask_cached(smaps, R, acs_lines, mode, offset=0):
             acs_lines=acs_lines,
             mode=mode,
             offset=offset,
+            center_frac=center_frac,
+            adjust_accel=adjust_accel,
         ).to(smaps.device, non_blocking=True)
 
     if mode == "random" or offset == "random":
         return build()
 
-    key = (Ny, Nx, R, acs_lines, mode, offset, smaps.device)
+    # center_frac and adjust_accel change the PATTERN, so they belong in the
+    # key -- a cache hit across a change of either would hand back a mask for a
+    # different acceleration.
+    key = (Ny, Nx, R, acs_lines, mode, offset, center_frac, adjust_accel,
+           smaps.device)
 
     if key not in _mask_cache:
         _mask_cache[key] = build()

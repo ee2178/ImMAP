@@ -30,6 +30,69 @@ import matplotlib.pyplot as plt
 # ===========================================================================
 #  Tensor -> displayable array
 # ===========================================================================
+DISPLAY_ORIENTS = ("radiological", "neurological", None)
+_DEFAULT_ORIENT = None
+
+
+def set_display_orient(mode):
+    """Set the orientation every later `plot_image` / `subplot_images` uses by default.
+
+    DISPLAY ONLY -- nothing here touches stored pixels, so it cannot invalidate a checkpoint.
+    Call it once at the top of a NYUMets notebook or script:
+
+        from visualization.image import set_display_orient
+        set_display_orient("radiological")
+
+    Returns the previous value, so a caller can put it back.
+    """
+    global _DEFAULT_ORIENT
+    if mode not in DISPLAY_ORIENTS:
+        raise ValueError(f"orient must be one of {DISPLAY_ORIENTS}, got {mode!r}")
+    prev, _DEFAULT_ORIENT = _DEFAULT_ORIENT, mode
+    return prev
+
+
+def orient_image(a, mode):
+    """Rotate a 2-D array from canonical-RAS axes into a conventional axial view.
+
+    The NYUMets h5s (preprocessing/nyumets_h5.py) store slices on canonical-RAS axes: H runs
+    to the patient's RIGHT, W ANTERIOR. Drawn as-is, `imshow` puts the eyes on the image's
+    RIGHT. The conventional axial view has them at the TOP:
+
+        a.T          rows become the A axis  -> anterior at the BOTTOM
+        [::-1]                               -> anterior at the TOP
+        [:, ::-1]    radiological only       -> patient's LEFT on the image's RIGHT
+
+    Without that last flip the columns still run toward the patient's right, i.e. the
+    patient's left stays on the image's left: the NEUROLOGICAL convention. Both are in use;
+    neither is more correct, so the caller says which.
+
+    `mode=None` returns `a` untouched, which is what every non-NYUMets caller wants -- the
+    BraTS h5s do not go through `nib.as_closest_canonical` (preprocessing/cmap.py reads
+    `get_fdata()` directly), so this transform is not theirs to assume.
+    """
+    if mode is None:
+        return a
+    if mode not in DISPLAY_ORIENTS:
+        raise ValueError(f"orient must be one of {DISPLAY_ORIENTS}, got {mode!r}")
+    a = np.asarray(a).T[::-1]
+    return a[:, ::-1] if mode == "radiological" else a
+
+
+def orient_tensor(x, mode):
+    """`orient_image` for a (..., H, W) torch tensor: same rotation, batched, stays a tensor.
+
+    For the display paths that build a grid out of tensors (the wandb val panels) rather than
+    going through `plot_image`. H and W SWAP, so call it on everything in a panel or nothing.
+    """
+    if mode is None:
+        return x
+    if mode not in DISPLAY_ORIENTS:
+        raise ValueError(f"orient must be one of {DISPLAY_ORIENTS}, got {mode!r}")
+    x = x.transpose(-2, -1).flip(-2)
+    return x.flip(-1) if mode == "radiological" else x
+
+
 def to_numpy(x, magnitude=True, index=0):
     """
     Any image-ish object -> a 2-D float32 numpy array that `imshow` accepts.
@@ -288,6 +351,7 @@ def plot_image(
     show=None,
     contrast=False,
     thresh=1.0,
+    orient="default",
 ):
     """
     Display one image.
@@ -296,6 +360,10 @@ def plot_image(
     ----------
     x : torch.Tensor or np.ndarray
         Image, any leading dims, real or complex.
+    orient : {"default", "radiological", "neurological", None}
+        Display-only reorientation, applied to `x`, `mask` and `overlay` alike --
+        see `orient_image`. "default" takes whatever `set_display_orient` last
+        set, which ships as None: no reorientation, byte-identical to before.
     vmin, vmax : float or None
         Display window. Whichever is None is filled in from the data (using `p`,
         `mask` and `symmetric`), so `imshow` never picks its own scale behind
@@ -341,6 +409,17 @@ def plot_image(
     matplotlib Axes
     """
     img = to_numpy(x, magnitude=magnitude, index=index)
+
+    # Display orientation. `mask` and `overlay` are rotated with the image or the window
+    # statistics and the contours would land on the wrong pixels; "default" defers to
+    # `set_display_orient`, and None (the shipped default) leaves everything as it was.
+    orient = _DEFAULT_ORIENT if orient == "default" else orient
+    if orient is not None:
+        img = orient_image(img, orient)
+        if mask is not None:
+            mask = orient_image(to_numpy(mask, magnitude=False, index=index), orient)
+        if overlay is not None:
+            overlay = orient_image(to_numpy(overlay, magnitude=False, index=index), orient)
 
     if contrast:
         img = np.clip(img, None, thresh)
@@ -433,6 +512,7 @@ def subplot_images(
     index=0,
     axis_off=True,
     show=True,
+    orient="default",
 ):
     """
     Draw a row or grid of images that share one display window.
@@ -591,6 +671,7 @@ def subplot_images(
                 index=index,
                 axis_off=axis_off,
                 show=False,
+                orient=orient,
             )
             im = ax.images[-1]
 

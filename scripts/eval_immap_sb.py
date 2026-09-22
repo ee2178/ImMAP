@@ -172,7 +172,10 @@ def main():
 
     import matplotlib.pyplot as plt
     plt.switch_backend("Agg")
-    from visualization.image import subplot_images
+    from visualization.image import set_display_orient, subplot_images
+
+    # NYUMets stores canonical-RAS axes; draw the panel eyes-up.
+    set_display_orient("radiological")
     _, gt, t1, mk = panel[cs[0]]
     img_rows = ([[gt, None], [t1, None]]
                 + [[panel[c][0], panel[c][0] - gt] for c in cs])

@@ -76,6 +76,7 @@
         }
     },
     "training": {
+        "display_orient": "radiological",
         "num_epochs": 50,
         "steps_per_epoch": 200,
         "val_every_epochs": 5,

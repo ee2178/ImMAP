@@ -549,6 +549,8 @@ def prepare_measurement(
     noise_dist,
     whiten_kspace,
     generator=None,
+    online_smaps=None,
+    online_smaps_kws=None,
 ):
     """Build (y, sigma, extra) for one reconstruction batch.
 
@@ -559,6 +561,14 @@ def prepare_measurement(
 
     `generator` seeds the noise draw; pass one during validation so the same
     realization is seen every epoch.
+
+    `online_smaps` ("espirit" | "walsh" | None) re-estimates the coil maps from
+    the ACS OF THE MEASUREMENT just built, as `Sljiva`'s `genobs` does, and the
+    operator is then built from those instead of the dataset's precomputed
+    maps. It is applied AFTER the measurement exists, so `y` still comes from
+    the maps on disk and the forward model is deliberately NOT self-consistent
+    with it -- which is the situation a real reconstruction is in, and the one
+    the reference pipeline trains for. See physics/online_smaps.py.
     """
     extra = {}
 
@@ -570,6 +580,36 @@ def prepare_measurement(
             image, mask, smaps, noise_std, noise_dist, generator=generator,
         )
         extra["smaps"] = smaps_n
+
+    elif kspace_type == "measurement_awgn":
+        # MEASURED k-space plus known AWGN (--protocol measured). `y` is the
+        # acquired data, masked with noise added, so no map enters the
+        # measurement: the ground truth is whatever the loader hands back (the
+        # stored SENSE combination, or RSS with target="rss"), and the forward
+        # model is deliberately not required to reproduce it exactly -- as in a
+        # real reconstruction, and in Sljiva's genobs. Unlike "measurement",
+        # sigma is a real, sampled level, so the noise-adaptive nets keep their
+        # sweep. See operators/noise.py::kspace_awgn.
+        if whiten_kspace:
+            raise ValueError(
+                "kspace_type='measurement_awgn' does not whiten: the added noise "
+                "is already white, and whitening would rescale sigma away from "
+                "the level the network is told.")
+        # THE OFFLINE MAPS NEVER REACH THE OPERATOR HERE. They were estimated
+        # from the fully sampled data and define the ground truth `image`;
+        # handing them to the network too would give it maps the scan could
+        # not have produced, and make the problem exact again. The operator's
+        # maps must come from THIS measurement's ACS.
+        if not online_smaps:
+            raise ValueError(
+                "kspace_type='measurement_awgn' requires online_smaps "
+                "('espirit' or 'walsh'): the dataset's maps are reserved for "
+                "the ground truth, and the operator must estimate its own from "
+                "the measurement.")
+        from operators.noise import kspace_awgn
+        y, sigma_n = kspace_awgn(kspace, mask, noise_std, noise_dist,
+                                 generator=generator)
+        extra["smaps"] = smaps          # replaced below by the online estimate
 
     elif kspace_type == "measurement":
 
@@ -593,6 +633,20 @@ def prepare_measurement(
 
     else:
         raise ValueError(f"Unknown kspace_type: {kspace_type}")
+
+    if online_smaps:
+        # The maps the NETWORK gets. `extra["smaps"]` is contractually "the
+        # maps y is consistent with", and after this it is not -- so the key is
+        # overwritten on purpose and the original kept beside it, because a
+        # caller checking consistency has to be able to see both.
+        from physics.online_smaps import online_smaps as _estimate
+        extra["smaps_data"] = extra["smaps"]
+        # no_grad: the maps are a preprocessing of the measurement, not part of
+        # the model. Nothing upstream requires grad today, but a graph through
+        # ESPIRiT's SVD and power method would cost more memory than the net.
+        with torch.no_grad():
+            extra["smaps"] = _estimate(y, mask, method=online_smaps,
+                                       **(online_smaps_kws or {}))
 
     # Always (B, 1, 1, 1): that is the shape a Polynomial threshold broadcasts
     # against and the only one `MGCDLNet(resize_noise=True)` will resize.

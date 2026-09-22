@@ -12,9 +12,17 @@
 #    5   i2sb_sbguidedcdl_otherstudy.json     SBGuidedGroupCDL  T1; guide other-study CT1
 #    6   i2sb_lggcdl_session.json             LGGCDL   C=1      guides T1, T2, FLAIR
 #    7   i2sb_lggs_session.json               LGGS     C=1      guides T1, T2, FLAIR
+#    8   i2sb_unet_from_otherct1.json         SBUnet   C=4      FLAIR, T1, T2; the bridge STARTS at
+#                                                              the other study's CT1 (x1_source),
+#                                                              this session's T1 comes back as `y`
 #
 # Paired comparisons: 1 vs 2 isolates the other-study CT1 channel; 3 vs 4 is conditioning
-# channels vs guided prox; 4 vs 5 swaps same-session guides for the other-study CT1.
+# channels vs guided prox; 4 vs 5 swaps same-session guides for the other-study CT1; 2 vs 8 is
+# the prior scan as a CONDITIONING CHANNEL vs as the BRIDGE START (what ImMAP-SB needs, and what
+# notebooks/immap_sb_longitudinal.ipynb compares).
+#
+# The LONGITUDINAL subset -- the ones that use another study of the same patient -- is 2, 5, 8:
+#   sbatch --array=2,5,8 bigpurple/i2sb_nyumets_array.sbatch
 # (SB-LGGCDL with all 3 guides + other CT1 was dropped: it OOMs on one A100.)
 #
 # Submit all (at most 4 GPUs at once):
@@ -32,7 +40,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-7%4
+#SBATCH --array=0-8%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -60,6 +68,7 @@ CONFIGS=(
     config/NYUMets/i2sb_sbguidedcdl_otherstudy.json
     config/NYUMets/i2sb_lggcdl_session.json
     config/NYUMets/i2sb_lggs_session.json
+    config/NYUMets/i2sb_unet_from_otherct1.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then

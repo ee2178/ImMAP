@@ -14,14 +14,24 @@ Layout mirrors preprocessing/cmap.py, so the existing BraTS loaders read these u
         support          (n, H, W, 1) uint8     common acquisition support (see below)
         slice_index      (n,)         int32     maps n back to the original RAS z
 
-COMMON SUPPORT. Contrasts of one session do not always cover the same anatomy -- a T1 whose
-FOV reaches the eyes paired with a CT1 whose FOV does not is the usual case. Every channel is
-therefore masked to the INTERSECTION of the per-contrast acquisition supports, so T1 and CT1
-share a domain exactly. Without it a T1 -> CT1 bridge is trained to delete an eye that
-legitimately exists in its input, and the loss is dominated by a region the target never
-acquired. Disable with --no-intersect-support. Per-contrast `support_lost_<C>` attrs record
-how much of each contrast's own support the intersection dropped -- a large value on one
-contrast IS the FOV mismatch.
+COMMON SUPPORT -- COMPUTED AND STORED, NOT APPLIED (`--support store`, the default). Contrasts
+of one session do not always cover the same anatomy: a T1 whose FOV reaches the eyes paired
+with a CT1 whose FOV does not is the usual case. The INTERSECTION of the per-contrast
+acquisition supports is written to `support` and summarised in the `support_lost_<C>` attrs
+(a large value on one contrast IS the FOV mismatch), but the pixels are left alone.
+
+`--support apply` restores the older behaviour of multiplying it into every channel. That was
+the default until 2026-09-22 and was dropped because zeroing the pixels bakes a ragged FOV
+boundary into the data, which the regressors then have to reproduce -- the visible boundary
+artefacts in the reconstructions. The trade it makes is real in the other direction too: with
+the support merely stored, a T1 -> CT1 bridge does see input anatomy (an eye) that its target
+never acquired, and must learn to drop it. Apply `support` in the loss instead if that shows up.
+
+ORIENTATION. Stored axes stay canonical RAS: H runs to the patient's RIGHT, W ANTERIOR, so a
+slice drawn as-is has the eyes on the image's RIGHT. That is a DISPLAY concern and is fixed at
+display time -- `visualization.image.set_display_orient("radiological")`, or the `orient=`
+argument of plot_image / subplot_images -- NOT by rewriting the pixels, which would invalidate
+every checkpoint trained on the old axes for no modelling gain.
 
 Channel order is [FLAIR, T1, T1ce, T2] -- the BraTS order, so `contrast_idx` and every
 existing config keep their meaning. NYUMets writes the enhanced T1 as CT1; the stored
@@ -215,24 +225,29 @@ def build(files, cfg):
 
     # COMMON SUPPORT. Contrasts of the same session do not always cover the same anatomy --
     # a T1 whose FOV includes the eyes paired with a CT1 whose FOV does not is the usual
-    # case. Left alone, the bridge is trained to DELETE an eye that legitimately exists in
-    # its input, and the loss is dominated by a region the target simply never acquired.
-    # So intersect the per-contrast supports and give every channel the same one.
+    # case. The intersection of the per-contrast supports is the region all four share.
     #
     # This cannot come from brain_mask: that AVERAGES the contrasts, so an eye voxel carrying
     # signal in one of four contrasts still lands at ~1/4 of its normalised value, well above
     # bg_frac, and survives.
+    #
+    # `store` (default) records it and leaves the pixels alone; `apply` multiplies it in,
+    # which bakes the ragged FOV boundary into the data. See the module docstring.
     lost = {}
-    if cfg.intersect_support:
+    if cfg.support != "none":
         sup = support_mask(img, cfg.support_frac, cfg.support_close)
         fov = sup.all(dim=1)                                   # (D,H,W)
         for c, name in enumerate(CONTRASTS):
             own = sup[:, c].sum()
             lost[name] = float(1.0 - (fov & sup[:, c]).sum() / own.clamp_min(1))
-        img = img * fov.unsqueeze(1).to(img.dtype)
+        if cfg.support == "apply":
+            img = img * fov.unsqueeze(1).to(img.dtype)
     else:
         fov = torch.ones(img.shape[:1] + img.shape[2:], dtype=torch.bool)
 
+    # `& fov` even under `--support store`: the pixels outside the common FOV are kept, but a
+    # median/MAD taken over voxels only some contrasts acquired would not be comparable across
+    # channels. So the STATISTICS (and the stored brain mask) stay on the shared region.
     fg = brain_mask(img, cfg.bg_frac) & fov
     clipped = (channelwise_percentile_clip(img, fg, cfg.clip[0], cfg.clip[1])
                if cfg.clip else img)
@@ -275,8 +290,9 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         f["img"] = h5py.SoftLink("/" + norm_key(MODE))
         f.create_dataset("mask", data=mask.astype(np.uint8),
                          chunks=chunk(mask), compression=comp)
-        # the common acquisition support every channel was cropped to; kept so the region
-        # that was zeroed is inspectable rather than merely gone
+        # the common acquisition support: under the default `--support store` the pixels are
+        # NOT multiplied by it, so this is the region to mask WITH downstream if you want to
+        # -- check `support_applied` before assuming either way
         f.create_dataset("support", data=support.astype(np.uint8),
                          chunks=chunk(support), compression=comp)
         f.create_dataset("slice_index", data=idx.astype(np.int32))
@@ -293,16 +309,22 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         f.attrs["orig_depth"] = int(orig_depth)
         f.attrs["min_brain_frac"] = float(cfg.min_brain_frac)
         f.attrs["mask_rule"] = f"mean_c(v/p99.5_c) > {cfg.bg_frac}"
-        f.attrs["intersect_support"] = bool(cfg.intersect_support)
+        f.attrs["support_mode"] = cfg.support                     # store | apply | none
+        f.attrs["support_applied"] = bool(cfg.support == "apply")  # were the pixels zeroed?
+        # kept under its old name so anything written against the pre-2026-09-22 h5s still
+        # reads something sensible -- but it says COMPUTED, which is no longer the same as
+        # APPLIED; `support_applied` is the one that describes the pixels.
+        f.attrs["intersect_support"] = bool(cfg.support != "none")
         f.attrs["support_rule"] = (f"intersect_c(open/close(v_c > {cfg.support_frac}*p99.5_c), "
-                                   f"r={cfg.support_close})" if cfg.intersect_support else "none")
+                                   f"r={cfg.support_close})" if cfg.support != "none" else "none")
         # fraction of each contrast's OWN support dropped by the intersection: a large value
         # on one contrast is the FOV mismatch (eyes in T1, absent in CT1) this guards against
         for _c in CONTRASTS:
             f.attrs[f"support_lost_{_c}"] = float(lost.get(_c, 0.0))
         f.attrs["affine"] = np.asarray(affine, dtype=np.float32)
         f.attrs["source_files"] = ",".join(os.path.basename(files[c]) for c in CONTRASTS)
-        f.attrs["axis_order"] = "N,H,W,C ; slice_index maps N back to the canonical-RAS z"
+        f.attrs["axis_order"] = ("N,H,W,C ; H,W are the canonical-RAS (R, A) axes and "
+                                 "slice_index maps N back to the canonical-RAS z")
 
 
 def main():
@@ -314,9 +336,13 @@ def main():
     ap.add_argument("--clip", type=float, nargs=2, default=(0.5, 99.5),
                     help="foreground percentile clip before the stats; '--clip 0 0' disables")
     ap.add_argument("--bg-frac", type=float, default=0.05, dest="bg_frac")
-    ap.add_argument("--no-intersect-support", action="store_false", dest="intersect_support",
-                    help="do NOT force a common support across contrasts (not recommended: "
-                         "a bridge then learns to delete anatomy its target never acquired)")
+    ap.add_argument("--support", choices=("store", "apply", "none"), default="store",
+                    help="what to do with the common acquisition support. store (default): "
+                         "write it to `support`, leave the pixels alone. apply: also zero "
+                         "every channel outside it -- the pre-2026-09-22 behaviour, which "
+                         "bakes a ragged FOV boundary into the data. none: do not compute it")
+    ap.add_argument("--no-intersect-support", action="store_const", const="none",
+                    dest="support", help="deprecated alias for --support none")
     ap.add_argument("--support-frac", type=float, default=0.02, dest="support_frac",
                     help="acquisition-support threshold as a fraction of each contrast's "
                          "p99.5; low on purpose, so dark-but-acquired CSF stays inside")
@@ -344,6 +370,9 @@ def main():
     if cfg.limit:
         sessions = dict(list(sessions.items())[:cfg.limit])
     print(f"{len(sessions)} complete {'/'.join(CONTRASTS)} sessions under {cfg.root}")
+    print(f"support    : {cfg.support}"
+          + ("  (pixels outside the common FOV are ZEROED)" if cfg.support == "apply" else
+             "  (pixels are left alone)" if cfg.support == "store" else "  (not computed)"))
 
     if cfg.dry_run:
         # nib.load is lazy and as_closest_canonical only rewrites the affine, so .shape costs
@@ -427,8 +456,9 @@ def main():
         if lost:
             worst = max(lost, key=lost.get)
             if lost[worst] > cfg.support_warn:
-                print(f"  ?? {key[0]}/{key[1]}: intersection dropped {lost[worst]:.1%} of "
-                      f"{worst}'s support -- FOV mismatch between contrasts")
+                print(f"  ?? {key[0]}/{key[1]}: {lost[worst]:.1%} of {worst}'s support is "
+                      f"outside the intersection -- FOV mismatch between contrasts"
+                      + (" (ZEROED)" if cfg.support == "apply" else " (kept; see `support`)"))
             support_lost.append((key, dict(lost)))
         shapes[raw.shape[1:3]] = shapes.get(raw.shape[1:3], 0) + 1
         rows.append({"patient": key[0], "session": key[1], "path": path,
@@ -449,7 +479,11 @@ def main():
     print("stored in-plane sizes:", dict(shapes))
     if support_lost:
         import statistics
-        print("\ncommon-support intersection, fraction of each contrast's own support dropped:")
+        print("\ncommon-support intersection, fraction of each contrast's own support that "
+              "falls outside it")
+        print(f"  (support={cfg.support}: "
+              + ("those voxels were ZEROED in every channel):"
+                 if cfg.support == "apply" else "the pixels were KEPT; this is diagnostic):"))
         for c in CONTRASTS:
             vals = [d[c] for _, d in support_lost]
             print(f"  {c:<6} median {statistics.median(vals):6.2%}   max {max(vals):6.2%}")

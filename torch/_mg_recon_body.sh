@@ -130,9 +130,11 @@ echo "       config: ${BASE_CONFIG}"
 # ---- (re)generate the configs -------------------------------------------------------------
 # Cheap, and it keeps a stale hand-edited config from silently deciding a run.
 if [ "${REGENERATE}" = "1" ]; then
+    # PROTOCOL=legacy reproduces the old synthetic grid; unset = the
+    # generator's default (measured). See the generator's module docstring.
     python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
         --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} \
-        ${ORGAN_MASK:+--organ-mask} >/dev/null
+        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"} >/dev/null
 fi
 
 if [ ! -f "${BASE_CONFIG}" ]; then
@@ -170,10 +172,15 @@ if cfg.get("task") != "recon":
     raise SystemExit(f"[grid] {base} has task={cfg.get('task')!r}, expected 'recon'.")
 
 mri = cfg["mri"]
-if mri.get("kspace_type") != "simulated":
+# The two kspace_types the generator writes: "simulated" (--protocol legacy)
+# and "measurement_awgn" (--protocol measured, measured k-space + known AWGN).
+# Plain "measurement" is still refused -- it adds no noise and pins sigma, so a
+# noise-adaptive net would be told a level that is not in its data.
+if mri.get("kspace_type") not in ("simulated", "measurement_awgn"):
     raise SystemExit(
-        f"[grid] {base} has kspace_type={mri.get('kspace_type')!r}. This grid is the "
-        f"SYNTHETIC k-space experiment -- 'simulated' is the whole point.")
+        f"[grid] {base} has kspace_type={mri.get('kspace_type')!r}. This grid "
+        f"trains on 'simulated' (legacy) or 'measurement_awgn' (measured) k-space; "
+        f"regenerate with scripts/make_mg_recon_configs.py.")
 
 # The expected range is READ FROM THE GENERATOR, not written here as well. It
 # was duplicated as a literal (0.0, 0.01) and that made changing the noise level

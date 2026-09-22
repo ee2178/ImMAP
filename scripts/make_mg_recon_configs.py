@@ -11,11 +11,30 @@ config per (anatomy, acceleration, model) cell to
 sbatch files (`torch/mg_recon_{knee,brain}.sbatch`); each asks this script for
 its own cell list via `--list-cells --anatomy <a>`, so the two stay in sync.
 
-Every cell trains on SYNTHETIC k-space (`kspace_type: "simulated"`): the clean
-coil-combined image is pushed through Sense -> Fourier -> mask with complex AWGN
-at sigma ~ U[0.01, 0.02] added in the coil-image domain. See
-`operators/noise.py::mri_awgn`, the port of `genobs(clo::SyntheticMRIReco, ...)`
-in `Sljiva/src/closures/mrireco.jl`.
+TWO PROTOCOLS (`--protocol`, default "measured" since 2026-09-22):
+
+  measured  MEASURED k-space plus known AWGN (`kspace_type: "measurement_awgn"`),
+            masks with Sljiva's heuristics (`center_frac: 0.04`,
+            `adjust_accel: true` -- R is the EFFECTIVE rate), and the
+            OPERATOR's coil maps estimated from each measurement's ACS
+            (`online_smaps: "espirit"`). The ground truth is the stored SENSE
+            combination `S^H c` from maps estimated on the FULLY sampled data
+            -- the split Sljiva's `genobs` makes: reference from stored maps,
+            operator from online ones. `--target rss` swaps the ground truth
+            for the RSS of the acquired coils.
+  legacy    the old grid: SYNTHETIC k-space (`kspace_type: "simulated"`), the
+            stored SENSE combination as ground truth, precomputed maps in the
+            operator, nominal R. Kept so an old run can be reproduced; its
+            numbers are not comparable to measured ones.
+
+THE STORED `image` MUST COME FROM THE FIXED ESPIRiT. Under `measured` it is the
+ground truth, and the maps it was written with predate the per-sample row-space
+truncation and the strongest-coil phase reference in physics/smaps.py.
+Regenerate with torch/espirit_smaps.sbatch before training.
+
+In both, noise is complex AWGN at the anatomy's NOISE_STD with the convention
+of `operators/noise.py::mri_awgn` (the port of `genobs` in
+`Sljiva/src/closures/mrireco.jl`); `kspace_awgn` is its measured counterpart.
 
 Usage
 -----
@@ -569,6 +588,63 @@ def cells(anatomy=None, only=None, accels=None, every=False):
 # ===========================================================================
 #  Config assembly
 # ===========================================================================
+def _apply_protocol(args):
+    """Fill the protocol's defaults for anything not set explicitly.
+
+    Explicit flags win, so `--protocol measured --online-smaps walsh` is the
+    measured protocol with the cheap estimator, and `--online-smaps off` turns
+    the online maps off even under measured.
+    """
+    if args.protocol == "measured":
+        args.kspace_type = "measurement_awgn"
+        if args.online_smaps == "off":
+            # The stored maps define the ground truth; the operator must not
+            # see them. prepare_measurement refuses this too -- failing here
+            # names the flag instead of a training step.
+            raise SystemExit("--online-smaps off is not allowed with --protocol "
+                             "measured: the stored maps are reserved for the "
+                             "ground truth, and the operator must estimate its "
+                             "own. Use 'espirit' or 'walsh'.")
+        if args.center_frac is None:
+            args.center_frac = 0.04
+        args.adjust_accel = True
+        if args.online_smaps is None:
+            args.online_smaps = "espirit"
+    else:
+        args.kspace_type = "simulated"
+        if args.target == "rss":
+            # An RSS image has no phase, so `M F S image` would be a phase-free
+            # phantom rather than the scan. RSS is only meaningful against
+            # measured k-space.
+            raise SystemExit("--target rss needs --protocol measured: under "
+                             "legacy the measurement is synthesised from the "
+                             "target, and an RSS target has no phase.")
+    if args.online_smaps == "off":
+        args.online_smaps = None
+    return args
+
+
+def _opt_mri(args):
+    """The optional `mri` keys, present ONLY when switched on.
+
+    torch/_mg_recon_body.sh's launch guard flattens both configs and compares
+    with `a.get(k) != b.get(k)`, so an absent key reads as None. Writing
+    `adjust_accel: false` into every config would therefore differ from every
+    run dir launched before the key existed, and the guard would refuse all of
+    them -- with the feature OFF. Omitting the defaults keeps those configs
+    byte-identical in these keys, and a run that DOES turn one on differs, as
+    it should.
+    """
+    out = {}
+    if getattr(args, "center_frac", None) is not None:
+        out["center_frac"] = float(args.center_frac)
+    if getattr(args, "adjust_accel", False):
+        out["adjust_accel"] = True
+    if getattr(args, "online_smaps", None):
+        out["online_smaps"] = args.online_smaps
+    return out
+
+
 def _variant(params):
     """"mg" or "flat" (or "L<L>w<widen>"), read off the params -- not off the
     cell's name.
@@ -798,7 +874,14 @@ def make_config(anatomy, r, model, args):
             # guard in torch/_mg_recon_body.sh compares configs and will refuse
             # the old run dirs, which is the intended behaviour.
             "organ_mask_source": "rss",
+            # Ground truth: absent = the stored SENSE combination (default);
+            # "rss" only with --target rss.
+            **({"target": "rss"} if getattr(args, "target", "sense") == "rss"
+               else {}),
         }
+
+    if getattr(args, "online_smaps", None) in (None, "off"):
+        args.online_smaps = None
 
     total_steps = args.num_epochs * args.steps_per_epoch
 
@@ -848,8 +931,49 @@ def make_config(anatomy, r, model, args):
             "acs_lines": 20,
             "mask_dist": "uniform",
             "mask_offset": 0,
-            "kspace_type": "simulated",
+            # SAMPLING HEURISTICS (Sljiva/src/mask.jl).
+            #
+            # `adjust_accel: true` widens the outer line spacing so the ACS
+            # comes out of the acceleration budget rather than being added to
+            # it. WITHOUT IT R IS NOMINAL, NOT REAL -- measured on this grid's
+            # 320-line axis with acs_lines=20:
+            #
+            #     R=4  -> 95 lines -> effective 3.37
+            #     R=8  -> 57 lines -> effective 5.61
+            #     R=16 -> 39 lines -> effective 8.21
+            #
+            # so the "deep acceleration" arm has been running at about R=8.
+            # `center_frac` (0.04 in Sljiva, i.e. 13 lines at N=320) replaces
+            # acs_lines with a fraction of the axis; at R=16 the current 20
+            # ACS lines are the WHOLE budget, so adjust_accel needs a smaller
+            # ACS to be satisfiable at all.
+            #
+            # Both are off by default because turning them on changes the
+            # sampling pattern, and therefore the problem: runs either side of
+            # the change are not comparable. They are merged in below ONLY
+            # WHEN SET -- see `_opt_mri`.
+            "kspace_type": getattr(args, "kspace_type", "simulated"),
             "whiten_kspace": False,
+            # WHERE THE NETWORK'S COIL MAPS COME FROM.
+            #   None       the dataset's precomputed maps (current behaviour)
+            #   "espirit"  re-estimated from the ACS of each measurement
+            #   "walsh"    the same, with the cheap estimator
+            #
+            # Online maps are what Sljiva's `genobs` does, and they change the
+            # PROBLEM, not just the numbers: `y` still comes from the maps on
+            # disk, so the forward model is no longer self-consistent with the
+            # ground truth and the net has to tolerate map error the way a real
+            # reconstruction must. That is the reference protocol; it is also
+            # strictly harder than what this grid has trained on so far, and
+            # not comparable to it.
+            #
+            # OFF BY DEFAULT because of cost, not doubt: ESPIRiT's kernel
+            # images are coils x kernels x grid, ~10 GB per slice at 20 coils
+            # on 640x320, recomputed EVERY step
+            # (physics/online_smaps.py::estimate_cost_gb). Probe a short run
+            # before committing the queue, and use "walsh" -- which is what
+            # Sljiva's own multigrid experiments ran -- if it does not fit.
+            **_opt_mri(args),
         },
         "optimizer": {
             "type": "Adam",
@@ -880,6 +1004,30 @@ def main():
                         "later). Lower than --lr because they backtrack at "
                         "5e-4. Cosine T_max is unchanged, so these cells "
                         "anneal from a lower start over the same budget.")
+    p.add_argument("--center-frac", type=float, default=None,
+                   help="ACS as a fraction of the phase-encode axis (Sljiva "
+                        "uses 0.04), instead of the fixed --acs-lines count.")
+    p.add_argument("--adjust-accel", action="store_true",
+                   help="take the ACS out of the acceleration budget, so R is "
+                        "the EFFECTIVE rate (Sljiva's generate_uniform_mask). "
+                        "Off by default -- it changes every mask.")
+    p.add_argument("--protocol", choices=("measured", "legacy"),
+                   default="measured",
+                   help="'measured' (default): measured k-space + AWGN, Sljiva "
+                        "masks, operator maps estimated from each measurement, "
+                        "SENSE ground truth. 'legacy': the old synthetic-k-space "
+                        "grid. See the module docstring.")
+    p.add_argument("--target", choices=("sense", "rss"), default="sense",
+                   help="ground truth under --protocol measured: the stored "
+                        "SENSE combination (default) or the RSS of the "
+                        "acquired coils.")
+    p.add_argument("--online-smaps", choices=("off", "espirit", "walsh"),
+                   default=None,
+                   help="estimate the coil maps from each measurement's ACS "
+                        "instead of using the precomputed ones. 'espirit' "
+                        "matches Sljiva's :espirit branch; 'walsh' is the "
+                        "cheap one its experiments actually used. Changes the "
+                        "problem -- see the `mri.online_smaps` comment.")
     p.add_argument("--only", nargs="*", default=None,
                    help="restrict to these model tags")
     p.add_argument("--anatomy", choices=("knee", "brain"), default=None,
@@ -909,6 +1057,7 @@ def main():
     p.add_argument("--accels", nargs="*", type=int, default=None,
                    help="restrict to these accelerations (with --list-cells)")
     args = p.parse_args()
+    _apply_protocol(args)
 
     if args.list_cells:
         # --only / --accels narrow the list AND renumber it, so an experiment

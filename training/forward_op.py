@@ -137,7 +137,7 @@ def validate(ops, loader, device, enh_q, panel_idx=0):
     return res, panel
 
 
-def panel_figure(panel, step, res):
+def panel_figure(panel, step, res, orient="default"):
     """One val slice, one row per operator. Columns:
 
       1  image      gray, ONE window taken from T1 (the target) for every row -- E(CT1) should look
@@ -164,7 +164,7 @@ def panel_figure(panel, step, res):
     inb = (x - y)[m > 0.5]
     v = float(torch.quantile(inb.abs().float(), 0.99)) if inb.numel() else 1.0
     fig, _ = subplot_images(
-        rows, row_labels=labels, xlabels=xlab,
+        rows, row_labels=labels, xlabels=xlab, orient=orient,
         col_titles=["image (T1 window)", "left over: E(CT1) - T1", "removed: CT1 - E(CT1)"],
         cmap=["gray", "RdBu_r", "RdBu_r"],
         vmin=[None, -v, -v], vmax=[None, v, v],
@@ -208,6 +208,8 @@ def train_forward_op(
     loss_type="complex-mse",
     use_mask=True,
     psnr_only=False,
+    display_orient=None,             # "radiological" / "neurological" rotate the val panels into
+                                     # a conventional axial view (eyes up). DISPLAY ONLY.
     data_range=2.0,
     val_slices=4000,                 # fixed random val subset; 0 / null = the whole val set
     val_seed=0,
@@ -330,7 +332,9 @@ def train_forward_op(
                 if panel is not None:
                     name = f"E ({_inputs(net)})"
                     p = (panel[0], panel[1], panel[2], {name: panel[3]["E"]})
-                    fig = panel_figure(p, global_step, {"identity": res["identity"], name: res["E"]})
+                    fig = panel_figure(p, global_step,
+                                       {"identity": res["identity"], name: res["E"]},
+                                       orient=display_orient)
                     log["val/panel"] = wandb.Image(fig)
                     plt.close(fig)
                 wandb.log(log, step=global_step)

@@ -4,6 +4,16 @@
 #
 #   mkdir -p logs && sbatch bigpurple/nyumets_h5.sbatch
 #
+# REBUILD (2026-09-22 defaults): slices are stored ANTERIOR-UP, radiological
+# (--orient radiological), and the common acquisition support is RECORDED but no longer
+# multiplied into the pixels (--support store). Both are the builder's defaults, so nothing
+# is passed below; set OVERWRITE=1 or existing h5s are silently kept:
+#
+#   OVERWRITE=1 sbatch bigpurple/nyumets_h5.sbatch
+#
+# Every NYUMets checkpoint trained before this rebuild saw the OLD orientation and the
+# support-masked pixels, so none of them transfer -- they have to be retrained.
+#
 # cpu_short is 12h / 50 nodes on BigPurple -- the shortest tier this fits, so the shortest
 # queue. Use cpu_dev (4h, 4 nodes) with --limit for a shakeout run; cpu_medium (5d) only if
 # the full set really needs more than 12h.

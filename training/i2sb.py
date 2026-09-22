@@ -27,6 +27,7 @@ import math
 
 import numpy as np
 import torch
+from visualization.image import orient_tensor
 from visualization.wandb_image import wandb_image
 import torch.nn.functional as F
 import torchvision.utils as vutils
@@ -250,6 +251,9 @@ def train_i2sb(
                                      # frame, is hours per validation.
     display_window=None,             # [vmin, vmax] for the val panels; None = [DISPLAY_VMIN,
                                      # DISPLAY_VMAX], the med/MAD window. [0, 1] for raw/scale data.
+    display_orient=None,             # "radiological" / "neurological" rotate the val panels into
+                                     # a conventional axial view (eyes up). DISPLAY ONLY -- the
+                                     # network never sees it. None = draw the stored axes.
     data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
                                      # data in [-1, 1]. Must match the loader's actual scaling or
                                      # every reported dB is offset by 20*log10(data_range).
@@ -448,7 +452,7 @@ def train_i2sb(
                 target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
                 loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
                 data_range=data_range, wandb=wandb, global_step=global_step,
-                display_window=display_window,
+                display_window=display_window, display_orient=display_orient,
                 loss_params=loss_params, val_lpips=val_lpips, dc=dc,
             )
             # wall-clock cost of this validation, next to the training throughput it competes with
@@ -546,7 +550,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
               data_range, wandb, global_step, loss_params=None, val_lpips=False, dc=None,
-              display_window=None):
+              display_window=None, display_orient=None):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -632,6 +636,9 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
                   else (float(display_window[0]), float(display_window[1])))
         grid = mask[:1] * torch.cat([((c - lo) / (hi - lo)).clamp(0, 1) for c in cols], dim=0)
         res = (x0_m[:1] - pred_m[:1]).abs(); res = res / res.max().clamp(min=1e-8)
+        # Display-only rotation into a conventional axial view; applied AFTER the window and
+        # the mask, so every scalar logged below is computed on the stored axes either way.
+        grid, res = orient_tensor(grid, display_orient), orient_tensor(res, display_orient)
         # How much of the BRAIN falls outside that window, and how bright the panel came out.
         # These turn "the image is black" into two numbers: clip_frac ~ 1 means the data is not
         # on the [-1, 1] scale the window assumes (rescale `scales`), while grid_mean ~ 0 with
