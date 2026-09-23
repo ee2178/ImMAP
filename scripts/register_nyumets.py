@@ -102,14 +102,15 @@ class Study:
         full[self.index] = a
         return full
 
-    def planes(self, ci):
-        """(D, H, W) float32 of ONE normalised contrast -- all report mode reads.
+    def planes(self, ci, source="norm"):
+        """(D, H, W) float32 of ONE contrast -- all report mode reads.
 
         h5py slices in the file, so only that channel leaves disk: a quarter of the bytes of
         `img_median_mad`, and `img_raw` / `mask` / `support` are never touched at all.
         """
+        key = "img_raw" if source == "raw" else norm_key(MODE)
         with h5py.File(self.path, "r") as f:
-            a = np.asarray(f[norm_key(MODE)][:, :, :, ci], dtype=np.float32)
+            a = np.asarray(f[key][:, :, :, ci], dtype=np.float32)
         return torch.from_numpy(self._on_z(a))
 
     def load(self):
@@ -178,7 +179,7 @@ def measure(planes, acq, cfg, ref):
         if i == ref:
             offsets.append((0, 0, 0))
             continue
-        t = translation_offset(fixed, probe(q))
+        t = translation_offset(fixed, probe(q), phase=bool(getattr(cfg, "reg_phase", True)))
         if cfg.reg_max_shift and max(abs(c) for c in t) > cfg.reg_max_shift:
             print(f"  ?? offset {t} exceeds --reg-max-shift {cfg.reg_max_shift}; "
                   f"leaving this study unshifted")
@@ -235,6 +236,87 @@ def write_registered(st, vol, idx, offset, reference, out_path, cfg):
                                "scripts/register_nyumets.py")
 
 
+def compare(patients, cfg):
+    """Every (source x correlation) variant on the same patients, scored by residual.
+
+    The question this answers -- does it matter whether the offset is measured on raw or on
+    normalised data -- has a real answer and it is not the same for every cohort, so measure
+    it rather than argue it. `none` is the control: the residual with NO shift at all. A
+    variant that cannot beat `none` is not registering anything.
+    """
+    import statistics
+
+    variants = [("none", None, None),
+                ("norm, phase", "norm", True), ("norm, plain", "norm", False),
+                ("raw,  phase", "raw", True), ("raw,  plain", "raw", False)]
+    scores = {v[0]: [] for v in variants}
+    moved = {v[0]: [] for v in variants}
+    ci = CONTRASTS.index(cfg.reg_contrast)
+    n_done = 0
+
+    for pid, studies in patients.items():
+        studies.sort(key=lambda s: s.case)
+        if len(studies) < 2 or len({tuple(s.hw) for s in studies}) != 1:
+            continue
+        depth = max(s.depth for s in studies)
+        acq = [np.pad(a.acquired, (0, depth - a.depth)) for a in studies]
+        if int(np.logical_and.reduce(acq).sum()) < cfg.min_overlap:
+            continue
+        ref = max(range(len(studies)), key=lambda i: (int(acq[i].sum()), -i))
+        cache = {}
+        for name, src, phase in variants:
+            # the residual is always scored on the NORMALISED planes, whatever the offset was
+            # measured on -- otherwise `raw` and `norm` would be graded on different scales
+            scoring = cache.setdefault("norm", [st.planes(ci, "norm") for st in studies])
+            if src is None:
+                offs = [(0, 0, 0)] * len(studies)
+            else:
+                pl = cache.setdefault(src, [st.planes(ci, src) for st in studies])
+                offs = measure(pl, acq, dict_cfg(cfg, reg_source=src, reg_phase=phase), ref)
+            valid = [translate(torch.as_tensor(a), (t[0],)).numpy() if any(t) else a
+                     for a, t in zip(acq, offs)]
+            idx = np.where(np.logical_and.reduce(valid))[0]
+            if idx.size == 0:
+                continue
+            scores[name].append(residual(scoring, offs, idx, ref)[1])
+            moved[name].append(sum(1 for t in offs if any(t)))
+        cache.clear()
+        n_done += 1
+        if n_done % 10 == 0:
+            print(f"  {n_done} patients...")
+
+    if not n_done:
+        print("no patient had two comparable studies to compare on")
+        return
+    print(f"\n{n_done} patient(s) compared. Residual after the shift "
+          f"(mean |other - ref| / mean |ref| on the common slices, lower is better):\n")
+    print(f"  {'variant':<14}{'median':>9}{'mean':>9}{'p90':>9}   studies shifted")
+    base = statistics.median(scores["none"]) if scores["none"] else float("nan")
+    for name, _, _ in variants:
+        v = scores[name]
+        if not v:
+            continue
+        med = statistics.median(v)
+        gain = "" if name == "none" else f"   ({100 * (1 - med / base):+.0f}% vs none)"
+        print(f"  {name:<14}{med:9.3f}{statistics.mean(v):9.3f}"
+              f"{sorted(v)[int(0.9 * (len(v) - 1))]:9.3f}   {sum(moved[name])}{gain}")
+    best = min((n for n, _, _ in variants[1:] if scores[n]),
+               key=lambda n: statistics.median(scores[n]), default=None)
+    print(f"\n  best: {best}" if best else "")
+    print("  If NOTHING beats `none` by much, the studies are not related by a translation: "
+          "rotation, or a residual that is dominated by genuine change between visits rather "
+          "than by misalignment. Compare `none` against the visual check before rebuilding.")
+
+
+def dict_cfg(cfg, **over):
+    """A shallow copy of cfg with a few fields overridden -- variants must not mutate cfg."""
+    import copy as _copy
+    c = _copy.copy(cfg)
+    for k, v in over.items():
+        setattr(c, k, v)
+    return c
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -252,6 +334,19 @@ def main():
     ap.add_argument("--min-overlap", type=int, default=8, dest="min_overlap",
                     help="refuse a patient whose studies share fewer acquired slices than "
                          "this -- too little to trust the through-plane offset")
+    ap.add_argument("--reg-source", default="norm", choices=("norm", "raw"),
+                    dest="reg_source",
+                    help="measure the offset on img_median_mad ('norm') or img_raw ('raw'). "
+                         "They are NOT equivalent: normalize_masked ends with `out = out * fg`, "
+                         "so the normalised array is exactly zero outside the brain mask and "
+                         "its strongest edge is a mask boundary that differs between studies")
+    ap.add_argument("--no-phase", action="store_false", dest="reg_phase",
+                    help="plain cross-correlation instead of phase correlation (what "
+                         "generate_longibrain.jl does)")
+    ap.add_argument("--compare", action="store_true",
+                    help="measure every (source x correlation) variant on the sample and print "
+                         "which one aligns best. Read-only; settles the choice on YOUR data "
+                         "instead of on an argument about DC terms")
     ap.add_argument("--device", default=None, dest="reg_device",
                     help="where the FFTs run: cuda, cuda:0, cpu. Default: cuda when one is "
                          "visible. Only the low-passed probe moves, so GPU memory scales with "
@@ -284,6 +379,8 @@ def main():
     if cfg.apply and os.path.abspath(out_root) == os.path.abspath(cfg.root) and not cfg.in_place:
         raise SystemExit("--out is --root; pass --in-place if that is really the intent")
 
+    if cfg.compare and cfg.apply:
+        raise SystemExit("--compare is a read-only measurement; drop --apply")
     if cfg.apply and cfg.sample and not cfg.allow_partial:
         raise SystemExit(
             f"--apply with --sample {cfg.sample} would write a set in which only {cfg.sample} "
@@ -310,6 +407,9 @@ def main():
     print(f"offset on the low-passed normalised {cfg.reg_contrast} "
           f"(lowpass={cfg.reg_lowpass}, max shift {cfg.reg_max_shift}) on {cfg.reg_device}\n")
 
+    if cfg.compare:
+        return compare(patients, cfg)
+
     rows, skipped, resid_rows = [], [], []
     for pid, studies in patients.items():
         studies.sort(key=lambda s: s.case)
@@ -332,7 +432,7 @@ def main():
 
         # MEASURE from one contrast. Report mode stops here and never touches img_raw / mask /
         # support, which is what makes a whole-cohort survey affordable.
-        planes = [st.planes(ci) for st in studies]
+        planes = [st.planes(ci, cfg.reg_source) for st in studies]
         offsets = measure(planes, acq, cfg, ref) if len(studies) > 1 else [(0, 0, 0)]
 
         # The common slice set needs each study's acquired extent carried through its own shift.

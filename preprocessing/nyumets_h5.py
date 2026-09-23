@@ -205,10 +205,10 @@ def lowpass_inplane(v, frac):
     return ifftc(fftc(v, dim=(-2, -1)) * win, dim=(-2, -1)).abs()
 
 
-def translation_offset(x, y):
+def translation_offset(x, y, phase=True):
     """Integer (dz, dh, dw) to pass to `translate(y, t)` so that y lands on x.
 
-    3-D FFT cross-correlation.
+    3-D FFT cross-correlation, PHASE-normalised by default (see `phase`).
 
     corr = IFFT( FFT(x) * conj(FFT(y)) ), peak -> lag. The transform is UNCENTERED here and
     the peak index is folded into [-n/2, n/2), which is the same answer generate_longibrain.jl
@@ -226,7 +226,16 @@ def translation_offset(x, y):
     dim = (-3, -2, -1)
     X = fftc(x.to(torch.float32), dim=dim)
     Y = fftc(y.to(torch.float32), dim=dim)
-    corr = ifftc(X * Y.conj(), dim=dim).abs().cpu()      # one small transfer, then plain numpy
+    C = X * Y.conj()
+    if phase:
+        # PHASE correlation: divide the cross-power spectrum by its magnitude. Every frequency
+        # then contributes equally, so the peak is a near-delta instead of a broad blob, the
+        # estimate stops depending on per-scan intensity scaling, and -- the part that matters
+        # here -- the DC / overlap-area envelope that biases plain correlation toward zero lag
+        # is gone. generate_longibrain.jl does NOT do this; it registers one protocol at three
+        # visits on identical grids, which is a far easier problem than two NYUMets studies.
+        C = C / C.abs().clamp_min(1e-12)
+    corr = ifftc(C, dim=dim).abs().cpu()                # one small transfer, then plain numpy
     # `ifftc` is centred, so zero lag sits at the array centre -- the same convention
     # generate_longibrain.jl reads with `argmax .- size .÷ 2 .- 1`. NEGATED, because the peak
     # says where y sits relative to x and moving y onto x is the opposite direction.
@@ -307,12 +316,21 @@ def register_patient(vols, cfg, ref=0, real=None):
     # sliced and concatenated by `translate`, which is memory-bound either way, while the
     # 3-D FFTs are what actually pay for a GPU.
     dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
-    probe = lambda v: lowpass_inplane(v.norm[:, ci].to(dev), cfg.reg_lowpass)
+    phase = bool(getattr(cfg, "reg_phase", True))
+    # WHICH ARRAY. `norm` (img_median_mad) is brain-masked -- cmap.normalize_masked ends with
+    # `out = out * fg`, so it is EXACTLY zero outside the mask, and the mask is brain & fov, so
+    # it carries each study's own FOV cut. Correlating it aligns mask shapes as much as
+    # anatomy. `raw` is the whole unmasked head but carries a large DC, which only plain
+    # correlation cares about (phase correlation whitens it away). Measure both with
+    # scripts/register_nyumets.py --compare rather than guessing.
+    src = getattr(cfg, "reg_source", "norm")
+    pick = (lambda v: v.raw) if src == "raw" else (lambda v: v.norm)
+    probe = lambda v: lowpass_inplane(pick(v)[:, ci].to(dev), cfg.reg_lowpass)
     fixed = probe(vols[ref])
 
     offsets, valid = [], []
     for i, v in enumerate(vols):
-        t = (0, 0, 0) if i == ref else translation_offset(fixed, probe(v))
+        t = (0, 0, 0) if i == ref else translation_offset(fixed, probe(v), phase=phase)
         if i != ref and cfg.reg_max_shift and max(abs(c) for c in t) > cfg.reg_max_shift:
             print(f"  ?? offset {t} exceeds --reg-max-shift {cfg.reg_max_shift}; "
                   f"leaving this study unshifted")
@@ -553,6 +571,15 @@ def main():
     ap.add_argument("--reg-lowpass", type=float, default=0.25, dest="reg_lowpass",
                     help="fraction of k-space kept IN-PLANE before correlating; small = "
                          "coarse structure drives the peak. 1.0 disables the low-pass")
+    ap.add_argument("--reg-source", default="norm", choices=("norm", "raw"),
+                    dest="reg_source",
+                    help="measure the offset on img_median_mad ('norm', brain-MASKED, so its "
+                         "strongest edge is a mask boundary that differs between studies) or "
+                         "on img_raw ('raw', the whole head, large DC)")
+    ap.add_argument("--no-reg-phase", action="store_false", dest="reg_phase",
+                    help="plain cross-correlation instead of phase correlation -- exactly what "
+                         "generate_longibrain.jl does. Phase is the default because it removes "
+                         "the zero-lag bias that plain correlation has on unmasked data")
     ap.add_argument("--reg-device", default="cpu", dest="reg_device",
                     help="where the registration FFTs run. 'cpu' by default because this "
                          "builder is IO- and NIfTI-bound and normally runs on a cpu_ partition; "
