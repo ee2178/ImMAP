@@ -34,7 +34,16 @@ from sb.base import build_schedule
 
 
 def varsigma(root, x0_idx, x1_idx, image_key, scale, max_subjects, max_slices, seed):
-    """RMS(x0 - x1) over brain voxels, pooled across subjects, in scaled units."""
+    """RMS(x0 - x1) over brain voxels, pooled across subjects, in the units the LOADER feeds.
+
+    `scale` is either one divisor for every channel or a PER-CONTRAST list. The distinction is
+    not cosmetic: the loader divides each contrast by its own `scales[c]`, so the difference the
+    net sees is x0/s0 - x1/s1, not (x0 - x1)/s. With per-contrast scales taken from each
+    contrast's own in-brain median, both endpoints have brain median 1.0 and the systematic
+    brightness offset between T1 and CT1 is gone -- what remains is closer to the enhancement
+    alone, and varsigma is correspondingly SMALLER. A single divisor overstates it and would
+    size the noise ladder too high.
+    """
     files = sorted(glob.glob(os.path.join(root, "*", "*_img.h5")))
     if not files:
         raise SystemExit(f"no */*_img.h5 under {root}")
@@ -54,7 +63,11 @@ def varsigma(root, x0_idx, x1_idx, image_key, scale, max_subjects, max_slices, s
                 sel = np.sort(rng.permutation(N)[:max_slices])
             img = f[image_key][sel]                      # (n, H, W, C)
             msk = f["mask"][sel][..., 0].astype(bool)
-        d = (img[..., x0_idx] - img[..., x1_idx]) / scale
+        if np.ndim(scale) == 0:
+            d = (img[..., x0_idx] - img[..., x1_idx]) / float(scale)
+        else:
+            sc = np.asarray(scale, dtype=np.float64)
+            d = img[..., x0_idx] / sc[x0_idx] - img[..., x1_idx] / sc[x1_idx]
         v = d[msk]
         if v.size == 0:
             continue
@@ -144,7 +157,13 @@ def main():
     ap.add_argument("--x1-idx", type=int, default=1, dest="x1_idx")   # T1
     ap.add_argument("--image-key", default="img_median_mad", dest="image_key")
     ap.add_argument("--scale", type=float, default=1.0,
-                    help="the loader's `scales` divisor for these channels")
+                    help="ONE divisor for both endpoints; use --scales when each contrast has "
+                         "its own")
+    ap.add_argument("--scales", type=float, nargs="+", default=None,
+                    help="the config's per-contrast `scales`, e.g. --scales 2800 2500 2390 2370. "
+                         "Each endpoint is divided by ITS OWN entry, which is what the loader "
+                         "does; with per-contrast medians that removes the T1/CT1 brightness "
+                         "offset, so varsigma is smaller than a single divisor reports")
     ap.add_argument("--n-points", type=int, default=1000, dest="n_points")
     ap.add_argument("--max-subjects", type=int, default=60, dest="max_subjects")
     ap.add_argument("--max-slices", type=int, default=40, dest="max_slices")
@@ -185,11 +204,13 @@ def main():
         print("  --scale <the x1 contrast's value> to get beta_max in these units.")
         return
 
+    divisor = cfg.scales if cfg.scales else cfg.scale
     vs, per_subj, n_subj = varsigma(cfg.root, cfg.x0_idx, cfg.x1_idx, cfg.image_key,
-                                    cfg.scale, cfg.max_subjects, cfg.max_slices, cfg.seed)
+                                    divisor, cfg.max_subjects, cfg.max_slices, cfg.seed)
     hi_vs = float(np.percentile(per_subj, 90))
 
-    print(f"\n{n_subj} sessions, image_key={cfg.image_key}, scales divisor={cfg.scale}")
+    print("\n%d sessions, image_key=%s, divisor=%s"
+          % (n_subj, cfg.image_key, cfg.scales if cfg.scales else cfg.scale))
     print(f"varsigma = RMS(x0 - x1) over brain")
     print(f"  pooled          {vs:.4f}")
     print(f"  per-session     median {np.median(per_subj):.4f}   "
