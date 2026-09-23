@@ -3,8 +3,11 @@
 """
 Register a patient's NYUMets studies to one another, on h5s that are ALREADY BUILT.
 
-    # measure only -- writes nothing, prints the offsets                (default)
+    # survey a random sample of 40 patients; writes nothing        (the default)
     python -m scripts.register_nyumets --root ../datasets/NYUMets_h5
+
+    # the whole cohort, still read-only
+    python -m scripts.register_nyumets --root ../datasets/NYUMets_h5 --sample 0
 
     # same, then write the registered set somewhere new
     python -m scripts.register_nyumets --root ../datasets/NYUMets_h5 \
@@ -36,6 +39,13 @@ a patient whose studies share too few slices to give a trustworthy dz.
 
 Patients with one study are left alone (nothing to register), and are copied unchanged under
 `--apply --out`.
+
+COST. Report mode reads ONE contrast of `img_median_mad` per study and never opens `img_raw`,
+`mask` or `support`, so a survey is roughly an eighth of the bytes a full pass would move; the
+pixels for `--apply` are read per patient and dropped again. It is still far too heavy for a
+login node, which kills compute -- run it in a cpu_short job (see bigpurple/nyumets_h5.sbatch
+for the conda preamble) or an interactive allocation. `--sample` defaults to 40 patients so
+that a survey stays a survey.
 """
 
 import argparse
@@ -48,7 +58,7 @@ import numpy as np
 import torch
 
 from preprocessing.nyumets_h5 import (
-    CONTRASTS, MODE, register_patient, translate,
+    CONTRASTS, MODE, lowpass_inplane, register_patient, translate, translation_offset,
 )
 from preprocessing.cmap import norm_key
 
@@ -56,7 +66,13 @@ DATASETS = ("img_raw", norm_key(MODE), "mask", "support")
 
 
 class Study:
-    """One built h5, reconstituted on its original z axis."""
+    """One built h5. Opening reads only the attrs and `slice_index`; the pixels come later.
+
+    Loading is deferred because report mode never needs most of them: the offset and the
+    residual are computed from ONE contrast of `img_median_mad`, while `img_raw`, `mask` and
+    `support` are only needed to write a registered copy. Reading all four at full depth for
+    every study of every patient is what gets the job killed.
+    """
 
     __slots__ = ("path", "patient", "session", "depth", "index", "acquired", "arrays",
                  "attrs", "hw")
@@ -69,15 +85,8 @@ class Study:
             self.depth = int(f.attrs.get("orig_depth", self.index.max() + 1))
             if self.index.max() >= self.depth:               # older files, or a bad attr
                 self.depth = int(self.index.max()) + 1
-            self.arrays = {}
-            for name in DATASETS:
-                if name not in f:
-                    continue
-                a = np.asarray(f[name])                       # (n, H, W, C)
-                full = np.zeros((self.depth,) + a.shape[1:], dtype=a.dtype)
-                full[self.index] = a
-                self.arrays[name] = full
-            self.hw = self.arrays[norm_key(MODE)].shape[1:3]
+            self.hw = tuple(f[norm_key(MODE)].shape[1:3])
+        self.arrays = {}
         self.patient = str(self.attrs.get("patient", os.path.basename(path).split("_")[0]))
         self.session = str(self.attrs.get("session", ""))
         self.acquired = np.zeros(self.depth, dtype=bool)
@@ -87,9 +96,41 @@ class Study:
     def case(self):
         return f"{self.patient}_{self.session}" if self.session else self.patient
 
+    def _on_z(self, a):
+        """(n, ...) stored slices -> (orig_depth, ...) on the original z axis, gaps zero."""
+        full = np.zeros((self.depth,) + a.shape[1:], dtype=a.dtype)
+        full[self.index] = a
+        return full
+
+    def planes(self, ci):
+        """(D, H, W) float32 of ONE normalised contrast -- all report mode reads.
+
+        h5py slices in the file, so only that channel leaves disk: a quarter of the bytes of
+        `img_median_mad`, and `img_raw` / `mask` / `support` are never touched at all.
+        """
+        with h5py.File(self.path, "r") as f:
+            a = np.asarray(f[norm_key(MODE)][:, :, :, ci], dtype=np.float32)
+        return torch.from_numpy(self._on_z(a))
+
+    def load(self):
+        """Read every dataset at full depth. Only `--apply` needs this."""
+        if self.arrays:
+            return self
+        with h5py.File(self.path, "r") as f:
+            for name in DATASETS:
+                if name in f:
+                    self.arrays[name] = self._on_z(np.asarray(f[name]))
+        return self
+
+    def unload(self):
+        self.arrays = {}
+
 
 def _volume(st):
-    """A `Volume`-shaped view of a Study, for `register_patient` (which shifts .raw/.norm/.fg/.fov)."""
+    """A loaded Study as a `Volume`, for `register_patient` (which shifts raw/norm/fg/fov).
+
+    `--apply` only. Call `st.load()` first; report mode never builds one of these.
+    """
     from preprocessing.nyumets_h5 import Volume
 
     to_dchw = lambda a: torch.from_numpy(np.ascontiguousarray(a.transpose(0, 3, 1, 2)))
@@ -103,7 +144,7 @@ def _volume(st):
 
 
 def index_patients(root):
-    """-> {patient: [Study, ...]}, every */*_img.h5 under `root`."""
+    """-> {patient: [Study, ...]}, every */*_img.h5 under `root`. Reads attrs only."""
     paths = sorted(glob.glob(os.path.join(root, "*", "*_img.h5")))
     if not paths:
         raise RuntimeError(f"no */*_img.h5 under {root}")
@@ -112,6 +153,54 @@ def index_patients(root):
         st = Study(p)
         out.setdefault(st.patient, []).append(st)
     return out
+
+
+def measure(planes, acq, cfg, ref):
+    """-> offsets, from the reg-contrast planes alone. No pixels are moved.
+
+    The measuring half of `preprocessing.nyumets_h5.register_patient`, on one contrast instead
+    of four whole volumes -- same `lowpass_inplane`, same `translation_offset`, same
+    --reg-max-shift rejection, so report mode and --apply cannot disagree (tests pin that they
+    return the same offsets). Volumes are zero-padded at the END to the deepest study first,
+    exactly as register_patient does, so index 0 stays original slice 0 for all of them.
+    """
+    depth = max(p.shape[0] for p in planes)
+    dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
+
+    def probe(q):
+        if q.shape[0] < depth:
+            q = torch.cat([q, torch.zeros((depth - q.shape[0],) + q.shape[1:])])
+        return lowpass_inplane(q.to(dev), cfg.reg_lowpass)
+
+    fixed = probe(planes[ref])
+    offsets = []
+    for i, q in enumerate(planes):
+        if i == ref:
+            offsets.append((0, 0, 0))
+            continue
+        t = translation_offset(fixed, probe(q))
+        if cfg.reg_max_shift and max(abs(c) for c in t) > cfg.reg_max_shift:
+            print(f"  ?? offset {t} exceeds --reg-max-shift {cfg.reg_max_shift}; "
+                  f"leaving this study unshifted")
+            t = (0, 0, 0)
+        offsets.append(t)
+    return offsets
+
+
+def residual(planes, offsets, idx, ref):
+    """Worst disagreement with the reference over `idx`, before and after the shift."""
+    depth = max(p.shape[0] for p in planes)
+    pad = lambda q: (q if q.shape[0] >= depth else
+                     torch.cat([q, torch.zeros((depth - q.shape[0],) + q.shape[1:])]))
+    pre = [pad(q) for q in planes]
+    post = [translate(q, t) if any(t) else q for q, t in zip(pre, offsets)]
+
+    def worst(ps):
+        r = ps[ref][idx]
+        den = max(float(r.abs().mean()), 1e-8)
+        return max(float((ps[i][idx] - r).abs().mean()) / den
+                   for i in range(len(ps)) if i != ref)
+    return worst(pre), worst(post)
 
 
 def write_registered(st, vol, idx, offset, reference, out_path, cfg):
@@ -163,27 +252,63 @@ def main():
     ap.add_argument("--min-overlap", type=int, default=8, dest="min_overlap",
                     help="refuse a patient whose studies share fewer acquired slices than "
                          "this -- too little to trust the through-plane offset")
+    ap.add_argument("--device", default=None, dest="reg_device",
+                    help="where the FFTs run: cuda, cuda:0, cpu. Default: cuda when one is "
+                         "visible. Only the low-passed probe moves, so GPU memory scales with "
+                         "ONE contrast, not four whole volumes")
     ap.add_argument("--resid-warn", type=float, default=0.15, dest="resid_warn",
                     help="flag a patient whose studies still disagree by more than this "
                          "(mean |other - ref| / mean |ref| on the common slices) AFTER the "
                          "shift -- usually too little overlap to register a built set")
-    ap.add_argument("--limit", type=int, default=None, help="first N patients only")
+    ap.add_argument("--sample", type=int, default=40,
+                    help="survey this many RANDOMLY CHOSEN patients (0 = every patient). A "
+                         "random sample, not the first N: patient directories sort by ID and "
+                         "the head of that list is not a random slice of the cohort. 40 pins "
+                         "the offset distribution well enough to decide whether to rebuild")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="which sample. Change it to check the survey was not a fluke")
+    ap.add_argument("--multi-only", action="store_true", dest="multi_only",
+                    help="sample only from patients that HAVE more than one study -- the only "
+                         "ones registration can say anything about")
+    ap.add_argument("--allow-partial", action="store_true", dest="allow_partial",
+                    help="permit --apply on a sample. Off by default: it would write a set in "
+                         "which only some patients are registered")
     cfg = ap.parse_args()
     cfg.register = True
+    if cfg.reg_device is None:
+        cfg.reg_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if cfg.reg_device.startswith("cuda") and not torch.cuda.is_available():
+        raise SystemExit(f"--device {cfg.reg_device}, but torch sees no CUDA device")
 
     out_root = cfg.root if cfg.in_place else (cfg.out or cfg.root.rstrip("/\\") + "_reg")
     if cfg.apply and os.path.abspath(out_root) == os.path.abspath(cfg.root) and not cfg.in_place:
         raise SystemExit("--out is --root; pass --in-place if that is really the intent")
 
+    if cfg.apply and cfg.sample and not cfg.allow_partial:
+        raise SystemExit(
+            f"--apply with --sample {cfg.sample} would write a set in which only {cfg.sample} "
+            f"patients are registered and the rest are not -- one that looks complete and is "
+            f"not. Use --sample 0 for every patient, or --allow-partial if that really is the "
+            f"intent.")
+
     patients = index_patients(cfg.root)
-    if cfg.limit:
-        patients = dict(list(patients.items())[:cfg.limit])
-    multi = sum(1 for v in patients.values() if len(v) > 1)
-    print(f"{len(patients)} patient(s), {sum(len(v) for v in patients.values())} studies; "
-          f"{multi} patient(s) have more than one study")
+    n_all = len(patients)
+    n_multi = sum(1 for v in patients.values() if len(v) > 1)
+    pool = [k for k, v in patients.items() if len(v) > 1] if cfg.multi_only else list(patients)
+    sampled = bool(cfg.sample) and cfg.sample < len(pool)
+    if sampled:
+        rng = np.random.default_rng(cfg.seed)
+        pick = sorted(rng.choice(len(pool), size=cfg.sample, replace=False).tolist())
+        pool = [pool[i] for i in pick]
+    patients = {k: patients[k] for k in pool}
+    how = (f"random sample, seed {cfg.seed}" + (", multi-study only" if cfg.multi_only else "")
+           if sampled else "all of them")
+    print(f"{n_all} patient(s) under {cfg.root}, {n_multi} with more than one study")
+    print(f"surveying {len(patients)} patient(s), "
+          f"{sum(len(v) for v in patients.values())} studies  ({how})")
     print(f"mode: {'APPLY -> ' + out_root if cfg.apply else 'REPORT ONLY (no writes)'}")
     print(f"offset on the low-passed normalised {cfg.reg_contrast} "
-          f"(lowpass={cfg.reg_lowpass}, max shift {cfg.reg_max_shift})\n")
+          f"(lowpass={cfg.reg_lowpass}, max shift {cfg.reg_max_shift}) on {cfg.reg_device}\n")
 
     rows, skipped, resid_rows = [], [], []
     for pid, studies in patients.items():
@@ -202,17 +327,19 @@ def main():
             print(f"  !! {pid}: {skipped[-1][1]} -- left unregistered")
             continue
 
-        vols = [_volume(s) for s in studies]
         ref = max(range(len(studies)), key=lambda i: (int(acq[i].sum()), -i))
         ci = CONTRASTS.index(cfg.reg_contrast)
-        # register_patient shifts in place, so keep the BEFORE picture to score against
-        pre = [v.norm[:, ci].clone() for v in vols]
-        if len(studies) > 1:
-            offsets, valid = register_patient(vols, cfg, ref=ref, real=acq)
-        else:
-            offsets = [(0, 0, 0)]
-            valid = [acq[0]]
 
+        # MEASURE from one contrast. Report mode stops here and never touches img_raw / mask /
+        # support, which is what makes a whole-cohort survey affordable.
+        planes = [st.planes(ci) for st in studies]
+        offsets = measure(planes, acq, cfg, ref) if len(studies) > 1 else [(0, 0, 0)]
+
+        # The common slice set needs each study's acquired extent carried through its own shift.
+        valid = [torch.as_tensor(np.pad(a, (0, depth - a.shape[0])) if a.shape[0] < depth else a)
+                 for a in acq]
+        valid = [translate(v, (t[0],)).numpy() if any(t) else np.asarray(v)
+                 for v, t in zip(valid, offsets)]
         common = np.logical_and.reduce(valid)
         idx = np.where(common)[0]
         if idx.size == 0:
@@ -225,20 +352,8 @@ def main():
         # each study was already cut to its own brain-bearing slices, so the correlation sees
         # only the surviving extent, and a small overlap gives a poor dz. A residual that
         # barely moves means "rebuild instead", not "they were already aligned".
-        resid = None
-        if len(studies) > 1:
-            def _pad(q):
-                if q.shape[0] >= depth:
-                    return q
-                return torch.cat([q, torch.zeros((depth - q.shape[0],) + q.shape[1:])])
-
-            def _disagree(planes):
-                r = planes[ref][idx]
-                den = max(float(r.abs().mean()), 1e-8)
-                return max(float((planes[i][idx] - r).abs().mean()) / den
-                           for i in range(len(planes)) if i != ref)
-            resid = (_disagree([_pad(q) for q in pre]),
-                     _disagree([v.norm[:, ci] for v in vols]))
+        resid = residual(planes, offsets, idx, ref) if len(studies) > 1 else None
+        del planes
 
         tag = "" if len(studies) > 1 else "   (single study: nothing to register)"
         print(f"  {pid}: {len(studies)} studies, ref {studies[ref].case}, "
@@ -252,11 +367,19 @@ def main():
             print(f"      {st.case:<28s} offset (dz={offsets[i][0]:+d}, dh={offsets[i][1]:+d}, "
                   f"dw={offsets[i][2]:+d}){mark}")
             rows.append((pid, st.case, offsets[i], i == ref))
-            if cfg.apply:
+        if cfg.apply:
+            # Only now are the full volumes read, and only for a patient that is being
+            # written. register_patient RE-MEASURES from them; `measure` above used the same
+            # primitives on the same planes, so the offsets agree (tests/test pins it).
+            vols = [_volume(st.load()) for st in studies]
+            if len(studies) > 1:
+                register_patient(vols, cfg, ref=ref, real=acq)
+            for i, st in enumerate(studies):
                 rel = os.path.relpath(st.path, cfg.root)
                 write_registered(st, vols[i], idx, offsets[i], studies[ref].case,
                                  os.path.join(out_root, rel), cfg)
-        del vols
+                st.unload()
+            del vols
 
     moved = [r for r in rows if not r[3]]
     if moved:
@@ -286,8 +409,12 @@ def main():
         for pid, why in skipped[:10]:
             print(f"  {pid}: {why}")
     if not cfg.apply:
-        print("\nREPORT ONLY -- nothing was written. Add --apply to write, or rebuild with "
-              "preprocessing/nyumets_h5.py, which registers on the full volumes.")
+        print("\nREPORT ONLY -- nothing was written."
+              + (f" This was {len(patients)} of {n_multi} multi-study patients; --sample 0 "
+                 f"does all of them, and a different --seed draws a different sample."
+                 if sampled else "")
+              + " To write, add --apply --sample 0. To do better, rebuild with "
+                "preprocessing/nyumets_h5.py, which registers on the full volumes.")
 
 
 if __name__ == "__main__":

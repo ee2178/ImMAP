@@ -193,12 +193,14 @@ def lowpass_inplane(v, frac):
     """
     if not frac or frac >= 1.0:
         return v
-    win = torch.ones(v.shape[-2:], dtype=v.dtype)
+    # on v's device: a CPU window against a CUDA volume is an error, not a silent copy
+    kw = dict(dtype=v.dtype, device=v.device)
+    win = torch.ones(v.shape[-2:], **kw)
     for ax, n in enumerate(v.shape[-2:]):
         k = max(2, int(round(n * float(frac))))
-        w = torch.zeros(n, dtype=v.dtype)
+        w = torch.zeros(n, **kw)
         lo = n // 2 - k // 2
-        w[lo:lo + k] = torch.hamming_window(k, periodic=False, dtype=v.dtype)
+        w[lo:lo + k] = torch.hamming_window(k, periodic=False, **kw)
         win = win * (w.view(-1, 1) if ax == 0 else w.view(1, -1))
     return ifftc(fftc(v, dim=(-2, -1)) * win, dim=(-2, -1)).abs()
 
@@ -224,7 +226,7 @@ def translation_offset(x, y):
     dim = (-3, -2, -1)
     X = fftc(x.to(torch.float32), dim=dim)
     Y = fftc(y.to(torch.float32), dim=dim)
-    corr = ifftc(X * Y.conj(), dim=dim).abs()
+    corr = ifftc(X * Y.conj(), dim=dim).abs().cpu()      # one small transfer, then plain numpy
     # `ifftc` is centred, so zero lag sits at the array centre -- the same convention
     # generate_longibrain.jl reads with `argmax .- size .÷ 2 .- 1`. NEGATED, because the peak
     # says where y sits relative to x and moving y onto x is the opposite direction.
@@ -248,7 +250,8 @@ def translate(a, t):
         src = slice(c, n) if c > 0 else slice(0, n + c)
         piece = a[(slice(None),) * axis + (src,)]
         pad = torch.zeros(
-            a.shape[:axis] + (n - piece.shape[axis],) + a.shape[axis + 1:], dtype=a.dtype)
+            a.shape[:axis] + (n - piece.shape[axis],) + a.shape[axis + 1:],
+            dtype=a.dtype, device=a.device)
         a = torch.cat([piece, pad] if c > 0 else [pad, piece], dim=axis)
     return a
 
@@ -296,10 +299,15 @@ def register_patient(vols, cfg, ref=0, real=None):
         if depth > d0:
             for name in ("raw", "norm", "fg", "fov"):
                 a = getattr(v, name)
-                z = torch.zeros((depth - d0,) + a.shape[1:], dtype=a.dtype)
+                z = torch.zeros((depth - d0,) + a.shape[1:], dtype=a.dtype,
+                                device=a.device)
                 setattr(v, name, torch.cat([a, z], dim=0))
 
-    probe = lambda v: lowpass_inplane(v.norm[:, ci], cfg.reg_lowpass)
+    # Only the PROBE moves to the accelerator. The bulk arrays stay put: they are only
+    # sliced and concatenated by `translate`, which is memory-bound either way, while the
+    # 3-D FFTs are what actually pay for a GPU.
+    dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
+    probe = lambda v: lowpass_inplane(v.norm[:, ci].to(dev), cfg.reg_lowpass)
     fixed = probe(vols[ref])
 
     offsets, valid = [], []
@@ -545,6 +553,10 @@ def main():
     ap.add_argument("--reg-lowpass", type=float, default=0.25, dest="reg_lowpass",
                     help="fraction of k-space kept IN-PLANE before correlating; small = "
                          "coarse structure drives the peak. 1.0 disables the low-pass")
+    ap.add_argument("--reg-device", default="cpu", dest="reg_device",
+                    help="where the registration FFTs run. 'cpu' by default because this "
+                         "builder is IO- and NIfTI-bound and normally runs on a cpu_ partition; "
+                         "pass cuda on a GPU node. Only the low-passed probe moves")
     ap.add_argument("--reg-max-shift", type=int, default=40, dest="reg_max_shift",
                     help="reject (and treat as unregistered) any offset larger than this in "
                          "any axis -- a cross-correlation failure, not a real displacement; "
