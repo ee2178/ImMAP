@@ -205,6 +205,50 @@ def lowpass_inplane(v, frac):
     return ifftc(fftc(v, dim=(-2, -1)) * win, dim=(-2, -1)).abs()
 
 
+def stored_to_world(affine, native_hw, crop):
+    """4x4 mapping a STORED (z, h, w) index to world mm.
+
+    `center_crop_or_pad` shifts the in-plane indices and the builder never folded that into the
+    saved affine, so reconstruct it here: an axis of native length n rendered at `crop` moves by
+    `(crop - n) // 2` -- positive when padded, negative when cropped, one expression for both.
+    The z index is untouched (slice_index IS the native z), so only rows 0 and 1 shift.
+    """
+    A = np.asarray(affine, dtype=np.float64).copy()
+    if not crop:
+        return A
+    # stored = native + off  ->  native = stored - off
+    off = [int((crop - int(n)) // 2) for n in native_hw]
+    S = np.eye(4)
+    S[0, 3], S[1, 3] = -off[0], -off[1]
+    return A @ S
+
+
+def affine_offset(ref, other, crop):
+    """Integer (dz, dh, dw) putting `other` onto `ref`, from their affines alone.
+
+    Each argument is (affine, native_hw, orig_depth). Exact whenever the two volumes share a
+    voxel size and differ by a translation -- which the --geometry survey says is this cohort:
+    1.0 mm isotropic everywhere, only the FOV and the slice count differ. Cross-correlation is
+    estimating a quantity the headers already state exactly.
+
+    Also returns `oblique`, the largest off-axis component of the rotation relating them (0 for
+    a pure translation). A large value means the studies are genuinely rotated and NO integer
+    shift aligns them, whatever method produced it.
+    """
+    Ar = stored_to_world(ref[0], ref[1], crop)
+    Ao = stored_to_world(other[0], other[1], crop)
+    M = np.linalg.inv(Ao) @ Ar          # ref index -> other index
+    R = M[:3, :3]
+    oblique = float(np.abs(R - np.diag(np.diag(R))).max())
+    # M maps a REF index to the OTHER index holding the same anatomy, so ref row h is other
+    # row h + t. `translate(a, c)` sets out[i] = a[i + c], so c = +t is exactly the shift that
+    # brings other onto ref -- NOT -t. (The negation belongs in `translation_offset`, whose
+    # correlation peak points the other way; putting it here too cancels out and silently
+    # doubles nothing while inverting everything.) In (h, w, z) order -> (dz, dh, dw).
+    t = M[:3, 3]
+    return (int(round(t[2])), int(round(t[0])), int(round(t[1]))), oblique
+
+
 def translation_offset(x, y, phase=True):
     """Integer (dz, dh, dw) to pass to `translate(y, t)` so that y lands on x.
 

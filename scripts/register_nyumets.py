@@ -58,7 +58,8 @@ import numpy as np
 import torch
 
 from preprocessing.nyumets_h5 import (
-    CONTRASTS, MODE, lowpass_inplane, register_patient, translate, translation_offset,
+    CONTRASTS, MODE, affine_offset, lowpass_inplane, register_patient, translate,
+    translation_offset,
 )
 from preprocessing.cmap import norm_key
 
@@ -150,13 +151,36 @@ def _volume(st):
                   affine=st.attrs.get("affine"), lost={}, native_hw=st.hw)
 
 
+def find_h5(root):
+    """Every *_img.h5 under `root`, whatever the nesting depth.
+
+    The builder writes <root>/<patient>_<session>/<case>_img.h5, so one level is the normal
+    case and the cheap glob is tried first. A split directory of symlinks, or a set arranged
+    per patient as <root>/<patient>/<session>/, nests one deeper -- fall back to a recursive
+    walk rather than reporting "no files" for a layout that merely differs.
+    """
+    root = os.path.expanduser(root)
+    for pattern in (os.path.join(root, "*", "*_img.h5"),
+                    os.path.join(root, "*_img.h5"),
+                    os.path.join(root, "**", "*_img.h5")):
+        hits = sorted(glob.glob(pattern, recursive=True))
+        if hits:
+            return hits
+    if not os.path.isdir(root):
+        raise RuntimeError(
+            f"{root} is not a directory (cwd is {os.getcwd()}). In a notebook the cwd is "
+            f"usually notebooks/, so a path like '../datasets/...' resolves one level off -- "
+            f"give an absolute path, or one relative to the repo root.")
+    listing = sorted(os.listdir(root))[:8]
+    raise RuntimeError(
+        f"no *_img.h5 anywhere under {root}; it contains "
+        f"{len(os.listdir(root))} entries, first few: {listing}")
+
+
 def index_patients(root):
-    """-> {patient: [Study, ...]}, every */*_img.h5 under `root`. Reads attrs only."""
-    paths = sorted(glob.glob(os.path.join(root, "*", "*_img.h5")))
-    if not paths:
-        raise RuntimeError(f"no */*_img.h5 under {root}")
+    """-> {patient: [Study, ...]}, every *_img.h5 under `root`. Reads attrs only."""
     out = {}
-    for p in paths:
+    for p in find_h5(root):
         st = Study(p)
         out.setdefault(st.patient, []).append(st)
     return out
@@ -330,6 +354,42 @@ def geometry(patients, cfg):
                   f"  native {native}")
     if len(rows) > 8:
         print(f"  ... and {len(rows) - 8} more")
+
+    # WHAT THE HEADERS ALREADY KNOW. With one voxel size across the cohort the studies differ
+    # by a translation, and the affines state it exactly -- so print it, and print how oblique
+    # they are, because a rotation is the one thing no integer shift can fix.
+    print("\n  offset predicted by the AFFINES (no pixels involved), vs each study's stored")
+    print("  reg_offset if the set was registered:\n")
+    pred, obl = [], []
+    for pid, studies in list(patients.items())[:8]:
+        if len(studies) < 2:
+            continue
+        studies.sort(key=lambda s: s.case)
+        crop = int(studies[0].attrs.get("crop_size", 0) or 0)
+        ref = max(range(len(studies)), key=lambda i: (int(studies[i].acquired.sum()), -i))
+        key = lambda st: (np.asarray(st.attrs.get("affine", np.eye(4))),
+                          tuple(int(v) for v in st.attrs.get("native_size", (crop, crop))),
+                          st.depth)
+        print(f"  {pid}  (ref {studies[ref].case})")
+        for i, st in enumerate(studies):
+            if i == ref:
+                continue
+            t, ob = affine_offset(key(studies[ref]), key(st), crop)
+            was = (tuple(np.asarray(st.attrs["reg_offset"]).tolist())
+                   if "reg_offset" in st.attrs else None)
+            pred.append(t)
+            obl.append(ob)
+            print(f"      {st.case:<30s} affine says (dz={t[0]:+4d}, dh={t[1]:+4d}, "
+                  f"dw={t[2]:+4d})  oblique {ob:.3f}"
+                  + (f"   stored {was}" if was else ""))
+    if pred:
+        import statistics as _st
+        print("")
+        for ax, name in enumerate(("dz", "dh", "dw")):
+            v = [abs(t[ax]) for t in pred]
+            print(f"  |{name}| from the affines: median {_st.median(v):.1f}  max {max(v)}")
+        print(f"  obliqueness: median {_st.median(obl):.4f}  max {max(obl):.4f}   "
+              f"(0 = pure translation; > ~0.02 and a shift cannot align them)")
 
     zs = [g[1][2] for _, geo, _, _ in rows for g in geo]
     print(f"\n  slice spacing across all sampled studies: median {statistics.median(zs):.2f} mm, "
