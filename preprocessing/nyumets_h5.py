@@ -584,10 +584,12 @@ def main():
                     help="where the registration FFTs run. 'cpu' by default because this "
                          "builder is IO- and NIfTI-bound and normally runs on a cpu_ partition; "
                          "pass cuda on a GPU node. Only the low-passed probe moves")
-    ap.add_argument("--reg-max-shift", type=int, default=40, dest="reg_max_shift",
-                    help="reject (and treat as unregistered) any offset larger than this in "
-                         "any axis -- a cross-correlation failure, not a real displacement; "
-                         "0 accepts anything")
+    ap.add_argument("--reg-max-shift", type=int, default=0, dest="reg_max_shift",
+                    help="reject any offset larger than this in any axis. 0 (the default) "
+                         "accepts whatever the correlation finds: the 40 this used to default "
+                         "to was arbitrary, and the 2026-09-23 survey caught it rejecting dz of "
+                         "43-49 that looked genuine -- large through-plane, small and consistent "
+                         "in-plane. --min-overlap is the principled guard")
     ap.add_argument("--start", type=int, default=None)
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--require-affine", action="store_true", dest="require_affine",

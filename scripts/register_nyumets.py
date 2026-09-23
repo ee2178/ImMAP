@@ -113,6 +113,12 @@ class Study:
             a = np.asarray(f[key][:, :, :, ci], dtype=np.float32)
         return torch.from_numpy(self._on_z(a))
 
+    def masks(self):
+        """(D, H, W) bool brain mask on the original z axis. uint8, one channel: cheap."""
+        with h5py.File(self.path, "r") as f:
+            a = np.asarray(f["mask"][:, :, :, 0])
+        return torch.from_numpy(self._on_z(a).astype(bool))
+
     def load(self):
         """Read every dataset at full depth. Only `--apply` needs this."""
         if self.arrays:
@@ -188,20 +194,47 @@ def measure(planes, acq, cfg, ref):
     return offsets
 
 
-def residual(planes, offsets, idx, ref):
-    """Worst disagreement with the reference over `idx`, before and after the shift."""
-    depth = max(p.shape[0] for p in planes)
-    pad = lambda q: (q if q.shape[0] >= depth else
-                     torch.cat([q, torch.zeros((depth - q.shape[0],) + q.shape[1:])]))
-    pre = [pad(q) for q in planes]
-    post = [translate(q, t) if any(t) else q for q, t in zip(pre, offsets)]
+def residual(planes, offsets, idx, ref, masks=None):
+    """Worst disagreement with the reference over `idx`, before and after the shift.
 
-    def worst(ps):
+    RESTRICTED TO WHERE BOTH STUDIES HAVE BRAIN when `masks` is given, and that matters more
+    than it sounds. `img_median_mad` is zero outside the brain mask, so a whole-frame mean is
+    diluted by background and then dominated by the two masks DISAGREEING -- a pair that is
+    perfectly aligned but masked slightly differently scores as badly as a pair that is not
+    aligned at all. Scoring inside the intersection measures the thing the name claims.
+
+    Even then the floor is not zero on real data: two scans months apart differ by noise,
+    scanner state and genuine progression. Read the before -> after change, not the absolute.
+    """
+    depth = max(p.shape[0] for p in planes)
+
+    def pad(q, fill=0):
+        if q.shape[0] >= depth:
+            return q
+        z = torch.full((depth - q.shape[0],) + q.shape[1:], fill, dtype=q.dtype)
+        return torch.cat([q, z])
+
+    def shifted(qs, fill=0):
+        return [translate(pad(q, fill), t) if any(t) else pad(q, fill)
+                for q, t in zip(qs, offsets)]
+
+    pre, post = [pad(q) for q in planes], shifted(planes)
+    if masks is None:
+        keep_pre = keep_post = None
+    else:
+        keep_pre = torch.stack([pad(m, False) for m in masks]).all(0)[idx]
+        keep_post = torch.stack(shifted(masks, False)).all(0)[idx]
+
+    def worst(ps, keep):
         r = ps[ref][idx]
-        den = max(float(r.abs().mean()), 1e-8)
-        return max(float((ps[i][idx] - r).abs().mean()) / den
+        sel = (lambda a: a[keep]) if keep is not None else (lambda a: a)
+        rv = sel(r)
+        if rv.numel() == 0:
+            return float("nan")
+        den = max(float(rv.abs().mean()), 1e-8)
+        return max(float((sel(ps[i][idx]) - rv).abs().mean()) / den
                    for i in range(len(ps)) if i != ref)
-    return worst(pre), worst(post)
+    return worst(pre, keep_pre), worst(post, keep_post)
 
 
 def write_registered(st, vol, idx, offset, reference, out_path, cfg):
@@ -234,6 +267,73 @@ def write_registered(st, vol, idx, offset, reference, out_path, cfg):
                                f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}), integer voxel "
                                "translation only, applied POST-BUILD by "
                                "scripts/register_nyumets.py")
+
+
+def geometry(patients, cfg):
+    """Is an integer-index translation even the right model? Attrs only -- no pixels read.
+
+    A shift in INDEX space only means something if the studies sample the same physical grid.
+    NYUMets is a clinical cohort, so slice thickness and in-plane spacing vary between studies
+    of one patient; when they do, no integer offset can align them and a cross-correlation will
+    still return a confident-looking number. This prints the geometry so that possibility is
+    settled before anything is rebuilt.
+    """
+    import statistics
+
+    rows, spacing_bad, depth_bad, fov_bad = [], [], [], []
+    for pid, studies in patients.items():
+        if len(studies) < 2:
+            continue
+        studies.sort(key=lambda s: s.case)
+        geo = []
+        for st in studies:
+            aff = np.asarray(st.attrs.get("affine", np.eye(4)), dtype=np.float64)
+            sp = tuple(round(float(np.linalg.norm(aff[:3, k])), 3) for k in range(3))
+            geo.append((st.case, sp, st.depth, int(st.index.min()), int(st.index.max()),
+                        tuple(int(v) for v in st.attrs.get("native_size", (0, 0)))))
+        sp_set = {g[1] for g in geo}
+        z_set = {g[1][2] for g in geo}
+        d_set = {g[2] for g in geo}
+        n_set = {g[5] for g in geo}
+        rows.append((pid, geo, len(sp_set) > 1, len(z_set) > 1))
+        if len(z_set) > 1:
+            spacing_bad.append(pid)
+        if len(d_set) > 1:
+            depth_bad.append(pid)
+        if len(n_set) > 1:
+            fov_bad.append(pid)
+
+    n = len(rows)
+    if not n:
+        print("no multi-study patient in this sample")
+        return
+    print(f"\n{n} multi-study patient(s):\n")
+    print(f"  studies whose SLICE SPACING differs within the patient : "
+          f"{len(spacing_bad)}/{n}  ({100 * len(spacing_bad) / n:.0f}%)")
+    print(f"  studies whose full-spacing triple differs              : "
+          f"{sum(1 for r in rows if r[2])}/{n}")
+    print(f"  studies whose orig_depth differs                       : "
+          f"{len(depth_bad)}/{n}")
+    print(f"  studies whose native in-plane size differs              : "
+          f"{len(fov_bad)}/{n}")
+    print("\n  An integer-index shift can only align studies that share a physical grid. Where")
+    print("  the slice spacing differs, registration has to RESAMPLE to a common grid first --")
+    print("  cross-correlation will still return a confident-looking offset, and it will be")
+    print("  meaningless.\n")
+
+    for pid, geo, sp_mix, z_mix in rows[:8]:
+        flag = "  <-- SPACING DIFFERS" if z_mix else ("  <-- spacing triple differs" if sp_mix
+                                                      else "")
+        print(f"  {pid}{flag}")
+        for case, sp, depth, lo, hi, native in geo:
+            print(f"      {case:<30s} spacing {sp}  depth {depth:>4d}  kept {lo:>3d}..{hi:<3d}"
+                  f"  native {native}")
+    if len(rows) > 8:
+        print(f"  ... and {len(rows) - 8} more")
+
+    zs = [g[1][2] for _, geo, _, _ in rows for g in geo]
+    print(f"\n  slice spacing across all sampled studies: median {statistics.median(zs):.2f} mm, "
+          f"min {min(zs):.2f}, max {max(zs):.2f}, {len(set(zs))} distinct value(s)")
 
 
 def compare(patients, cfg):
@@ -278,7 +378,8 @@ def compare(patients, cfg):
             idx = np.where(np.logical_and.reduce(valid))[0]
             if idx.size == 0:
                 continue
-            scores[name].append(residual(scoring, offs, idx, ref)[1])
+            mk = cache.setdefault("mask", [st.masks() for st in studies])
+            scores[name].append(residual(scoring, offs, idx, ref, masks=mk)[1])
             moved[name].append(sum(1 for t in offs if any(t)))
         cache.clear()
         n_done += 1
@@ -289,7 +390,7 @@ def compare(patients, cfg):
         print("no patient had two comparable studies to compare on")
         return
     print(f"\n{n_done} patient(s) compared. Residual after the shift "
-          f"(mean |other - ref| / mean |ref| on the common slices, lower is better):\n")
+          f"(mean |other - ref| / mean |ref| INSIDE the joint brain mask, lower is better):\n")
     print(f"  {'variant':<14}{'median':>9}{'mean':>9}{'p90':>9}   studies shifted")
     base = statistics.median(scores["none"]) if scores["none"] else float("nan")
     for name, _, _ in variants:
@@ -330,7 +431,12 @@ def main():
                     help="rewrite --root itself. Destructive; --apply is still required")
     ap.add_argument("--reg-contrast", default="T1", choices=CONTRASTS, dest="reg_contrast")
     ap.add_argument("--reg-lowpass", type=float, default=0.25, dest="reg_lowpass")
-    ap.add_argument("--reg-max-shift", type=int, default=40, dest="reg_max_shift")
+    ap.add_argument("--reg-max-shift", type=int, default=0, dest="reg_max_shift",
+                    help="reject an offset larger than this in any axis. 0 (the default) "
+                         "accepts whatever the correlation finds: the 40 this used to default "
+                         "to was arbitrary, and the 2026-09-23 survey caught it rejecting dz of "
+                         "43-49 that looked genuine -- large through-plane, small and consistent "
+                         "in-plane. --min-overlap is the principled guard")
     ap.add_argument("--min-overlap", type=int, default=8, dest="min_overlap",
                     help="refuse a patient whose studies share fewer acquired slices than "
                          "this -- too little to trust the through-plane offset")
@@ -343,6 +449,11 @@ def main():
     ap.add_argument("--no-phase", action="store_false", dest="reg_phase",
                     help="plain cross-correlation instead of phase correlation (what "
                          "generate_longibrain.jl does)")
+    ap.add_argument("--geometry", action="store_true",
+                    help="print each patient's per-study voxel spacing, depth and kept range "
+                         "and exit. Attrs only, no pixels -- run this FIRST when registration "
+                         "is not converging: an integer-index shift cannot align studies that "
+                         "do not share a physical grid")
     ap.add_argument("--compare", action="store_true",
                     help="measure every (source x correlation) variant on the sample and print "
                          "which one aligns best. Read-only; settles the choice on YOUR data "
@@ -379,8 +490,8 @@ def main():
     if cfg.apply and os.path.abspath(out_root) == os.path.abspath(cfg.root) and not cfg.in_place:
         raise SystemExit("--out is --root; pass --in-place if that is really the intent")
 
-    if cfg.compare and cfg.apply:
-        raise SystemExit("--compare is a read-only measurement; drop --apply")
+    if (cfg.compare or cfg.geometry) and cfg.apply:
+        raise SystemExit("--compare / --geometry are read-only measurements; drop --apply")
     if cfg.apply and cfg.sample and not cfg.allow_partial:
         raise SystemExit(
             f"--apply with --sample {cfg.sample} would write a set in which only {cfg.sample} "
@@ -407,6 +518,8 @@ def main():
     print(f"offset on the low-passed normalised {cfg.reg_contrast} "
           f"(lowpass={cfg.reg_lowpass}, max shift {cfg.reg_max_shift}) on {cfg.reg_device}\n")
 
+    if cfg.geometry:
+        return geometry(patients, cfg)
     if cfg.compare:
         return compare(patients, cfg)
 
@@ -452,7 +565,8 @@ def main():
         # each study was already cut to its own brain-bearing slices, so the correlation sees
         # only the surviving extent, and a small overlap gives a poor dz. A residual that
         # barely moves means "rebuild instead", not "they were already aligned".
-        resid = residual(planes, offsets, idx, ref) if len(studies) > 1 else None
+        resid = (residual(planes, offsets, idx, ref, masks=[st.masks() for st in studies])
+                 if len(studies) > 1 else None)
         del planes
 
         tag = "" if len(studies) > 1 else "   (single study: nothing to register)"
