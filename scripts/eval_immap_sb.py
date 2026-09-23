@@ -185,7 +185,9 @@ def main():
     fig, _ = subplot_images(
         img_rows, row_labels=labels, col_titles=["image", "sample - CT1"],
         cmap=["gray", "RdBu_r"], vmin=[None, -v], vmax=[None, v],
-        window_from=[gt], p=(1, 99), mask=mk, apply_mask=True, magnitude=False,
+        # mask sets the display WINDOW only; the frame is drawn whole, so the
+        # brain-mask edge (which carries the h5's FOV cut) is not drawn into the panel
+        window_from=[gt], p=(1, 99), mask=mk, apply_mask=False, magnitude=False,
         colorbar="each", panel_size=(3.0, 3.0), show=False)
     fig.savefig(os.path.join(args.out, "panel.png"), dpi=130, bbox_inches="tight")
     print(f"\nwrote {os.path.join(args.out, 'results.json')} and panel.png")

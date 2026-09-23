@@ -59,6 +59,7 @@ import torch.nn.functional as F
 import h5py
 import nibabel as nib
 
+from operators.fourier import fftc, ifftc
 from preprocessing.cmap import (
     normalize_masked, channelwise_percentile_clip, center_crop_spatial, norm_key,
 )
@@ -161,6 +162,164 @@ def center_crop_or_pad(a, size, h_axis, w_axis):
     return a.to(torch.bool) if is_bool else a
 
 
+class Volume:
+    """One session's full-depth arrays, before any slice filtering.
+
+    raw/norm are (D, C, H, W); fg/fov are (D, H, W). Registration shifts all four together.
+    """
+
+    __slots__ = ("raw", "norm", "fg", "fov", "stats", "orig_depth", "affine", "lost",
+                 "native_hw")
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw[k])
+
+
+def lowpass_inplane(v, frac):
+    """Blur a (D, H, W) real volume by keeping the central `frac` of k-space IN-PLANE only.
+
+    Follows generate_longibrain.jl, which correlates `rss(F'(F(c) .* hamming .* acs_mask))`:
+    a Hamming-tapered, ACS-cropped (so heavily low-passed) image. Registering on coarse
+    structure is what keeps the peak from being set by noise and fine detail.
+
+    IN-PLANE only, deliberately: the through-plane offset is the one worth having here, and
+    blurring along z would smear exactly the axis we are trying to localise. Slice spacing is
+    also several times the in-plane spacing, so z has far less detail to reject.
+
+    `operators.fourier.fftc` is already centred (fftshift o fft o ifftshift), so the window
+    below is built about the array centre and needs no shifting of its own -- unlike
+    `operators.hpf.HighPassFilter`, which builds its window from an UNSHIFTED `fftfreq` grid.
+    """
+    if not frac or frac >= 1.0:
+        return v
+    win = torch.ones(v.shape[-2:], dtype=v.dtype)
+    for ax, n in enumerate(v.shape[-2:]):
+        k = max(2, int(round(n * float(frac))))
+        w = torch.zeros(n, dtype=v.dtype)
+        lo = n // 2 - k // 2
+        w[lo:lo + k] = torch.hamming_window(k, periodic=False, dtype=v.dtype)
+        win = win * (w.view(-1, 1) if ax == 0 else w.view(1, -1))
+    return ifftc(fftc(v, dim=(-2, -1)) * win, dim=(-2, -1)).abs()
+
+
+def translation_offset(x, y):
+    """Integer (dz, dh, dw) to pass to `translate(y, t)` so that y lands on x.
+
+    3-D FFT cross-correlation.
+
+    corr = IFFT( FFT(x) * conj(FFT(y)) ), peak -> lag. The transform is UNCENTERED here and
+    the peak index is folded into [-n/2, n/2), which is the same answer generate_longibrain.jl
+    gets from its centred `Fourier{3}` and `argmax - size/2 - 1`, without the fftshift dance.
+
+    PLAIN cross-correlation, not phase correlation: the cross-power spectrum is NOT normalised
+    by its magnitude. That matches the Julia script. Two consequences worth knowing:
+      * bright regions dominate the peak, which is usually what you want on magnitude MR;
+      * with zero-padded volumes the overlap shrinks as |lag| grows, so the estimate is biased
+        TOWARD SMALL SHIFTS. Fine when the studies are nearly aligned already, which is the
+        regime here; it would under-estimate a genuinely large offset.
+    """
+    if x.shape != y.shape:
+        raise ValueError(f"cross-correlation needs one grid: {tuple(x.shape)} vs {tuple(y.shape)}")
+    dim = (-3, -2, -1)
+    X = fftc(x.to(torch.float32), dim=dim)
+    Y = fftc(y.to(torch.float32), dim=dim)
+    corr = ifftc(X * Y.conj(), dim=dim).abs()
+    # `ifftc` is centred, so zero lag sits at the array centre -- the same convention
+    # generate_longibrain.jl reads with `argmax .- size .÷ 2 .- 1`. NEGATED, because the peak
+    # says where y sits relative to x and moving y onto x is the opposite direction.
+    peak = np.unravel_index(int(torch.argmax(corr)), tuple(corr.shape))
+    return tuple(int(n // 2 - p) for p, n in zip(peak, corr.shape))
+
+
+def translate(a, t):
+    """Shift `a` by integer `t` along its FIRST len(t) axes: crop, then zero-pad the other end.
+
+    `Sljiva.translate`'s semantics (src/utils.jl), NOT a circular shift: anatomy pushed out of
+    the volume is dropped rather than wrapping around to the far side. `valid_after` says which
+    slices are then real data instead of the zeros that came in.
+    """
+    for axis, c in enumerate(t):
+        if c == 0:
+            continue
+        n = a.shape[axis]
+        if abs(c) >= n:
+            return torch.zeros_like(a)
+        src = slice(c, n) if c > 0 else slice(0, n + c)
+        piece = a[(slice(None),) * axis + (src,)]
+        pad = torch.zeros(
+            a.shape[:axis] + (n - piece.shape[axis],) + a.shape[axis + 1:], dtype=a.dtype)
+        a = torch.cat([piece, pad] if c > 0 else [pad, piece], dim=axis)
+    return a
+
+
+def register_patient(vols, cfg, ref=0, real=None):
+    """-> (offsets, valid) for one patient's studies, all aligned onto `vols[ref]`.
+
+    Every study is first zero-padded at the END to the deepest one, so index 0 stays original
+    slice 0 for all of them and the measured dz is a true inter-study offset rather than an
+    artefact of differing depth. The offset is measured on the low-passed `reg_contrast` of the
+    NORMALISED volume -- raw intensities are not comparable between scans, median/MAD ones are
+    -- and the resulting (dz, dh, dw) is applied to raw / norm / fg / fov alike.
+
+    `valid[i]` marks the slices of study i that hold REAL data afterwards: the study's own
+    acquired extent, carried through the same shift. The padding a shallow study needed, and
+    the zeros a shift pulled in, are both False -- so intersecting `valid` across the patient
+    is what "truncate to the same slice range" has to be built on.
+
+    The reference is not shifted, so afterwards every study of the patient lives on the
+    reference's index axis and `slice_index` means one anatomical level across the whole
+    patient -- exactly what the loader's guide_slice="index" assumes.
+    """
+    hw = {tuple(v.raw.shape[2:]) for v in vols}
+    if len(hw) != 1:
+        raise ValueError(f"studies are on different in-plane grids {sorted(hw)}; set --crop so "
+                         f"they share one before registering")
+    depth = max(v.raw.shape[0] for v in vols)
+    ci = CONTRASTS.index(cfg.reg_contrast)
+
+    # `real[i]` marks study i's genuinely acquired slices. Straight from the volume when the
+    # caller says nothing (a builder volume is dense from 0), but scripts/register_nyumets.py
+    # rebuilds volumes from h5s that were already slice-filtered, so their acquired set has
+    # gaps and it passes the masks in explicitly.
+    given, real = real, []
+    for i, v in enumerate(vols):
+        d0 = v.raw.shape[0]
+        if given is None:
+            ok = torch.zeros(depth, dtype=torch.bool)
+            ok[:d0] = True
+        else:
+            ok = torch.as_tensor(given[i], dtype=torch.bool)
+            if ok.shape[0] < depth:
+                ok = torch.cat([ok, torch.zeros(depth - ok.shape[0], dtype=torch.bool)])
+        real.append(ok)
+        if depth > d0:
+            for name in ("raw", "norm", "fg", "fov"):
+                a = getattr(v, name)
+                z = torch.zeros((depth - d0,) + a.shape[1:], dtype=a.dtype)
+                setattr(v, name, torch.cat([a, z], dim=0))
+
+    probe = lambda v: lowpass_inplane(v.norm[:, ci], cfg.reg_lowpass)
+    fixed = probe(vols[ref])
+
+    offsets, valid = [], []
+    for i, v in enumerate(vols):
+        t = (0, 0, 0) if i == ref else translation_offset(fixed, probe(v))
+        if i != ref and cfg.reg_max_shift and max(abs(c) for c in t) > cfg.reg_max_shift:
+            print(f"  ?? offset {t} exceeds --reg-max-shift {cfg.reg_max_shift}; "
+                  f"leaving this study unshifted")
+            t = (0, 0, 0)
+        if any(t):
+            v.raw = translate(v.raw, (t[0], 0, t[1], t[2]))
+            v.norm = translate(v.norm, (t[0], 0, t[1], t[2]))
+            v.fg = translate(v.fg, t)
+            v.fov = translate(v.fov, t)
+            real[i] = translate(real[i], (t[0],))
+        offsets.append(t)
+        valid.append(real[i].numpy())
+    return offsets, valid
+
+
 def _morph(m, r, op):
     """2D per-slice dilate/erode of a bool mask with a (2r+1)^2 box."""
     x = m[:, None].float()
@@ -213,8 +372,14 @@ def brain_mask(img, bg_frac):
     return (acc / img.shape[1]) > bg_frac
 
 
-def build(files, cfg):
-    """-> (raw, norm, mask, support, slice_idx, stats, orig_depth, affine, lost, native_hw)."""
+def build_volume(files, cfg):
+    """One session -> a FULL-DEPTH `Volume`, in-plane cropped, not yet slice-filtered.
+
+    Registration across a patient's studies runs on these full volumes (that is the whole
+    reason the slice filtering is a separate step): a study whose h5 had already been cut to
+    its own brain-bearing slices could only be aligned to another such cut, and the through-
+    plane offset would be confounded with the difference in what each cut kept.
+    """
     vols, affines = zip(*(load_ras(files[c]) for c in CONTRASTS))
     if len({v.shape for v in vols}) != 1:
         raise ValueError(f"shapes differ: {[v.shape for v in vols]} -- not on a common grid")
@@ -261,22 +426,30 @@ def build(files, cfg):
         fg = center_crop_or_pad(fg, cfg.crop, h_axis=1, w_axis=2)
         fov = center_crop_or_pad(fov, cfg.crop, h_axis=1, w_axis=2)
 
-    frac = fg.reshape(fg.shape[0], -1).float().mean(dim=1).numpy()
+    return Volume(raw=raw, norm=norm, fg=fg, fov=fov, stats=stats, orig_depth=orig_depth,
+                  affine=affines[0], lost=lost, native_hw=native_hw)
+
+
+def keep_mask(vol, cfg):
+    """Per-slice boolean over the FULL depth: enough brain, and inside --start/--end."""
+    frac = vol.fg.reshape(vol.fg.shape[0], -1).float().mean(dim=1).numpy()
     keep = frac >= cfg.min_brain_frac
     if cfg.start is not None or cfg.end is not None:
-        z = np.arange(orig_depth)
-        keep &= (z >= (cfg.start or 0)) & (z < (cfg.end if cfg.end is not None else orig_depth))
-    idx = np.where(keep)[0]
-    if idx.size == 0:
-        raise ValueError("no slice passed min_brain_frac")
+        z = np.arange(vol.fg.shape[0])
+        hi = cfg.end if cfg.end is not None else vol.fg.shape[0]
+        keep &= (z >= (cfg.start or 0)) & (z < hi)
+    return keep
 
+
+def select_slices(vol, idx):
+    """A registered, full-depth Volume + the kept indices -> the arrays write_h5 stores."""
     to_hwc = lambda t: np.transpose(t.numpy()[idx], (0, 2, 3, 1))
-    return (to_hwc(raw), to_hwc(norm), fg.numpy()[idx][..., None],
-            fov.numpy()[idx][..., None], idx, stats, orig_depth, affines[0], lost, native_hw)
+    return (to_hwc(vol.raw), to_hwc(vol.norm), vol.fg.numpy()[idx][..., None],
+            vol.fov.numpy()[idx][..., None])
 
 
 def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key,
-             files, cfg, lost, native_hw):
+             files, cfg, lost, native_hw, reg=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     comp = "gzip" if cfg.compress else None
     chunk = lambda a: (1,) + a.shape[1:]
@@ -323,6 +496,17 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
             f.attrs[f"support_lost_{_c}"] = float(lost.get(_c, 0.0))
         f.attrs["affine"] = np.asarray(affine, dtype=np.float32)
         f.attrs["source_files"] = ",".join(os.path.basename(files[c]) for c in CONTRASTS)
+        # Cross-study registration. `reg_offset` is the (dz, dh, dw) THIS study was shifted by
+        # to land on `reg_reference`; (0,0,0) on the reference itself, and on every study when
+        # `reg_applied` is False. After registration all studies of a patient share one index
+        # axis and one slice set, so `slice_index` names the same anatomical level in each.
+        r = reg or {}
+        f.attrs["reg_applied"] = bool(r.get("applied", False))
+        f.attrs["reg_offset"] = np.asarray(r.get("offset", (0, 0, 0)), dtype=np.int32)
+        f.attrs["reg_reference"] = str(r.get("reference", ""))
+        f.attrs["reg_rule"] = ("3-D FFT cross-correlation of the low-passed normalised "
+                               f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}), integer "
+                               "voxel translation only" if r.get("applied") else "none")
         f.attrs["axis_order"] = ("N,H,W,C ; H,W are the canonical-RAS (R, A) axes and "
                                  "slice_index maps N back to the canonical-RAS z")
 
@@ -352,6 +536,19 @@ def main():
                     help="warn when the intersection drops more than this fraction of a "
                          "contrast's own support")
     ap.add_argument("--min-brain-frac", type=float, default=0.02, dest="min_brain_frac")
+    ap.add_argument("--no-register", action="store_false", dest="register",
+                    help="do NOT align a patient's studies to one another (they are then "
+                         "written on their own index axes, as before 2026-09-23)")
+    ap.add_argument("--reg-contrast", default="T1", choices=CONTRASTS, dest="reg_contrast",
+                    help="which contrast the cross-correlation runs on; the same contrast is "
+                         "compared across studies, so a structural one is the right choice")
+    ap.add_argument("--reg-lowpass", type=float, default=0.25, dest="reg_lowpass",
+                    help="fraction of k-space kept IN-PLANE before correlating; small = "
+                         "coarse structure drives the peak. 1.0 disables the low-pass")
+    ap.add_argument("--reg-max-shift", type=int, default=40, dest="reg_max_shift",
+                    help="reject (and treat as unregistered) any offset larger than this in "
+                         "any axis -- a cross-correlation failure, not a real displacement; "
+                         "0 accepts anything")
     ap.add_argument("--start", type=int, default=None)
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--require-affine", action="store_true", dest="require_affine",
@@ -433,44 +630,107 @@ def main():
         return
 
     rows, shapes, skipped, support_lost = [], {}, [], []
-    natives, padded = {}, []
-    for i, (key, files) in enumerate(sessions.items(), 1):
-        # ONE DIRECTORY PER SESSION, not per patient. I2SBDataset.index_img_from_root takes
-        # imgs[0] -- the first *_img.h5 in each subdirectory -- so grouping a patient's
-        # sessions under one folder would silently index only one of them.
-        case = f"{key[0]}_{key[1]}"
-        path = os.path.join(cfg.out, case, f"{case}_img.h5")
-        if os.path.exists(path) and not cfg.overwrite:
+    natives, padded, reg_rows = {}, [], []
+
+    # PER PATIENT, not per session: registration is a cross-study operation, and the common
+    # slice range it produces is a property of the patient. Sessions of one patient are built
+    # together, aligned, truncated to their shared range, and only then written.
+    by_patient = {}
+    for key, files in sessions.items():
+        by_patient.setdefault(key[0], []).append((key, files))
+
+    done = 0
+    for pid, items in by_patient.items():
+        paths = [os.path.join(cfg.out, f"{k[0]}_{k[1]}", f"{k[0]}_{k[1]}_img.h5")
+                 for k, _ in items]
+        if all(os.path.exists(q) for q in paths) and not cfg.overwrite:
+            done += len(items)
             continue
-        try:
-            raw, norm, mask, support, idx, stats, depth, aff, lost, native = build(files, cfg)
-        except Exception as err:
-            skipped.append((key, str(err)))
-            print(f"  !! {key[0]}/{key[1]}: {err}")
+
+        vols, keys = [], []
+        for (key, files), _ in zip(items, paths):
+            try:
+                vols.append(build_volume(files, cfg))
+                keys.append(key)
+            except Exception as err:
+                skipped.append((key, str(err)))
+                print(f"  !! {key[0]}/{key[1]}: {err}")
+        done += len(items)
+        if not vols:
             continue
-        write_h5(path, raw, norm, mask, support, idx, stats, depth, aff, key, files, cfg,
-                 lost, native)
-        natives[native] = natives.get(native, 0) + 1
-        if cfg.crop and (native[0] < cfg.crop or native[1] < cfg.crop):
-            padded.append((key, native))
-        if lost:
-            worst = max(lost, key=lost.get)
-            if lost[worst] > cfg.support_warn:
-                print(f"  ?? {key[0]}/{key[1]}: {lost[worst]:.1%} of {worst}'s support is "
-                      f"outside the intersection -- FOV mismatch between contrasts"
-                      + (" (ZEROED)" if cfg.support == "apply" else " (kept; see `support`)"))
-            support_lost.append((key, dict(lost)))
-        shapes[raw.shape[1:3]] = shapes.get(raw.shape[1:3], 0) + 1
-        rows.append({"patient": key[0], "session": key[1], "path": path,
-                     "n_slices": len(idx), "orig_depth": depth,
-                     "H": raw.shape[1], "W": raw.shape[2]})
-        if i % 25 == 0:
-            print(f"  {i}/{len(sessions)}  {len(rows)} written, {len(skipped)} skipped")
+
+        # ---- register every study of this patient onto one of them --------------------------
+        # Reference = the DEEPEST study (ties broken by session id, so a rebuild is
+        # reproducible): the most z coverage to align the others into, which keeps the common
+        # range as large as it can be.
+        offsets = [(0, 0, 0)] * len(vols)
+        valid = [np.ones(v.raw.shape[0], dtype=bool) for v in vols]
+        ref = 0
+        if cfg.register and len(vols) > 1:
+            ref = max(range(len(vols)), key=lambda i: (vols[i].raw.shape[0], -i))
+            try:
+                offsets, valid = register_patient(vols, cfg, ref=ref)
+            except ValueError as err:
+                print(f"  !! {pid}: registration skipped -- {err}")
+                offsets = [(0, 0, 0)] * len(vols)
+                valid = [np.ones(v.raw.shape[0], dtype=bool) for v in vols]
+
+        # ---- ONE slice range for the whole patient ------------------------------------------
+        # Intersect each study's own keep rule with every study's real-data extent, so the
+        # written slice set is IDENTICAL across the patient and `slice_index` means the same
+        # anatomical level in all of them. That is the invariant guide_slice="index" needs.
+        depth = max(v.raw.shape[0] for v in vols)
+        common = np.ones(depth, dtype=bool)
+        for v, ok in zip(vols, valid):
+            k = keep_mask(v, cfg)
+            # register_patient pads every study to `depth`; without it (--no-register, or a
+            # single-study patient) a shallow study still has its own shorter masks, and the
+            # slices it simply does not have must count as unavailable rather than broadcast.
+            if k.shape[0] < depth:
+                k = np.pad(k, (0, depth - k.shape[0]))
+            if ok.shape[0] < depth:
+                ok = np.pad(ok, (0, depth - ok.shape[0]))
+            common &= k & ok
+        idx = np.where(common)[0]
+        if idx.size == 0:
+            for key in keys:
+                skipped.append((key, "no slice survived the patient's common range"))
+                print(f"  !! {key[0]}/{key[1]}: no slice survived the patient's common range")
+            continue
+
+        for i, (v, key) in enumerate(zip(vols, keys)):
+            case = f"{key[0]}_{key[1]}"
+            path = os.path.join(cfg.out, case, f"{case}_img.h5")
+            raw, norm, mask, support = select_slices(v, idx)
+            write_h5(path, raw, norm, mask, support, idx, v.stats, v.orig_depth, v.affine,
+                     key, sessions[key], cfg, v.lost, v.native_hw,
+                     reg=dict(offset=offsets[i], reference=f"{keys[ref][0]}_{keys[ref][1]}",
+                              applied=bool(cfg.register and len(vols) > 1)))
+            natives[v.native_hw] = natives.get(v.native_hw, 0) + 1
+            if cfg.crop and (v.native_hw[0] < cfg.crop or v.native_hw[1] < cfg.crop):
+                padded.append((key, v.native_hw))
+            if v.lost:
+                worst = max(v.lost, key=v.lost.get)
+                if v.lost[worst] > cfg.support_warn:
+                    print(f"  ?? {key[0]}/{key[1]}: {v.lost[worst]:.1%} of {worst}'s support is "
+                          f"outside the intersection -- FOV mismatch between contrasts"
+                          + (" (ZEROED)" if cfg.support == "apply" else " (kept; see `support`)"))
+                support_lost.append((key, dict(v.lost)))
+            shapes[raw.shape[1:3]] = shapes.get(raw.shape[1:3], 0) + 1
+            rows.append({"patient": key[0], "session": key[1], "path": path,
+                         "n_slices": len(idx), "orig_depth": v.orig_depth,
+                         "H": raw.shape[1], "W": raw.shape[2],
+                         "dz": offsets[i][0], "dh": offsets[i][1], "dw": offsets[i][2]})
+            if i != ref:
+                reg_rows.append((key, offsets[i]))
+        del vols
+        if done % 25 < len(items):
+            print(f"  {done}/{len(sessions)}  {len(rows)} written, {len(skipped)} skipped")
 
     os.makedirs(cfg.out, exist_ok=True)
     with open(os.path.join(cfg.out, "manifest.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["patient", "session", "path", "n_slices",
-                                          "orig_depth", "H", "W"])
+                                          "orig_depth", "H", "W", "dz", "dh", "dw"])
         w.writeheader()
         w.writerows(rows)
 
@@ -490,6 +750,19 @@ def main():
         worst = max(support_lost, key=lambda kv: max(kv[1].values()))
         print(f"  worst session: {worst[0][0]}/{worst[0][1]}  "
               + "  ".join(f"{k} {v:.1%}" for k, v in worst[1].items()))
+    if reg_rows:
+        import statistics
+        print(f"\ncross-study registration: {len(reg_rows)} non-reference study(ies) shifted "
+              f"onto their patient's reference")
+        for ax, name in enumerate(("dz (slice)", "dh (R)", "dw (A)")):
+            v = [abs(t[ax]) for _, t in reg_rows]
+            nz = sum(x > 0 for x in v)
+            print(f"  {name:<11} |offset| median {statistics.median(v):5.1f}  max {max(v):3d}  "
+                  f"nonzero on {nz}/{len(v)}")
+        worst = max(reg_rows, key=lambda kt: max(abs(c) for c in kt[1]))
+        print(f"  largest: {worst[0][0]}/{worst[0][1]} -> {worst[1]}")
+        print("  A large offset is either a real displacement or a correlation failure; "
+              "--reg-max-shift rejects the obvious failures.")
     if padded:
         print(f"\n{len(padded)} session(s) were smaller than --crop {cfg.crop} and were "
               f"ZERO-PADDED up to it:")

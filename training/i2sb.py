@@ -254,6 +254,9 @@ def train_i2sb(
     display_orient=None,             # "radiological" / "neurological" rotate the val panels into
                                      # a conventional axial view (eyes up). DISPLAY ONLY -- the
                                      # network never sees it. None = draw the stored axes.
+    display_mask=None,               # mask the val PANEL with the brain mask? None = follow
+                                     # use_mask. False shows the full frame, including whatever
+                                     # the net does outside a masked loss's supervision.
     data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
                                      # data in [-1, 1]. Must match the loader's actual scaling or
                                      # every reported dB is offset by 20*log10(data_range).
@@ -453,6 +456,7 @@ def train_i2sb(
                 loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
                 data_range=data_range, wandb=wandb, global_step=global_step,
                 display_window=display_window, display_orient=display_orient,
+                display_mask=display_mask,
                 loss_params=loss_params, val_lpips=val_lpips, dc=dc,
             )
             # wall-clock cost of this validation, next to the training throughput it competes with
@@ -550,7 +554,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
               data_range, wandb, global_step, loss_params=None, val_lpips=False, dc=None,
-              display_window=None, display_orient=None):
+              display_window=None, display_orient=None, display_mask=None):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -611,7 +615,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             et_sse += float((et * (x0_m - pred_m).abs() ** 2).sum())
             et_n += float(et.sum())
         n_samples += bs
-        last = (x1, xt, x0_m, pred_m, mask, step)
+        last = (x1, xt, x0_m, pred_m, x0, pred, mask, step)
 
     mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
     if lp_n:
@@ -623,19 +627,28 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         mean_metrics["et_psnr"] = 10.0 * math.log10(data_range ** 2 / (et_sse / et_n + 1e-12))
 
     if wandb and last is not None:
-        x1, xt, x0_m, pred_m, mask, step = last
+        x1, xt, x0_m, pred_m, x0_u, pred_u, mask, step = last
+        # The PANEL's masking is separate from the loss's. It used to be unconditional -- the
+        # grid was multiplied by `mask` whatever `use_mask` said -- which hid the whole region
+        # outside the brain mask, including the FOV boundary the h5 `mask` still carries
+        # (nyumets_h5.py intersects brain_mask with the common support). A run that is NOT
+        # masking its loss has no reason to hide what it predicts out there.
+        show_masked = use_mask if display_mask is None else bool(display_mask)
+        x0_d, pred_d = (x0_m, pred_m) if show_masked else (x0_u, pred_u)
         if val_mode == "single_pass":
-            cols = [x1[:1], xt[:1], pred_m[:1], x0_m[:1]]
+            cols = [x1[:1], xt[:1], pred_d[:1], x0_d[:1]]
             cap = f"x1 (bridge start) | x_t (step={int(step[0])}) | single-pass pred_x0 | T1ce GT"
         else:
-            cols = [x1[:1], pred_m[:1], x0_m[:1]]
+            cols = [x1[:1], pred_d[:1], x0_d[:1]]
             cap = f"x1 (bridge start) | I2SB recon (nfe={val_nfe}) | T1ce GT"
         # Every panel is drawn on the FIXED window [DISPLAY_VMIN, DISPLAY_VMAX] -- see the
         # module-level constants for why it is a constant rather than a derived quantity.
         lo, hi = ((DISPLAY_VMIN, DISPLAY_VMAX) if display_window is None
                   else (float(display_window[0]), float(display_window[1])))
-        grid = mask[:1] * torch.cat([((c - lo) / (hi - lo)).clamp(0, 1) for c in cols], dim=0)
-        res = (x0_m[:1] - pred_m[:1]).abs(); res = res / res.max().clamp(min=1e-8)
+        grid = torch.cat([((c - lo) / (hi - lo)).clamp(0, 1) for c in cols], dim=0)
+        if show_masked:
+            grid = mask[:1] * grid
+        res = (x0_d[:1] - pred_d[:1]).abs(); res = res / res.max().clamp(min=1e-8)
         # Display-only rotation into a conventional axial view; applied AFTER the window and
         # the mask, so every scalar logged below is computed on the stored axes either way.
         grid, res = orient_tensor(grid, display_orient), orient_tensor(res, display_orient)

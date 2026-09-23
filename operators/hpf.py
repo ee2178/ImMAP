@@ -11,16 +11,25 @@ class HighPassFilter(Operator):
         """
         Build (or retrieve from cache) a high-pass window matching x's spatial dims.
         Returns a real-valued tensor of shape (1, 1, H, W) broadcastable over B and C.
+
+        THE GRID MUST BE FFTSHIFTED. `forward` multiplies this window into `fftc(x)`, and
+        `operators.fourier.fftc` is CENTERED (fftshift o fftn o ifftshift), so DC sits at index
+        n // 2. `torch.fft.fftfreq` returns the UNSHIFTED order, with DC at index 0 -- so
+        without the `fftshift` below the `1 - gaussian` notch lands at the array corner and the
+        filter does the exact opposite of its name: measured at 32x32, sigma=0.2, a constant
+        image came through at 0.998 of its amplitude and a Nyquist checkerboard at 0.000.
+        tests/test_hpf.py pins the direction.
         """
         H, W = x.shape[-2], x.shape[-1]
 
-        # Return cached window if spatial dims match
-        if self.window_cache is not None and self.window_cache.shape[-2:] == (H, W):
-            return self.window_cache
+        cached = self.window_cache
+        if (cached is not None and cached.shape[-2:] == (H, W)
+                and cached.device == x.device):
+            return cached
 
-        # Build centered frequency grids in [-0.5, 0.5)
-        fy = torch.fft.fftfreq(H, device=x.device).view(H, 1)  # (H, 1)
-        fx = torch.fft.fftfreq(W, device=x.device).view(1, W)  # (1, W)
+        # Centered frequency grids in [-0.5, 0.5), DC in the MIDDLE to match fftc's output
+        fy = torch.fft.fftshift(torch.fft.fftfreq(H, device=x.device)).view(H, 1)  # (H, 1)
+        fx = torch.fft.fftshift(torch.fft.fftfreq(W, device=x.device)).view(1, W)  # (1, W)
 
         # Gaussian low-pass window centered at DC
         gaussian = torch.exp(-(fx**2 + fy**2) / (2 * self.sigma**2))  # (H, W)

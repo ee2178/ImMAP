@@ -97,7 +97,7 @@
         "clip_grad": 0.05,
         "backtrack_thresh": 1000,
         "backtrack_factor": 0.9,
-        "use_mask": true,
+        "use_mask": false,
         "loss_type": "complex-mse",
         "loss_weight": "uniform",
         "et_weight": 1.0,
