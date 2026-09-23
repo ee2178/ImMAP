@@ -17,7 +17,8 @@
         }
     },
     "i2sb": {
-        "kind": "i2sb",
+        "kind": "brownian",
+        "tau": 0.1,
         "n_points": 1000,
         "beta_max": 0.3,
         "deterministic": false,
@@ -43,12 +44,7 @@
             "image_key": "img_raw",
             "slice_range": [40, 110],
             "guide_mode": "none",
-            "scales": [
-                4000.0,
-                4000.0,
-                4000.0,
-                6000.0
-            ],
+            "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 8,
@@ -63,12 +59,7 @@
             "image_key": "img_raw",
             "slice_range": [40, 110],
             "guide_mode": "none",
-            "scales": [
-                4000.0,
-                4000.0,
-                4000.0,
-                6000.0
-            ],
+            "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8

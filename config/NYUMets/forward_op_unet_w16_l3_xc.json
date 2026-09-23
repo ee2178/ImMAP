@@ -24,15 +24,10 @@
                 3,
                 0
             ],
-            "image_key": "img_median_mad",
+            "image_key": "img_raw",
             "slice_range": [40, 110],
             "guide_mode": "none",
-            "scales": [
-                3.0,
-                3.0,
-                3.0,
-                3.0
-            ],
+            "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 8,
@@ -47,15 +42,10 @@
                 3,
                 0
             ],
-            "image_key": "img_median_mad",
+            "image_key": "img_raw",
             "slice_range": [40, 110],
             "guide_mode": "none",
-            "scales": [
-                3.0,
-                3.0,
-                3.0,
-                3.0
-            ],
+            "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8

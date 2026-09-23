@@ -27,15 +27,15 @@
             "t0": 0.001,
             "deg_eta": 0,
             "deg_tau": 1,
-            "kind": "i2sb",
-            "tau": 0.19,
+            "kind": "brownian",
+            "tau": 0.1,
             "n_points": 1000,
             "beta_max": 0.3
         }
     },
     "i2sb": {
-        "kind": "i2sb",
-        "tau": 0.19,
+        "kind": "brownian",
+        "tau": 0.1,
         "n_points": 1000,
         "beta_max": 0.3,
         "deterministic": false,
@@ -55,14 +55,9 @@
             "cond_idx": [
                 1
             ],
-            "image_key": "img_median_mad",
+            "image_key": "img_raw",
             "slice_range": [40, 110],
-            "scales": [
-                3.0,
-                3.0,
-                3.0,
-                3.0
-            ],
+            "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "guide_mode": "same_session",
             "guide_contrasts": [
                 1,
@@ -83,14 +78,9 @@
             "cond_idx": [
                 1
             ],
-            "image_key": "img_median_mad",
+            "image_key": "img_raw",
             "slice_range": [40, 110],
-            "scales": [
-                3.0,
-                3.0,
-                3.0,
-                3.0
-            ],
+            "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "guide_mode": "same_session",
             "guide_contrasts": [
                 1,
@@ -104,6 +94,7 @@
         }
     },
     "training": {
+        "display_window": [0.0, 2.0],
         "display_orient": "radiological",
         "num_epochs": 3000,
         "steps_per_epoch": 100,
