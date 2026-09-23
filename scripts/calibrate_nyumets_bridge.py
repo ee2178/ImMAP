@@ -66,6 +66,50 @@ def varsigma(root, x0_idx, x1_idx, image_key, scale, max_subjects, max_slices, s
     return float(np.sqrt(sq / n)), np.asarray(per_subj), len(per_subj)
 
 
+def raw_scales(root, image_key, max_subjects, max_slices, seed, q=99.5):
+    """Per-contrast intensity percentiles IN BRAIN, and a suggested single scale factor.
+
+    For SCALE-ONLY normalisation -- divide by one constant per contrast, subtract nothing -- the
+    whole point is that the raw background is natively 0 and stays 0, so there is no sentinel to
+    protect and no mask needed anywhere. The scale just has to put the brain in a sane numeric
+    range; `q` (p99.5 by default) is the robust top of the tissue distribution, so dividing by it
+    lands bright tissue near 1.0 and leaves data_range 1.0 with a [0, 1] display window.
+
+    ONE CONSTANT PER CONTRAST FOR THE WHOLE COHORT, not per volume: a per-volume scale would
+    rescale each study independently and destroy the intensity relationship BETWEEN a patient's
+    studies, which is the signal a longitudinal bridge is supposed to use. The cost is that
+    scanner drift is no longer normalised away -- the spread reported below is how much drift
+    there is.
+    """
+    files = sorted(glob.glob(os.path.join(root, "*", "*_img.h5")))
+    if not files:
+        raise SystemExit(f"no */*_img.h5 under {root}")
+    rng = np.random.default_rng(seed)
+    if max_subjects and len(files) > max_subjects:
+        files = [files[i] for i in sorted(rng.permutation(len(files))[:max_subjects])]
+
+    per_contrast = None
+    for p in files:
+        with h5py.File(p, "r") as f:
+            if image_key not in f:
+                continue
+            N = f[image_key].shape[0]
+            sel = np.arange(N)
+            if max_slices and N > max_slices:
+                sel = np.sort(rng.permutation(N)[:max_slices])
+            img = np.asarray(f[image_key][sel], dtype=np.float32)
+            msk = np.asarray(f["mask"][sel])[..., 0].astype(bool)
+        if per_contrast is None:
+            per_contrast = [[] for _ in range(img.shape[-1])]
+        for c in range(img.shape[-1]):
+            v = img[..., c][msk]
+            if v.size:
+                per_contrast[c].append(np.percentile(v, q))
+    if not per_contrast:
+        raise SystemExit(f"no volume had '{image_key}'")
+    return [np.asarray(v) for v in per_contrast]
+
+
 def solve_beta_max(target, n_points, lo=0.01, iters=60, hi_cap=1e4):
     """beta_max whose std_fwd[-1] matches `target`. -> (beta_max, achieved, status).
 
@@ -105,7 +149,41 @@ def main():
     ap.add_argument("--max-subjects", type=int, default=60, dest="max_subjects")
     ap.add_argument("--max-slices", type=int, default=40, dest="max_slices")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--report-scales", action="store_true", dest="report_scales",
+                    help="first report the per-contrast in-brain percentile of --image-key and "
+                         "a ready-to-paste `scales` line, for scale-only normalisation")
+    ap.add_argument("--scale-pct", type=float, default=99.5, dest="scale_pct",
+                    help="which in-brain percentile --report-scales divides by")
     cfg = ap.parse_args()
+
+    if cfg.report_scales:
+        cols = raw_scales(cfg.root, cfg.image_key, cfg.max_subjects, cfg.max_slices, cfg.seed,
+                          q=cfg.scale_pct)
+        names = ("FLAIR", "T1", "T1ce", "T2")
+        print("\nin-brain p%g of %s, over %d session(s)"
+              % (cfg.scale_pct, cfg.image_key, len(cols[0])))
+        print("  %-8s%10s%10s%10s%16s" % ("contrast", "median", "p10", "p90", "spread p90/p10"))
+        picks = []
+        for c, v in enumerate(cols):
+            med = float(np.median(v))
+            lo, hi = float(np.percentile(v, 10)), float(np.percentile(v, 90))
+            picks.append(med)
+            label = names[c] if c < len(names) else str(c)
+            print("  %-8s%10.1f%10.1f%10.1f%15.2fx" % (label, med, lo, hi, hi / max(lo, 1e-9)))
+
+        # rounded so the number is recognisable in a config diff
+        rounded = [float("%.3g" % p) for p in picks]
+        print("\n  ONE constant per contrast, from the median session:")
+        print('      "image_key": "%s",' % cfg.image_key)
+        print('      "scales": %s,' % rounded)
+        print("\n  A large spread is real scanner drift between sessions that a single constant")
+        print("  does NOT remove. That is the price of keeping a patient's studies on a COMMON")
+        print("  intensity scale -- which is the signal a longitudinal bridge uses, and which a")
+        print("  per-volume normalisation would destroy.")
+        print("\n  Then re-run WITHOUT --report-scales, passing --image-key %s and"
+              % cfg.image_key)
+        print("  --scale <the x1 contrast's value> to get beta_max in these units.")
+        return
 
     vs, per_subj, n_subj = varsigma(cfg.root, cfg.x0_idx, cfg.x1_idx, cfg.image_key,
                                     cfg.scale, cfg.max_subjects, cfg.max_slices, cfg.seed)

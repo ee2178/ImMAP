@@ -231,21 +231,34 @@ def affine_offset(ref, other, crop):
     1.0 mm isotropic everywhere, only the FOV and the slice count differ. Cross-correlation is
     estimating a quantity the headers already state exactly.
 
-    Also returns `oblique`, the largest off-axis component of the rotation relating them (0 for
-    a pure translation). A large value means the studies are genuinely rotated and NO integer
-    shift aligns them, whatever method produced it.
+    The translation is taken AT THE VOLUME CENTRE (see below), which is the best single shift
+    when the two are also slightly rotated -- as this cohort is.
+
+    Also returns `oblique`, the largest off-axis component of the rotation relating them: 0 for a
+    pure translation, ~0.0175 per degree. Above ~0.02 the studies are genuinely rotated and NO
+    integer shift aligns them, whatever produced it -- the periphery of the head is displaced by
+    roughly sin(angle) * 110 voxels even after the best possible shift.
     """
     Ar = stored_to_world(ref[0], ref[1], crop)
     Ao = stored_to_world(other[0], other[1], crop)
+    hw = (crop, crop) if crop and int(crop) > 0 else tuple(int(v) for v in ref[1])
     M = np.linalg.inv(Ao) @ Ar          # ref index -> other index
     R = M[:3, :3]
     oblique = float(np.abs(R - np.diag(np.diag(R))).max())
     # M maps a REF index to the OTHER index holding the same anatomy, so ref row h is other
     # row h + t. `translate(a, c)` sets out[i] = a[i + c], so c = +t is exactly the shift that
     # brings other onto ref -- NOT -t. (The negation belongs in `translation_offset`, whose
-    # correlation peak points the other way; putting it here too cancels out and silently
-    # doubles nothing while inverting everything.) In (h, w, z) order -> (dz, dh, dw).
-    t = M[:3, 3]
+    # correlation peak points the other way.)
+    #
+    # EVALUATED AT THE VOLUME CENTRE, not at index (0, 0, 0). `M[:3, 3]` is the displacement at
+    # the CORNER, and the two only agree when the studies are related by a pure translation.
+    # This cohort is oblique -- ~5 deg between sessions is normal for clinically angled brain
+    # MRI -- and at 5 deg the corner and the centre of a 224 volume disagree by
+    # sin(5 deg) * 112 ~ 10 voxels. The head sits at the centre, so that is where the best
+    # single translation is measured. Whatever rotation remains is what `oblique` reports and
+    # no integer shift can remove.
+    c = np.array([(hw[0] - 1) / 2.0, (hw[1] - 1) / 2.0, (ref[2] - 1) / 2.0, 1.0])
+    t = (M @ c)[:3] - c[:3]
     return (int(round(t[2])), int(round(t[0])), int(round(t[1]))), oblique
 
 
@@ -380,10 +393,15 @@ def register_patient(vols, cfg, ref=0, real=None):
                   f"leaving this study unshifted")
             t = (0, 0, 0)
         if any(t):
-            v.raw = translate(v.raw, (t[0], 0, t[1], t[2]))
-            v.norm = translate(v.norm, (t[0], 0, t[1], t[2]))
-            v.fg = translate(v.fg, t)
-            v.fov = translate(v.fov, t)
+            # The shifts themselves go to the accelerator too when there is one. A crop and a
+            # zero-pad is memory-bound, so this is worth the transfer only because the arrays
+            # are large (4 contrasts at full depth); on CPU `to`/`back` are both no-ops.
+            to = (lambda a: a.to(dev)) if dev.type == "cuda" else (lambda a: a)
+            back = (lambda a: a.cpu()) if dev.type == "cuda" else (lambda a: a)
+            v.raw = back(translate(to(v.raw), (t[0], 0, t[1], t[2])))
+            v.norm = back(translate(to(v.norm), (t[0], 0, t[1], t[2])))
+            v.fg = back(translate(to(v.fg), t))
+            v.fov = back(translate(to(v.fov), t))
             real[i] = translate(real[i], (t[0],))
         offsets.append(t)
         valid.append(real[i].numpy())
@@ -486,7 +504,10 @@ def build_volume(files, cfg):
     fg = brain_mask(img, cfg.bg_frac) & fov
     clipped = (channelwise_percentile_clip(img, fg, cfg.clip[0], cfg.clip[1])
                if cfg.clip else img)
-    norm, stats = normalize_masked(clipped, fg, mode=MODE)
+    # mask_output=False: NOTHING is masked into the stored pixels. `fg` sets the statistics
+    # only. See the module docstring -- a masked array cannot be used to judge alignment, and it
+    # puts a hard mask edge in every training target.
+    norm, stats = normalize_masked(clipped, fg, mode=MODE, mask_output=False)
 
     raw, orig_depth = img, img.shape[0]
     native_hw = tuple(int(v) for v in img.shape[2:4])
@@ -552,6 +573,9 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         f.attrs["orig_depth"] = int(orig_depth)
         f.attrs["min_brain_frac"] = float(cfg.min_brain_frac)
         f.attrs["mask_rule"] = f"mean_c(v/p99.5_c) > {cfg.bg_frac}"
+        # NO mask is multiplied into any stored array: `mask` and `support` are recorded for
+        # downstream use, never applied. Background is therefore NOT 0 in img_median_mad.
+        f.attrs["background_masked"] = False
         f.attrs["support_mode"] = cfg.support                     # store | apply | none
         f.attrs["support_applied"] = bool(cfg.support == "apply")  # were the pixels zeroed?
         # kept under its old name so anything written against the pre-2026-09-22 h5s still

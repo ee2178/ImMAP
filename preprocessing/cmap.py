@@ -137,8 +137,19 @@ def _centre_scale(vals, mode, eps):
     raise ValueError(f"normalize must be one of {NORMALIZE_MODES}, got {mode!r}")
 
 
-def normalize_masked(img, fg, mode="zscore", eps=1e-8, per_slice=False):
-    """Per-channel normalization computed ONLY within the brain mask; background -> 0.
+def normalize_masked(img, fg, mode="zscore", eps=1e-8, per_slice=False, mask_output=True):
+    """Per-channel normalization computed ONLY within the brain mask.
+
+    `mask_output=True` (the default, and what every BraTS h5 was built with) additionally ZEROES
+    everything outside `fg`, so the stored array is brain-only. `mask_output=False` applies the
+    same affine transform to the WHOLE volume and masks nothing: the brain still lands near 0,
+    but air lands near `-centre/scale` rather than exactly 0, and skull, scalp and orbits keep
+    real values instead of vanishing.
+
+    Which you want is not a detail. A masked array cannot be used to judge whether two studies
+    are aligned -- two volumes masked slightly differently look displaced when they are not --
+    and a network trained on one has a hard mask edge in every target. NYUMets builds now pass
+    False for exactly those reasons; BraTS keeps the default so its h5s stay as they were.
 
     img (D,C,H,W), fg (D,H,W) bool. Returns (out, stats), where stats holds the (centre, scale)
     actually applied so the transform stays invertible:
@@ -177,7 +188,8 @@ def normalize_masked(img, fg, mode="zscore", eps=1e-8, per_slice=False):
         else:
             stats[c] = _apply(slice(None), c, img[:, c][fg])
 
-    out = out * fg.unsqueeze(1)            # background -> 0 sentinel (consistent across channels)
+    if mask_output:
+        out = out * fg.unsqueeze(1)        # background -> 0 sentinel (consistent across channels)
     return out, stats
 
 

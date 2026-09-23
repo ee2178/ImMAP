@@ -52,6 +52,7 @@ import argparse
 import glob
 import os
 import shutil
+import time
 
 import h5py
 import numpy as np
@@ -261,36 +262,64 @@ def residual(planes, offsets, idx, ref, masks=None):
     return worst(pre, keep_pre), worst(post, keep_post)
 
 
+def needs_write(st, idx, offset):
+    """False when this study is already exactly what would be written -- skip the I/O.
+
+    A reference study whose kept slices already equal the patient's common set is the common
+    case, and rewriting it means reading and writing a few hundred MB to reproduce the file
+    byte for byte.
+    """
+    return bool(any(offset)) or not np.array_equal(st.index, idx)
+
+
 def write_registered(st, vol, idx, offset, reference, out_path, cfg):
-    """Copy the source h5, replacing the four arrays with their shifted, truncated selves."""
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    if os.path.abspath(out_path) != os.path.abspath(st.path):
-        shutil.copyfile(st.path, out_path)
-    from_dchw = lambda t: np.ascontiguousarray(t.numpy()[idx].transpose(0, 2, 3, 1))
+    """Write the registered study as a FRESH file, then rename it over the target.
+
+    NOT an in-file rewrite. HDF5 does not reclaim the space of a deleted dataset, so
+    `del f[name]` + `create_dataset` inside the live file grows it by the size of the arrays on
+    every pass -- fatal for `--in-place`, which is meant to be repeatable. A crash halfway
+    through would also leave a truncated dataset where the data used to be. Building beside the
+    target and `os.replace`-ing is atomic, self-compacting, and costs the same write either way.
+
+    Datasets this does not touch are copied across, so nothing in the file is lost.
+    """
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    from_dchw = lambda t: np.ascontiguousarray(t.cpu().numpy()[idx].transpose(0, 2, 3, 1))
     new = {"img_raw": from_dchw(vol.raw), norm_key(MODE): from_dchw(vol.norm),
-           "mask": vol.fg.numpy()[idx][..., None], "support": vol.fov.numpy()[idx][..., None]}
-    with h5py.File(out_path, "a") as f:
-        for name, a in new.items():
-            if name not in st.arrays:
-                continue
-            was = f[name]
-            comp = was.compression
-            del f[name]
-            f.create_dataset(name, data=a.astype(st.arrays[name].dtype),
-                             chunks=(1,) + a.shape[1:], compression=comp)
-        del f["slice_index"]
-        f.create_dataset("slice_index", data=idx.astype(np.int32))
-        # `img` is a soft link to the normalised array; deleting the target breaks it
-        if "img" in f:
-            del f["img"]
-        f["img"] = h5py.SoftLink("/" + norm_key(MODE))
-        f.attrs["reg_applied"] = True
-        f.attrs["reg_offset"] = np.asarray(offset, dtype=np.int32)
-        f.attrs["reg_reference"] = str(reference)
-        f.attrs["reg_rule"] = ("3-D FFT cross-correlation of the low-passed normalised "
-                               f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}), integer voxel "
-                               "translation only, applied POST-BUILD by "
-                               "scripts/register_nyumets.py")
+           "mask": vol.fg.cpu().numpy()[idx][..., None],
+           "support": vol.fov.cpu().numpy()[idx][..., None]}
+    link_name = "/" + norm_key(MODE)
+    tmp = out_path + ".tmp"
+    try:
+        with h5py.File(st.path, "r") as src, h5py.File(tmp, "w") as dst:
+            for k, v in src.attrs.items():
+                dst.attrs[k] = v
+            for name in src:
+                if isinstance(src.get(name, getlink=True), h5py.SoftLink):
+                    continue                      # remade below, once its target exists
+                if name in new:
+                    a = new[name].astype(src[name].dtype)
+                    dst.create_dataset(name, data=a, chunks=(1,) + a.shape[1:],
+                                       compression=src[name].compression)
+                elif name == "slice_index":
+                    dst.create_dataset("slice_index", data=idx.astype(np.int32))
+                else:
+                    src.copy(name, dst, name)
+            if "img" in src or link_name.lstrip("/") in dst:
+                dst["img"] = h5py.SoftLink(link_name)
+            dst.attrs["reg_applied"] = True
+            dst.attrs["reg_offset"] = np.asarray(offset, dtype=np.int32)
+            dst.attrs["reg_reference"] = str(reference)
+            dst.attrs["reg_rule"] = (
+                f"3-D FFT cross-correlation of the low-passed {cfg.reg_source} "
+                f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}, "
+                f"{'phase' if cfg.reg_phase else 'plain'}), integer voxel translation applied to "
+                f"img_raw / {norm_key(MODE)} / mask / support alike, by "
+                f"scripts/register_nyumets.py")
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def geometry(patients, cfg):
@@ -584,6 +613,7 @@ def main():
         return compare(patients, cfg)
 
     rows, skipped, resid_rows = [], [], []
+    n_write, n_skip, secs_io, t_start = [0], [0], [0.0], time.time()
     for pid, studies in patients.items():
         studies.sort(key=lambda s: s.case)
         hw = {tuple(s.hw) for s in studies}
@@ -642,18 +672,25 @@ def main():
                   f"dw={offsets[i][2]:+d}){mark}")
             rows.append((pid, st.case, offsets[i], i == ref))
         if cfg.apply:
-            # Only now are the full volumes read, and only for a patient that is being
-            # written. register_patient RE-MEASURES from them; `measure` above used the same
-            # primitives on the same planes, so the offsets agree (tests/test pins it).
-            vols = [_volume(st.load()) for st in studies]
-            if len(studies) > 1:
-                register_patient(vols, cfg, ref=ref, real=acq)
-            for i, st in enumerate(studies):
-                rel = os.path.relpath(st.path, cfg.root)
-                write_registered(st, vols[i], idx, offsets[i], studies[ref].case,
-                                 os.path.join(out_root, rel), cfg)
-                st.unload()
-            del vols
+            todo = [i for i, st in enumerate(studies) if needs_write(st, idx, offsets[i])]
+            n_skip[0] += len(studies) - len(todo)
+            if todo:
+                # Only now are the full volumes read, and only for the studies that change.
+                # register_patient RE-MEASURES from them; `measure` above used the same
+                # primitives on the same planes, so the offsets agree (a test pins that).
+                _t = time.time()
+                vols = [_volume(st.load()) for st in studies]
+                if len(studies) > 1:
+                    register_patient(vols, cfg, ref=ref, real=acq)
+                for i in todo:
+                    st = studies[i]
+                    rel = os.path.relpath(st.path, cfg.root)
+                    write_registered(st, vols[i], idx, offsets[i], studies[ref].case,
+                                     os.path.join(out_root, rel), cfg)
+                    st.unload()
+                del vols
+                secs_io[0] += time.time() - _t
+                n_write[0] += len(todo)
 
     moved = [r for r in rows if not r[3]]
     if moved:
@@ -682,6 +719,11 @@ def main():
         print(f"\n{len(skipped)} patient(s) skipped:")
         for pid, why in skipped[:10]:
             print(f"  {pid}: {why}")
+    if cfg.apply:
+        print(f"\nwrote {n_write[0]} study(ies), skipped {n_skip[0]} already correct; "
+              f"{secs_io[0]:.0f}s of read+shift+write out of {time.time() - t_start:.0f}s total")
+        print("  This job is I/O bound -- each study is a few hundred MB of h5 in and out. The "
+              "GPU shortens the correlation and the shift, not the transfer.")
     if not cfg.apply:
         print("\nREPORT ONLY -- nothing was written."
               + (f" This was {len(patients)} of {n_multi} multi-study patients; --sample 0 "
