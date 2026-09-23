@@ -214,7 +214,7 @@ def stored_to_world(affine, native_hw, crop):
     The z index is untouched (slice_index IS the native z), so only rows 0 and 1 shift.
     """
     A = np.asarray(affine, dtype=np.float64).copy()
-    if not crop:
+    if not crop or int(crop) <= 0:        # write_h5 stores crop_size = -1 for "no crop"
         return A
     # stored = native + off  ->  native = stored - off
     off = [int((crop - int(n)) // 2) for n in native_hw]

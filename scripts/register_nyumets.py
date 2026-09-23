@@ -365,7 +365,7 @@ def geometry(patients, cfg):
         if len(studies) < 2:
             continue
         studies.sort(key=lambda s: s.case)
-        crop = int(studies[0].attrs.get("crop_size", 0) or 0)
+        crop = max(0, int(studies[0].attrs.get("crop_size", 0) or 0))   # -1 = no crop
         ref = max(range(len(studies)), key=lambda i: (int(studies[i].acquired.sum()), -i))
         key = lambda st: (np.asarray(st.attrs.get("affine", np.eye(4))),
                           tuple(int(v) for v in st.attrs.get("native_size", (crop, crop))),
