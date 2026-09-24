@@ -27,6 +27,27 @@ artefacts in the reconstructions. The trade it makes is real in the other direct
 the support merely stored, a T1 -> CT1 bridge does see input anatomy (an eye) that its target
 never acquired, and must learn to drop it. Apply `support` in the loss instead if that shows up.
 
+CROSS-STUDY REGISTRATION -- READ OFF THE AFFINES (`--reg-method affine`, the default since
+2026-09-24). A patient's sessions are built together and every one of them is resampled onto the
+grid of the deepest, so `slice_index` names one anatomical level across the patient and the
+studies are aligned in-plane too. The transform is `inv(A_other) @ A_ref` from the NIfTI headers
+-- exact for a rigid pair on a common voxel grid, which the --geometry survey says this cohort
+is: 1.0 mm isotropic, one stored FOV, across all 4478 studies.
+
+It replaced 3-D FFT cross-correlation (`--reg-method xcorr`), which could only return a
+translation. The cohort survey measured a MEDIAN inter-session obliqueness of 0.113 -- about
+6.5 degrees, with the p90 worse -- which displaces the edge of a 224 volume by ~13 voxels after
+the best possible shift, and no correlation peak can remove it. The visible symptom was studies
+that looked aligned through-plane and were plainly off in-plane, with the correlation reporting
+small in-plane offsets because there was no good translation to find.
+
+Because the pixels are resampled onto the reference's grid, the `affine` and `native_size` attrs
+describe THAT grid, not the session's own; the session's own are kept as `affine_source` and
+`native_size_source`. `reg_matrix` is the transform applied, and `reg_offset` is only the closest
+single translation to it, for readability. Slices survive where at least `--reg-min-cover` of the
+REFERENCE'S BRAIN was drawn from real acquired data (not of the whole frame -- rotating a square
+empties its corners, and those corners are air).
+
 ORIENTATION. Stored axes stay canonical RAS: H runs to the patient's RIGHT, W ANTERIOR, so a
 slice drawn as-is has the eyes on the image's RIGHT. That is a DISPLAY concern and is fixed at
 display time -- `visualization.image.set_display_orient("radiological")`, or the `orient=`
@@ -165,15 +186,20 @@ def center_crop_or_pad(a, size, h_axis, w_axis):
 class Volume:
     """One session's full-depth arrays, before any slice filtering.
 
-    raw/norm are (D, C, H, W); fg/fov are (D, H, W). Registration shifts all four together.
+    raw/norm are (D, C, H, W); fg/fov are (D, H, W). Registration resamples all four together.
+
+    `reg` is filled in by `register_patient` -- the transform that was applied, for write_h5 to
+    record. It is not a constructor argument; nothing builds a Volume already registered.
     """
 
     __slots__ = ("raw", "norm", "fg", "fov", "stats", "orig_depth", "affine", "lost",
-                 "native_hw")
+                 "native_hw", "reg")
 
     def __init__(self, **kw):
+        self.reg = None
         for k in self.__slots__:
-            setattr(self, k, kw[k])
+            if k != "reg":
+                setattr(self, k, kw[k])
 
 
 def lowpass_inplane(v, frac):
@@ -206,7 +232,11 @@ def lowpass_inplane(v, frac):
 
 
 def stored_to_world(affine, native_hw, crop):
-    """4x4 mapping a STORED (z, h, w) index to world mm.
+    """4x4 mapping a STORED (h, w, z, 1) index to world mm.
+
+    INDEX ORDER IS (h, w, z), matching the NIfTI (i, j, k) the affine was written for -- NOT
+    the (z, h, w) the stored arrays are shaped as. `load_ras` transposes the pixels to put z
+    first; the affine is left alone, so anything multiplying by it has to use (h, w, z).
 
     `center_crop_or_pad` shifts the in-plane indices and the builder never folded that into the
     saved affine, so reconstruct it here: an axis of native length n rendered at `crop` moves by
@@ -221,6 +251,30 @@ def stored_to_world(affine, native_hw, crop):
     S = np.eye(4)
     S[0, 3], S[1, 3] = -off[0], -off[1]
     return A @ S
+
+
+def affine_matrix(ref, other, crop):
+    """-> (M, oblique). M is the 4x4 taking a REF stored index (h, w, z, 1) to the OTHER's.
+
+    Each argument is (affine, native_hw, orig_depth); `orig_depth` is unused here and accepted
+    only so the signature matches `affine_offset`.
+
+    This is the whole transform relating the two studies, rotation included, and it is EXACT
+    for a rigid pair on a common voxel grid -- which the --geometry survey says NYUMets is
+    (1.0 mm isotropic, one stored FOV, 4478 studies). It is the quantity a cross-correlation
+    was estimating, badly: the correlation can only return a translation, and the 2026-09-24
+    cohort survey put the median inter-session obliqueness at 0.113 (~6.5 deg), five times the
+    0.02 above which no translation aligns anything. `M` is what `register_patient` resamples
+    with, and it needs no pixels to compute.
+
+    M maps an OUTPUT (reference-grid) index to the SOURCE index it should be sampled from,
+    which is the direction `torch.nn.functional.grid_sample` wants.
+    """
+    Ar = stored_to_world(ref[0], ref[1], crop)
+    Ao = stored_to_world(other[0], other[1], crop)
+    M = np.linalg.inv(Ao) @ Ar
+    R = M[:3, :3]
+    return M, float(np.abs(R - np.diag(np.diag(R))).max())
 
 
 def affine_offset(ref, other, crop):
@@ -239,12 +293,8 @@ def affine_offset(ref, other, crop):
     integer shift aligns them, whatever produced it -- the periphery of the head is displaced by
     roughly sin(angle) * 110 voxels even after the best possible shift.
     """
-    Ar = stored_to_world(ref[0], ref[1], crop)
-    Ao = stored_to_world(other[0], other[1], crop)
     hw = (crop, crop) if crop and int(crop) > 0 else tuple(int(v) for v in ref[1])
-    M = np.linalg.inv(Ao) @ Ar          # ref index -> other index
-    R = M[:3, :3]
-    oblique = float(np.abs(R - np.diag(np.diag(R))).max())
+    M, oblique = affine_matrix(ref, other, crop)
     # M maps a REF index to the OTHER index holding the same anatomy, so ref row h is other
     # row h + t. `translate(a, c)` sets out[i] = a[i + c], so c = +t is exactly the shift that
     # brings other onto ref -- NOT -t. (The negation belongs in `translation_offset`, whose
@@ -322,8 +372,192 @@ def translate(a, t):
     return a
 
 
+def _source_index(M, out_dhw, dev):
+    """-> (src_h, src_w, src_z), each (D, H, W): where each OUTPUT voxel reads from.
+
+    `M` is `affine_matrix`'s, so it consumes (h, w, z, 1) -- see `stored_to_world` on why the
+    index order is not the array's.
+    """
+    D, H, W = out_dhw
+    M = torch.as_tensor(np.asarray(M, dtype=np.float32), device=dev)
+    z = torch.arange(D, dtype=torch.float32, device=dev).view(D, 1, 1)
+    h = torch.arange(H, dtype=torch.float32, device=dev).view(1, H, 1)
+    w = torch.arange(W, dtype=torch.float32, device=dev).view(1, 1, W)
+    # each term broadcasts to (D, H, W)
+    return tuple(M[r, 0] * h + M[r, 1] * w + M[r, 2] * z + M[r, 3] for r in range(3))
+
+
+def resample_plan(M, out_dhw, src_dhw, real, dev):
+    """-> (grid, cover) for a resample by `M` from a `src_dhw` volume onto an `out_dhw` grid.
+
+    `grid` is what `resample_array` feeds to grid_sample. `cover` is a (D, H, W) bool saying
+    which output voxels are drawn from real acquired source data rather than invented at the
+    edge -- the replacement for `translate`'s `valid_after`, which could be a per-slice flag
+    only because a translation along z moves whole slices. Under a rotation validity varies
+    within a slice, so it is tracked per voxel and the caller reduces it.
+
+    `cover` comes from the SOURCE INDEX BOUNDS, exactly, never from the sampled values: after
+    padding, an invented voxel and a genuinely dark one are indistinguishable.
+
+    Geometry only -- no intensities are touched, so a survey can compute the kept slice range
+    from the headers and one mask without reading any image data.
+    """
+    Ds, Hs, Ws = (int(n) for n in src_dhw)
+    sh, sw, sz = _source_index(M, out_dhw, dev)
+    inside = ((sh >= 0) & (sh <= Hs - 1) & (sw >= 0) & (sw <= Ws - 1)
+              & (sz >= 0) & (sz <= Ds - 1))
+
+    # ACQUIRED slices of the source. `real` is a function of the source z alone, so interpolate
+    # it along z rather than grid_sample a whole volume of it. 0.999 rather than 0.5: a voxel
+    # half-interpolated from a slice the study never acquired is not real data.
+    zc = sz.clamp(0, max(Ds - 1, 0))
+    z0 = zc.floor().long()
+    z1 = (z0 + 1).clamp(max=max(Ds - 1, 0))
+    f = zc - z0.to(zc.dtype)
+    rf = torch.as_tensor(np.asarray(real, dtype=np.float32), device=dev)
+    cover = inside & ((rf[z0] * (1.0 - f) + rf[z1] * f) >= 0.999)
+
+    unit = lambda a, n: 2.0 * a / max(n - 1, 1) - 1.0
+    grid = torch.stack([unit(sw, Ws), unit(sh, Hs), unit(sz, Ds)], dim=-1)[None]
+    return grid, cover
+
+
+def resample_array(x, grid, dev, pad="border"):
+    """Apply a `resample_plan` grid to a (D, C, H, W) or (D, H, W) tensor."""
+    flat = x.dim() == 3
+    t = (x[:, None] if flat else x).permute(1, 0, 2, 3)[None].to(dev, torch.float32)
+    o = F.grid_sample(t, grid, mode="bilinear", padding_mode=pad, align_corners=True)
+    o = o[0].permute(1, 0, 2, 3)
+    return o[:, 0] if flat else o
+
+
+def resample_to_ref(v, M, out_dhw, real, dev):
+    """Rigidly resample `v`'s raw / norm / fg / fov onto the reference grid. Mutates `v`.
+
+    -> the plan's `cover`; see `resample_plan`.
+    """
+    dtypes = (v.raw.dtype, v.norm.dtype)
+    src = (v.raw.shape[0], v.raw.shape[2], v.raw.shape[3])
+    grid, cover = resample_plan(M, out_dhw, src, real, dev)
+    # `border`, NOT `zeros`, for the intensities. The uncovered sliver sits at the frame
+    # periphery, which is air in both studies, so border replication fills it with air. Zero
+    # would be wrong for `norm`: median/MAD on an unmasked volume puts background at
+    # -median/MAD, so 0 is a mid-tissue value there and zero-padding would paint a bright rim
+    # exactly where the old masking artefacts were. `cover`, not the padding, records where the
+    # data is real.
+    v.raw = resample_array(v.raw, grid, dev, "border").to(dtypes[0]).cpu()
+    v.norm = resample_array(v.norm, grid, dev, "border").to(dtypes[1]).cpu()
+    # masks: zero-pad and threshold. Outside the source IS "not brain", and a mask has no
+    # background offset to get wrong.
+    v.fg = (resample_array(v.fg.to(torch.float32), grid, dev, "zeros") > 0.5).cpu()
+    v.fov = (resample_array(v.fov.to(torch.float32), grid, dev, "zeros") > 0.5).cpu()
+    return cover
+
+
+def _register_affine(vols, cfg, ref, given):
+    """Read each study's rigid transform off its header and RESAMPLE onto vols[ref]'s grid.
+
+    Rotation and translation in one trilinear pass. No correlation, no peak to trust, and
+    nothing is zero-padded into the middle of a volume: every study comes out on the
+    reference's grid, so `slice_index` names one anatomical level across the patient -- the
+    invariant the loader's guide_slice="index" needs, now actually delivered rather than
+    approximated by an integer shift.
+
+    Studies are NOT padded to a common depth first. That padding only existed because
+    `translate` needs matching shapes; resampling reads the source at fractional indices and
+    handles the bounds itself, so each study keeps its own depth as the source and the output
+    is the reference's.
+    """
+    crop = int(getattr(cfg, "crop", 0) or 0)
+    dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
+    min_cover = float(getattr(cfg, "reg_min_cover", 0.99))
+    out_dhw = (vols[ref].raw.shape[0],) + tuple(int(n) for n in vols[ref].raw.shape[2:])
+    key = lambda v: (v.affine, v.native_hw, v.orig_depth)
+
+    real = []
+    for v, i in zip(vols, range(len(vols))):
+        d0 = v.raw.shape[0]
+        if given is None:
+            ok = torch.ones(d0, dtype=torch.bool)
+        else:
+            ok = torch.as_tensor(np.asarray(given[i]), dtype=torch.bool)
+            if ok.shape[0] < d0:
+                ok = torch.cat([ok, torch.zeros(d0 - ok.shape[0], dtype=torch.bool)])
+            ok = ok[:d0]
+        real.append(ok)
+
+    # THE REFERENCE'S BRAIN is the region a slice has to cover to count as usable. A frame-wide
+    # coverage rule would fail every study for a reason that does not matter: rotating a square
+    # by 6 deg empties its corners, which are air. Read before anything is resampled -- the
+    # reference itself never is.
+    roi = vols[ref].fg.to(dev)
+
+    # The grid every study ends up on. write_h5 stores this as `affine` / `native_size`, because
+    # after resampling a study's own header no longer addresses its pixels.
+    grid = {"grid_affine": np.asarray(vols[ref].affine, dtype=np.float32),
+            "grid_native_hw": tuple(int(n) for n in vols[ref].native_hw)}
+
+    offsets, valid = [], []
+    for i, v in enumerate(vols):
+        if i == ref:
+            v.reg = dict(grid, method="affine", matrix=np.eye(4, dtype=np.float32),
+                         oblique=0.0, cover=1.0)
+            offsets.append((0, 0, 0))
+            valid.append(real[i].numpy())
+            continue
+        M, ob = affine_matrix(key(vols[ref]), key(v), crop)
+        cover = resample_to_ref(v, M, out_dhw, real[i], dev)
+        num = (cover & roi).flatten(1).sum(1).to(torch.float32)
+        den = roi.flatten(1).sum(1).to(torch.float32)
+        frac = torch.where(den > 0, num / den.clamp_min(1.0),
+                           cover.flatten(1).to(torch.float32).mean(1))
+        valid.append((frac >= min_cover).cpu().numpy())
+        # reporting only: the single translation closest to this transform, so the manifest and
+        # the summary stay readable. The DATA was moved by `matrix`, not by this.
+        t, _ = affine_offset(key(vols[ref]), key(v), crop)
+        v.reg = dict(grid, method="affine", matrix=np.asarray(M, dtype=np.float32), oblique=ob,
+                     cover=float(cover.to(torch.float32).mean()))
+        offsets.append(t)
+        del cover
+    return offsets, valid
+
+
 def register_patient(vols, cfg, ref=0, real=None):
-    """-> (offsets, valid) for one patient's studies, all aligned onto `vols[ref]`.
+    """-> (offsets, valid) for one patient's studies, all put onto vols[ref]'s grid.
+
+    `cfg.reg_method` picks how:
+
+      affine (default)  read the rigid transform off the headers and resample. Exact for a
+                        rigid pair on a common grid, and it corrects ROTATION, which the
+                        cohort has ~6.5 deg of between sessions.
+      xcorr             the old 3-D FFT cross-correlation, integer translation only. Kept so
+                        the two can be compared on real data, not argued about.
+
+    `offsets` is (dz, dh, dw) per study either way -- under `affine` it is the equivalent
+    centre translation and is REPORTING ONLY; the transform actually applied is on
+    `vols[i].reg["matrix"]`, which `write_h5` stores.
+
+    `valid[i]` marks the output slices of study i that hold real data: acquired in the source
+    AND covered after the transform. Intersecting `valid` across the patient is what "truncate
+    to the same slice range" is built on.
+    """
+    hw = {tuple(v.raw.shape[2:]) for v in vols}
+    if len(hw) != 1:
+        raise ValueError(f"studies are on different in-plane grids {sorted(hw)}; set --crop so "
+                         f"they share one before registering")
+    if getattr(cfg, "reg_method", "affine") == "affine":
+        return _register_affine(vols, cfg, ref, real)
+    return _register_xcorr(vols, cfg, ref, real)
+
+
+def _register_xcorr(vols, cfg, ref=0, real=None):
+    """TRANSLATION ONLY, by 3-D FFT cross-correlation. The pre-2026-09-24 default; now the
+    `--reg-method xcorr` fallback, kept for comparison against `_register_affine`.
+
+    It cannot correct rotation, and the cohort survey measured a median inter-session
+    obliqueness of 0.113 (~6.5 deg, p90 worse), which displaces the edge of a 224 volume by
+    ~13 voxels after the best possible shift. That is what this leaves on the table, and it is
+    why `affine` is the default.
 
     Every study is first zero-padded at the END to the deepest one, so index 0 stays original
     slice 0 for all of them and the measured dz is a true inter-study offset rather than an
@@ -340,10 +574,6 @@ def register_patient(vols, cfg, ref=0, real=None):
     reference's index axis and `slice_index` means one anatomical level across the whole
     patient -- exactly what the loader's guide_slice="index" assumes.
     """
-    hw = {tuple(v.raw.shape[2:]) for v in vols}
-    if len(hw) != 1:
-        raise ValueError(f"studies are on different in-plane grids {sorted(hw)}; set --crop so "
-                         f"they share one before registering")
     depth = max(v.raw.shape[0] for v in vols)
     ci = CONTRASTS.index(cfg.reg_contrast)
 
@@ -403,6 +633,11 @@ def register_patient(vols, cfg, ref=0, real=None):
             v.fg = back(translate(to(v.fg), t))
             v.fov = back(translate(to(v.fov), t))
             real[i] = translate(real[i], (t[0],))
+        # the same record `_register_affine` leaves, so write_h5 stores one shape of attrs
+        # whichever method ran. A translation IS a 4x4, in (h, w, z) order like `affine_matrix`'s.
+        T = np.eye(4, dtype=np.float32)
+        T[0, 3], T[1, 3], T[2, 3] = t[1], t[2], t[0]
+        v.reg = {"method": "xcorr", "matrix": T, "oblique": 0.0}
         offsets.append(t)
         valid.append(real[i].numpy())
     return offsets, valid
@@ -568,8 +803,20 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         f.attrs["norm_stats"] = stats
         f.attrs["clip_percentiles"] = np.asarray(cfg.clip or (-1, -1), dtype=np.float32)
         f.attrs["crop_size"] = int(cfg.crop) if cfg.crop else -1
+        # `affine` and `native_size` describe THE GRID THE STORED PIXELS ARE ON. Under
+        # reg_method="affine" that is the patient's REFERENCE study's grid, not this session's
+        # own -- the pixels were resampled onto it, so its own affine no longer addresses them,
+        # and anything recomputing geometry from these attrs (scripts/register_nyumets.py
+        # --geometry, stored_to_world, affine_offset) has to see the grid the data is actually
+        # on or it will report aligned data as misaligned. The session's own values are kept
+        # alongside as provenance.
+        _r = reg or {}
+        _grid_aff = _r.get("grid_affine")
+        _grid_hw = _r.get("grid_native_hw")
         # native in-plane size BEFORE the crop/pad, so a padded session is identifiable
-        f.attrs["native_size"] = np.asarray(native_hw, dtype=np.int32)
+        f.attrs["native_size"] = np.asarray(
+            _grid_hw if _grid_hw is not None else native_hw, dtype=np.int32)
+        f.attrs["native_size_source"] = np.asarray(native_hw, dtype=np.int32)
         f.attrs["orig_depth"] = int(orig_depth)
         f.attrs["min_brain_frac"] = float(cfg.min_brain_frac)
         f.attrs["mask_rule"] = f"mean_c(v/p99.5_c) > {cfg.bg_frac}"
@@ -588,19 +835,39 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         # on one contrast is the FOV mismatch (eyes in T1, absent in CT1) this guards against
         for _c in CONTRASTS:
             f.attrs[f"support_lost_{_c}"] = float(lost.get(_c, 0.0))
-        f.attrs["affine"] = np.asarray(affine, dtype=np.float32)
+        f.attrs["affine"] = np.asarray(
+            _grid_aff if _grid_aff is not None else affine, dtype=np.float32)
+        f.attrs["affine_source"] = np.asarray(affine, dtype=np.float32)
         f.attrs["source_files"] = ",".join(os.path.basename(files[c]) for c in CONTRASTS)
-        # Cross-study registration. `reg_offset` is the (dz, dh, dw) THIS study was shifted by
-        # to land on `reg_reference`; (0,0,0) on the reference itself, and on every study when
-        # `reg_applied` is False. After registration all studies of a patient share one index
-        # axis and one slice set, so `slice_index` names the same anatomical level in each.
-        r = reg or {}
+        # Cross-study registration. After it, all studies of a patient share one index axis and
+        # one slice set, so `slice_index` names the same anatomical level in each.
+        #
+        # `reg_matrix` is the authoritative record: the 4x4 that took an OUTPUT (reference-grid)
+        # index (h, w, z, 1) to the SOURCE index this study was sampled at. `reg_offset` is only
+        # the closest single translation to it, kept because a manifest column has to be a
+        # number -- under reg_method="affine" it does NOT describe what was done to the pixels,
+        # because a rotation was corrected too.
+        r = _r
         f.attrs["reg_applied"] = bool(r.get("applied", False))
+        f.attrs["reg_method"] = str(r.get("method", "none"))
         f.attrs["reg_offset"] = np.asarray(r.get("offset", (0, 0, 0)), dtype=np.int32)
+        f.attrs["reg_matrix"] = np.asarray(r.get("matrix", np.eye(4)), dtype=np.float32)
+        # obliqueness this study was rotated by relative to the reference, ~0.0175 per degree.
+        # Under "affine" it was CORRECTED; under "xcorr" it was left in the data.
+        f.attrs["reg_oblique"] = float(r.get("oblique", 0.0))
+        # fraction of the output volume drawn from real acquired source data; NaN when the
+        # method does not track it (xcorr zero-fills instead)
+        f.attrs["reg_cover"] = float(r.get("cover", float("nan")))
         f.attrs["reg_reference"] = str(r.get("reference", ""))
-        f.attrs["reg_rule"] = ("3-D FFT cross-correlation of the low-passed normalised "
-                               f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}), integer "
-                               "voxel translation only" if r.get("applied") else "none")
+        f.attrs["reg_rule"] = (
+            "none" if not r.get("applied") else
+            ("rigid transform read off the NIfTI affines (inv(A_other) @ A_ref), applied by "
+             "trilinear grid_sample onto the reference's grid: rotation AND translation, "
+             "border padding for intensities, nearest-threshold for the masks"
+             if r.get("method") == "affine" else
+             "3-D FFT cross-correlation of the low-passed normalised "
+             f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}), integer voxel translation only "
+             "-- rotation NOT corrected"))
         f.attrs["axis_order"] = ("N,H,W,C ; H,W are the canonical-RAS (R, A) axes and "
                                  "slice_index maps N back to the canonical-RAS z")
 
@@ -633,6 +900,20 @@ def main():
     ap.add_argument("--no-register", action="store_false", dest="register",
                     help="do NOT align a patient's studies to one another (they are then "
                          "written on their own index axes, as before 2026-09-23)")
+    ap.add_argument("--reg-method", default="affine", choices=("affine", "xcorr"),
+                    dest="reg_method",
+                    help="affine (default): read the rigid transform off the NIfTI headers and "
+                         "resample onto the patient's reference grid, correcting ROTATION as "
+                         "well as translation. Exact for a rigid pair on a common voxel grid, "
+                         "which --geometry says this cohort is. xcorr: the old 3-D FFT "
+                         "cross-correlation, integer translation only -- it cannot remove the "
+                         "~6.5 deg of median inter-session obliqueness the 2026-09-24 survey "
+                         "measured, which leaves ~13 voxels of error at the edge of the head")
+    ap.add_argument("--reg-min-cover", type=float, default=0.99, dest="reg_min_cover",
+                    help="--reg-method affine only: keep an output slice when at least this "
+                         "fraction of the REFERENCE'S BRAIN on it was drawn from real acquired "
+                         "source data. Not the whole frame -- rotating a square empties its "
+                         "corners, and those corners are air")
     ap.add_argument("--reg-contrast", default="T1", choices=CONTRASTS, dest="reg_contrast",
                     help="which contrast the cross-correlation runs on; the same contrast is "
                          "compared across studies, so a structural one is the right choice")
@@ -813,7 +1094,8 @@ def main():
             raw, norm, mask, support = select_slices(v, idx)
             write_h5(path, raw, norm, mask, support, idx, v.stats, v.orig_depth, v.affine,
                      key, sessions[key], cfg, v.lost, v.native_hw,
-                     reg=dict(offset=offsets[i], reference=f"{keys[ref][0]}_{keys[ref][1]}",
+                     reg=dict(v.reg or {}, offset=offsets[i],
+                              reference=f"{keys[ref][0]}_{keys[ref][1]}",
                               applied=bool(cfg.register and len(vols) > 1)))
             natives[v.native_hw] = natives.get(v.native_hw, 0) + 1
             if cfg.crop and (v.native_hw[0] < cfg.crop or v.native_hw[1] < cfg.crop):
@@ -831,7 +1113,7 @@ def main():
                          "H": raw.shape[1], "W": raw.shape[2],
                          "dz": offsets[i][0], "dh": offsets[i][1], "dw": offsets[i][2]})
             if i != ref:
-                reg_rows.append((key, offsets[i]))
+                reg_rows.append((key, offsets[i], v.reg))
         del vols
         if done % 25 < len(items):
             print(f"  {done}/{len(sessions)}  {len(rows)} written, {len(skipped)} skipped")
@@ -860,18 +1142,36 @@ def main():
         print(f"  worst session: {worst[0][0]}/{worst[0][1]}  "
               + "  ".join(f"{k} {v:.1%}" for k, v in worst[1].items()))
     if reg_rows:
+        import math
         import statistics
-        print(f"\ncross-study registration: {len(reg_rows)} non-reference study(ies) shifted "
-              f"onto their patient's reference")
+        print(f"\ncross-study registration ({cfg.reg_method}): {len(reg_rows)} non-reference "
+              f"study(ies) put onto their patient's reference grid")
         for ax, name in enumerate(("dz (slice)", "dh (R)", "dw (A)")):
-            v = [abs(t[ax]) for _, t in reg_rows]
+            v = [abs(t[ax]) for _, t, _ in reg_rows]
             nz = sum(x > 0 for x in v)
             print(f"  {name:<11} |offset| median {statistics.median(v):5.1f}  max {max(v):3d}  "
                   f"nonzero on {nz}/{len(v)}")
         worst = max(reg_rows, key=lambda kt: max(abs(c) for c in kt[1]))
         print(f"  largest: {worst[0][0]}/{worst[0][1]} -> {worst[1]}")
-        print("  A large offset is either a real displacement or a correlation failure; "
-              "--reg-max-shift rejects the obvious failures.")
+        if cfg.reg_method == "affine":
+            deg = lambda x: math.degrees(math.asin(min(abs(x), 1.0)))
+            ob = [float((r or {}).get("oblique", 0.0)) for _, _, r in reg_rows]
+            cv = [float((r or {}).get("cover", float("nan"))) for _, _, r in reg_rows]
+            cv = [c for c in cv if c == c]
+            print(f"  obliqueness CORRECTED: median {statistics.median(ob):.4f} "
+                  f"({deg(statistics.median(ob)):.1f} deg)  max {max(ob):.4f} "
+                  f"({deg(max(ob)):.1f} deg)")
+            print("  The offset above is only the closest single translation, for readability; "
+                  "the\n  transform applied is the full 4x4 in each file's `reg_matrix` attr.")
+            if cv:
+                print(f"  coverage (output voxels drawn from real source data): median "
+                      f"{statistics.median(cv):.3f}  min {min(cv):.3f}")
+                print(f"  slices are kept only where >= {cfg.reg_min_cover:.0%} of the "
+                      f"REFERENCE'S BRAIN is covered")
+        else:
+            print("  A large offset is either a real displacement or a correlation failure; "
+                  "--reg-max-shift rejects the obvious failures. Rotation is NOT corrected by "
+                  "this method -- use --reg-method affine.")
     if padded:
         print(f"\n{len(padded)} session(s) were smaller than --crop {cfg.crop} and were "
               f"ZERO-PADDED up to it:")

@@ -59,8 +59,8 @@ import numpy as np
 import torch
 
 from preprocessing.nyumets_h5 import (
-    CONTRASTS, MODE, affine_offset, lowpass_inplane, register_patient, translate,
-    translation_offset,
+    CONTRASTS, MODE, affine_matrix, affine_offset, lowpass_inplane, register_patient,
+    resample_array, resample_plan, translate, translation_offset,
 )
 from preprocessing.cmap import norm_key
 
@@ -219,6 +219,85 @@ def measure(planes, acq, cfg, ref):
     return offsets
 
 
+def geo_key(st, crop):
+    """(affine, native_hw, depth) for `affine_matrix` / `affine_offset`, from attrs alone."""
+    return (np.asarray(st.attrs.get("affine", np.eye(4))),
+            tuple(int(v) for v in st.attrs.get("native_size", (crop, crop))),
+            st.depth)
+
+
+def measure_affine(studies, acq, cfg, ref):
+    """-> (offsets, plans) with the rigid transform READ OFF THE HEADERS. No intensities read.
+
+    `plans[i]` is (matrix, oblique, grid, cover) for study i on the reference's grid; `cover` is
+    geometric, so the kept slice range can be decided before any image data is touched. The
+    reference's entry carries an identity and full cover.
+
+    This is the measuring half of `preprocessing.nyumets_h5._register_affine`, on the same
+    primitives, so report mode and --apply cannot disagree.
+    """
+    crop = max(0, int(studies[0].attrs.get("crop_size", 0) or 0))      # -1 = no crop
+    dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
+    out = (studies[ref].depth,) + tuple(int(n) for n in studies[ref].hw)
+
+    offsets, plans = [], []
+    for i, st in enumerate(studies):
+        if i == ref:
+            offsets.append((0, 0, 0))
+            plans.append((np.eye(4, dtype=np.float32), 0.0, None,
+                          torch.as_tensor(acq[i], device=dev)[:, None, None].expand(out)))
+            continue
+        m, ob = affine_matrix(geo_key(studies[ref], crop), geo_key(st, crop), crop)
+        src = (st.depth,) + tuple(int(n) for n in st.hw)
+        grid, cover = resample_plan(m, out, src, acq[i], dev)
+        t, _ = affine_offset(geo_key(studies[ref], crop), geo_key(st, crop), crop)
+        offsets.append(t)
+        plans.append((np.asarray(m, dtype=np.float32), ob, grid, cover))
+    return offsets, plans
+
+
+def affine_valid(studies, plans, roi, cfg, ref):
+    """-> per-study per-slice validity on the reference's grid.
+
+    A slice counts when at least --reg-min-cover of the REFERENCE'S BRAIN on it came from real
+    source data. Not the whole frame: rotating a square empties its corners, and those corners
+    are air.
+    """
+    min_cover = float(getattr(cfg, "reg_min_cover", 0.99))
+    den = roi.flatten(1).sum(1).to(torch.float32)
+    out = []
+    for i, (_, _, _, cover) in enumerate(plans):
+        num = (cover & roi).flatten(1).sum(1).to(torch.float32)
+        frac = torch.where(den > 0, num / den.clamp_min(1.0),
+                           cover.flatten(1).to(torch.float32).mean(1))
+        out.append((frac >= min_cover).cpu().numpy())
+    return out
+
+
+def residual_affine(planes, plans, idx, ref, dev, masks=None):
+    """`residual`, but the studies are RESAMPLED by their plans instead of shifted.
+
+    One contrast only, so this costs one grid_sample per study -- affordable on a whole-cohort
+    survey, which is the point of keeping report mode cheap.
+    """
+    moved, mmoved = [], []
+    for i, (_, _, grid, _) in enumerate(plans):
+        if i == ref or grid is None:
+            moved.append(planes[i])
+            mmoved.append(None if masks is None else masks[i])
+            continue
+        moved.append(resample_array(planes[i].to(dev), grid, dev, "border").cpu())
+        if masks is not None:
+            mmoved.append(
+                (resample_array(masks[i].to(torch.float32).to(dev), grid, dev, "zeros")
+                 > 0.5).cpu())
+    zero = [(0, 0, 0)] * len(planes)
+    pre = residual(planes, zero, idx, ref, masks=masks)[0]
+    post = residual(moved, zero, idx, ref, masks=None if masks is None else mmoved)[1]
+    del moved, mmoved
+    return pre, post
+
+
 def residual(planes, offsets, idx, ref, masks=None):
     """Worst disagreement with the reference over `idx`, before and after the shift.
 
@@ -310,12 +389,35 @@ def write_registered(st, vol, idx, offset, reference, out_path, cfg):
             dst.attrs["reg_applied"] = True
             dst.attrs["reg_offset"] = np.asarray(offset, dtype=np.int32)
             dst.attrs["reg_reference"] = str(reference)
+            # the same record preprocessing.nyumets_h5.write_h5 leaves, so a file is readable
+            # the same way whichever produced it. `vol.reg` is set by register_patient.
+            r = getattr(vol, "reg", None) or {}
+            dst.attrs["reg_method"] = str(r.get("method", cfg.reg_method))
+            dst.attrs["reg_matrix"] = np.asarray(r.get("matrix", np.eye(4)), dtype=np.float32)
+            dst.attrs["reg_oblique"] = float(r.get("oblique", 0.0))
+            dst.attrs["reg_cover"] = float(r.get("cover", float("nan")))
+            if r.get("grid_affine") is not None:
+                # the pixels are on the REFERENCE'S grid now, so its affine is the one that
+                # addresses them; the study's own is kept as provenance
+                if "affine" in dst.attrs and "affine_source" not in dst.attrs:
+                    dst.attrs["affine_source"] = np.asarray(dst.attrs["affine"],
+                                                            dtype=np.float32)
+                if "native_size" in dst.attrs and "native_size_source" not in dst.attrs:
+                    dst.attrs["native_size_source"] = np.asarray(dst.attrs["native_size"],
+                                                                 dtype=np.int32)
+                dst.attrs["affine"] = np.asarray(r["grid_affine"], dtype=np.float32)
+                dst.attrs["native_size"] = np.asarray(r["grid_native_hw"], dtype=np.int32)
             dst.attrs["reg_rule"] = (
+                "rigid transform read off the NIfTI affines (inv(A_other) @ A_ref), applied by "
+                f"trilinear grid_sample onto the reference's grid -- rotation AND translation -- "
+                f"to img_raw / {norm_key(MODE)} / mask / support alike, by "
+                f"scripts/register_nyumets.py"
+                if r.get("method", cfg.reg_method) == "affine" else
                 f"3-D FFT cross-correlation of the low-passed {cfg.reg_source} "
                 f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}, "
-                f"{'phase' if cfg.reg_phase else 'plain'}), integer voxel translation applied to "
-                f"img_raw / {norm_key(MODE)} / mask / support alike, by "
-                f"scripts/register_nyumets.py")
+                f"{'phase' if cfg.reg_phase else 'plain'}), integer voxel translation only "
+                f"-- rotation NOT corrected -- applied to img_raw / {norm_key(MODE)} / mask / "
+                f"support alike, by scripts/register_nyumets.py")
         os.replace(tmp, out_path)
     finally:
         if os.path.exists(tmp):
@@ -409,36 +511,80 @@ def geometry(patients, cfg):
     # they are, because a rotation is the one thing no integer shift can fix.
     print("\n  offset predicted by the AFFINES (no pixels involved), vs each study's stored")
     print("  reg_offset if the set was registered:\n")
-    pred, obl = [], []
-    for pid, studies in list(patients.items())[:8]:
+    # STATISTICS OVER EVERY SAMPLED PATIENT, details for the first 8. These used to share one
+    # `[:8]` loop, so the obliqueness median that the deferral decision rested on was an
+    # 8-patient number wearing a whole-cohort label.
+    pred, obl, disagree = [], [], []
+    for n_pat, (pid, studies) in enumerate(patients.items()):
         if len(studies) < 2:
             continue
         studies.sort(key=lambda s: s.case)
         crop = max(0, int(studies[0].attrs.get("crop_size", 0) or 0))   # -1 = no crop
-        ref = max(range(len(studies)), key=lambda i: (int(studies[i].acquired.sum()), -i))
+        # ANCHOR ON THE STUDY THE BUILD USED. preprocessing.nyumets_h5 registers onto the
+        # DEEPEST study; this report's own rule (most acquired slices) always ties after the
+        # build, because a patient's studies then share one slice set, and falls through to
+        # studies[0]. Comparing an affine offset measured from one reference against a
+        # `reg_offset` measured from another is not a comparison at all -- it reported studies
+        # as disagreeing with the headers when the two were simply anchored differently.
+        ref = None
+        stored_ref = str(studies[0].attrs.get("reg_reference", "") or "")
+        if stored_ref:
+            ref = next((i for i, s in enumerate(studies) if s.case == stored_ref), None)
+        if ref is None:
+            ref = max(range(len(studies)), key=lambda i: (int(studies[i].acquired.sum()), -i))
         key = lambda st: (np.asarray(st.attrs.get("affine", np.eye(4))),
                           tuple(int(v) for v in st.attrs.get("native_size", (crop, crop))),
                           st.depth)
-        print(f"  {pid}  (ref {studies[ref].case})")
+        show = n_pat < 8
+        if show:
+            print(f"  {pid}  (ref {studies[ref].case}"
+                  + ("" if stored_ref else ", NOT the build's -- no reg_reference attr") + ")")
         for i, st in enumerate(studies):
             if i == ref:
                 continue
             t, ob = affine_offset(key(studies[ref]), key(st), crop)
-            was = (tuple(np.asarray(st.attrs["reg_offset"]).tolist())
+            was = (tuple(int(v) for v in np.asarray(st.attrs["reg_offset"]).tolist())
                    if "reg_offset" in st.attrs else None)
             pred.append(t)
             obl.append(ob)
-            print(f"      {st.case:<30s} affine says (dz={t[0]:+4d}, dh={t[1]:+4d}, "
-                  f"dw={t[2]:+4d})  oblique {ob:.3f}"
-                  + (f"   stored {was}" if was else ""))
+            # Only meaningful where the stored offset was supposed to BE the whole transform.
+            # After an affine build it is just the closest translation to a transform already
+            # applied, and the affines have been rewritten to the reference's grid -- so `t` is
+            # correctly zero and differencing the two would report history as disagreement.
+            if (was is not None and stored_ref
+                    and str(st.attrs.get("reg_method", "xcorr")) != "affine"):
+                disagree.append(tuple(a - b for a, b in zip(t, was)))
+            if show:
+                print(f"      {st.case:<30s} affine says (dz={t[0]:+4d}, dh={t[1]:+4d}, "
+                      f"dw={t[2]:+4d})  oblique {ob:.3f}"
+                      + (f"   stored {was}" if was else ""))
+    if len(patients) > 8:
+        print(f"  ... statistics below cover all {len(patients)} sampled patient(s)")
     if pred:
+        import math as _m
         import statistics as _st
         print("")
         for ax, name in enumerate(("dz", "dh", "dw")):
             v = [abs(t[ax]) for t in pred]
-            print(f"  |{name}| from the affines: median {_st.median(v):.1f}  max {max(v)}")
-        print(f"  obliqueness: median {_st.median(obl):.4f}  max {max(obl):.4f}   "
-              f"(0 = pure translation; > ~0.02 and a shift cannot align them)")
+            print(f"  |{name}| from the affines: median {_st.median(v):.1f}  max {max(v)}  "
+                  f"p90 {sorted(v)[int(0.9 * (len(v) - 1))]}")
+        deg = lambda x: _m.degrees(_m.asin(min(abs(x), 1.0)))
+        med_o, max_o = _st.median(obl), max(obl)
+        print(f"  obliqueness: median {med_o:.4f} ({deg(med_o):.1f} deg)  "
+              f"max {max_o:.4f} ({deg(max_o):.1f} deg)  over {len(obl)} non-reference studies")
+        print(f"  a rotation of {deg(med_o):.1f} deg displaces the edge of a {crop or 224} "
+              f"volume by ~{_m.sin(_m.radians(deg(med_o))) * (crop or 224) / 2:.0f} voxels, "
+              f"which NO integer shift removes")
+        print("  (0 = pure translation; above ~0.02 a translation is the wrong model)")
+        if disagree:
+            print("\n  affine MINUS stored reg_offset, same reference, so directly comparable:")
+            for ax, name in enumerate(("dz", "dh", "dw")):
+                v = [abs(t[ax]) for t in disagree]
+                print(f"    |{name}| disagreement: median {_st.median(v):.1f}  max {max(v)}  "
+                      f"p90 {sorted(v)[int(0.9 * (len(v) - 1))]}")
+            print(f"    over {len(disagree)} studies. The affines are EXACT for a rigid pair on "
+                  f"a common grid,\n    so a large disagreement is the cross-correlation "
+                  f"missing a shift the headers state.")
 
     zs = [g[1][2] for _, geo, _, _, _ in rows for g in geo]
     print(f"\n  slice spacing across all sampled studies: median {statistics.median(zs):.2f} mm, "
@@ -470,6 +616,7 @@ def compare(patients, cfg):
     import statistics
 
     variants = [("none", None, None),
+                ("AFFINE", "affine", None),
                 ("norm, phase", "norm", True), ("norm, plain", "norm", False),
                 ("raw,  phase", "raw", True), ("raw,  plain", "raw", False)]
     scores = {v[0]: [] for v in variants}
@@ -487,23 +634,33 @@ def compare(patients, cfg):
             continue
         ref = max(range(len(studies)), key=lambda i: (int(acq[i].sum()), -i))
         cache = {}
+        dev = torch.device(cfg.reg_device or "cpu")
         for name, src, phase in variants:
-            # the residual is always scored on the NORMALISED planes, whatever the offset was
+            # the residual is always scored on the NORMALISED planes, whatever the transform was
             # measured on -- otherwise `raw` and `norm` would be graded on different scales
             scoring = cache.setdefault("norm", [st.planes(ci, "norm") for st in studies])
+            mk = cache.setdefault("mask", [st.masks() for st in studies])
+            plans = None
             if src is None:
                 offs = [(0, 0, 0)] * len(studies)
+            elif src == "affine":
+                offs, plans = measure_affine(studies, acq, cfg, ref)
             else:
                 pl = cache.setdefault(src, [st.planes(ci, src) for st in studies])
                 offs = measure(pl, acq, dict_cfg(cfg, reg_source=src, reg_phase=phase), ref)
-            valid = [translate(torch.as_tensor(a), (t[0],)).numpy() if any(t) else a
-                     for a, t in zip(acq, offs)]
+            if plans is not None:
+                valid = affine_valid(studies, plans, mk[ref].to(dev), cfg, ref)
+            else:
+                valid = [translate(torch.as_tensor(a), (t[0],)).numpy() if any(t) else a
+                         for a, t in zip(acq, offs)]
             idx = np.where(np.logical_and.reduce(valid))[0]
             if idx.size == 0:
                 continue
-            mk = cache.setdefault("mask", [st.masks() for st in studies])
-            scores[name].append(residual(scoring, offs, idx, ref, masks=mk)[1])
+            scores[name].append(
+                residual_affine(scoring, plans, idx, ref, dev, masks=mk)[1] if plans is not None
+                else residual(scoring, offs, idx, ref, masks=mk)[1])
             moved[name].append(sum(1 for t in offs if any(t)))
+            del plans
         cache.clear()
         n_done += 1
         if n_done % 10 == 0:
@@ -552,6 +709,17 @@ def main():
                     help="actually write. Without it this only measures and prints")
     ap.add_argument("--in-place", action="store_true", dest="in_place",
                     help="rewrite --root itself. Destructive; --apply is still required")
+    ap.add_argument("--reg-method", default="affine", choices=("affine", "xcorr"),
+                    dest="reg_method",
+                    help="affine (default): read the rigid transform off the NIfTI affines and "
+                         "resample, correcting ROTATION as well as translation. xcorr: the old "
+                         "3-D FFT cross-correlation, integer translation only -- it cannot "
+                         "remove the ~6.5 deg median inter-session obliqueness this cohort has. "
+                         "--reg-contrast / --reg-lowpass / --reg-source / --no-phase / "
+                         "--reg-max-shift apply to xcorr only")
+    ap.add_argument("--reg-min-cover", type=float, default=0.99, dest="reg_min_cover",
+                    help="affine only: keep a slice when at least this fraction of the "
+                         "REFERENCE'S BRAIN on it came from real acquired source data")
     ap.add_argument("--reg-contrast", default="T1", choices=CONTRASTS, dest="reg_contrast")
     ap.add_argument("--reg-lowpass", type=float, default=0.25, dest="reg_lowpass")
     ap.add_argument("--reg-max-shift", type=int, default=0, dest="reg_max_shift",
@@ -638,8 +806,14 @@ def main():
     print(f"surveying {len(patients)} patient(s), "
           f"{sum(len(v) for v in patients.values())} studies  ({how})")
     print(f"mode: {'APPLY -> ' + out_root if cfg.apply else 'REPORT ONLY (no writes)'}")
-    print(f"offset on the low-passed normalised {cfg.reg_contrast} "
-          f"(lowpass={cfg.reg_lowpass}, max shift {cfg.reg_max_shift}) on {cfg.reg_device}\n")
+    if cfg.reg_method == "affine":
+        print(f"transform read off the NIfTI affines (rotation AND translation), resampled on "
+              f"{cfg.reg_device}\nslices kept where >= {cfg.reg_min_cover:.0%} of the "
+              f"reference's brain is covered\n")
+    else:
+        print(f"offset on the low-passed {cfg.reg_source} {cfg.reg_contrast} "
+              f"(lowpass={cfg.reg_lowpass}, max shift {cfg.reg_max_shift}) on {cfg.reg_device}"
+              f"\nTRANSLATION ONLY -- rotation is not corrected\n")
 
     if cfg.geometry:
         return geometry(patients, cfg)
@@ -666,17 +840,30 @@ def main():
 
         ref = max(range(len(studies)), key=lambda i: (int(acq[i].sum()), -i))
         ci = CONTRASTS.index(cfg.reg_contrast)
+        dev = torch.device(cfg.reg_device or "cpu")
+        affine = cfg.reg_method == "affine"
+        plans = None
 
-        # MEASURE from one contrast. Report mode stops here and never touches img_raw / mask /
-        # support, which is what makes a whole-cohort survey affordable.
-        planes = [st.planes(ci, cfg.reg_source) for st in studies]
-        offsets = measure(planes, acq, cfg, ref) if len(studies) > 1 else [(0, 0, 0)]
+        # MEASURE. Report mode reads one contrast (and, under affine, the masks) and never
+        # touches img_raw / support, which is what makes a whole-cohort survey affordable.
+        # Under affine the OFFSET itself costs nothing at all: it is in the headers.
+        if len(studies) == 1:
+            offsets = [(0, 0, 0)]
+        elif affine:
+            offsets, plans = measure_affine(studies, acq, cfg, ref)
+        else:
+            offsets = measure([st.planes(ci, cfg.reg_source) for st in studies], acq, cfg, ref)
 
-        # The common slice set needs each study's acquired extent carried through its own shift.
-        valid = [torch.as_tensor(np.pad(a, (0, depth - a.shape[0])) if a.shape[0] < depth else a)
-                 for a in acq]
-        valid = [translate(v, (t[0],)).numpy() if any(t) else np.asarray(v)
-                 for v, t in zip(valid, offsets)]
+        masks = [st.masks() for st in studies] if len(studies) > 1 else None
+        if plans is not None:
+            # geometric coverage against the REFERENCE'S brain -- no intensities involved
+            valid = affine_valid(studies, plans, masks[ref].to(dev), cfg, ref)
+        else:
+            # translation only: each study's acquired extent carried through its own shift
+            valid = [torch.as_tensor(np.pad(a, (0, depth - a.shape[0]))
+                                     if a.shape[0] < depth else a) for a in acq]
+            valid = [translate(v, (t[0],)).numpy() if any(t) else np.asarray(v)
+                     for v, t in zip(valid, offsets)]
         common = np.logical_and.reduce(valid)
         idx = np.where(common)[0]
         if idx.size == 0:
@@ -685,13 +872,16 @@ def main():
             continue
 
         # RESIDUAL. How much the studies still disagree where they overlap, before vs after.
-        # On a post-build set this is the number that says whether the offset can be trusted:
-        # each study was already cut to its own brain-bearing slices, so the correlation sees
-        # only the surviving extent, and a small overlap gives a poor dz. A residual that
-        # barely moves means "rebuild instead", not "they were already aligned".
-        resid = (residual(planes, offsets, idx, ref, masks=[st.masks() for st in studies])
-                 if len(studies) > 1 else None)
-        del planes
+        # On a post-build set this is the number that says whether the transform can be trusted:
+        # each study was already cut to its own brain-bearing slices, so a correlation sees only
+        # the surviving extent. A residual that barely moves means "rebuild instead", not "they
+        # were already aligned".
+        resid = None
+        if len(studies) > 1:
+            planes = [st.planes(ci, cfg.reg_source) for st in studies]
+            resid = (residual_affine(planes, plans, idx, ref, dev, masks=masks) if affine
+                     else residual(planes, offsets, idx, ref, masks=masks))
+            del planes
 
         tag = "" if len(studies) > 1 else "   (single study: nothing to register)"
         print(f"  {pid}: {len(studies)} studies, ref {studies[ref].case}, "
@@ -702,16 +892,19 @@ def main():
             resid_rows.append((pid, resid))
         for i, st in enumerate(studies):
             mark = " <- ref" if i == ref else ""
+            # under affine the offset is only the closest single translation; `oblique` is the
+            # part of the transform it cannot express, and the part xcorr had to leave behind
+            extra = "" if plans is None else f"  oblique {plans[i][1]:.3f}"
             print(f"      {st.case:<28s} offset (dz={offsets[i][0]:+d}, dh={offsets[i][1]:+d}, "
-                  f"dw={offsets[i][2]:+d}){mark}")
+                  f"dw={offsets[i][2]:+d}){extra}{mark}")
             rows.append((pid, st.case, offsets[i], i == ref))
         if cfg.apply:
             todo = [i for i, st in enumerate(studies) if needs_write(st, idx, offsets[i])]
             n_skip[0] += len(studies) - len(todo)
             if todo:
                 # Only now are the full volumes read, and only for the studies that change.
-                # register_patient RE-MEASURES from them; `measure` above used the same
-                # primitives on the same planes, so the offsets agree (a test pins that).
+                # register_patient RE-DERIVES the transform from them; the measuring pass above
+                # used the same primitives on the same inputs, so the two agree (a test pins it).
                 _t = time.time()
                 vols = [_volume(st.load()) for st in studies]
                 if len(studies) > 1:

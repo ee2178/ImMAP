@@ -4,15 +4,27 @@
 #
 #   mkdir -p logs && sbatch bigpurple/nyumets_h5.sbatch
 #
-# REBUILD (2026-09-22 defaults): slices are stored ANTERIOR-UP, radiological
-# (--orient radiological), and the common acquisition support is RECORDED but no longer
-# multiplied into the pixels (--support store). Both are the builder's defaults, so nothing
-# is passed below; set OVERWRITE=1 or existing h5s are silently kept:
+# REBUILD. Set OVERWRITE=1 or existing h5s are silently kept:
 #
 #   OVERWRITE=1 sbatch bigpurple/nyumets_h5.sbatch
 #
-# Every NYUMets checkpoint trained before this rebuild saw the OLD orientation and the
-# support-masked pixels, so none of them transfer -- they have to be retrained.
+# What the current defaults do, none of which is passed below:
+#
+#   --support store      the common acquisition support is RECORDED, not multiplied into the
+#                        pixels (2026-09-22). Zeroing them baked a ragged FOV boundary into the
+#                        data, which is where the boundary artefacts came from.
+#   --reg-method affine  a patient's sessions are resampled onto the grid of the deepest using
+#                        the rigid transform read off their NIfTI affines (2026-09-24), so they
+#                        are aligned THROUGH-PLANE AND IN-PLANE, with rotation corrected. The
+#                        old cross-correlation (--reg-method xcorr) could only translate, and
+#                        the cohort has a median 6.5 degrees of inter-session obliqueness that
+#                        no translation removes.
+#
+# Stored axes stay canonical RAS; ANTERIOR-UP is applied at DISPLAY time
+# (visualization.image.set_display_orient, or the configs' display_orient), never to the pixels.
+#
+# Every NYUMets checkpoint trained before this rebuild saw support-masked pixels and
+# translation-only alignment, so none of them transfer -- they have to be retrained.
 #
 # cpu_short is 12h / 50 nodes on BigPurple -- the shortest tier this fits, so the shortest
 # queue. Use cpu_dev (4h, 4 nodes) with --limit for a shakeout run; cpu_medium (5d) only if
