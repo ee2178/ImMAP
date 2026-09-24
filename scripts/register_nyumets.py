@@ -333,7 +333,7 @@ def geometry(patients, cfg):
     """
     import statistics
 
-    rows, spacing_bad, depth_bad, fov_bad = [], [], [], []
+    rows, spacing_bad, depth_bad, fov_bad, xy_bad = [], [], [], [], []
     for pid, studies in patients.items():
         if len(studies) < 2:
             continue
@@ -341,16 +341,21 @@ def geometry(patients, cfg):
         geo = []
         for st in studies:
             aff = np.asarray(st.attrs.get("affine", np.eye(4)), dtype=np.float64)
+            # affine columns are (h, w, z) -- see preprocessing.nyumets_h5.stored_to_world
             sp = tuple(round(float(np.linalg.norm(aff[:3, k])), 3) for k in range(3))
+            crop = max(0, int(st.attrs.get("crop_size", 0) or 0))      # -1 = no crop
             geo.append((st.case, sp, st.depth, int(st.index.min()), int(st.index.max()),
-                        tuple(int(v) for v in st.attrs.get("native_size", (0, 0)))))
+                        tuple(int(v) for v in st.attrs.get("native_size", (0, 0))), crop))
         sp_set = {g[1] for g in geo}
         z_set = {g[1][2] for g in geo}
+        xy_set = {g[1][:2] for g in geo}
         d_set = {g[2] for g in geo}
         n_set = {g[5] for g in geo}
-        rows.append((pid, geo, len(sp_set) > 1, len(z_set) > 1))
+        rows.append((pid, geo, len(sp_set) > 1, len(z_set) > 1, len(xy_set) > 1))
         if len(z_set) > 1:
             spacing_bad.append(pid)
+        if len(xy_set) > 1:
+            xy_bad.append(pid)
         if len(d_set) > 1:
             depth_bad.append(pid)
         if len(n_set) > 1:
@@ -361,6 +366,8 @@ def geometry(patients, cfg):
         print("no multi-study patient in this sample")
         return
     print(f"\n{n} multi-study patient(s):\n")
+    print(f"  studies whose IN-PLANE SPACING differs within the patient: "
+          f"{len(xy_bad)}/{n}  ({100 * len(xy_bad) / n:.0f}%)")
     print(f"  studies whose SLICE SPACING differs within the patient : "
           f"{len(spacing_bad)}/{n}  ({100 * len(spacing_bad) / n:.0f}%)")
     print(f"  studies whose full-spacing triple differs              : "
@@ -372,15 +379,28 @@ def geometry(patients, cfg):
     print("\n  An integer-index shift can only align studies that share a physical grid. Where")
     print("  the slice spacing differs, registration has to RESAMPLE to a common grid first --")
     print("  cross-correlation will still return a confident-looking offset, and it will be")
-    print("  meaningless.\n")
+    print("  meaningless.")
+    if xy_bad:
+        print("\n  !! IN-PLANE SPACING DIFFERS, and `--crop N` crops in INDEX space, not in mm.")
+        print("     Two studies at different in-plane resolution therefore come out of the")
+        print("     build holding DIFFERENT PHYSICAL FOVs at DIFFERENT ANATOMICAL SCALES -- the")
+        print("     `FOV` column below is crop * in-plane spacing. No integer translation can")
+        print("     align a scale mismatch, so cross-correlation reports a SMALL in-plane")
+        print("     offset (there is no good one) while the images stay visibly off-centre.")
+        print("     The build has to resample to one in-plane spacing, or crop a fixed number")
+        print("     of MILLIMETRES rather than of voxels, before a shift means anything.\n")
+    else:
+        print("")
 
-    for pid, geo, sp_mix, z_mix in rows[:8]:
-        flag = "  <-- SPACING DIFFERS" if z_mix else ("  <-- spacing triple differs" if sp_mix
-                                                      else "")
+    for pid, geo, sp_mix, z_mix, xy_mix in rows[:8]:
+        flag = ("  <-- IN-PLANE SPACING DIFFERS" if xy_mix else
+                "  <-- SLICE SPACING DIFFERS" if z_mix else
+                "  <-- spacing triple differs" if sp_mix else "")
         print(f"  {pid}{flag}")
-        for case, sp, depth, lo, hi, native in geo:
+        for case, sp, depth, lo, hi, native, crop in geo:
+            fov = f"{crop * sp[0]:6.1f}x{crop * sp[1]:<6.1f}mm" if crop else "  (uncropped)"
             print(f"      {case:<30s} spacing {sp}  depth {depth:>4d}  kept {lo:>3d}..{hi:<3d}"
-                  f"  native {native}")
+                  f"  native {native}  FOV {fov}")
     if len(rows) > 8:
         print(f"  ... and {len(rows) - 8} more")
 
@@ -420,9 +440,23 @@ def geometry(patients, cfg):
         print(f"  obliqueness: median {_st.median(obl):.4f}  max {max(obl):.4f}   "
               f"(0 = pure translation; > ~0.02 and a shift cannot align them)")
 
-    zs = [g[1][2] for _, geo, _, _ in rows for g in geo]
+    zs = [g[1][2] for _, geo, _, _, _ in rows for g in geo]
     print(f"\n  slice spacing across all sampled studies: median {statistics.median(zs):.2f} mm, "
           f"min {min(zs):.2f}, max {max(zs):.2f}, {len(set(zs))} distinct value(s)")
+    # IN-PLANE spacing, which the earlier version of this report never printed -- and it is the
+    # one that interacts with `--crop N`, an index-space crop, to change the stored FOV.
+    xys = [g[1][0] for _, geo, _, _, _ in rows for g in geo]
+    xys += [g[1][1] for _, geo, _, _, _ in rows for g in geo]
+    fovs = sorted({round(g[6] * g[1][0], 1) for _, geo, _, _, _ in rows for g in geo if g[6]})
+    print(f"  in-plane spacing across all sampled studies: "
+          f"median {statistics.median(xys):.3f} mm, min {min(xys):.3f}, max {max(xys):.3f}, "
+          f"{len(set(xys))} distinct value(s)")
+    if fovs:
+        print(f"  stored in-plane FOV (crop * spacing): {len(fovs)} distinct value(s), "
+              f"{min(fovs):.1f}..{max(fovs):.1f} mm")
+        if len(fovs) > 1:
+            print("  A cohort with more than one stored FOV is NOT on a common grid, however "
+                  "well\n  the slice spacing agrees.")
 
 
 def compare(patients, cfg):
