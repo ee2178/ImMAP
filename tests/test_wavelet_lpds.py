@@ -121,6 +121,70 @@ def test_layer_init():
           bool((t[0, rest] == 1e-3).all() and (t[1, rest] == 0).all()))
 
 
+def test_carry_unshuffle_matches_conv():
+    """At init the fixed-unshuffle carries give exactly the dense-conv K, K^H."""
+    fast = WaveletLPDSLayer(P=7, spectral_init=False, carry="unshuffle")
+    dense = WaveletLPDSLayer(P=7, spectral_init=False, carry="conv")
+    check("unshuffle carry: only the LL split is a conv at levels 2-3",
+          [tuple(a.weight.shape) for a in fast.analysis]
+          == [(16, 1, 7, 7)] * 3)
+    x = torch.randn(2, 1, 32, 32, dtype=torch.complex64)
+    z = torch.randn(2, 256, 4, 4, dtype=torch.complex64)
+    ea = (fast.analyse(x) - dense.analyse(x)).abs().max().item()
+    eh = (fast.adjoint(z) - dense.adjoint(z)).abs().max().item()
+    check("unshuffle carry: K matches the dense cascade", ea < 1e-5, f"{ea:.1e}")
+    check("unshuffle carry: K^H matches the dense cascade", eh < 1e-5, f"{eh:.1e}")
+
+
+def _complexify(lay):
+    """Random complex weights, with B = conj(A) so K^H is still the adjoint."""
+    from models.base import set_weight
+    for a, b in zip(lay.analysis, lay.synthesis):
+        w = a.weight + 0.1 * torch.randn_like(a.weight)
+        set_weight(a, w)
+        set_weight(b, w.conj())
+
+
+def test_interleaved_matches_gauss():
+    """The one-real-conv interleaved path == the Gauss-trick complex modules."""
+    lay = WaveletLPDSLayer(P=7, spectral_init=False, carry="conv")
+    _complexify(lay)
+    x = torch.randn(2, 1, 32, 32, dtype=torch.complex64)
+    z = torch.randn(2, 256, 4, 4, dtype=torch.complex64)
+
+    def mix(v, Q):
+        B, _, h, w = v.shape
+        v = v.reshape(B, 4, lay.Cg, h, w)
+        return torch.einsum("cij,bjchw->bichw", Q, v).reshape(B, -1, h, w)
+
+    ref_a = x
+    for a in lay.analysis:
+        ref_a = a(ref_a)
+    ref_a = mix(ref_a, lay.Q)
+    ref_h = mix(z, lay.QH)
+    for b in reversed(lay.synthesis):
+        ref_h = b(ref_h)
+    ea = ((lay.analyse(x) - ref_a).abs().max() / ref_a.abs().max()).item()
+    eh = ((lay.adjoint(z) - ref_h).abs().max() / ref_h.abs().max()).item()
+    check("interleaved K == Gauss-trick K (complex weights)", ea < 1e-5, f"{ea:.1e}")
+    check("interleaved K^H == Gauss-trick K^H (complex weights)", eh < 1e-5, f"{eh:.1e}")
+    check("real input goes through K", lay.analyse(x.real).is_complex())
+
+
+def test_adjoint_complex_weights():
+    for carry in ("unshuffle", "conv"):
+        lay = WaveletLPDSLayer(P=7, spectral_init=False, carry=carry)
+        _complexify(lay)
+        x = torch.randn(2, 1, 32, 32, dtype=torch.complex128)
+        z = torch.randn(2, 256, 4, 4, dtype=torch.complex128)
+        lay.double()
+        lhs = (lay.analyse(x).conj() * z).sum()
+        rhs = (x.conj() * lay.adjoint(z)).sum()
+        err = (abs(lhs - rhs) / abs(lhs)).item()
+        check(f"<Kx, z> = <x, K^H z> with complex weights ({carry})",
+              err < 1e-10, f"rel err {err:.1e}")
+
+
 def test_net_forward_backward():
     net = build_model({"model": {"type": "WaveletLPDSNet", "params": dict(
         K=4, M=16, P=7, s=2, degrees=1, preproc="identity")}})
@@ -144,6 +208,9 @@ if __name__ == "__main__":
     test_truncation()
     test_Q()
     test_layer_init()
+    test_carry_unshuffle_matches_conv()
+    test_interleaved_matches_gauss()
+    test_adjoint_complex_weights()
     test_net_forward_backward()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)

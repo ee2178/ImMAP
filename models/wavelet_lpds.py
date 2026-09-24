@@ -11,6 +11,17 @@ deepest code is penalised and there is ONE dual.  The iteration is therefore
 `models/lpds.py::LPDSLayer` with `A -> K` and `B -> K^H`; see
 `models/wavelets.py` for the initialisation and its channel layout.
 
+Carries (`carry=`)
+------------------
+* "unshuffle" (default): at levels 2-3 only the LL split is a learnable conv
+  (1 -> 4 per tree); every other channel is a FIXED pixel-unshuffle (its
+  adjoint a pixel-shuffle).  The operator at init is identical to "conv", at
+  ~1/15 of the FLOPs, but the carries cannot learn and the LL split reads LL
+  only.
+* "conv": the dense grouped conv of `dtcwt_weights` -- carries are learnable
+  7x7 filters that may mix every channel of a tree (4 -> 16, 16 -> 64).  Needed
+  to load checkpoints trained before the unshuffle path existed.
+
 Channels 16 -> 64 -> 256 (M = 16): one 2D DT-CWT, LeGall 5/3 at level 1 and
 `qshift_06` (end taps truncated to fit P = 7) at levels 2-3.
 
@@ -30,6 +41,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.base import set_weight
 from models.components import Conv2d, ConvTranspose2d
@@ -42,6 +54,124 @@ from operators.identity import Identity
 from operators.projections import proj_dims, uball_project
 from solvers.eigen import power_method
 
+CARRY_MODES = ("unshuffle", "conv")
+
+
+# -- K and K^H on an interleaved real layout -----------------------------------
+# Inside the cascade a complex map (B, C, H, W) is carried as a real
+# (B, 2C, H, W) with channel 2c = Re, 2c + 1 = Im.  Each level is then ONE real
+# conv with the block weight [[wr, -wi], [wi, wr]] instead of the Gauss trick's
+# three convs plus the Re/Im split and recombine; conv groups stay contiguous in
+# this layout.  Complex <-> real happens once per operator: at the image end
+# (one channel) and fused into the Q mix at depth 3.  Both are pure functions of
+# the weights so ONE `torch.compile` serves all K layers (see
+# `WaveletLPDSNet(compile_operator=True)`).
+
+# (Explicit .real/.imag + torch.complex rather than view_as_real/_complex: the
+# latter's gradients come back with a non-unit last stride under
+# torch.compile's backward and fail.  Same one copy either way.)
+
+def _to_ri(x):
+    """complex (B, C, H, W) -> real (B, 2C, H, W), channels interleaved."""
+    B, C, H, W = x.shape
+    if not x.is_complex():
+        return torch.stack([x, torch.zeros_like(x)], 2).view(B, 2 * C, H, W)
+    return torch.stack([x.real, x.imag], 2).view(B, 2 * C, H, W)
+
+
+def _from_ri(x):
+    """Inverse of `_to_ri`."""
+    B, C2, H, W = x.shape
+    x = x.view(B, C2 // 2, 2, H, W)
+    return torch.complex(x[:, :, 0], x[:, :, 1])
+
+
+def _cblock(wr, wi, transpose=False):
+    """Real (2O, 2I, P, P) weight of the complex conv `wr + i wi` (O, I, P, P).
+
+    Blocks are [out part][in part] = [[wr, -wi], [wi, wr]]; a conv_transpose
+    weight is indexed (in, out), so there they are read transposed.
+    """
+    if transpose:
+        w = torch.stack([torch.stack([wr, wi], 2), torch.stack([-wi, wr], 2)], 1)
+    else:
+        w = torch.stack([torch.stack([wr, -wi], 2), torch.stack([wi, wr], 2)], 1)
+    return w.reshape(2 * wr.shape[0], 2 * wr.shape[1], *wr.shape[2:])
+
+
+def _real_Q(Q):
+    """(n, 4, 4) complex -> (n, 4, 2, 4, 2) real, [out part][in part] blocks."""
+    r, m = Q.real, Q.imag
+    return torch.stack([torch.stack([r, -m], -1), torch.stack([m, r], -1)], 2)
+
+
+def _unshuffle(x):
+    """(B, T, n, 2, H, W) -> (B, T, 4n, 2, H/2, W/2), channel 4c + 2dy + dx.
+
+    The stride-2 one-hot kernels of `dtcwt_weights` in their order (and
+    `F.pixel_unshuffle`'s), with the Re/Im axis kept innermost.
+    """
+    B, T, n, _, H, W = x.shape
+    x = x.reshape(B, T, n, 2, H // 2, 2, W // 2, 2)
+    return x.permute(0, 1, 2, 5, 7, 3, 4, 6).reshape(B, T, 4 * n, 2, H // 2, W // 2)
+
+
+def _shuffle(x):
+    """Inverse (and adjoint) of `_unshuffle`."""
+    B, T, c, _, h, w = x.shape
+    x = x.reshape(B, T, c // 4, 2, 2, 2, h, w)
+    return x.permute(0, 1, 2, 5, 6, 3, 7, 4).reshape(B, T, c // 4, 2, 2 * h, 2 * w)
+
+
+def _analyse(x, ws, Qr, carry):
+    """`K x`: complex (B, 1, H, W) -> complex (B, M, H/8, W/8).
+
+    `ws[l] = (wr, wi)` are level l's analysis weights, `Qr = _real_Q(Q)`.
+    """
+    x = _to_ri(x)
+    for l, (wr, wi) in enumerate(ws):
+        w, p = _cblock(wr, wi), wr.shape[-1] // 2
+        if l == 0 or carry == "conv":
+            x = F.conv2d(x, w, stride=2, padding=p, groups=1 if l == 0 else NTREES)
+            continue
+        B, _, H, W = x.shape
+        x = x.view(B, NTREES, -1, 2, H, W)
+        ll = F.conv2d(x[:, :, 0].reshape(B, 2 * NTREES, H, W), w,
+                      stride=2, padding=p, groups=NTREES)
+        x = torch.cat([ll.view(B, NTREES, 4, 2, H // 2, W // 2),
+                       _unshuffle(x[:, :, 1:])], 2)
+        x = x.view(B, -1, H // 2, W // 2)
+    B, _, h, w = x.shape
+    x = x.view(B, NTREES, Qr.shape[0], 2, h, w)
+    z = torch.einsum("cipja,njcahw->pnichw", Qr, x)
+    return torch.complex(z[0], z[1]).reshape(B, -1, h, w)
+
+
+def _adjoint(z, ws, QHr, carry):
+    """`K^H z`: complex (B, M, h, w) -> complex (B, 1, 8h, 8w).
+
+    `ws[l] = (wr, wi)` are level l's synthesis weights, `QHr = _real_Q(Q^H)`.
+    """
+    B, _, h, w = z.shape
+    z = torch.stack([z.real, z.imag]).view(2, B, NTREES, QHr.shape[0], h, w)
+    z = torch.einsum("cjpia,anichw->njcphw", QHr, z).reshape(B, -1, h, w)
+    for l in reversed(range(len(ws))):
+        wr, wi = ws[l]
+        wt, p = _cblock(wr, wi, transpose=True), wr.shape[-1] // 2
+        g = 1 if l == 0 else NTREES
+        if l == 0 or carry == "conv":
+            z = F.conv_transpose2d(z, wt, stride=2, padding=p, output_padding=1,
+                                   groups=g)
+            continue
+        B, _, h, w = z.shape
+        z = z.view(B, NTREES, -1, 2, h, w)
+        ll = F.conv_transpose2d(z[:, :, :4].reshape(B, 8 * NTREES, h, w), wt,
+                                stride=2, padding=p, output_padding=1, groups=g)
+        z = torch.cat([ll.view(B, NTREES, 1, 2, 2 * h, 2 * w),
+                       _shuffle(z[:, :, 4:])], 2)
+        z = z.view(B, -1, 2 * h, 2 * w)
+    return _from_ri(z)
+
 
 class WaveletLPDSLayer(nn.Module):
     """One unrolled Condat-Vu step with `K = Q T_3 T_2 T_1`.
@@ -51,13 +181,20 @@ class WaveletLPDSLayer(nn.Module):
     """
 
     def __init__(self, P=7, lam0=1e-3, tau0=5e-1, theta0=0.0, degrees=0,
-                 proj_mode="slice", spectral_init=True):
+                 proj_mode="slice", spectral_init=True, carry="unshuffle"):
         super().__init__()
+        if carry not in CARRY_MODES:
+            raise ValueError("carry must be one of %r; got %r" % (CARRY_MODES, carry))
+        self.carry = carry
         weights, tags = dtcwt_weights(P, levels=3)
         self.proj_dims = proj_dims(proj_mode)
 
         self.analysis, self.synthesis = nn.ModuleList(), nn.ModuleList()
         for l, w in enumerate(weights):
+            if l > 0 and carry == "unshuffle":
+                # keep rows 0-3 (the LL split) of each tree, reading LL only
+                w = w.view(NTREES, -1, *w.shape[1:])[:, :4, :1].reshape(
+                    4 * NTREES, 1, P, P)
             cout, cin_g = w.shape[:2]
             g = 1 if l == 0 else NTREES
             a = Conv2d(cin_g * g, cout, P, stride=2, groups=g)
@@ -70,6 +207,12 @@ class WaveletLPDSLayer(nn.Module):
         Q = dtcwt_Q(tags)                                   # (64, 4, 4)
         self.register_buffer("Q", Q)
         self.register_buffer("QH", Q.conj().transpose(1, 2).resolve_conj().contiguous())
+        # real forms for `_analyse` / `_adjoint`; derived, so kept out of the
+        # state dict (old checkpoints load unchanged)
+        self.register_buffer("Qr", _real_Q(self.Q), persistent=False)
+        self.register_buffer("QHr", _real_Q(self.QH), persistent=False)
+        # swapped for one shared torch.compile'd pair by the net
+        self._analyse_fn, self._adjoint_fn = _analyse, _adjoint
         self.Cg = len(tags)
         self.M = NTREES * self.Cg
 
@@ -88,21 +231,17 @@ class WaveletLPDSLayer(nn.Module):
         return [t * self.Cg for t in range(NTREES)]
 
     # -- K and K^H -----------------------------------------------------------
-    def _mix(self, z, Q):
-        B, _, H, W = z.shape
-        z = z.reshape(B, NTREES, self.Cg, H, W)
-        return torch.einsum("cij,bjchw->bichw", Q, z).reshape(B, self.M, H, W)
+    # The Conv2d / ConvTranspose2d modules only hold the (real, imag) weights;
+    # the convs themselves run in `_analyse` / `_adjoint`.
+    @staticmethod
+    def _weights(convs):
+        return [(c.conv_real.weight, c.conv_imag.weight) for c in convs]
 
     def analyse(self, x):
-        for a in self.analysis:
-            x = a(x)
-        return self._mix(x, self.Q)
+        return self._analyse_fn(x, self._weights(self.analysis), self.Qr, self.carry)
 
     def adjoint(self, z):
-        z = self._mix(z, self.QH)
-        for b in reversed(self.synthesis):
-            z = b(z)
-        return z
+        return self._adjoint_fn(z, self._weights(self.synthesis), self.QHr, self.carry)
 
     # -- forward -------------------------------------------------------------
     def forward(self, state, y_tilde, E=None, sigma=None, pi=None, cache=None):
@@ -164,7 +303,8 @@ class WaveletLPDSNet(_MLIO):
 
     def __init__(self, K=30, M=16, L=3, C=1, P=7, s=2, lam0=1e-3, tau0=5e-1,
                  theta0=0.0, degrees=0, is_complex=True, preproc="kspace",
-                 proj_mode="slice", spectral_init=True):
+                 proj_mode="slice", spectral_init=True, carry="unshuffle",
+                 compile_operator=False):
         super().__init__()
         if (M, L, C, s, is_complex) != (16, 3, 1, 2, True):
             raise ValueError(
@@ -180,7 +320,24 @@ class WaveletLPDSNet(_MLIO):
 
         self.net = LPDSStack(self.K, lambda: WaveletLPDSLayer(
             P=P, lam0=lam0, tau0=tau0, theta0=theta0, degrees=degrees,
-            proj_mode=proj_mode, spectral_init=spectral_init))
+            proj_mode=proj_mode, spectral_init=spectral_init, carry=carry))
+        self.carry = carry
+        if compile_operator:
+            self.compile_operator()
+
+    def compile_operator(self, **kws):
+        """torch.compile K and K^H once, shared by every layer.
+
+        The weights are arguments, so the K layers hit one graph per shape
+        instead of K recompiles (compiling each layer's bound method would
+        blow dynamo's recompile limit and silently fall back to eager).
+        Fuses the layout shuffles, block-weight builds and Q mixes around the
+        cuDNN convs.  Compiles lazily on the first call, on whatever device.
+        """
+        fa, fh = torch.compile(_analyse, **kws), torch.compile(_adjoint, **kws)
+        for lay in self.net.layers:
+            lay._analyse_fn, lay._adjoint_fn = fa, fh
+        return self
 
     def forward(self, y, E=None, sigma=None, state=None):
         if E is None:
@@ -198,5 +355,5 @@ class WaveletLPDSNet(_MLIO):
         return self.layer(k).step_bound(**kws)
 
     def extra_repr(self):
-        return "K=%d, channels=16/64/256, P=%d, preproc=%r" % (
-            self.K, self.P, self.preproc)
+        return "K=%d, channels=16/64/256, P=%d, preproc=%r, carry=%r" % (
+            self.K, self.P, self.preproc, self.carry)
