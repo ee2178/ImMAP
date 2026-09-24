@@ -89,22 +89,23 @@ class _GaussConvNd(nn.Module):
         return torch.complex(real, imag)
 
 class Conv2d(_GaussConvNd):
-    def __init__(self, C, M, P, stride=1, bias=False, complex=True):
+    def __init__(self, C, M, P, stride=1, bias=False, complex=True, groups=1):
         super().__init__(complex=complex)
         self.padding = (P - 1) // 2
         self.stride = stride
-        self.conv_real = nn.Conv2d(C, M, P, stride=stride,
-                                   padding=self.padding, bias=bias)
-        self.conv_imag = nn.Conv2d(C, M, P, stride=stride,
-                                   padding=self.padding, bias=bias) if complex else None
+        self.groups = int(groups)
+        self.conv_real = nn.Conv2d(C, M, P, stride=stride, padding=self.padding,
+                                   bias=bias, groups=self.groups)
+        self.conv_imag = nn.Conv2d(C, M, P, stride=stride, padding=self.padding,
+                                   bias=bias, groups=self.groups) if complex else None
 
     def _op(self, x, weight, bias=None):
-        return F.conv2d(x, weight, bias=bias,
-                        stride=self.stride, padding=self.padding)
+        return F.conv2d(x, weight, bias=bias, stride=self.stride,
+                        padding=self.padding, groups=self.groups)
 
 
 class ConvTranspose2d(_GaussConvNd):
-    def __init__(self, M, C, P, stride=1, bias=False, complex=True):
+    def __init__(self, M, C, P, stride=1, bias=False, complex=True, groups=1):
         super().__init__(complex=complex)
         self.padding = (P - 1) // 2
         # torch requires output_padding < stride; stride - 1 is the value that
@@ -113,14 +114,18 @@ class ConvTranspose2d(_GaussConvNd):
         # unchanged for the common stride=2 case).
         self.output_padding = max(stride - 1, 0)
         self.stride = stride
+        self.groups = int(groups)
         self.conv_real = nn.ConvTranspose2d(M, C, P, stride=stride,
-            padding=self.padding, output_padding=self.output_padding, bias=bias)
+            padding=self.padding, output_padding=self.output_padding, bias=bias,
+            groups=self.groups)
         self.conv_imag = nn.ConvTranspose2d(M, C, P, stride=stride,
-            padding=self.padding, output_padding=self.output_padding, bias=bias) if complex else None
+            padding=self.padding, output_padding=self.output_padding, bias=bias,
+            groups=self.groups) if complex else None
 
     def _op(self, x, weight, bias=None):
         return F.conv_transpose2d(x, weight, bias=bias, stride=self.stride,
-            padding=self.padding, output_padding=self.output_padding)
+            padding=self.padding, output_padding=self.output_padding,
+            groups=self.groups)
 
 
 

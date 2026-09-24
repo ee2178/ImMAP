@@ -10,6 +10,7 @@ from .cclnet import CCLNet, Unet2D
 from .multigrid import MGCDLNet, VCycle
 from .ml_cdlnet import MLCDLNet, MLSplitCDLNet, MLSweep, MLSplitSweep
 from .ml_lpds import MLLPDSLayer, MLLPDSNet
+from .wavelet_lpds import WaveletLPDSLayer, WaveletLPDSNet
 from .lpds import LPDSLayer, LPDSStack
 from .mg_lpds import MGLPDSNet, PDVCycle
 from .guided_lpds import GuidedLPDSLayer, GuidedLPDSNet, LGGSNet
@@ -128,6 +129,11 @@ def build_model(cfg):
                 "MLLPDSNet was given window > 1, which builds a GROUP prox. "
                 "Use MLGroupLPDS so the config states that intent.")
         return MLLPDSNet(**params)
+
+    # LPDSNet with a DT-CWT-initialised analysis cascade (models/wavelet_lpds.py):
+    # grouped by tree, every band carried to depth 3, one dual on the deepest code.
+    elif model_type == "WaveletLPDSNet":
+        return WaveletLPDSNet(**params)
 
     # Multigrid family, all one class:
     #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations

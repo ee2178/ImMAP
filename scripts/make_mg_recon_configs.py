@@ -459,7 +459,23 @@ MODELS.update({
                       params=dict(ML_CDL_COMMON, **_W2_SHAPE)),
 })
 
+# DT-CWT LPDS (models/wavelet_lpds.py): `lpdsnet` with its one strided conv
+# replaced by a 3-level cascade initialised as the 2D dual-tree complex wavelet
+# transform -- channels 16/64/256, grouped by tree, every band carried to depth 3
+# and only that code penalised (LL^3 thresholds start at 0). The baseline of the
+# wavelet ladder: it tests the DT-CWT prior itself. Everything else is
+# ML_LPDS_COMMON (K=30, L=3, P=7, s=2, lam0, tau0=0.5, theta0, degrees).
+MODELS.update({
+    "wlpds16": dict(type="WaveletLPDSNet", params=dict(
+        {k: ML_LPDS_COMMON[k] for k in ("K", "L", "C", "P", "s", "lam0", "tau0",
+                                        "theta0", "degrees", "is_complex",
+                                        "preproc")},
+        M=16)),
+})
+
 OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnetmaps",
+          # DT-CWT LPDS baseline (exp7)
+          "wlpds16",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
