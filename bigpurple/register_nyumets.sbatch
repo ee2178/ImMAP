@@ -11,6 +11,24 @@
 #   APPLY=1 SAMPLE=0 OUT=~/scratch/datasets/NYUMets_h5_reg \
 #           sbatch bigpurple/register_nyumets.sbatch             # write a registered copy
 #
+# GEOMETRY SURVEY -- run this FIRST, and before trusting any offset:
+#
+#   GEOMETRY=1 sbatch --gres=none --time=00:30:00 bigpurple/register_nyumets.sbatch
+#
+# It reads ATTRS ONLY: no pixels, no FFTs, no GPU, and it defaults to every patient because
+# it is cheap enough to do the whole cohort. What it answers is whether an integer-index
+# shift is even the right model -- the per-study voxel spacing, depth, kept range, and the
+# STORED PHYSICAL FOV (crop * in-plane spacing). `--crop N` crops in INDEX space, so two
+# studies at different in-plane resolution come out of the build holding different physical
+# FOVs at different anatomical scales; cross-correlation then reports a SMALL in-plane offset
+# (there is no good one) while the images stay visibly off-centre. Read the
+# `in-plane spacing across all sampled studies` line: more than one distinct value means the
+# build has to resample to a common in-plane spacing before registration means anything.
+#
+# `--gres=none` because no GPU is used; the partition stays radiology, which is the only one
+# these jobs run on. GEOMETRY=1 forces DEVICE=cpu so the script's CUDA check cannot fail the
+# job over a device it was never going to touch.
+#
 # APPLY=1 with a SAMPLE is refused by the script itself: it would write a set in which only
 # some patients are registered. Pass SAMPLE=0 (or ALLOW_PARTIAL=1 if you really mean it).
 #
@@ -60,9 +78,21 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 IMMAP_ROOT="${IMMAP_ROOT:-$HOME/scratch/ImMAP}"
 ROOT="${ROOT:-$HOME/scratch/datasets/NYUMets_h5}"
 OUT="${OUT:-${ROOT}_reg}"
-SAMPLE="${SAMPLE:-40}"
 SEED="${SEED:-0}"
-DEVICE="${DEVICE:-cuda}"
+if [ -n "${GEOMETRY:-}" ]; then
+    # Attrs only, so the whole cohort is the sensible default and the device is irrelevant --
+    # but the script hard-exits on --device cuda with no CUDA visible, and this is meant to be
+    # submitted with --gres=none, so pin it to cpu unless the caller insists otherwise.
+    SAMPLE="${SAMPLE:-0}"
+    DEVICE="${DEVICE:-cpu}"
+    if [ -n "${APPLY:-}" ]; then
+        echo "GEOMETRY=1 is a read-only measurement; drop APPLY=1" >&2
+        exit 1
+    fi
+else
+    SAMPLE="${SAMPLE:-40}"
+    DEVICE="${DEVICE:-cuda}"
+fi
 
 cd "$IMMAP_ROOT" || { echo "no such directory: $IMMAP_ROOT" >&2; exit 1; }
 if [ ! -d "$ROOT" ]; then
@@ -76,7 +106,9 @@ echo "root   : $ROOT"
 echo "sample : $SAMPLE (seed $SEED)   device: $DEVICE"
 
 # A GPU was requested, so say plainly whether one arrived -- a silent fall back to CPU on a
-# radiology node is a slow job that looks like a fast one.
+# radiology node is a slow job that looks like a fast one. Skipped for GEOMETRY=1, which is
+# submitted with --gres=none and would only report a GPU it does not want.
+if [ -z "${GEOMETRY:-}" ]; then
 python - <<'PY'
 import torch
 if torch.cuda.is_available():
@@ -85,11 +117,15 @@ else:
     print("gpu    : NONE VISIBLE -- torch.cuda.is_available() is False; the run will use the "
           "CPU. Check the --gres line and the conda env's torch build.")
 PY
+fi
 
 ARGS=(--root "$ROOT" --sample "$SAMPLE" --seed "$SEED" --device "$DEVICE")
 [ -n "${MULTI_ONLY:-}" ]    && ARGS+=(--multi-only)
 [ -n "${ALLOW_PARTIAL:-}" ] && ARGS+=(--allow-partial)
-if [ -n "${APPLY:-}" ]; then
+if [ -n "${GEOMETRY:-}" ]; then
+    ARGS+=(--geometry)
+    echo "mode   : GEOMETRY SURVEY (attrs only, no pixels, no writes)"
+elif [ -n "${APPLY:-}" ]; then
     ARGS+=(--apply --out "$OUT")
     echo "mode   : APPLY -> $OUT"
 else
