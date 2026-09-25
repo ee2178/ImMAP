@@ -13,11 +13,13 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0
+#SBATCH --array=0-1
 #
 # EXPERIMENT 7 -- DT-CWT LPDS baseline.  BRAIN R16.
 #
 #   0  wlpds16   LPDS with a 3-level DT-CWT analysis cascade, 16/64/256, K=30
+#   1  clpds16   the same cascade, no wavelet structure: dense random convs,
+#                each level spectrally normalised on its own (cascade_lpds.py)
 #
 #   reference: mllpds64 (exp4 cell 3)  and  lpdsnet (exp3 cell 0)
 #
@@ -58,12 +60,13 @@
 # torch/ the job dies before the script runs.
 
 ANATOMY=brain
-ONLY="${ONLY:-wlpds16}"
+ONLY="${ONLY:-wlpds16 clpds16}"
 ACCELS="${ACCELS:-16}"
-# ORGAN MASK OFF (2026-09-22), in EVERY launcher: loss and metrics run over the
-# whole image. Regeneration rewrites every config of an anatomy, so these must
-# all agree -- turn it back on everywhere or nowhere.
-ORGAN_MASK=""                       # matches every other brain launcher --
+# ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the
+# support of the STORED ESPIRiT maps (organ_mask_source="smaps"). Regeneration
+# rewrites every config of an anatomy, so these must all agree -- turn it off
+# everywhere or nowhere.
+ORGAN_MASK=1                      # matches every other brain launcher --
                                      # regeneration rewrites every brain config,
                                      # so a mismatch silently un-masks the anatomy
 CONFIG_ROOT="config"

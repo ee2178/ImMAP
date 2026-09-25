@@ -17,7 +17,8 @@ TWO PROTOCOLS (`--protocol`, default "measured" since 2026-09-22):
             masks with Sljiva's heuristics (`center_frac: 0.04`,
             `adjust_accel: true` -- R is the EFFECTIVE rate), and the
             OPERATOR's coil maps estimated from each measurement's ACS
-            (`online_smaps: "espirit"`). The ground truth is the stored SENSE
+            (`online_smaps: "walsh"`, as Sljiva's multigrid runs; "espirit"
+            via --online-smaps). The ground truth is the stored SENSE
             combination `S^H c` from maps estimated on the FULLY sampled data
             -- the split Sljiva's `genobs` makes: reference from stored maps,
             operator from online ones. `--target rss` swaps the ground truth
@@ -473,9 +474,22 @@ MODELS.update({
         M=16)),
 })
 
+# Cascade LPDS (models/cascade_lpds.py): wlpds16 with the wavelet structure
+# removed -- the same 16/64/256 stride-2 cascade and single deepest dual, but
+# dense convs (no tree groups, no Q, no carries), random init, and each level
+# spectrally normalised on its own rather than the composed operator. The
+# ablation of wlpds16's init and structure.
+MODELS.update({
+    "clpds16": dict(type="CascadeLPDSNet", params=dict(
+        {k: ML_LPDS_COMMON[k] for k in ("K", "L", "C", "P", "s", "lam0", "tau0",
+                                        "theta0", "degrees", "is_complex",
+                                        "preproc")},
+        M=16, widen=4)),
+})
+
 OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnetmaps",
-          # DT-CWT LPDS baseline (exp7)
-          "wlpds16",
+          # DT-CWT LPDS baseline and its structure-free ablation (exp7)
+          "wlpds16", "clpds16",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
@@ -520,26 +534,36 @@ ANATOMIES = {
 # (operators/noise.py::mri_awgn) on data already scaled by the anatomy's
 # scale_fac, so these are fractions of unit signal scale.
 #
-#     brain   U[0.04, 0.06]   ~5%     val 0.05
+#     brain   U[0.01, 0.02]   ~1.5%   val 0.015
 #     knee    U[0.01, 0.02]   ~1.5%   val 0.015
 #
 # PER-ANATOMY AND NOT GLOBAL, because the two were moved independently and a
-# single constant made one of them collateral damage. brain went to [0.01, 0.02]
-# and is now back at [0.04, 0.06]; knee was never asked to move. Anything
+# single constant made one of them collateral damage. brain went to [0.01, 0.02],
+# back to [0.04, 0.06], and on 2026-09-25 to [0.01, 0.02] again; knee was never
+# asked to move.
+#
+# WHY BRAIN CAME BACK DOWN (2026-09-25). [0.04, 0.06] was chosen by eye against
+# SENSE reconstructions under the LEGACY protocol: 20 ACS lines on top of the
+# outer lines (nominal R -- R=16 was effectively 8.2) and the stored maps in the
+# operator, which are exactly zero off the object and so hand SENSE a support
+# prior. The measured protocol has 13 ACS lines inside the budget (R=16 is
+# effectively 15.2: 21 of 320 lines) and online Walsh maps calibrated from those
+# 13 noisy lines, with no support. At the same sigma that is a much harder
+# problem, and every net struggled. Re-chosen with
+# notebooks/measured_noise_testbench.ipynb. Anything
 # reading this must index by anatomy -- `noise_std()` below, and the staleness
 # check in torch/_mg_recon_body.sh, both do.
 #
-# brain is at [0.04, 0.06] because at [0.01, 0.02] the grid stopped separating
-# the models: a comparison run in a regime where the prior does not have to do
+# brain was at [0.04, 0.06] because at [0.01, 0.02] -- UNDER THE LEGACY
+# PROTOCOL -- the grid stopped separating the models: a comparison run in a regime where the prior does not have to do
 # any work measures nothing about the prior. That is the same reason the range
 # was first raised from [0.0, 0.01].
 #
 # HOW THIS RELATES TO THE Sljiva REFERENCE, because it is not a straight copy.
 # `config/synthmri_closure.yaml` TRAINS at noise_level [0.00, 0.001] -- lower
 # than either range here -- and the fastMRI eval scripts then EVALUATE at a
-# single pinned 0.05 (`scripts/eval_guidedfastmri.jl:44`). 0.05 is the centre of
-# the brain range, so brain now moves the reference's TEST operating point into
-# TRAINING and matches train to test, rather than reproducing its protocol.
+# single pinned 0.05 (`scripts/eval_guidedfastmri.jl:44`). Brain now trains
+# and validates at [0.01, 0.02] / 0.015, which is neither.
 #
 # That is a defensible design and it is the one asked for, but it is a different
 # experiment from the paper's: a net trained at the level it is tested at should
@@ -553,7 +577,7 @@ ANATOMIES = {
 # trained at a different sigma. Move the affected dirs aside (or pass
 # FORCE_RESTART=1) before re-submitting.
 NOISE_STD = {
-    "brain": [0.04, 0.06],
+    "brain": [0.01, 0.02],
     "knee":  [0.01, 0.02],
 }
 
@@ -631,7 +655,12 @@ def _apply_protocol(args):
             args.center_frac = 0.04
         args.adjust_accel = True
         if args.online_smaps is None:
-            args.online_smaps = "espirit"
+            # Walsh since 2026-09-25: what Sljiva's multigrid experiments ran
+            # (`makeconfigs_mglpds.jl`, `:online_smaps=>[true,]`), and cheap --
+            # online ESPIRiT is GBs per slice at 640x320x20. Neither applies a
+            # support: Sljiva's `walsh_smaps` has a `thresh_eig` hook but
+            # `genobs` never passes it.
+            args.online_smaps = "walsh"
     else:
         args.kspace_type = "simulated"
         if args.target == "rss":
@@ -901,10 +930,16 @@ def make_config(anatomy, r, model, args):
             # of noise_std: the numbers measure a different region. The launch
             # guard in torch/_mg_recon_body.sh compares configs and will refuse
             # the old run dirs, which is the intended behaviour.
-            # "none" when the grid runs unmasked (the default since
-            # 2026-09-22): the loader then skips the RSS mask entirely instead
-            # of computing one nothing reads.
-            "organ_mask_source": ("rss" if getattr(args, "organ_mask", False)
+            # "none" when the grid runs unmasked: the loader then skips the
+            # mask entirely instead of computing one nothing reads.
+            #
+            # MASKED RUNS USE "smaps" (2026-09-25): the support of the STORED
+            # ESPIRiT maps (thresholded, exactly zero off the object) -- the
+            # same maps that define the SENSE ground truth, which is itself
+            # zero there. Dilated relative to "rss" as noted above, so masked
+            # numbers from the two sources do not share a table.
+            "organ_mask_source": (getattr(args, "organ_mask_source", "smaps")
+                                  if getattr(args, "organ_mask", False)
                                   else "none"),
             # Ground truth: absent = the stored SENSE combination (default);
             # "rss" only with --target rss.
@@ -997,6 +1032,8 @@ def make_config(anatomy, r, model, args):
             # WHERE THE NETWORK'S COIL MAPS COME FROM.
             #   None       the dataset's precomputed maps (current behaviour)
             #   "espirit"  re-estimated from the ACS of each measurement
+            #   (the measured protocol's default is "walsh" -- see
+            #   _apply_protocol)
             #   "walsh"    the same, with the cheap estimator
             #
             # Online maps are what Sljiva's `genobs` does, and they change the
@@ -1066,7 +1103,8 @@ def main():
                    help="estimate the coil maps from each measurement's ACS "
                         "instead of using the precomputed ones. 'espirit' "
                         "matches Sljiva's :espirit branch; 'walsh' is the "
-                        "cheap one its experiments actually used. Changes the "
+                        "cheap one its experiments actually used, and the "
+                        "default under --protocol measured. Changes the "
                         "problem -- see the `mri.online_smaps` comment.")
     p.add_argument("--only", nargs="*", default=None,
                    help="restrict to these model tags")
@@ -1094,6 +1132,12 @@ def main():
                         "OFF by default and deliberately not per-anatomy: it "
                         "changes what PSNR/NRMSE/SSIM MEAN, so a masked run "
                         "cannot go in the same table as an unmasked one.")
+    p.add_argument("--organ-mask-source", choices=("smaps", "rss"),
+                   default="smaps",
+                   help="with --organ-mask: the region the loss and metrics "
+                        "are restricted to. 'smaps' (default) is the support "
+                        "of the stored ESPIRiT maps; 'rss' thresholds the "
+                        "coil RSS (physics/object_mask.py).")
     p.add_argument("--accels", nargs="*", type=int, default=None,
                    help="restrict to these accelerations (with --list-cells)")
     args = p.parse_args()

@@ -83,10 +83,11 @@ ONLY="mggrouplpds"
 ACCELS="8"
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it
-# ORGAN MASK OFF (2026-09-22), in EVERY launcher: loss and metrics run over the
-# whole image. Regeneration rewrites every config of an anatomy, so these must
-# all agree -- turn it back on everywhere or nowhere.
-ORGAN_MASK=""                       # MUST match exp2_knee_group.sbatch and
+# ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the
+# support of the STORED ESPIRiT maps (organ_mask_source="smaps"). Regeneration
+# rewrites every config of an anatomy, so these must all agree -- turn it off
+# everywhere or nowhere.
+ORGAN_MASK=1                      # MUST match exp2_knee_group.sbatch and
                                      # mg_recon_knee.sbatch -- regeneration
                                      # rewrites every knee config, so a mismatch
                                      # here silently un-masks the whole anatomy

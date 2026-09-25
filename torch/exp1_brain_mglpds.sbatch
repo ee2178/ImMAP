@@ -74,10 +74,11 @@ ACCELS="8 4"                         # PINNED. Was "" (= all), which
                                      # silently grew to include R16 when
                                      # exp3 added it to the global list.
                                      # R16 belongs to exp3.
-# ORGAN MASK OFF (2026-09-22), in EVERY launcher: loss and metrics run over the
-# whole image. Regeneration rewrites every config of an anatomy, so these must
-# all agree -- turn it back on everywhere or nowhere.
-ORGAN_MASK=""                       # matches every other brain launcher
+# ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the
+# support of the STORED ESPIRiT maps (organ_mask_source="smaps"). Regeneration
+# rewrites every config of an anatomy, so these must all agree -- turn it off
+# everywhere or nowhere.
+ORGAN_MASK=1                      # matches every other brain launcher
 CONFIG_ROOT="config"
 SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs. Settable
                                      # on the sbatch line; a short run lands in

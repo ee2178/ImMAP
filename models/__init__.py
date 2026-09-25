@@ -11,6 +11,7 @@ from .multigrid import MGCDLNet, VCycle
 from .ml_cdlnet import MLCDLNet, MLSplitCDLNet, MLSweep, MLSplitSweep
 from .ml_lpds import MLLPDSLayer, MLLPDSNet
 from .wavelet_lpds import WaveletLPDSLayer, WaveletLPDSNet
+from .cascade_lpds import CascadeLPDSLayer, CascadeLPDSNet
 from .lpds import LPDSLayer, LPDSStack
 from .mg_lpds import MGLPDSNet, PDVCycle
 from .guided_lpds import GuidedLPDSLayer, GuidedLPDSNet, LGGSNet
@@ -134,6 +135,12 @@ def build_model(cfg):
     # grouped by tree, every band carried to depth 3, one dual on the deepest code.
     elif model_type == "WaveletLPDSNet":
         return WaveletLPDSNet(**params)
+
+    # The same one-dual cascade with the wavelet structure removed
+    # (models/cascade_lpds.py): dense random convs 16/64/256, each level
+    # spectrally normalised on its own.
+    elif model_type == "CascadeLPDSNet":
+        return CascadeLPDSNet(**params)
 
     # Multigrid family, all one class:
     #   K = [K_outer, [iters_per_level...]]  -> V-cycle iterations

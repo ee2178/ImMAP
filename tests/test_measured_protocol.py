@@ -223,8 +223,8 @@ def test_generator_protocols():
           "target" not in data, f"target={data.get('target')!r}")
     check("measured: Julia masks (center_frac 0.04, adjust_accel)",
           mri.get("center_frac") == 0.04 and mri.get("adjust_accel") is True)
-    check("measured: operator maps estimated online with ESPIRiT",
-          mri.get("online_smaps") == "espirit")
+    check("measured: operator maps estimated online with Walsh",
+          mri.get("online_smaps") == "walsh")
 
     check("measured: acs_lines is null -- derived from center_frac, not a fixed 20",
           mri.get("acs_lines", "absent") is None, f"acs_lines={mri.get('acs_lines')!r}")
