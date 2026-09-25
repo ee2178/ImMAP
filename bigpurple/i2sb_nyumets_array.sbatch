@@ -15,14 +15,21 @@
 #    8   i2sb_unet_from_otherct1.json         SBUnet   C=4      FLAIR, T1, T2; the bridge STARTS at
 #                                                              the other study's CT1 (x1_source),
 #                                                              this session's T1 comes back as `y`
+#    9   i2sb_unet_otherstudy_pair.json       SBUnet   C=6      FLAIR, T1, T2 + other-study T1, CT1
+#   10   i2sb_unet_otherstudy_pair_w1.json    SBUnet   C=10     ... + other-study T1/CT1 at z-1..z+1
+#   11   i2sb_unet_otherstudy_pair_w2.json    SBUnet   C=14     ... + other-study T1/CT1 at z-2..z+2
 #
 # Paired comparisons: 1 vs 2 isolates the other-study CT1 channel; 3 vs 4 is conditioning
 # channels vs guided prox; 4 vs 5 swaps same-session guides for the other-study CT1; 2 vs 8 is
 # the prior scan as a CONDITIONING CHANNEL vs as the BRIDGE START (what ImMAP-SB needs, and what
 # notebooks/immap_sb_longitudinal.ipynb compares).
+# The GUIDE-WIDTH sweep is 2, 9, 10, 11: other-study CT1 alone, then the other study's T1/CT1
+# pair at 1, 3 and 5 slices (guide_idx [1, 2], guide_window 0 / 1 / 2). SBUnet only -- the guided
+# prox models pay per guide plane, the UNet only widens its first conv.
+#   sbatch --array=2,9-11 bigpurple/i2sb_nyumets_array.sbatch
 #
-# The LONGITUDINAL subset -- the ones that use another study of the same patient -- is 2, 5, 8:
-#   sbatch --array=2,5,8 bigpurple/i2sb_nyumets_array.sbatch
+# The LONGITUDINAL subset -- the ones that use another study of the same patient -- is 2, 5, 8-11:
+#   sbatch --array=2,5,8-11 bigpurple/i2sb_nyumets_array.sbatch
 # (SB-LGGCDL with all 3 guides + other CT1 was dropped: it OOMs on one A100.)
 #
 # Submit all (at most 4 GPUs at once):
@@ -40,7 +47,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-8%4
+#SBATCH --array=0-11%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -69,6 +76,9 @@ CONFIGS=(
     config/NYUMets/i2sb_lggcdl_session.json
     config/NYUMets/i2sb_lggs_session.json
     config/NYUMets/i2sb_unet_from_otherct1.json
+    config/NYUMets/i2sb_unet_otherstudy_pair.json
+    config/NYUMets/i2sb_unet_otherstudy_pair_w1.json
+    config/NYUMets/i2sb_unet_otherstudy_pair_w2.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then

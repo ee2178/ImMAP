@@ -62,6 +62,18 @@ guide volume to use:
 
 `min_slice_gap` exists because an adjacent slice of the same contrast is nearly the answer.
 
+SEVERAL CONTRASTS AND A SLICE WINDOW. `guide_idx` may be a LIST of stored contrasts, e.g. [1, 2]
+for the other study's T1/CT1 PAIR: every drawn guide slice then yields one plane per contrast.
+`guide_window` = k (other_study only) also reads the k slices either side of the matched one, from
+the SAME other study, so a guide becomes 2k+1 slices x len(guide_idx) contrasts, ordered by slice
+offset -k..+k with the contrasts innermost:
+
+    guide_idx=[1, 2], guide_window=1  ->  T1(z-1) CT1(z-1) T1(z) CT1(z) T1(z+1) CT1(z+1)
+
+A neighbour past either end of the stored slices repeats the edge slice. With guide_as_cond the
+planes land after cond_idx in that order, so the net's C = 1 + len(cond_idx) + n_guide_planes, and
+n_guide_planes = n_guides * (2k + 1) * len(guide_idx).
+
 SAMPLING uses torch's RNG, which DataLoader seeds per worker. numpy's is not seeded per worker, so
 np.random here would hand every worker the identical guide stream. `deterministic=True` derives
 every choice from the sample index instead, so val/test see the same guide every epoch.
@@ -127,7 +139,21 @@ class NYUMetsGuidedDataset(Dataset):
         self.image_key = str(getattr(cfg, "image_key", "img_median_mad"))
 
         self.modes = _as_modes(getattr(cfg, "guide_mode", "none"))
-        self.guide_idx = int(getattr(cfg, "guide_idx", self.x0_idx))
+        # the stored contrast(s) every non-session guide mode draws: an int, or a list such as
+        # [1, 2] for a T1/CT1 PAIR -- each drawn slice then yields one plane per listed contrast
+        gi = getattr(cfg, "guide_idx", None)
+        gi = self.x0_idx if gi is None else gi
+        self.guide_idx = [int(c) for c in gi] if isinstance(gi, (list, tuple)) else [int(gi)]
+        if not self.guide_idx:
+            raise ValueError("guide_idx must name at least one stored contrast")
+        # other_study only: also take the +-guide_window neighbouring slices of the SAME other
+        # study around the matched one, so the net sees the prior scan's local through-plane
+        # context (and some tolerance to a residual dz). 0 = just the matched slice.
+        self.guide_window = int(getattr(cfg, "guide_window", 0) or 0)
+        if self.guide_window < 0:
+            raise ValueError(f"guide_window must be >= 0, got {self.guide_window}")
+        if self.guide_window and "other_study" not in self.modes:
+            raise ValueError("guide_window applies to guide_mode 'other_study' only")
         gc = getattr(cfg, "guide_contrasts", None)
         self.guide_contrasts = [1, 3, 0] if gc is None else [int(c) for c in gc]   # T1, T2, FLAIR
         self.n_guides = int(getattr(cfg, "n_guides", 1))
@@ -224,7 +250,11 @@ class NYUMetsGuidedDataset(Dataset):
         """G, the number of guide planes per sample -- fixed for a given configuration."""
         n = 0
         for m in self.modes:
-            n += len(self.guide_contrasts) if m == "same_session" else self.n_guides
+            if m == "same_session":
+                n += len(self.guide_contrasts)
+            else:
+                w = 2 * self.guide_window + 1 if m == "other_study" else 1
+                n += self.n_guides * w * len(self.guide_idx)
         return n
 
     def __len__(self):
@@ -256,15 +286,23 @@ class NYUMetsGuidedDataset(Dataset):
             for g in range(self.n_guides):
                 salt = salt0 + g
                 if mode == "same_slice":
-                    out.append((fi, li, self.guide_idx))
+                    out += [(fi, li, c) for c in self.guide_idx]
                 elif mode == "central_slice":
-                    out.append((fi, self.n_slices[fi] // 2, self.guide_idx))
+                    out += [(fi, self.n_slices[fi] // 2, c) for c in self.guide_idx]
                 elif mode == "far_slice":
                     far = [z for z in range(self.n_slices[fi]) if abs(z - li) >= self.min_slice_gap]
-                    out.append((fi, far[self._pick(len(far), idx, salt)], self.guide_idx))
+                    z = far[self._pick(len(far), idx, salt)]
+                    out += [(fi, z, c) for c in self.guide_idx]
                 elif mode == "other_study":
+                    # ONE sibling and ONE matched slice per guide; the window and the contrast
+                    # list are then read from that same study. Order: slice offset -w..+w
+                    # outermost, contrast innermost -- [z-1: T1, CT1], [z: T1, CT1], [z+1: ...].
+                    # A neighbour past either end of the stored slices repeats the edge slice.
                     gf, gz = self._other_study_slice(fi, li, idx, salt)
-                    out.append((gf, gz, self.guide_idx))
+                    last = self.n_slices[gf] - 1
+                    for d in range(-self.guide_window, self.guide_window + 1):
+                        z = min(max(gz + d, 0), last)
+                        out += [(gf, z, c) for c in self.guide_idx]
                 else:
                     raise AssertionError(mode)
         return out
@@ -337,10 +375,11 @@ class NYUMetsGuidedDataset(Dataset):
 
         guide = None
         if self.modes:
-            planes = []
+            planes, slices = [], {(fi, li): img}    # each (study, slice) read once, all contrasts
             for gf, gz, gc in self._guide_planes(fi, li, idx):
-                gimg = img if (gf == fi and gz == li) else self._read(gf, gz)[0]
-                planes.append(gimg[..., gc])
+                if (gf, gz) not in slices:
+                    slices[(gf, gz)] = self._read(gf, gz)[0]
+                planes.append(slices[(gf, gz)][..., gc])
             guide = chw(np.stack(planes, axis=-1))        # (G, H, W)
 
         # Joint geometric transform: stack -> transform -> split. The guide rides the SAME
