@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build the NYUMets FLAIR/T1/CT1/T2 h5 set.  CPU-only: preprocessing/nyumets_h5.py runs
-# entirely on CPU tensors, so this must NOT sit on a gpu partition.
+# Build the NYUMets FLAIR/T1/CT1/T2 h5 set. CPU by default; only the cross-study registration
+# can use a GPU (REG_DEVICE=cuda, see RUNTIME below) -- everything else is NIfTI I/O.
 #
 #   mkdir -p logs && sbatch bigpurple/nyumets_h5.sbatch
 #
@@ -13,12 +13,33 @@
 #   --support store      the common acquisition support is RECORDED, not multiplied into the
 #                        pixels (2026-09-22). Zeroing them baked a ragged FOV boundary into the
 #                        data, which is where the boundary artefacts came from.
-#   --reg-method affine  a patient's sessions are resampled onto the grid of the deepest using
-#                        the rigid transform read off their NIfTI affines (2026-09-24), so they
-#                        are aligned THROUGH-PLANE AND IN-PLANE, with rotation corrected. The
-#                        old cross-correlation (--reg-method xcorr) could only translate, and
-#                        the cohort has a median 6.5 degrees of inter-session obliqueness that
-#                        no translation removes.
+#   --reg-method centroid  a patient's sessions are put onto the index axis of the deepest by
+#                        a dz found by masked T1 correlation, then ONE in-plane (dh, dw) that
+#                        centres each study's brain mask on the reference's (2026-09-25). It
+#                        replaced --reg-method affine, whose header transform re-posed studies
+#                        instead of aligning them (~0 correlation after resampling), and the FFT
+#                        cross-correlation (--reg-method xcorr), whose peak sometimes locked onto
+#                        the wrong lag. --reg-method search finds (dh, dw) by a correlation search
+#                        instead (optionally per slice): marginally better, ~5x slower.
+#                        Translation only: rotation is NOT undone. Each h5 records reg_offset,
+#                        reg_slice_shift and reg_ncc (the quality gate; studies below
+#                        --reg-min-ncc are flagged in the log).
+#
+# RUNTIME. centroid registration costs ~1.5 s per non-reference study on 8-10 CPU threads
+# (benchmarked 2026-09-25 at 224x224, depth ~190): ~1.5 h for the cohort on top of the NIfTI
+# loading, which cpu_short's 12 h should hold. --reg-method search is ~8 s per study (~7 h); for
+# that, give registration a GPU or the longer tier:
+#
+#   OVERWRITE=1 REG_DEVICE=cuda EXTRA="--reg-method search" OUT=... \
+#       sbatch --partition=radiology --gres=gpu:a100:1 bigpurple/nyumets_h5.sbatch
+#   OVERWRITE=1 EXTRA="--reg-method search" OUT=... \
+#       sbatch --partition=cpu_medium --time=48:00:00 bigpurple/nyumets_h5.sbatch
+#
+# Build into a FRESH OUT and re-split from it, so no file from an earlier build survives:
+#
+#   OVERWRITE=1 OUT=~/scratch/datasets/NYUMets_h5_centroid sbatch bigpurple/nyumets_h5.sbatch
+#
+# EXTRA="..." appends builder flags, e.g. EXTRA="--limit 200" for a shakeout run.
 #
 # Stored axes stay canonical RAS; ANTERIOR-UP is applied at DISPLAY time
 # (visualization.image.set_display_orient, or the configs' display_orient), never to the pixels.
@@ -85,4 +106,5 @@ python -m preprocessing.nyumets_h5 \
     --out  "$OUT" \
     --crop 224 \
     --min-brain-frac 0.02 \
-    --compress $OVERWRITE_FLAG
+    --reg-device "${REG_DEVICE:-cpu}" \
+    --compress $OVERWRITE_FLAG ${EXTRA:-}

@@ -27,26 +27,31 @@ artefacts in the reconstructions. The trade it makes is real in the other direct
 the support merely stored, a T1 -> CT1 bridge does see input anatomy (an eye) that its target
 never acquired, and must learn to drop it. Apply `support` in the loss instead if that shows up.
 
-CROSS-STUDY REGISTRATION -- READ OFF THE AFFINES (`--reg-method affine`, the default since
-2026-09-24). A patient's sessions are built together and every one of them is resampled onto the
-grid of the deepest, so `slice_index` names one anatomical level across the patient and the
-studies are aligned in-plane too. The transform is `inv(A_other) @ A_ref` from the NIfTI headers
--- exact for a rigid pair on a common voxel grid, which the --geometry survey says this cohort
-is: 1.0 mm isotropic, one stored FOV, across all 4478 studies.
+CROSS-STUDY REGISTRATION -- dz FROM THE IMAGES, IN-PLANE FROM THE BRAIN CENTROID
+(`--reg-method centroid`, the default since 2026-09-25). A patient's sessions are built together
+and every one is put onto the index axis of the deepest: a through-plane shift dz found by the
+masked correlation of the normalised T1 with the reference, then ONE in-plane shift (dh, dw) that
+centres the study's brain mask on the reference's. Integer translations only; rotation is not
+undone. `reg_offset` is the (dz, dh, dw) applied, `reg_slice_shift` the per-stored-slice (dh, dw)
+(uniform under centroid), and `reg_ncc` the masked correlation with the reference afterwards -- the
+quality gate. `--reg-method search` finds (dh, dw) by a correlation search instead, optionally per
+slice: slightly better scores (median masked CT1 0.485 vs 0.465 for one searched shift, below),
+at ~8 s per study against ~1-2 s.
 
-It replaced 3-D FFT cross-correlation (`--reg-method xcorr`), which could only return a
-translation. The cohort survey measured a MEDIAN inter-session obliqueness of 0.113 -- about
-6.5 degrees, with the p90 worse -- which displaces the edge of a 224 volume by ~13 voxels after
-the best possible shift, and no correlation peak can remove it. The visible symptom was studies
-that looked aligned through-plane and were plainly off in-plane, with the correlation reporting
-small in-plane offsets because there was no good translation to find.
+Why not the alternatives (2026-09-25 comparison on the source NIfTIs, median masked CT1
+correlation over 27 study pairs, which the search never sees): no registration 0.06, 3-D FFT
+cross-correlation (`--reg-method xcorr`) 0.35, search with one in-plane shift 0.47, search with
+per-slice shifts 0.49; dz with a brain-centroid shift landed close to the searched shift on visual
+comparison, for a fraction of the cost. `--reg-method affine` -- resampling with inv(A_other) @ A_ref from the NIfTI
+headers -- scored ~0: scanner coordinates are not anatomical across sessions (the patient lies
+differently each visit), so the header transform re-poses a study rather than aligning it. The
+NYUMets release's own tooling (github.com/nyumets/nyumets) registers across timepoints with a
+translation-only SimpleITK fit, and also writes voxel spacing with `set_spacing([1, 1, 1])`
+without resampling, so the "1 mm isotropic" in these headers is not a measurement.
 
-Because the pixels are resampled onto the reference's grid, the `affine` and `native_size` attrs
-describe THAT grid, not the session's own; the session's own are kept as `affine_source` and
-`native_size_source`. `reg_matrix` is the transform applied, and `reg_offset` is only the closest
-single translation to it, for readability. Slices survive where at least `--reg-min-cover` of the
-REFERENCE'S BRAIN was drawn from real acquired data (not of the whole frame -- rotating a square
-empties its corners, and those corners are air).
+Under `affine` the pixels are resampled onto the reference's grid and the `affine` / `native_size`
+attrs describe THAT grid (the session's own are kept as `affine_source` / `native_size_source`);
+`reg_matrix` is the transform applied. Under `search` and `xcorr` the pixels are only shifted.
 
 ORIENTATION. Stored axes stay canonical RAS: H runs to the patient's RIGHT, W ANTERIOR, so a
 slice drawn as-is has the eyes on the image's RIGHT. That is a DISPLAY concern and is fixed at
@@ -527,7 +532,11 @@ def register_patient(vols, cfg, ref=0, real=None):
 
     `cfg.reg_method` picks how:
 
-      affine (default)  read the rigid transform off the headers and resample. Exact for a
+      centroid (default) dz by masked correlation, then one in-plane (dh, dw) that centres the
+                        brain mask on the reference's. See `_register_centroid`.
+      search            dz, then in-plane (dh, dw) -- one per volume, then per slice -- found by
+                        searching the masked correlation of the images. See `_register_search`.
+      affine            read the rigid transform off the headers and resample. Exact for a
                         rigid pair on a common grid, and it corrects ROTATION, which the
                         cohort has ~6.5 deg of between sessions.
       xcorr             the old 3-D FFT cross-correlation, integer translation only. Kept so
@@ -545,7 +554,12 @@ def register_patient(vols, cfg, ref=0, real=None):
     if len(hw) != 1:
         raise ValueError(f"studies are on different in-plane grids {sorted(hw)}; set --crop so "
                          f"they share one before registering")
-    if getattr(cfg, "reg_method", "affine") == "affine":
+    method = getattr(cfg, "reg_method", "centroid")
+    if method == "centroid":
+        return _register_centroid(vols, cfg, ref, real)
+    if method == "search":
+        return _register_search(vols, cfg, ref, real)
+    if method == "affine":
         return _register_affine(vols, cfg, ref, real)
     return _register_xcorr(vols, cfg, ref, real)
 
@@ -639,6 +653,383 @@ def _register_xcorr(vols, cfg, ref=0, real=None):
         T[0, 3], T[1, 3], T[2, 3] = t[1], t[2], t[0]
         v.reg = {"method": "xcorr", "matrix": T, "oblique": 0.0}
         offsets.append(t)
+        valid.append(real[i].numpy())
+    return offsets, valid
+
+
+def masked_ncc(a, b, ma, mb, t=(0, 0, 0), stride=1, min_px=1000):
+    """Correlation of `a` against `translate(b, t)`, inside BOTH brain masks. NaN if they overlap
+    in fewer than `min_px` (strided) voxels.
+
+    (D, H, W) tensors; `t` is (dz, dh, dw) with `translate`'s semantics, so the `t` that maximises
+    this is exactly the shift that puts b onto a. `stride` subsamples in-plane only -- a speed knob,
+    never along z, which is the axis the search most needs to resolve.
+    """
+    if a.shape != b.shape:
+        raise ValueError(f"masked_ncc needs one grid: {tuple(a.shape)} vs {tuple(b.shape)}")
+    # a[i] against b[i + t] over their OVERLAP, as views: identical to translating b (whose
+    # zero-filled edge the mask excludes anyway) without copying the volume for every shift
+    sa, sb = [], []
+    for ax, (n, d) in enumerate(zip(a.shape, t)):
+        st = 1 if ax == 0 else stride
+        sa.append(slice(max(0, -d), n - max(0, d), st))
+        sb.append(slice(max(0, d), n - max(0, -d), st))
+    sa, sb = tuple(sa), tuple(sb)
+    j = ma[sa] & mb[sb]
+    if int(j.sum()) < min_px:
+        return float("nan")
+    x, y = a[sa][j].float(), b[sb][j].float()
+    x, y = x - x.mean(), y - y.mean()
+    return float((x * y).sum() / (x.norm() * y.norm()).clamp_min(1e-8))
+
+
+def _inplane_search(a, ma, b, mb, dz, shifts, stride, min_px):
+    """Score every (dh, dw) in `shifts` at a fixed dz, by masked NCC.
+
+    -> (global (dh, dw), per-slice best (D, 2) long, per-slice ok (D,) bool). One pass serves both
+    answers: per-slice sums give each slice its own best, and their totals give the volume's, so the
+    global and per-slice shifts are scored identically. A slice gets its own shift only where the
+    two brains overlap in >= `min_px` strided pixels.
+    """
+    S = max(max(abs(dh), abs(dw)) for dh, dw in shifts)
+    D = a.shape[0]
+    full_t = torch.zeros((D, 2), dtype=torch.long)
+    full_ok = torch.zeros(D, dtype=torch.bool)
+    # Only the REFERENCE brain's bounding box can contribute (the joint mask requires it), so the
+    # search runs on that box alone -- exact, and roughly half the voxels of the full frame.
+    nz = lambda m: torch.nonzero(m).flatten()
+    zs, hs, ws = nz(ma.any(2).any(1)), nz(ma.any(2).any(0)), nz(ma.any(1).any(0))
+    if zs.numel() == 0:
+        return (0, 0), full_t, full_ok
+    z0, z1 = int(zs[0]), int(zs[-1]) + 1
+    h0, h1 = int(hs[0]), int(hs[-1]) + 1
+    w0, w1 = int(ws[0]), int(ws[-1]) + 1
+    pad = lambda v: F.pad(translate(v, (dz, 0, 0))[z0:z1].float()[None], (S, S, S, S))[0]
+    bp, mp = pad(b), pad(mb) > 0.5
+    A = a[z0:z1, h0:h1:stride, w0:w1:stride].float()
+    MA = ma[z0:z1, h0:h1:stride, w0:w1:stride]
+    best_s = torch.full((z1 - z0,), -2.0, device=a.device)
+    best_t = torch.zeros((z1 - z0, 2), dtype=torch.long, device=a.device)
+    ok_any = torch.zeros(z1 - z0, dtype=torch.bool, device=a.device)
+    g_best, g_t = -2.0, (0, 0)
+    for dh, dw in shifts:
+        # strided VIEW of translate(b, (dz, dh, dw)) over the box -- no copy per shift
+        hsl = slice(S + h0 + dh, S + h1 + dh, stride)
+        wsl = slice(S + w0 + dw, S + w1 + dw, stride)
+        B = bp[:, hsl, wsl]
+        J = (MA & mp[:, hsl, wsl]).float()
+        n = J.sum((1, 2))
+        sx, sy = (A * J).sum((1, 2)), (B * J).sum((1, 2))
+        sxx, syy, sxy = (A * A * J).sum((1, 2)), (B * B * J).sum((1, 2)), (A * B * J).sum((1, 2))
+        ok = n >= min_px
+        nn = n.clamp_min(1)
+        cov = sxy - sx * sy / nn
+        var = ((sxx - sx ** 2 / nn) * (syy - sy ** 2 / nn)).clamp_min(1e-12)
+        c = torch.where(ok, cov / var.sqrt(), torch.full_like(cov, -2.0))
+        better = c > best_s
+        best_s = torch.where(better, c, best_s)
+        best_t[better] = torch.tensor([dh, dw], device=a.device)
+        ok_any |= ok
+        N = float(n.sum())
+        if N >= 1000:
+            cv = float(sxy.sum() - sx.sum() * sy.sum() / N)
+            vv = float((sxx.sum() - sx.sum() ** 2 / N) * (syy.sum() - sy.sum() ** 2 / N))
+            gs = cv / max(vv, 1e-12) ** 0.5
+            if gs > g_best:
+                g_best, g_t = gs, (dh, dw)
+    full_t[z0:z1] = best_t.cpu()
+    full_ok[z0:z1] = ok_any.cpu()
+    return g_t, full_t, full_ok
+
+
+def _blur_inplane(v, r):
+    """(D, H, W) -> the same, box-blurred twice in-plane with a (2r+1)^2 window (~triangular,
+    sigma ~ 0.8 r). Signed-safe, unlike lowpass_inplane's magnitude, which would fold the negative
+    half of a median/MAD image onto the positive. Only the coarse search stages see this."""
+    x = v[:, None].float()
+    for _ in range(2):
+        x = F.avg_pool2d(x, 2 * r + 1, 1, r, count_include_pad=False)
+    return x[:, 0]
+
+
+def _peaks(scores, k, sep):
+    """Indices of the k highest local maxima of a 1-D score list, at least `sep` apart."""
+    order = sorted(range(len(scores)), key=lambda i: -scores[i])
+    out = []
+    for i in order:
+        if all(abs(i - j) >= sep for j in out):
+            out.append(i)
+        if len(out) == k:
+            break
+    return out
+
+
+def _smooth_slice_shifts(t, ok, window):
+    """Median-filter per-slice shifts along z over the slices that had a shift of their own; the
+    rest take the nearest smoothed value. -> (D, 2) long."""
+    idx = torch.nonzero(ok).flatten()
+    v = t[idx].float()
+    h = max(int(window), 1) // 2
+    sm = torch.stack([v[max(0, i - h):i + h + 1].median(0).values for i in range(len(v))])
+    near = (torch.arange(t.shape[0])[:, None] - idx[None]).abs().argmin(1)
+    return sm[near].round().long()
+
+
+def _shift_slices(a, dz, shifts):
+    """translate `a` by dz along its first axis, then each slice z in-plane by shifts[z].
+
+    `a` is (D, ..., H, W): the in-plane shift lands on the LAST two axes whatever sits between
+    (the contrast axis of raw / norm, nothing for fg / fov).
+    """
+    az = translate(a, (dz,)) if dz else a
+    lead = (0,) * (a.dim() - 3)
+    out = torch.empty_like(az)
+    for z in range(az.shape[0]):
+        dh, dw = (int(v) for v in shifts[z])
+        out[z] = translate(az[z], lead + (dh, dw)) if (dh or dw) else az[z]
+    return out
+
+
+def _pad_studies(vols, given=None):
+    """Zero-pad every study at the END to the deepest, IN PLACE (raw / norm / fg / fov), so index 0
+    stays original slice 0 for all of them. -> per-study (depth,) bool of genuinely acquired slices:
+    `given[i]` when the caller knows them (register_nyumets rebuilds volumes with gaps), else each
+    study's own extent."""
+    depth = max(v.raw.shape[0] for v in vols)
+    real = []
+    for i, v in enumerate(vols):
+        d0 = v.raw.shape[0]
+        if given is None:
+            ok = torch.zeros(depth, dtype=torch.bool)
+            ok[:d0] = True
+        else:
+            ok = torch.as_tensor(np.asarray(given[i]), dtype=torch.bool)
+            if ok.shape[0] < depth:
+                ok = torch.cat([ok, torch.zeros(depth - ok.shape[0], dtype=torch.bool)])
+        real.append(ok)
+        if depth > d0:
+            for name in ("raw", "norm", "fg", "fov"):
+                a = getattr(v, name)
+                setattr(v, name, torch.cat(
+                    [a, torch.zeros((depth - d0,) + a.shape[1:], dtype=a.dtype)], dim=0))
+    return real
+
+
+def find_dz(a, ma, b, mb, max_dz, stride=2, blur_r=4):
+    """Through-plane shift of b onto a, in-plane held at 0: the masked-correlation maximum over
+    [-max_dz, max_dz] on in-plane-BLURRED images, refined +-2 at full resolution.
+
+    Blurred because an unknown in-plane offset of a few px wrecks full-resolution correlation and
+    can put the maximum on the wrong level (a 6 px offset did in the tests); blurred, the profile
+    barely cares where the brain sits in-plane.
+    """
+    ab, bb = _blur_inplane(a, blur_r), _blur_inplane(b, blur_r)
+    sc = lambda x, y, d: np.nan_to_num(masked_ncc(x, y, ma, mb, (d, 0, 0), stride), nan=-2.0)
+    d0 = max(range(-max_dz, max_dz + 1), key=lambda d: sc(ab, bb, d))
+    return max(range(d0 - 2, d0 + 3), key=lambda d: sc(a, b, d))
+
+
+def centroid_shift(ma, mb, dz):
+    """(dh, dw) that puts b's brain-mask centroid on a's, over the slices both hold after dz.
+
+    `translate(b, t)` sets out[i] = b[i + t], which moves b's centroid by -t, so t = c_b - c_a.
+    Cheap and search-free; biased wherever the two masks genuinely differ (coverage, a FOV or
+    skull-strip cut, a large lesion), which the 2026-09-25 viewer comparison found close enough
+    to a correlation search to prefer it.
+    """
+    mbz = translate(mb, (dz,))
+    both = ma.flatten(1).any(1) & mbz.flatten(1).any(1)
+    if not bool(both.any()):
+        return 0, 0
+    H, W = ma.shape[1:]
+    hh = torch.arange(H, dtype=torch.float64, device=ma.device)[:, None]
+    ww = torch.arange(W, dtype=torch.float64, device=ma.device)[None, :]
+
+    def c(m):
+        m = m[both].double()
+        n = m.sum().clamp_min(1)
+        return float((m * hh).sum() / n), float((m * ww).sum() / n)
+
+    (ah, aw), (bh, bw) = c(ma), c(mbz)
+    return int(round(bh - ah)), int(round(bw - aw))
+
+
+def _register_centroid(vols, cfg, ref=0, real=None):
+    """dz by masked correlation, then ONE in-plane (dh, dw) per study that centres its brain mask
+    on the reference's. Translation only; no in-plane search.
+
+    Chosen 2026-09-25 after comparing, on the source NIfTIs, dz alone (visibly off in-plane on
+    about half the patients), dz + brain-centroid shift, and dz + a correlation search for (dh, dw):
+    centroid and search landed close, and centroid costs one mask reduction instead of a few
+    hundred correlation evaluations. `--reg-method search` remains for the searched version,
+    optionally per-slice.
+
+      1. dz: `find_dz` -- blurred masked-correlation scan over +-reg_max_dz, refined +-2
+      2. (dh, dw): `centroid_shift` over the slices both brains occupy after dz
+      3. dz refined +-2 once more with that in-plane shift in place (cheap; the scan in 1 was
+         blind to the in-plane offset)
+
+    Same bookkeeping as `_register_search`: studies padded at the END, shifts applied to raw /
+    norm / fg / fov alike, `slice_shift` (uniform here) and the final masked `ncc` in v.reg.
+    """
+    ci = CONTRASTS.index(getattr(cfg, "reg_contrast", "T1"))
+    dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
+    stride = int(getattr(cfg, "reg_stride", 2))
+    max_dz = int(getattr(cfg, "reg_max_dz", 60))
+    real = _pad_studies(vols, real)
+    depth = vols[ref].raw.shape[0]
+
+    A = vols[ref].norm[:, ci].to(dev, torch.float32)
+    MA = vols[ref].fg.to(dev).bool()
+    offsets, valid = [], []
+    for i, v in enumerate(vols):
+        if i == ref:
+            v.reg = {"method": "centroid", "matrix": np.eye(4, dtype=np.float32),
+                     "oblique": 0.0, "ncc": 1.0,
+                     "slice_shift": np.zeros((depth, 2), dtype=np.int64)}
+            offsets.append((0, 0, 0))
+            valid.append(real[i].numpy())
+            continue
+        B = v.norm[:, ci].to(dev, torch.float32)
+        MB = v.fg.to(dev).bool()
+        dz = find_dz(A, MA, B, MB, max_dz, stride)
+        dh, dw = centroid_shift(MA, MB, dz)
+        dz = max(range(dz - 2, dz + 3), key=lambda d: np.nan_to_num(
+            masked_ncc(A, B, MA, MB, (d, dh, dw), stride), nan=-2.0))
+
+        v.raw = translate(v.raw, (dz, 0, dh, dw))
+        v.norm = translate(v.norm, (dz, 0, dh, dw))
+        v.fg = translate(v.fg, (dz, dh, dw))
+        v.fov = translate(v.fov, (dz, dh, dw))
+        real[i] = translate(real[i], (dz,))
+
+        T = np.eye(4, dtype=np.float32)
+        T[0, 3], T[1, 3], T[2, 3] = dh, dw, dz              # (h, w, z) order, like affine_matrix
+        v.reg = {"method": "centroid", "matrix": T, "oblique": 0.0,
+                 "ncc": masked_ncc(A, v.norm[:, ci].to(dev, torch.float32), MA,
+                                   v.fg.to(dev).bool(), (0, 0, 0), stride),
+                 "slice_shift": np.tile(np.asarray([[dh, dw]], dtype=np.int64), (depth, 1))}
+        offsets.append((dz, dh, dw))
+        valid.append(real[i].numpy())
+    return offsets, valid
+
+
+def _register_search(vols, cfg, ref=0, real=None):
+    """dz, then in-plane (dh, dw), found by SEARCHING the masked correlation. Translation only.
+
+    Chosen over `affine` and `xcorr` on the 2026-09-25 comparison (27 study pairs, 6 patients,
+    source NIfTIs, scored by masked CT1 correlation, which the search never sees):
+
+        none 0.060 | xcorr 3-D 0.353 | dz + global 0.465 | dz + per-slice (smoothed) 0.485
+
+    Header affines had ~0 correlation after resampling: scanner coordinates are not anatomical
+    across sessions. The FFT correlation peak occasionally locks onto the wrong lag (dh = 22 on one
+    pair, scoring 0.06 where the search found 0.44). A search cannot do that: it maximises the same
+    score that judges the result.
+
+    STEPS, all on the normalised `reg_contrast` inside the brain masks, in-plane strided by
+    `reg_stride`:
+      1. dz in [-reg_max_dz, reg_max_dz], in-plane held at 0, on in-plane-BLURRED images, keeping
+         the 3 best-separated peaks. At full resolution an unknown in-plane offset of a few px
+         wrecks the correlation and can put the maximum on the wrong level (a 6 px offset did in
+         the tests); blurred, the profile barely cares about in-plane position
+      2. one (dh, dw) per candidate, +-reg_search px: a step-4 grid on the blurred images, then
+         +-2 at full resolution. The candidate with the best full-resolution score wins
+      3. dz again, +-4 around the winner, at its (dh, dw)
+      4. joint +-1 hill-climb on (dz, dh, dw): sequential searches stop a voxel short where the
+         axes trade off
+      5. (reg_slicewise) every reference slice gets its own (dh, dw) within +-reg_slice_radius of
+         the global shift, median-filtered along z over reg_smooth slices. It follows the in-plane
+         drift a between-session head TILT produces, which no single shift can; it cannot undo a
+         rotation WITHIN the axial plane. Smoothing is what keeps it from fitting noise -- on the
+         comparison it changed CT1 by < 0.01, so the per-slice shifts were tracking a real trend.
+
+    The shifts are applied to raw / norm / fg / fov alike. As with xcorr, every study is first
+    zero-padded at the END to the deepest, so index 0 stays original slice 0 and `valid` (the
+    study's acquired slices carried through dz) is what the common slice range is built on.
+    `v.reg["slice_shift"]` is the (D, 2) per-OUTPUT-slice in-plane shift actually applied;
+    `v.reg["ncc"]` the final masked correlation, for write_h5 to record and the caller to gate on.
+    """
+    depth = max(v.raw.shape[0] for v in vols)
+    ci = CONTRASTS.index(getattr(cfg, "reg_contrast", "T1"))
+    dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
+    stride = int(getattr(cfg, "reg_stride", 2))
+    max_dz = int(getattr(cfg, "reg_max_dz", 60))
+    S = int(getattr(cfg, "reg_search", 16))
+    R = int(getattr(cfg, "reg_slice_radius", 6))
+    min_px = int(getattr(cfg, "reg_slice_min_px", 400))
+    slicewise = bool(getattr(cfg, "reg_slicewise", True))
+    window = int(getattr(cfg, "reg_smooth", 7))
+    real = _pad_studies(vols, real)
+
+    blur_r = max(2, S // 4)
+    n_cand = 3
+    coarse = [(dh, dw) for dh in range(-S, S + 1, 4) for dw in range(-S, S + 1, 4)]
+    A = vols[ref].norm[:, ci].to(dev, torch.float32)
+    MA = vols[ref].fg.to(dev).bool()
+    Ab = _blur_inplane(A, blur_r)
+    zero = torch.zeros((depth, 2), dtype=torch.long)
+    offsets, valid = [], []
+    for i, v in enumerate(vols):
+        if i == ref:
+            v.reg = {"method": "search", "matrix": np.eye(4, dtype=np.float32), "oblique": 0.0,
+                     "ncc": 1.0, "slice_shift": zero.numpy()}
+            offsets.append((0, 0, 0))
+            valid.append(real[i].numpy())
+            continue
+        B = v.norm[:, ci].to(dev, torch.float32)
+        MB = v.fg.to(dev).bool()
+        Bb = _blur_inplane(B, blur_r)
+        score = lambda t: np.nan_to_num(masked_ncc(A, B, MA, MB, t, stride), nan=-2.0)
+        score_b = lambda t: np.nan_to_num(masked_ncc(Ab, Bb, MA, MB, t, stride), nan=-2.0)
+
+        def global_at(d):
+            """Whole-volume (dh, dw) at dz = d: coarse grid on the blurred images, then +-2 at
+            full resolution around the winner."""
+            g0, _, _ = _inplane_search(Ab, MA, Bb, MB, d, coarse, stride, min_px)
+            fine = [(g0[0] + a, g0[1] + b) for a in range(-2, 3) for b in range(-2, 3)]
+            return _inplane_search(A, MA, B, MB, d, fine, stride, min_px)[0]
+
+        # 1. dz with in-plane held at 0, on the BLURRED images: an unknown in-plane offset of
+        #    several px wrecks full-resolution correlation and can put the maximum on the wrong
+        #    level entirely. Keep the top candidates and let the in-plane search judge them.
+        dzs = list(range(-max_dz, max_dz + 1))
+        prof = [score_b((d, 0, 0)) for d in dzs]
+        cands = [dzs[i] for i in _peaks(prof, n_cand, 3)]
+        # 2. an in-plane shift for each candidate; the best full-resolution score wins
+        best = max(((d, global_at(d)) for d in cands), key=lambda dg: score((dg[0],) + dg[1]))
+        dz, g = best
+        # 3. dz again around the winner, at its in-plane shift
+        dz = max(range(dz - 4, dz + 5), key=lambda d: score((d,) + tuple(g)))
+        g = global_at(dz)
+        cur = (dz, g[0], g[1])
+        cur_s = score(cur)
+        while True:
+            nb = max(((cur[0] + a, cur[1] + b, cur[2] + c) for a in (-1, 0, 1)
+                      for b in (-1, 0, 1) for c in (-1, 0, 1)), key=score)
+            if score(nb) <= cur_s:
+                break
+            cur, cur_s = nb, score(nb)
+        dz, g = cur[0], (cur[1], cur[2])
+
+        shifts = torch.tensor([g], dtype=torch.long).expand(depth, 2).clone()
+        if slicewise:
+            local = [(g[0] + a, g[1] + b) for a in range(-R, R + 1) for b in range(-R, R + 1)]
+            _, per, ok = _inplane_search(A, MA, B, MB, dz, local, stride, min_px)
+            if bool(ok.any()):
+                shifts = _smooth_slice_shifts(per, ok, window)
+
+        for name in ("raw", "norm", "fg", "fov"):
+            setattr(v, name, _shift_slices(getattr(v, name), dz, shifts))
+        real[i] = translate(real[i], (dz,))
+
+        T = np.eye(4, dtype=np.float32)
+        T[0, 3], T[1, 3], T[2, 3] = g[0], g[1], dz          # (h, w, z) order, like affine_matrix
+        v.reg = {"method": "search", "matrix": T, "oblique": 0.0,
+                 "ncc": masked_ncc(A, v.norm[:, ci].to(dev, torch.float32), MA,
+                                   v.fg.to(dev).bool(), (0, 0, 0), stride),
+                 "slice_shift": shifts.numpy()}
+        offsets.append((dz, g[0], g[1]))
         valid.append(real[i].numpy())
     return offsets, valid
 
@@ -859,12 +1250,32 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         # method does not track it (xcorr zero-fills instead)
         f.attrs["reg_cover"] = float(r.get("cover", float("nan")))
         f.attrs["reg_reference"] = str(r.get("reference", ""))
+        # masked correlation of reg_contrast with the reference AFTER registration (search only;
+        # NaN otherwise). The quality gate: a low value is a study that did not align.
+        f.attrs["reg_ncc"] = float(r.get("ncc", float("nan")))
+        if r.get("slice_shift") is not None:
+            # (n, 2) in-plane (dh, dw) applied to each STORED slice, after the whole-volume dz.
+            # Under reg_slicewise these differ slice to slice; reg_offset holds the global one.
+            f.create_dataset("reg_slice_shift",
+                             data=np.asarray(r["slice_shift"])[idx].astype(np.int32))
         f.attrs["reg_rule"] = (
             "none" if not r.get("applied") else
             ("rigid transform read off the NIfTI affines (inv(A_other) @ A_ref), applied by "
              "trilinear grid_sample onto the reference's grid: rotation AND translation, "
              "border padding for intensities, nearest-threshold for the masks"
              if r.get("method") == "affine" else
+             f"integer translation found by searching the masked correlation of the normalised "
+             f"{cfg.reg_contrast}: dz (+-{cfg.reg_max_dz}), then one (dh, dw) (+-{cfg.reg_search})"
+             + (f", then per-slice (dh, dw) within +-{cfg.reg_slice_radius} of it, median-"
+                f"filtered over {cfg.reg_smooth} slices (see reg_slice_shift)"
+                if cfg.reg_slicewise else "")
+             + " -- rotation NOT corrected"
+             if r.get("method") == "search" else
+             f"integer translation: dz by the masked correlation of the normalised "
+             f"{cfg.reg_contrast} (blurred scan over +-{cfg.reg_max_dz}, refined +-2), then one "
+             f"(dh, dw) centring the brain mask on the reference's over the shared slices "
+             f"-- rotation NOT corrected"
+             if r.get("method") == "centroid" else
              "3-D FFT cross-correlation of the low-passed normalised "
              f"{cfg.reg_contrast} (lowpass={cfg.reg_lowpass}), integer voxel translation only "
              "-- rotation NOT corrected"))
@@ -900,9 +1311,15 @@ def main():
     ap.add_argument("--no-register", action="store_false", dest="register",
                     help="do NOT align a patient's studies to one another (they are then "
                          "written on their own index axes, as before 2026-09-23)")
-    ap.add_argument("--reg-method", default="affine", choices=("affine", "xcorr"),
-                    dest="reg_method",
-                    help="affine (default): read the rigid transform off the NIfTI headers and "
+    ap.add_argument("--reg-method", default="centroid",
+                    choices=("centroid", "search", "affine", "xcorr"), dest="reg_method",
+                    help="centroid (default): dz by masked correlation, then one in-plane "
+                         "(dh, dw) centring the brain mask on the reference's -- see "
+                         "_register_centroid. "
+                         "search: dz, then in-plane (dh, dw) -- one per volume, then "
+                         "per slice -- found by searching the masked correlation of the images; "
+                         "see _register_search for the comparison that chose it. "
+                         "affine: read the rigid transform off the NIfTI headers and "
                          "resample onto the patient's reference grid, correcting ROTATION as "
                          "well as translation. Exact for a rigid pair on a common voxel grid, "
                          "which --geometry says this cohort is. xcorr: the old 3-D FFT "
@@ -939,6 +1356,26 @@ def main():
                          "to was arbitrary, and the 2026-09-23 survey caught it rejecting dz of "
                          "43-49 that looked genuine -- large through-plane, small and consistent "
                          "in-plane. --min-overlap is the principled guard")
+    ap.add_argument("--reg-max-dz", type=int, default=60, dest="reg_max_dz",
+                    help="centroid / search: through-plane search range, slices. The 2026-09-25 comparison "
+                         "saw |dz| up to ~30; 60 leaves headroom")
+    ap.add_argument("--reg-search", type=int, default=16, dest="reg_search",
+                    help="search: in-plane range for the whole-volume (dh, dw), px")
+    ap.add_argument("--no-reg-slicewise", action="store_false", dest="reg_slicewise",
+                    help="search: one in-plane shift per volume only, no per-slice refinement")
+    ap.add_argument("--reg-slice-radius", type=int, default=6, dest="reg_slice_radius",
+                    help="search: per-slice (dh, dw) range around the whole-volume shift, px")
+    ap.add_argument("--reg-slice-min-px", type=int, default=400, dest="reg_slice_min_px",
+                    help="search: joint-brain pixels (after the in-plane stride) a slice needs "
+                         "for a shift of its own; thinner slices take their neighbours'")
+    ap.add_argument("--reg-smooth", type=int, default=7, dest="reg_smooth",
+                    help="search: median window along z for the per-slice shifts")
+    ap.add_argument("--reg-stride", type=int, default=2, dest="reg_stride",
+                    help="search: in-plane subsampling while scoring (speed only; the shifts "
+                         "themselves stay in full-resolution pixels)")
+    ap.add_argument("--reg-min-ncc", type=float, default=0.2, dest="reg_min_ncc",
+                    help="search: flag studies whose masked correlation with the reference is "
+                         "below this after registration (recorded as reg_ncc; nothing dropped)")
     ap.add_argument("--start", type=int, default=None)
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--require-affine", action="store_true", dest="require_affine",
@@ -1029,6 +1466,16 @@ def main():
     for key, files in sessions.items():
         by_patient.setdefault(key[0], []).append((key, files))
 
+    def drop_stale(key):
+        """Delete a session's EXISTING h5 when this run skips it. Without this a rebuild with
+        --overwrite leaves the previous build's file in place for every session it could not
+        write, and a patient ends up mixing old (differently registered) files with new ones."""
+        case = f"{key[0]}_{key[1]}"
+        path = os.path.join(cfg.out, case, f"{case}_img.h5")
+        if cfg.overwrite and os.path.exists(path):
+            os.remove(path)
+            print(f"     removed stale {path}")
+
     done = 0
     for pid, items in by_patient.items():
         paths = [os.path.join(cfg.out, f"{k[0]}_{k[1]}", f"{k[0]}_{k[1]}_img.h5")
@@ -1045,6 +1492,7 @@ def main():
             except Exception as err:
                 skipped.append((key, str(err)))
                 print(f"  !! {key[0]}/{key[1]}: {err}")
+                drop_stale(key)
         done += len(items)
         if not vols:
             continue
@@ -1056,10 +1504,12 @@ def main():
         offsets = [(0, 0, 0)] * len(vols)
         valid = [np.ones(v.raw.shape[0], dtype=bool) for v in vols]
         ref = 0
+        reg_ok = False       # recorded as reg_applied: True only if the pixels were really moved
         if cfg.register and len(vols) > 1:
             ref = max(range(len(vols)), key=lambda i: (vols[i].raw.shape[0], -i))
             try:
                 offsets, valid = register_patient(vols, cfg, ref=ref)
+                reg_ok = True
             except ValueError as err:
                 print(f"  !! {pid}: registration skipped -- {err}")
                 offsets = [(0, 0, 0)] * len(vols)
@@ -1086,6 +1536,7 @@ def main():
             for key in keys:
                 skipped.append((key, "no slice survived the patient's common range"))
                 print(f"  !! {key[0]}/{key[1]}: no slice survived the patient's common range")
+                drop_stale(key)
             continue
 
         for i, (v, key) in enumerate(zip(vols, keys)):
@@ -1096,7 +1547,11 @@ def main():
                      key, sessions[key], cfg, v.lost, v.native_hw,
                      reg=dict(v.reg or {}, offset=offsets[i],
                               reference=f"{keys[ref][0]}_{keys[ref][1]}",
-                              applied=bool(cfg.register and len(vols) > 1)))
+                              applied=reg_ok))
+            ncc = float((v.reg or {}).get("ncc", float("nan")))
+            if reg_ok and i != ref and ncc == ncc and ncc < cfg.reg_min_ncc:
+                print(f"  ?? {key[0]}/{key[1]}: correlation with the reference after registration "
+                      f"is {ncc:.3f} < --reg-min-ncc {cfg.reg_min_ncc} -- check this study")
             natives[v.native_hw] = natives.get(v.native_hw, 0) + 1
             if cfg.crop and (v.native_hw[0] < cfg.crop or v.native_hw[1] < cfg.crop):
                 padded.append((key, v.native_hw))
@@ -1168,10 +1623,21 @@ def main():
                       f"{statistics.median(cv):.3f}  min {min(cv):.3f}")
                 print(f"  slices are kept only where >= {cfg.reg_min_cover:.0%} of the "
                       f"REFERENCE'S BRAIN is covered")
+        elif cfg.reg_method in ("search", "centroid"):
+            nc = [float((r or {}).get("ncc", float("nan"))) for _, _, r in reg_rows]
+            nc = [c for c in nc if c == c]
+            if nc:
+                low = sum(c < cfg.reg_min_ncc for c in nc)
+                print(f"  masked correlation with the reference after registration: median "
+                      f"{statistics.median(nc):.3f}  min {min(nc):.3f}  "
+                      f"{low}/{len(nc)} below --reg-min-ncc {cfg.reg_min_ncc} (reg_ncc attr)")
+            print("  Offsets are (dz, dh, dw) of the whole-volume shift"
+                  + ("; per-slice in-plane shifts are in each file's `reg_slice_shift`."
+                     if cfg.reg_method == "search" and cfg.reg_slicewise else "."))
         else:
             print("  A large offset is either a real displacement or a correlation failure; "
                   "--reg-max-shift rejects the obvious failures. Rotation is NOT corrected by "
-                  "this method -- use --reg-method affine.")
+                  "this method.")
     if padded:
         print(f"\n{len(padded)} session(s) were smaller than --crop {cfg.crop} and were "
               f"ZERO-PADDED up to it:")
