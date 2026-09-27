@@ -34,6 +34,16 @@ kernel.  With P = 7 the one +-0.0352 end tap per filter is dropped (energy
 orthogonal.  P >= 11 keeps the filters exact; `tests/test_wavelet_lpds.py`
 uses that to check the cascade against `dtcwt` itself.
 
+Other families
+--------------
+`haar_weights` builds the same layout with Haar filters: level 1 is Haar at
+the four parity shifts (cycle-spinning, where dtcwt uses its undecimated
+level 1), levels 2-3 the same Haar split in every tree, and `haar_Q` is the
+identity -- Haar trees are not Hilbert pairs, so there are no oriented complex
+bands to form.  Everything else (shapes, groups, carries, tags) is shared, so
+two families differ only in their filters.  `FAMILIES` maps a name to both
+builders.
+
 Recombination Q
 ---------------
 The oriented complex channels are a fixed unitary across the four trees,
@@ -118,10 +128,68 @@ def dtcwt_weights(P=7, levels=3):
     """
     if P < 7 or P % 2 == 0:
         raise ValueError("P must be odd and >= 7; got %r" % (P,))
+    return _carried_cascade(_level1_taps, _qshift_taps, P, levels)
+
+
+# ---------------------------------------------------------------------------
+#  Haar, in the same 4-tree layout
+# ---------------------------------------------------------------------------
+# Orthonormal Haar analysis pair.  Even length, so it is placed by its first
+# tap rather than centred: the stride-2 cross-correlation out[j] = sum_d g[d]
+# x[2j + d] pairs samples (2j + p, 2j + p + 1) with g on d = p, p + 1.
+HAAR_H0 = np.array([1.0, 1.0]) / np.sqrt(2.0)
+HAAR_H1 = np.array([1.0, -1.0]) / np.sqrt(2.0)
+
+
+def _haar_taps(hi, shift, P):
+    k = np.zeros(P)
+    k[P // 2 + shift:P // 2 + shift + 2] = HAAR_H1 if hi else HAAR_H0
+    return k
+
+
+def _haar_level1_taps(hi, parity, P):
+    """Level 1: tree t is the Haar DWT of the image displaced by its parity --
+    the four cycle-spins, as dtcwt's undecimated level 1 is four polyphase
+    trees."""
+    return _haar_taps(hi, parity, P)
+
+
+def _haar_deep_taps(hi, lineage, P):
+    """Levels >= 2: the same Haar split in every tree.  There is no q-shift
+    partner, so the lineage does not change the filter."""
+    return _haar_taps(hi, 0, P)
+
+
+def haar_weights(P=7, levels=3):
+    """`dtcwt_weights` with Haar filters: same shapes, groups, carries and
+    `tags`, so a Haar net differs from the DT-CWT one only in its filters.
+
+    Each tree is an exact orthonormal Haar DWT of its shifted image (interior
+    -- the convs zero-pad), so at init K^H K = 4 I there.  Exact at any P >= 5;
+    no truncation.
+    """
+    if P < 5 or P % 2 == 0:
+        raise ValueError("P must be odd and >= 5; got %r" % (P,))
+    return _carried_cascade(_haar_level1_taps, _haar_deep_taps, P, levels)
+
+
+def haar_Q(tags):
+    """Identity per channel.  Haar trees are not Hilbert pairs, so there are
+    no oriented complex bands to form and the trees are kept as they are."""
+    return torch.eye(NTREES, dtype=torch.complex64).expand(
+        len(tags), NTREES, NTREES).contiguous()
+
+
+def _carried_cascade(level1_taps, deep_taps, P, levels):
+    """The 4-tree carried cascade, for any separable filter family.
+
+    `level1_taps(hi, parity, P)` and `deep_taps(hi, lineage, P)` return the 1D
+    length-P cross-correlation taps along one axis.
+    """
     W1 = np.zeros((4 * NTREES, 1, P, P))
     for t in range(NTREES):
         for b in range(4):
-            W1[4 * t + b, 0] = _band(_level1_taps, t, b, P)
+            W1[4 * t + b, 0] = _band(level1_taps, t, b, P)
     weights, tags = [W1], [(1, b) for b in range(4)]
 
     for level in range(2, levels + 1):
@@ -130,7 +198,7 @@ def dtcwt_weights(P=7, levels=3):
         for t in range(NTREES):
             o = t * 4 * n
             for b in range(4):                               # split LL
-                W[o + b, 0] = _band(_qshift_taps, t, b, P)
+                W[o + b, 0] = _band(deep_taps, t, b, P)
             for c in range(1, n):                            # carry the rest
                 for p in range(4):
                     W[o + 4 * c + p, c, P // 2 + p // 2, P // 2 + p % 2] = 1.0
@@ -166,3 +234,10 @@ def dtcwt_Q(tags):
             label = 2 * (pH ^ hH) + (pW ^ hW)
             Q[c, :, t] = _Q0[:, label]
     return torch.from_numpy(Q)
+
+
+# name -> (weights builder, Q builder); `WaveletLPDSNet(family=...)` reads this
+FAMILIES = {
+    "dtcwt": (dtcwt_weights, dtcwt_Q),
+    "haar": (haar_weights, haar_Q),
+}

@@ -25,8 +25,41 @@ Carries (`carry=`)
 Channels 16 -> 64 -> 256 (M = 16): one 2D DT-CWT, LeGall 5/3 at level 1 and
 `qshift_06` (end taps truncated to fit P = 7) at levels 2-3.
 
+Where the redundancy goes (`dual_step`)
+---------------------------------------
+The frame is redundant -- ||K||^2 = 4 for four orthonormal trees -- and
+Condat-Vu needs that factor somewhere.  `"absorbed"` (the original) rescales
+level 1 so ||K|| = 1, which leaves level 1 at 0.2-0.5 and the deep LL-split
+rows at 1: under the per-slice unit-ball `project_`, gain can then only enter
+through level 1, and Haar's deep rows sit on the ball from the first step.
+`"learned"` keeps every filter at its wavelet normalisation and carries the
+factor in an explicit, learnable dual step (a Polynomial, like tau):
+
+    z <- clip_{c lam}(z + sigma_d K xb),   sigma_d = c^2,   c = 1/||K||
+
+which is the absorbed iteration exactly, reparametrised (z scaled by c).  The
+bound is tau (1/2 + sigma_d ||K||^2) <= 1.  With learned thresholds the two
+are equally expressive; they differ in which parameters absorb gain under the
+projection.
+
+Several families
+----------------
+`family=["dtcwt", "haar"]` stacks the two transforms as a union of frames,
+K = [K_dtcwt; K_haar] with 4 trees each (32/128/512).  Q is block-diagonal, so
+each family forms its own bands; one dual and one clip cover all 512
+channels.  At init every family is normalised to ||K_f|| = 1
+(`normalize_families`) before the global ||K|| = 1, so neither dominates by
+its raw filter scale.
+
 Init
 ----
+* `band_norm="equal"` rescales each band where it is born so that every deep
+  channel has the same noise gain `||K^H e_m||` (`equalize_bands`), before
+  the ||K|| = 1 normalisation.  The DT-CWT's level-1 LeGall pair has unit DC
+  gain and a small highpass while levels 2-3 are q-shift (near-orthonormal),
+  which otherwise leaves the noise std differing ~2.3x between bands under one
+  shared lam0.  Haar is orthonormal and already equal.  Default "none" keeps
+  wlpds16 as trained.
 * `B_l = A_l^H`, so layer 0..K-1 all start as the same classical Condat-Vu
   step.  Training unties them (the biorthogonal pair is a later option).
 * ||K|| = 1 by power iteration, one scalar on level 1, so tau0 = 0.5 sits
@@ -49,12 +82,24 @@ from models.lista import gram
 from models.lpds import LPDSStack
 from models.ml_cdlnet import _MLIO
 from models.prox import Polynomial, build_prox
-from models.wavelets import NTREES, dtcwt_Q, dtcwt_weights
+from models.wavelets import FAMILIES, NTREES
 from operators.identity import Identity
 from operators.projections import proj_dims, uball_project
 from solvers.eigen import power_method
 
 CARRY_MODES = ("unshuffle", "conv")
+
+
+def _as_families(family):
+    """`family` as a tuple of FAMILIES names: one name, or a list of them."""
+    fams = (family,) if isinstance(family, str) else tuple(family)
+    bad = [f for f in fams if f not in FAMILIES]
+    if not fams or bad or len(set(fams)) != len(fams):
+        raise ValueError("family must be one of %r, or a list of distinct ones; "
+                         "got %r" % (tuple(FAMILIES), family))
+    return fams
+BAND_NORMS = ("none", "equal")
+DUAL_STEPS = ("absorbed", "learned")
 
 
 # -- K and K^H on an interleaved real layout -----------------------------------
@@ -100,7 +145,7 @@ def _cblock(wr, wi, transpose=False):
 
 
 def _real_Q(Q):
-    """(n, 4, 4) complex -> (n, 4, 2, 4, 2) real, [out part][in part] blocks."""
+    """(n, T, T) complex -> (n, T, 2, T, 2) real, [out part][in part] blocks."""
     r, m = Q.real, Q.imag
     return torch.stack([torch.stack([r, -m], -1), torch.stack([m, r], -1)], 2)
 
@@ -126,23 +171,25 @@ def _shuffle(x):
 def _analyse(x, ws, Qr, carry):
     """`K x`: complex (B, 1, H, W) -> complex (B, M, H/8, W/8).
 
-    `ws[l] = (wr, wi)` are level l's analysis weights, `Qr = _real_Q(Q)`.
+    `ws[l] = (wr, wi)` are level l's analysis weights, `Qr = _real_Q(Q)`.  The
+    number of trees T (4 per family) is read off `Qr`, a static shape.
     """
+    T = Qr.shape[1]
     x = _to_ri(x)
     for l, (wr, wi) in enumerate(ws):
         w, p = _cblock(wr, wi), wr.shape[-1] // 2
         if l == 0 or carry == "conv":
-            x = F.conv2d(x, w, stride=2, padding=p, groups=1 if l == 0 else NTREES)
+            x = F.conv2d(x, w, stride=2, padding=p, groups=1 if l == 0 else T)
             continue
         B, _, H, W = x.shape
-        x = x.view(B, NTREES, -1, 2, H, W)
-        ll = F.conv2d(x[:, :, 0].reshape(B, 2 * NTREES, H, W), w,
-                      stride=2, padding=p, groups=NTREES)
-        x = torch.cat([ll.view(B, NTREES, 4, 2, H // 2, W // 2),
+        x = x.view(B, T, -1, 2, H, W)
+        ll = F.conv2d(x[:, :, 0].reshape(B, 2 * T, H, W), w,
+                      stride=2, padding=p, groups=T)
+        x = torch.cat([ll.view(B, T, 4, 2, H // 2, W // 2),
                        _unshuffle(x[:, :, 1:])], 2)
         x = x.view(B, -1, H // 2, W // 2)
     B, _, h, w = x.shape
-    x = x.view(B, NTREES, Qr.shape[0], 2, h, w)
+    x = x.view(B, T, Qr.shape[0], 2, h, w)
     z = torch.einsum("cipja,njcahw->pnichw", Qr, x)
     return torch.complex(z[0], z[1]).reshape(B, -1, h, w)
 
@@ -152,22 +199,23 @@ def _adjoint(z, ws, QHr, carry):
 
     `ws[l] = (wr, wi)` are level l's synthesis weights, `QHr = _real_Q(Q^H)`.
     """
+    T = QHr.shape[1]
     B, _, h, w = z.shape
-    z = torch.stack([z.real, z.imag]).view(2, B, NTREES, QHr.shape[0], h, w)
+    z = torch.stack([z.real, z.imag]).view(2, B, T, QHr.shape[0], h, w)
     z = torch.einsum("cjpia,anichw->njcphw", QHr, z).reshape(B, -1, h, w)
     for l in reversed(range(len(ws))):
         wr, wi = ws[l]
         wt, p = _cblock(wr, wi, transpose=True), wr.shape[-1] // 2
-        g = 1 if l == 0 else NTREES
+        g = 1 if l == 0 else T
         if l == 0 or carry == "conv":
             z = F.conv_transpose2d(z, wt, stride=2, padding=p, output_padding=1,
                                    groups=g)
             continue
         B, _, h, w = z.shape
-        z = z.view(B, NTREES, -1, 2, h, w)
-        ll = F.conv_transpose2d(z[:, :, :4].reshape(B, 8 * NTREES, h, w), wt,
+        z = z.view(B, T, -1, 2, h, w)
+        ll = F.conv_transpose2d(z[:, :, :4].reshape(B, 8 * T, h, w), wt,
                                 stride=2, padding=p, output_padding=1, groups=g)
-        z = torch.cat([ll.view(B, NTREES, 1, 2, 2 * h, 2 * w),
+        z = torch.cat([ll.view(B, T, 1, 2, 2 * h, 2 * w),
                        _shuffle(z[:, :, 4:])], 2)
         z = z.view(B, -1, 2 * h, 2 * w)
     return _from_ri(z)
@@ -181,22 +229,44 @@ class WaveletLPDSLayer(nn.Module):
     """
 
     def __init__(self, P=7, lam0=1e-3, tau0=5e-1, theta0=0.0, degrees=0,
-                 proj_mode="slice", spectral_init=True, carry="unshuffle"):
+                 proj_mode="slice", spectral_init=True, carry="unshuffle",
+                 family="dtcwt", band_norm="none", dual_step="absorbed"):
         super().__init__()
+        if dual_step not in DUAL_STEPS:
+            raise ValueError("dual_step must be one of %r; got %r"
+                             % (DUAL_STEPS, dual_step))
+        if band_norm not in BAND_NORMS:
+            raise ValueError("band_norm must be one of %r; got %r"
+                             % (BAND_NORMS, band_norm))
         if carry not in CARRY_MODES:
             raise ValueError("carry must be one of %r; got %r" % (CARRY_MODES, carry))
-        self.carry = carry
-        weights, tags = dtcwt_weights(P, levels=3)
+        self.families = _as_families(family)
+        self.carry, self.band_norm, self.dual_step = carry, band_norm, dual_step
+        self.family = "+".join(self.families)
+        self.T = NTREES * len(self.families)           # trees, 4 per family
+
+        # Every family builds the same carried layout (same tags), so several
+        # stack family-major: trees 0-3 are the first family, 4-7 the second.
+        # Level 1 concatenates rows; deeper levels concatenate conv groups.
+        built = [FAMILIES[f][0](P, levels=3) for f in self.families]
+        tags = built[0][1]
+        if any(t != tags for _, t in built):
+            raise ValueError("families disagree on the band layout")
         self.proj_dims = proj_dims(proj_mode)
 
         self.analysis, self.synthesis = nn.ModuleList(), nn.ModuleList()
-        for l, w in enumerate(weights):
-            if l > 0 and carry == "unshuffle":
-                # keep rows 0-3 (the LL split) of each tree, reading LL only
-                w = w.view(NTREES, -1, *w.shape[1:])[:, :4, :1].reshape(
-                    4 * NTREES, 1, P, P)
+        for l in range(len(built[0][0])):
+            parts = []
+            for weights, _ in built:
+                w = weights[l]
+                if l > 0 and carry == "unshuffle":
+                    # keep rows 0-3 (the LL split) of each tree, reading LL only
+                    w = w.view(NTREES, -1, *w.shape[1:])[:, :4, :1].reshape(
+                        4 * NTREES, 1, P, P)
+                parts.append(w)
+            w = torch.cat(parts, 0)
             cout, cin_g = w.shape[:2]
-            g = 1 if l == 0 else NTREES
+            g = 1 if l == 0 else self.T
             a = Conv2d(cin_g * g, cout, P, stride=2, groups=g)
             b = ConvTranspose2d(cout, cin_g * g, P, stride=2, groups=g)
             set_weight(a, w)
@@ -204,7 +274,9 @@ class WaveletLPDSLayer(nn.Module):
             self.analysis.append(a)
             self.synthesis.append(b)
 
-        Q = dtcwt_Q(tags)                                   # (64, 4, 4)
+        # block-diagonal: each family mixes only its own four trees
+        Q = torch.stack([torch.block_diag(*qs) for qs in zip(
+            *[FAMILIES[f][1](tags) for f in self.families])])   # (64, T, T)
         self.register_buffer("Q", Q)
         self.register_buffer("QH", Q.conj().transpose(1, 2).resolve_conj().contiguous())
         # real forms for `_analyse` / `_adjoint`; derived, so kept out of the
@@ -214,7 +286,8 @@ class WaveletLPDSLayer(nn.Module):
         # swapped for one shared torch.compile'd pair by the net
         self._analyse_fn, self._adjoint_fn = _analyse, _adjoint
         self.Cg = len(tags)
-        self.M = NTREES * self.Cg
+        self.M = self.T * self.Cg
+        self.tags = tags
 
         self.prox = build_prox(self.M, dual=True, tau0=lam0, degrees=degrees)
         with torch.no_grad():                               # LL^3: no penalty
@@ -223,12 +296,33 @@ class WaveletLPDSLayer(nn.Module):
         self.tau = Polynomial(1, degrees=degrees, tau0=tau0)
         self.theta = Polynomial(1, degrees=degrees, tau0=theta0)
 
-        if spectral_init:
+        if spectral_init and len(self.families) > 1:
+            self.normalize_families()
+        if band_norm == "equal":
+            self.equalize_bands()
+
+        # Where the frame's redundancy goes (see the module docstring).
+        #   absorbed  level 1 is rescaled so ||K|| = 1 (the original init)
+        #   learned   the filters stay at their wavelet normalisation and the
+        #             Condat-Vu dual step sigma_d = 1/||K||^2 carries it, with
+        #             the thresholds scaled by 1/||K|| -- the same algorithm at
+        #             init, exactly (see `test_dual_step`)
+        self.sigma_d = None
+        if dual_step == "learned":
+            n2 = float(self.op_norm2()) if spectral_init else 1.0
+            self.sigma_d = Polynomial(1, degrees=degrees, tau0=1.0 / n2)
+            with torch.no_grad():
+                self.prox.prox.tau.weight.mul_(n2 ** -0.5)
+        elif spectral_init:
             self.normalize()
 
     @property
     def ll_channels(self):
-        return [t * self.Cg for t in range(NTREES)]
+        return [t * self.Cg for t in range(self.T)]
+
+    def _family_of(self, m):
+        """Index into `self.families` of deep channel m."""
+        return (m // self.Cg) // NTREES
 
     # -- K and K^H -----------------------------------------------------------
     # The Conv2d / ConvTranspose2d modules only hold the (real, imag) weights;
@@ -250,7 +344,8 @@ class WaveletLPDSLayer(nn.Module):
         if cache is None:
             cache = {}
         if state is None:                                   # cold start
-            z, cache = self.prox(self.analyse(y_tilde), sigma, cache)
+            z, cache = self.prox(self._dual_scale(self.analyse(y_tilde), sigma, y_tilde),
+                                 sigma, cache)
             return (y_tilde, z), cache
 
         x, z = state
@@ -258,8 +353,15 @@ class WaveletLPDSLayer(nn.Module):
         theta = self.theta(sigma, ref=x)
         x_new = x - tau * (gram(E, x) - y_tilde + self.adjoint(z))
         x_bar = x_new + theta * (x_new - x)
-        z, cache = self.prox(z + self.analyse(x_bar), sigma, cache)
+        z, cache = self.prox(z + self._dual_scale(self.analyse(x_bar), sigma, x),
+                             sigma, cache)
         return (x_new, z), cache
+
+    def _dual_scale(self, Kx, sigma, ref):
+        """`sigma_d K x` under dual_step="learned", `K x` otherwise."""
+        if self.sigma_d is None:
+            return Kx
+        return self.sigma_d(sigma, ref=ref) * Kx
 
     # -- constraints ---------------------------------------------------------
     @torch.no_grad()
@@ -270,19 +372,103 @@ class WaveletLPDSLayer(nn.Module):
             set_weight(conv, uball_project(conv.weight, dim=self.proj_dims))
         self.tau.project_(lo=0.0)
         self.theta.project_(lo=0.0, hi=1.0)
+        if self.sigma_d is not None:
+            self.sigma_d.project_(lo=0.0)
 
     # -- normalisation -------------------------------------------------------
     @torch.no_grad()
-    def op_norm2(self, size=64, num_iter=100):
-        """`||K||^2` by power iteration on `K^H K` (exact while B = A^H)."""
+    def op_norm2(self, size=64, num_iter=100, family=None):
+        """`||K||^2` by power iteration on `K^H K` (exact while B = A^H).
+
+        `family` (an index into `self.families`) restricts to that family's
+        channels: `||K_f||^2 = ||K^H P_f K||`, P_f the channel selector.
+        """
         w = self.analysis[0].weight
         x0 = torch.rand(1, 1, size, size, dtype=w.dtype, device=w.device)
-        return abs(power_method(lambda x: self.adjoint(self.analyse(x)), x0,
-                                num_iter=num_iter, verbose=False)[0])
+        if family is None:
+            op = lambda x: self.adjoint(self.analyse(x))      # noqa: E731
+        else:
+            keep = torch.zeros(1, self.M, 1, 1, dtype=w.dtype, device=w.device)
+            keep[:, [m for m in range(self.M) if self._family_of(m) == family]] = 1
+            op = lambda x: self.adjoint(keep * self.analyse(x))   # noqa: E731
+        return abs(power_method(op, x0, num_iter=num_iter, verbose=False)[0])
 
     def step_bound(self, **kws):
-        """Condat-Vu's largest primal step `1 / (1/2 + ||K||^2)`, ||E|| <= 1."""
-        return 1.0 / (0.5 + self.op_norm2(**kws))
+        """Condat-Vu's largest primal step `1 / (1/2 + sigma_d ||K||^2)`,
+        ||E|| <= 1 (sigma_d = 1 under dual_step="absorbed"; its sigma-free
+        coefficient otherwise)."""
+        sd = 1.0 if self.sigma_d is None else float(self.sigma_d.weight[0, 0])
+        return 1.0 / (0.5 + sd * self.op_norm2(**kws))
+
+    @torch.no_grad()
+    def band_norms(self, size=16):
+        """`||K^H e_m||` per deep channel: the std, in channel m, of unit white
+        noise on the image (exact while B = A^H).  One delta per channel,
+        adjointed; `size` is the dual grid, and 16 (128 px) holds the widest
+        effective filter (~43 px at P = 7) with room to spare."""
+        w = self.analysis[0].weight
+        out = []
+        for lo in range(0, self.M, 32):
+            m = torch.arange(lo, min(lo + 32, self.M), device=w.device)
+            z = torch.zeros(len(m), self.M, size, size, dtype=w.dtype, device=w.device)
+            z[torch.arange(len(m)), m, size // 2, size // 2] = 1
+            out.append(self.adjoint(z).flatten(1).norm(dim=1))
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def equalize_bands(self):
+        """Give every deep channel the same noise gain.
+
+        A band is scaled on the level it is BORN on -- its LL-split row in
+        T_l, in every tree -- and the fixed carries and the unitary Q pass the
+        scale through unchanged.  The LL rows of levels 1..L-1 are not
+        touched: they feed every deeper band, and those are scaled on their
+        own rows.  The four trees of a band share one norm (Q mixes within a
+        band), so scaling them together keeps Q's action.  `normalize` then
+        restores ||K|| = 1.  A no-op on an orthonormal family (Haar).
+
+        Equalised DOWN, to the weakest band.  The common target is otherwise
+        free -- `normalize` only rescales level 1, so the target just moves
+        scale between the level-1 LL row and the deep birth rows -- and going
+        down only ever shrinks the deep rows, which keeps every filter slice
+        inside the unit ball `project_` enforces.  Equalising up to the mean
+        put DT-CWT's level-3 slices at ~1.9, and the first `project_` would
+        have clipped them and undone half of it.
+        """
+        nrm = self.band_norms()
+        per_tag = {}
+        for m in range(self.M):
+            key = (self._family_of(m),) + tuple(self.tags[m % self.Cg])
+            per_tag.setdefault(key, []).append(float(nrm[m]))
+        target = min(sum(v) / len(v) for v in per_tag.values())
+        for (fam, level, band), v in per_tag.items():
+            f = target * len(v) / sum(v)
+            trees = range(fam * NTREES, (fam + 1) * NTREES)
+            for conv in (self.analysis[level - 1], self.synthesis[level - 1]):
+                w = conv.weight.clone()
+                per_tree = w.shape[0] // self.T
+                w[[t * per_tree + band for t in trees]] *= f
+                set_weight(conv, w)
+
+    @torch.no_grad()
+    def normalize_families(self, **kws):
+        """Give every family the same `||K_f||` (on its level-1 rows), so
+        that no family outweighs another just because of its filters' raw
+        scale -- DT-CWT's unit-DC-gain LeGall and orthonormal Haar differ by
+        ~2x there.
+
+        Equalised DOWN, to the weakest family, like `equalize_bands`: only
+        shrinking keeps every slice inside the unit ball.  Under
+        dual_step="absorbed" the global `normalize` rescales level 1 after
+        this anyway, so the target makes no difference there."""
+        rows = self.analysis[0].weight.shape[0] // len(self.families)
+        g = [float(self.op_norm2(family=f, **kws)) ** 0.5
+             for f in range(len(self.families))]
+        for f, gf in enumerate(g):
+            for conv in (self.analysis[0], self.synthesis[0]):
+                w = conv.weight.clone()
+                w[f * rows:(f + 1) * rows] *= min(g) / gf
+                set_weight(conv, w)
 
     @torch.no_grad()
     def normalize(self, **kws):
@@ -296,7 +482,11 @@ class WaveletLPDSNet(_MLIO):
     """`preprocess -> K Wavelet-LPDS layers -> postprocess`.
 
     Same interface as `MLLPDSNet`: `forward(y, E, sigma, state)` returns
-    `(x_hat, (x, z))`.  Only the single DT-CWT baseline (M = 16, L = 3, s = 2,
+    `(x_hat, (x, z))`.  `family` picks the filters ("dtcwt", "haar"; see
+    `models/wavelets.py::FAMILIES`) in one shared 4-tree layout, or a LIST of
+    them for a union of frames: ["dtcwt", "haar"] is 8 trees, 32/128/512
+    channels, one dual over both (M = 16 per family).  Only that layout
+    (L = 3, s = 2,
     one complex image channel) is implemented; the arguments are kept so the
     config states the shape it trains.
     """
@@ -304,13 +494,16 @@ class WaveletLPDSNet(_MLIO):
     def __init__(self, K=30, M=16, L=3, C=1, P=7, s=2, lam0=1e-3, tau0=5e-1,
                  theta0=0.0, degrees=0, is_complex=True, preproc="kspace",
                  proj_mode="slice", spectral_init=True, carry="unshuffle",
+                 family="dtcwt", band_norm="none", dual_step="absorbed",
                  compile_operator=False):
         super().__init__()
-        if (M, L, C, s, is_complex) != (16, 3, 1, 2, True):
+        n_fam = len(_as_families(family))
+        if (M, L, C, s, is_complex) != (16 * n_fam, 3, 1, 2, True):
             raise ValueError(
-                "WaveletLPDSNet implements the single DT-CWT only: M=16, L=3, "
-                "C=1, s=2, is_complex=True; got M=%r L=%r C=%r s=%r "
-                "is_complex=%r" % (M, L, C, s, is_complex))
+                "WaveletLPDSNet implements the 4-tree layout only: M=16 per "
+                "family (%d here), L=3, C=1, s=2, is_complex=True; got M=%r "
+                "L=%r C=%r s=%r is_complex=%r"
+                % (16 * n_fam, M, L, C, s, is_complex))
         if preproc not in ("image", "kspace", "identity"):
             raise ValueError("preproc must be 'image', 'kspace' or 'identity'; "
                              "got %r" % (preproc,))
@@ -320,8 +513,10 @@ class WaveletLPDSNet(_MLIO):
 
         self.net = LPDSStack(self.K, lambda: WaveletLPDSLayer(
             P=P, lam0=lam0, tau0=tau0, theta0=theta0, degrees=degrees,
-            proj_mode=proj_mode, spectral_init=spectral_init, carry=carry))
-        self.carry = carry
+            proj_mode=proj_mode, spectral_init=spectral_init, carry=carry,
+            family=family, band_norm=band_norm, dual_step=dual_step))
+        self.carry, self.band_norm, self.dual_step = carry, band_norm, dual_step
+        self.family = "+".join(_as_families(family))
         if compile_operator:
             self.compile_operator()
 
@@ -355,5 +550,7 @@ class WaveletLPDSNet(_MLIO):
         return self.layer(k).step_bound(**kws)
 
     def extra_repr(self):
-        return "K=%d, channels=16/64/256, P=%d, preproc=%r, carry=%r" % (
-            self.K, self.P, self.preproc, self.carry)
+        return ("K=%d, family=%r, band_norm=%r, dual_step=%r, channels=%d/%d/%d, "
+                "P=%d, preproc=%r, carry=%r" % (
+                    self.K, self.family, self.band_norm, self.dual_step, self.M,
+                    4 * self.M, 16 * self.M, self.P, self.preproc, self.carry))

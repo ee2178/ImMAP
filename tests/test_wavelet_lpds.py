@@ -185,6 +185,208 @@ def test_adjoint_complex_weights():
               err < 1e-10, f"rel err {err:.1e}")
 
 
+def test_haar():
+    """Each tree is an exact orthonormal Haar DWT of its cycle-spun image."""
+    from models.wavelets import haar_weights
+    hw, htags = haar_weights(7)
+    dw, dtags = dtcwt_weights(7)
+    check("haar: same shapes and tags as dtcwt",
+          [w.shape for w in hw] == [w.shape for w in dw] and htags == dtags)
+
+    N = 64
+    x = torch.zeros(1, 1, N, N, dtype=torch.complex128)
+    x[..., 8:-8, 8:-8] = torch.randn(1, 1, N - 16, N - 16, dtype=torch.complex128)
+    for carry in ("unshuffle", "conv"):
+        lay = WaveletLPDSLayer(P=7, spectral_init=False, carry=carry, family="haar").double()
+        z = lay.analyse(x)                                  # Q = I: tree t at t * Cg
+        Cg = lay.Cg
+        ll = z[:, [t * Cg for t in range(4)]]
+        ref = F.avg_pool2d(x.real, 8) * 8 + 1j * F.avg_pool2d(x.imag, 8) * 8
+        e_ll = (ll[:, 0:1] - ref).abs().max().item()
+        e_gram = (lay.adjoint(z) - 4 * x).abs().max().item()
+        check(f"haar ({carry}): LL^3 of tree 0 = 8x8 block sum / 8", e_ll < 1e-10, f"{e_ll:.1e}")
+        check(f"haar ({carry}): K^H K = 4 I (interior image, 4 orthonormal trees)",
+              e_gram < 1e-10, f"{e_gram:.1e}")
+
+    # tree (1, 1) reads pairs (2j+1, 2j+2): tree (0, 0) of the image moved up-left
+    xs = torch.roll(x, shifts=(-1, -1), dims=(-2, -1))
+    z0, zs = lay.analyse(x), lay.analyse(xs)
+    e_sh = (z0[:, 3 * Cg:4 * Cg] - zs[:, 0:Cg]).abs().max().item()
+    check("haar: tree (1,1) = tree (0,0) of the shifted image", e_sh < 1e-10, f"{e_sh:.1e}")
+
+    # level-3 details of tree 0 are the Haar differences of LL^2 (4x4 sums / 4)
+    ll2 = (F.avg_pool2d(x.real, 4) + 1j * F.avg_pool2d(x.imag, 4)) * 4
+    a, b = ll2[..., 0::2, 0::2], ll2[..., 0::2, 1::2]
+    c, d = ll2[..., 1::2, 0::2], ll2[..., 1::2, 1::2]
+    ref = {1: (a - b + c - d) / 2, 2: (a + b - c - d) / 2, 3: (a - b - c + d) / 2}
+    e_d = max((z0[:, htags.index((3, band))] - ref[band][:, 0]).abs().max().item()
+              for band in (1, 2, 3))
+    check("haar: level-3 bands = Haar differences of LL^2 (B1 lo-H/hi-W, B2, B3)",
+          e_d < 1e-10, f"{e_d:.1e}")
+
+    lay = WaveletLPDSLayer(P=7, lam0=1e-3, tau0=0.5, degrees=1, family="haar")
+    n2 = lay.op_norm2()
+    check("haar: ||K|| = 1 after normalize", abs(n2 - 1) < 1e-3, f"||K||^2 = {n2:.5f}")
+    before = [c.weight.clone() for c in list(lay.analysis) + list(lay.synthesis)]
+    lay.project_()
+    check("haar: project() is a no-op at init",
+          all(torch.allclose(b_, c.weight, atol=1e-6) for b_, c in
+              zip(before, list(lay.analysis) + list(lay.synthesis))))
+    try:
+        WaveletLPDSLayer(family="db4")
+        check("unknown family is refused", False)
+    except ValueError:
+        check("unknown family is refused", True)
+
+
+def test_band_norm():
+    """`band_norm="equal"`: one noise gain for every deep channel, ||K|| = 1,
+    and still inside the unit ball, so `project_` cannot undo it."""
+    base = WaveletLPDSLayer(P=7, family="dtcwt")
+    nb = base.band_norms()
+    check("band_norm='none' (default) keeps the DT-CWT spread",
+          float(nb.max() / nb.min()) > 2.0, f"spread {float(nb.max() / nb.min()):.2f}")
+    for carry in ("unshuffle", "conv"):
+        lay = WaveletLPDSLayer(P=7, family="dtcwt", carry=carry, band_norm="equal")
+        nb = lay.band_norms()
+        spread = float(nb.max() / nb.min())
+        check(f"equal ({carry}): every deep channel has one noise gain",
+              spread < 1.001, f"spread {spread:.4f}")
+        n2 = lay.op_norm2()
+        check(f"equal ({carry}): ||K|| = 1", abs(n2 - 1) < 1e-2, f"||K||^2 = {n2:.4f}")
+        convs = list(lay.analysis) + list(lay.synthesis)
+        before = [c.weight.clone() for c in convs]
+        lay.project_()
+        check(f"equal ({carry}): project() is a no-op at init (slices <= 1)",
+              all(torch.allclose(b_, c.weight, atol=1e-5) for b_, c in zip(before, convs)))
+        x = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+        z = torch.randn(1, 256, 4, 4, dtype=torch.complex64)
+        lhs, rhs = (lay.analyse(x).conj() * z).sum(), (x.conj() * lay.adjoint(z)).sum()
+        check(f"equal ({carry}): B = A^H still holds",
+              abs(lhs - rhs).item() < 1e-4 * abs(lhs).item())
+    a = WaveletLPDSLayer(P=7, family="haar", band_norm="none")
+    b = WaveletLPDSLayer(P=7, family="haar", band_norm="equal")
+    check("equal is a no-op on Haar (already orthonormal)",
+          all(torch.allclose(x.weight, y.weight, atol=1e-6)
+              for x, y in zip(a.analysis, b.analysis)))
+
+
+def test_union():
+    """family=["dtcwt", "haar"]: the two transforms stacked, 32/128/512."""
+    x = torch.randn(2, 1, 32, 32, dtype=torch.complex128)
+    z = torch.randn(2, 512, 4, 4, dtype=torch.complex128)
+    for carry in ("unshuffle", "conv"):
+        u = WaveletLPDSLayer(P=7, spectral_init=False, carry=carry,
+                             family=["dtcwt", "haar"]).double()
+        d = WaveletLPDSLayer(P=7, spectral_init=False, carry=carry, family="dtcwt").double()
+        h = WaveletLPDSLayer(P=7, spectral_init=False, carry=carry, family="haar").double()
+        if carry == "unshuffle":
+            check("union: level-1 conv is 1 -> 32, 8 trees after",
+                  tuple(u.analysis[0].weight.shape[:2]) == (32, 1)
+                  and [a.groups for a in u.analysis] == [1, 8, 8])
+        ku = u.analyse(x)
+        e = max((ku[:, :256] - d.analyse(x)).abs().max().item(),
+                (ku[:, 256:] - h.analyse(x)).abs().max().item())
+        check(f"union ({carry}): K = [K_dtcwt; K_haar] exactly", e < 1e-12, f"{e:.1e}")
+        e = (u.adjoint(z) - d.adjoint(z[:, :256]) - h.adjoint(z[:, 256:])).abs().max().item()
+        check(f"union ({carry}): K^H = K_dtcwt^H + K_haar^H", e < 1e-12, f"{e:.1e}")
+
+    u = WaveletLPDSLayer(P=7, family=["dtcwt", "haar"])
+    nf = [u.op_norm2(family=f) for f in (0, 1)]
+    check("union: the two families carry equal weight (||K_f|| equal)",
+          abs(nf[0] / nf[1] - 1) < 2e-2, ", ".join(f"{v:.4f}" for v in nf))
+    n2 = u.op_norm2()
+    check("union: ||K|| = 1", abs(n2 - 1) < 1e-2, f"||K||^2 = {n2:.4f}")
+    check("union: 8 unpenalised LL^3 channels, one per tree",
+          u.ll_channels == [t * 64 for t in range(8)]
+          and bool((u.prox.prox.tau.weight[:, u.ll_channels] == 0).all()))
+    convs = list(u.analysis) + list(u.synthesis)
+    before = [c.weight.clone() for c in convs]
+    u.project_()
+    check("union: project() is a no-op at init",
+          all(torch.allclose(b_, c.weight, atol=1e-5) for b_, c in zip(before, convs)))
+
+    ue = WaveletLPDSLayer(P=7, family=["dtcwt", "haar"], band_norm="equal")
+    nb = ue.band_norms()
+    check("union + band_norm='equal': one noise gain over all 512 channels",
+          float(nb.max() / nb.min()) < 1.001, f"spread {float(nb.max() / nb.min()):.4f}")
+    convs = list(ue.analysis) + list(ue.synthesis)
+    before = [c.weight.clone() for c in convs]
+    ue.project_()
+    check("union + equal: project() is a no-op at init",
+          all(torch.allclose(b_, c.weight, atol=1e-5) for b_, c in zip(before, convs)))
+
+    net = build_model({"model": {"type": "WaveletLPDSNet", "params": dict(
+        K=3, M=32, P=7, s=2, degrees=1, preproc="identity", family=["dtcwt", "haar"])}})
+    y = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+    x_hat, (_, zz) = net(y, sigma=torch.full((1, 1, 1, 1), 0.05))
+    check("union net: dual is 512 channels on the depth-3 grid",
+          tuple(zz.shape) == (1, 512, 4, 4) and x_hat.shape == y.shape)
+    try:
+        WaveletLPDSNet(K=2, M=16, family=["dtcwt", "haar"])
+        check("union net: M must be 16 per family", False)
+    except ValueError:
+        check("union net: M must be 16 per family", True)
+    for bad in (["dtcwt", "dtcwt"], [], ["dtcwt", "db4"]):
+        try:
+            WaveletLPDSLayer(family=bad)
+            check(f"family={bad!r} is refused", False)
+        except ValueError:
+            check(f"family={bad!r} is refused", True)
+
+
+def test_dual_step():
+    """dual_step="learned": filters at wavelet normalisation, the redundancy in
+    sigma_d -- and the SAME algorithm as "absorbed" at init, exactly."""
+    y = torch.randn(2, 1, 32, 32, dtype=torch.complex64)
+    sig = torch.full((2, 1, 1, 1), 0.015)
+    cases = [("dtcwt", dict(M=16)), ("haar", dict(M=16, family="haar")),
+             ("dtcwt+eq", dict(M=16, band_norm="equal")),
+             ("dtcwt+haar", dict(M=32, family=["dtcwt", "haar"]))]
+    # lam0 large enough that the dual path does real work (at the config's
+    # 1e-3 the net moves y by ~0.1% and any error hides under that), and the
+    # error is measured against how far the net moves y.
+    def moved(net):
+        with torch.no_grad():
+            return net(y, sigma=sig)[0] - y
+    for name, kw in cases:
+        a = WaveletLPDSNet(K=6, degrees=1, lam0=0.3, preproc="identity", **kw)
+        b = WaveletLPDSNet(K=6, degrees=1, lam0=0.3, preproc="identity",
+                           dual_step="learned", **kw)
+        da, db = moved(a), moved(b)
+        err = ((da - db).norm() / da.norm()).item()
+        check(f"learned == absorbed at init, whole net ({name})", err < 1e-3,
+              f"rel err {err:.1e} of a {(da.norm() / y.norm()).item():.0%} move")
+        if name == "dtcwt":                    # the check must be able to fail
+            with torch.no_grad():              # undo the threshold rescale
+                for lay in b.net.layers:
+                    lay.prox.prox.tau.weight.mul_(float(lay.sigma_d.weight[0, 0]) ** -0.5)
+            bad = ((da - moved(b)).norm() / da.norm()).item()
+            check("... and it catches unscaled thresholds", bad > 1e-2, f"rel err {bad:.1e}")
+
+        lay = b.layer(0)
+        convs = list(lay.analysis) + list(lay.synthesis)
+        before = [c.weight.clone() for c in convs]
+        lay.project_()
+        check(f"learned ({name}): project() is a no-op at init",
+              all(torch.allclose(b_, c.weight, atol=1e-5) for b_, c in zip(before, convs)))
+        sb_a, sb_b = a.layer(0).step_bound(), lay.step_bound()
+        check(f"learned ({name}): same Condat-Vu step bound",
+              abs(sb_a - sb_b) < 1e-2 * sb_a, f"{sb_a:.3f} vs {sb_b:.3f}")
+
+    b = WaveletLPDSNet(K=2, M=16, family="haar", dual_step="learned", preproc="identity")
+    n1 = b.layer(0).analysis[0].weight.abs().pow(2).sum((2, 3)).sqrt()
+    check("learned (haar): level-1 filters stay at unit norm (not 0.5)",
+          bool(torch.allclose(n1, torch.ones_like(n1), atol=1e-6)))
+    sd = float(b.layer(0).sigma_d.weight[0, 0])
+    check("learned (haar): sigma_d = 1/||K||^2 = 1/4", abs(sd - 0.25) < 1e-3, f"{sd:.4f}")
+    try:
+        WaveletLPDSLayer(dual_step="free")
+        check("unknown dual_step is refused", False)
+    except ValueError:
+        check("unknown dual_step is refused", True)
+
+
 def test_net_forward_backward():
     net = build_model({"model": {"type": "WaveletLPDSNet", "params": dict(
         K=4, M=16, P=7, s=2, degrees=1, preproc="identity")}})
@@ -211,6 +413,10 @@ if __name__ == "__main__":
     test_carry_unshuffle_matches_conv()
     test_interleaved_matches_gauss()
     test_adjoint_complex_weights()
+    test_haar()
+    test_band_norm()
+    test_union()
+    test_dual_step()
     test_net_forward_backward()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)

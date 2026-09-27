@@ -251,11 +251,15 @@ MODELS = {
     ),
 
     # THE MAP-ASYMMETRY CONTROL. Same cascades, same size, but handed the
-    # dataset's ESPIRiT maps instead of estimating its own, and returning the
-    # SENSE combination `sum_c conj(s_c) x_c` rather than RSS -- which is
-    # exactly how `image` was built, so this arm is comparable to the ground
-    # truth in phase as well as magnitude, and carries none of RSS's positive
-    # noise bias.
+    # OPERATOR'S maps instead of estimating its own, and returning the SENSE
+    # combination `sum_c conj(s_c) x_c` rather than RSS.
+    #
+    # Which maps that is depends on the protocol. Under `measured` (the
+    # default) it is the ONLINE estimate from the measurement's ACS (Walsh) --
+    # exactly what the unrolled nets get, so the two differ only in the prior.
+    # Under `legacy` it was the dataset's ESPIRiT maps, and the output was then
+    # comparable to the ground truth in phase too. Online maps carry their own
+    # per-pixel phase, so under `measured` compare magnitudes only.
     #
     # NOT the published baseline: `varnet` stays the reference number. This
     # cell exists to answer one question -- how much of the gap to the unrolled
@@ -271,10 +275,11 @@ MODELS = {
         params=dict(num_cascades=12, sens_chans=8, sens_pools=4,
                     chans=18, pools=4, mask_center=True,
                     use_smaps=True, output="sense"),
-        note=("E2E-VarNet cascades on the dataset's ESPIRiT maps (no "
-              "SensitivityModel), returning the SENSE coil combination. The "
-              "map-asymmetry control for `varnet`, not the published "
-              "baseline."),
+        note=("E2E-VarNet cascades on the operator's maps (no "
+              "SensitivityModel) -- online Walsh under the measured protocol, "
+              "the same maps the unrolled nets get -- returning the SENSE coil "
+              "combination. The map-asymmetry control for `varnet`, not the "
+              "published baseline."),
     ),
 }
 
@@ -466,19 +471,29 @@ MODELS.update({
 # and only that code penalised (LL^3 thresholds start at 0). The baseline of the
 # wavelet ladder: it tests the DT-CWT prior itself. Everything else is
 # ML_LPDS_COMMON (K=30, L=3, P=7, s=2, lam0, tau0=0.5, theta0, degrees).
+#
+# dual_step="learned" (2026-09-26), inherited by every wavelet cell below: the
+# filters stay at their wavelet normalisation and the frame's redundancy
+# (||K||^2 = 4 per 4 trees) is an explicit learnable Condat-Vu dual step, not
+# a level-1 rescale. The same algorithm at init; it changes which parameters
+# absorb gain under the per-slice unit-ball projection (see the module
+# docstring of models/wavelet_lpds.py).
 MODELS.update({
     "wlpds16": dict(type="WaveletLPDSNet", params=dict(
         {k: ML_LPDS_COMMON[k] for k in ("K", "L", "C", "P", "s", "lam0", "tau0",
                                         "theta0", "degrees", "is_complex",
                                         "preproc")},
-        M=16)),
+        M=16, dual_step="learned")),
 })
 
 # Cascade LPDS (models/cascade_lpds.py): wlpds16 with the wavelet structure
 # removed -- the same 16/64/256 stride-2 cascade and single deepest dual, but
 # dense convs (no tree groups, no Q, no carries), random init, and each level
 # spectrally normalised on its own rather than the composed operator. The
-# ablation of wlpds16's init and structure.
+# ablation of wlpds16's init and structure: a LEARNED multirate filter bank
+# asked to produce sparse coefficients. Out of exp7 since it underperformed
+# every other arm at little speed gain over lpdsnet; kept opt-in (run it with
+# ONLY=clpds16) while its widening and structure are reconsidered.
 MODELS.update({
     "clpds16": dict(type="CascadeLPDSNet", params=dict(
         {k: ML_LPDS_COMMON[k] for k in ("K", "L", "C", "P", "s", "lam0", "tau0",
@@ -487,9 +502,32 @@ MODELS.update({
         M=16, widen=4)),
 })
 
+# Wavelet-family sweep (models/wavelets.py::FAMILIES): wlpds16's exact 4-tree
+# 16/64/256 layout with other filters, so the family is the only variable.
+# Haar: level 1 at the four parity shifts (cycle-spinning), the same Haar split
+# in every tree after, Q = identity (no Hilbert pairs, so no oriented bands).
+MODELS.update({
+    "whaar16": dict(type="WaveletLPDSNet", params=dict(
+        MODELS["wlpds16"]["params"], family="haar")),
+    # wlpds16 with every deep channel at ONE noise gain at init
+    # (WaveletLPDSLayer.equalize_bands). The dtcwt filters mix a unit-DC-gain
+    # LeGall level 1 with near-orthonormal q-shift levels, so under
+    # band_norm="none" the noise std differs ~2.3x between bands while every
+    # threshold starts at the same lam0. Haar needs no such cell: it is
+    # orthonormal and already equal.
+    "wlpds16eq": dict(type="WaveletLPDSNet", params=dict(
+        MODELS["wlpds16"]["params"], band_norm="equal")),
+    # Widening by a UNION OF FRAMES: the DT-CWT's 4 trees (LeGall level 1,
+    # qshift_06 after) and Haar's 4 cycle-spun trees, stacked -- 32/128/512,
+    # one dual and one clip over all 512 channels, each family normalised to
+    # ||K_f|| = 1 before the global ||K|| = 1. Twice wlpds16's redundancy.
+    "wdh32": dict(type="WaveletLPDSNet", params=dict(
+        MODELS["wlpds16"]["params"], M=32, family=["dtcwt", "haar"])),
+})
+
 OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnetmaps",
-          # DT-CWT LPDS baseline and its structure-free ablation (exp7)
-          "wlpds16", "clpds16",
+          # the wavelet-LPDS cells (exp7), and the cascade ablation (not in exp7)
+          "wlpds16", "whaar16", "wlpds16eq", "wdh32", "clpds16",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
@@ -783,6 +821,17 @@ def _display_name(spec_type, params):
         if params.get("init_norm", "cascade") != "cascade":
             tag += "-lvl"
         return "%s_%s" % (spec_type, tag)
+    if spec_type == "WaveletLPDSNet" and (
+            params.get("family", "dtcwt") != "dtcwt"
+            or params.get("band_norm", "none") != "none"):
+        # The families (and band_norm) share L, widen and the variant, so they
+        # would collide. Plain dtcwt keeps its existing name.
+        fam = params.get("family", "dtcwt")
+        fam = fam if isinstance(fam, str) else "-".join(fam)
+        tag = "" if fam == "dtcwt" else "_" + fam
+        if params.get("band_norm", "none") != "none":
+            tag += "_bn" + params["band_norm"]
+        return "%s%s_%s" % (spec_type, tag, variant)
     if spec_type == "E2EVarNet" and params.get("use_smaps"):
         # `varnet` and `varnetmaps` are the same class with the same variant,
         # so the table below cannot separate them -- and two cells under one

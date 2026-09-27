@@ -13,13 +13,15 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-1
+#SBATCH --array=0-2
 #
 # EXPERIMENT 7 -- DT-CWT LPDS baseline.  BRAIN R16.
 #
 #   0  wlpds16   LPDS with a 3-level DT-CWT analysis cascade, 16/64/256, K=30
-#   1  clpds16   the same cascade, no wavelet structure: dense random convs,
-#                each level spectrally normalised on its own (cascade_lpds.py)
+#   1  wlpds16eq wlpds16 with every deep channel at one noise gain at init
+#                (band_norm="equal"; DT-CWT's bands otherwise differ ~2.3x)
+#   2  wdh32     DT-CWT + Haar stacked as one union of frames: 8 trees,
+#                32/128/512, one dual -- does a SECOND family help? (vs 0)
 #
 #   reference: mllpds64 (exp4 cell 3)  and  lpdsnet (exp3 cell 0)
 #
@@ -60,7 +62,7 @@
 # torch/ the job dies before the script runs.
 
 ANATOMY=brain
-ONLY="${ONLY:-wlpds16 clpds16}"
+ONLY="${ONLY:-wlpds16 wlpds16eq wdh32}"
 ACCELS="${ACCELS:-16}"
 # ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the
 # support of the STORED ESPIRiT maps (organ_mask_source="smaps"). Regeneration

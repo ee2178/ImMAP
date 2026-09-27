@@ -23,7 +23,7 @@ from training.common import (
 # Backtracking bookkeeping. `backtrack` is the whole restore-and-drop-the-LR
 # operation; `resync_schedule` re-applies an already-earned reduction on resume.
 from training.common import backtrack as do_backtrack, resync_schedule
-from visualization.filters import get_filter_grids
+from visualization.filters import filter_snapshot, get_filter_grids
 from visualization.image import recon_panel
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
@@ -141,6 +141,15 @@ def train_recon(
     if backtrack_count:
         print(f"resuming at backtrack_count={backtrack_count}: LR -> "
               f"{resync_schedule(opt, sched, backtrack_count, backtrack_factor)}")
+
+    # The filters as training finds them: the reference for the drift numbers
+    # (`filters/drift/*`), and one filter log at the start so every later image
+    # has something to be compared with. After a resume both are relative to
+    # the resume point, not to the original init.
+    filter_init = filter_snapshot(net)
+    if wandb is not None:
+        wandb.log(get_filter_grids(net, init=filter_init),
+                  step=start_epoch * steps_per_epoch)
 
     for epoch in range(start_epoch, num_epochs):
         net.train()
@@ -448,7 +457,7 @@ def train_recon(
                 # transfer per tensor, and neither answers a question that needs answering
                 # every epoch -- thresholds and step sizes drift on the timescale of training.
                 wandb.log(get_param_logs(net), step=global_step)
-                wandb.log(get_filter_grids(net), step=global_step)
+                wandb.log(get_filter_grids(net, init=filter_init), step=global_step)
             else:
                 print(f"[VAL] epoch={epoch} {mean_metrics}")
 

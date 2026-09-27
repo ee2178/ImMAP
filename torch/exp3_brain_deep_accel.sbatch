@@ -13,13 +13,15 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-2
+#SBATCH --array=0-3
 #
 # EXPERIMENT 3 -- does the V-cycle pay off at DEEP acceleration?  brain, R = 16.
 #
 #   0   brain  R16  lpdsnet     flat LPDS, K=30
 #   1   brain  R16  mglpds      V-cycle, K=[6,[4,4,6]]
 #   2   brain  R16  varnet      E2E-VarNet baseline
+#   3   brain  R16  varnetmaps  E2E-VarNet on the operator's maps (online Walsh
+#                               under the measured protocol) -- the map control
 #
 # THE HYPOTHESIS
 # --------------
@@ -60,10 +62,10 @@
 #
 # Index map:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
-#       --accels 16 --only lpdsnet mglpds varnet
+#       --accels 16 --only lpdsnet mglpds varnet varnetmaps
 
 ANATOMY=brain
-ONLY="lpdsnet mglpds varnet"
+ONLY="lpdsnet mglpds varnet varnetmaps"
 ACCELS="16"
 ATTN="flex"
 # ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the
