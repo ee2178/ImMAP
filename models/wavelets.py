@@ -36,6 +36,10 @@ uses that to check the cascade against `dtcwt` itself.
 
 Other families
 --------------
+`dtcwt_family(h0, h1)` builds a DT-CWT with any level-1 biorthogonal pair;
+"dtcwt" is LeGall 5/3 and "dtcwt57" Kingsbury's near-symmetric 5/7
+(`near_sym_a`), both with `qshift_06` after.  `random_family(seed)` keeps
+the DT-CWT's layout and Q but draws every filter at random ("random").
 `haar_weights` builds the same layout with Haar filters: level 1 is Haar at
 the four parity shifts (cycle-spinning, where dtcwt uses its undecimated
 level 1), levels 2-3 the same Haar split in every tree, and `haar_Q` is the
@@ -65,6 +69,14 @@ import torch
 LEGALL_H0 = np.array([-0.125, 0.25, 0.75, 0.25, -0.125])
 LEGALL_H1 = np.array([-0.25, 0.5, -0.25])
 
+# Near-symmetric 5/7 analysis filters (`dtcwt.coeffs.biort('near_sym_a')`).
+# The 7-tap highpass does not fit a 7x7 window at parity 1: `_place` crops its
+# one outer tap (+-0.0107, 0.02% of the filter's energy) in those trees.
+NEAR_SYM_A_H0 = np.array([-0.05, 0.25, 0.6, 0.25, -0.05])
+NEAR_SYM_A_H1 = np.array([0.0107142857, -0.0535714286, -0.2607142857,
+                          0.6071428571, -0.2607142857, -0.0535714286,
+                          0.0107142857])
+
 # qshift_06 tree-a analysis filters (`dtcwt.coeffs.qshift('qshift_06')`).
 QSHIFT06_H0A = np.array([0.0351638366, 0.0, -0.0883294245, 0.2338903206,
                          0.7602723691, 0.5875182977, 0.0, -0.1143018371,
@@ -83,14 +95,25 @@ def _tree_parity(t):
 
 
 def _place(h, center, P):
-    """A length-P kernel holding the odd-length centred filter `h` at `center`."""
+    """A length-P kernel holding the odd-length centred filter `h` at `center`.
+    Taps that fall outside the window are dropped."""
     k, r = np.zeros(P), len(h) // 2
-    k[center - r:center + r + 1] = h
+    for j, v in enumerate(h):
+        i = center - r + j
+        if 0 <= i < P:
+            k[i] = v
     return k
 
 
-def _level1_taps(hi, parity, P):
-    return _place(LEGALL_H1 if hi else LEGALL_H0, P // 2 + parity, P)
+def _biort_level1(h0, h1):
+    """Level-1 taps of a DT-CWT with biorthogonal pair (h0, h1): the same
+    centred filter in every tree, displaced by the tree's parity."""
+    def taps(hi, parity, P):
+        return _place(h1 if hi else h0, P // 2 + parity, P)
+    return taps
+
+
+_level1_taps = _biort_level1(LEGALL_H0, LEGALL_H1)
 
 
 def _qshift_taps(hi, lineage, P):
@@ -118,17 +141,29 @@ def _band(taps, t, b, P):
     return np.outer(taps(hH, pH, P), taps(hW, pW, P))
 
 
-def dtcwt_weights(P=7, levels=3):
-    """Analysis weights of the carried 2D DT-CWT cascade, one per level.
+def dtcwt_family(h0, h1):
+    """`(weights builder, Q builder)` of a DT-CWT whose level 1 is the
+    biorthogonal pair (h0, h1) and whose levels >= 2 are `qshift_06`.
 
-    Returns `(weights, tags)`.  `weights[l]` has the shape of a stride-2
-    `Conv2d` with `groups = 1` at level 1 and `groups = 4` after:
-    (16, 1, P, P), (64, 4, P, P), (256, 16, P, P) for three levels.  `tags[c]`
-    is the `(level, band)` of in-group channel c at the deepest level.
+    Every DT-CWT variant differs only there, so adding one to `FAMILIES` is
+    one line.  The builder returns `(weights, tags)`: `weights[l]` has the
+    shape of a stride-2 `Conv2d` with `groups = 1` at level 1 and `groups = 4`
+    after -- (16, 1, P, P), (64, 4, P, P), (256, 16, P, P) for three levels --
+    and `tags[c]` is the `(level, band)` of in-group channel c at the deepest
+    level.
     """
-    if P < 7 or P % 2 == 0:
-        raise ValueError("P must be odd and >= 7; got %r" % (P,))
-    return _carried_cascade(_level1_taps, _qshift_taps, P, levels)
+    level1 = _biort_level1(h0, h1)
+
+    def weights(P=7, levels=3):
+        if P < 7 or P % 2 == 0:
+            raise ValueError("P must be odd and >= 7; got %r" % (P,))
+        return _carried_cascade(level1, _qshift_taps, P, levels)
+    return weights, dtcwt_Q
+
+
+def dtcwt_weights(P=7, levels=3):
+    """The LeGall 5/3 DT-CWT ("dtcwt"); see `dtcwt_family`."""
+    return FAMILIES["dtcwt"][0](P, levels)
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +221,19 @@ def _carried_cascade(level1_taps, deep_taps, P, levels):
     `level1_taps(hi, parity, P)` and `deep_taps(hi, lineage, P)` return the 1D
     length-P cross-correlation taps along one axis.
     """
+    def filt(level, t, b):
+        return _band(level1_taps if level == 1 else deep_taps, t, b, P)
+    return _carried_layout(filt, P, levels)
+
+
+def _carried_layout(filt, P, levels):
+    """The 4-tree carried cascade with `filt(level, t, b)` -> (P, P) kernel for
+    band b of tree t, born at `level`.  Only those rows are filters; the
+    carries are one-hot (pixel-unshuffle) whatever the family."""
     W1 = np.zeros((4 * NTREES, 1, P, P))
     for t in range(NTREES):
         for b in range(4):
-            W1[4 * t + b, 0] = _band(level1_taps, t, b, P)
+            W1[4 * t + b, 0] = filt(1, t, b)
     weights, tags = [W1], [(1, b) for b in range(4)]
 
     for level in range(2, levels + 1):
@@ -198,15 +242,49 @@ def _carried_cascade(level1_taps, deep_taps, P, levels):
         for t in range(NTREES):
             o = t * 4 * n
             for b in range(4):                               # split LL
-                W[o + b, 0] = _band(deep_taps, t, b, P)
+                W[o + b, 0] = filt(level, t, b)
             for c in range(1, n):                            # carry the rest
                 for p in range(4):
                     W[o + 4 * c + p, c, P // 2 + p // 2, P // 2 + p % 2] = 1.0
         weights.append(W)
-        tags = [(level, b) for b in range(4)] + \
-               [tag for tag in tags[1:] for _ in range(4)]
+        tags = [(level, b) for b in range(4)] +                [tag for tag in tags[1:] for _ in range(4)]
 
     return [torch.from_numpy(w).float() for w in weights], tags
+
+
+# ---------------------------------------------------------------------------
+#  Random filters in the dual-tree layout
+# ---------------------------------------------------------------------------
+def random_family(seed=0, full=False):
+    """`(weights builder, Q builder)` of the DT-CWT STRUCTURE with random
+    filters: every filter row (level 1, and each tree's LL split at levels
+    >= 2) is an independent real Gaussian P x P kernel at unit norm, drawn
+    from `seed`.  Groups, one-hot carries, tags and `dtcwt_Q` are the DT-CWT's,
+    so it differs from "dtcwt" only in its filters -- and, unlike it, the four
+    trees are not one-pixel shifts of one another.  Deterministic in `seed`,
+    so every build of a family is the same init.
+
+    `full=True` also randomises everything else inside a tree: at levels >= 2
+    each tree's whole grouped conv (n -> 4n) is Gaussian, so there are no
+    one-hot carries -- every output channel is a learned filter over all of
+    its tree's channels.  Only the tree grouping and Q remain.  Each output
+    row is at unit norm over its (n, P, P) inputs, so every (out, in) slice is
+    inside the unit ball.  Needs `carry="conv"`: the unshuffle path has no
+    carry parameters and would drop them (`WaveletLPDSLayer` refuses it).
+    """
+    def weights(P=7, levels=3):
+        rng = np.random.default_rng(seed)
+
+        def filt(level, t, b):
+            w = rng.standard_normal((P, P))
+            return w / np.linalg.norm(w)
+        ws, tags = _carried_layout(filt, P, levels)
+        if full:
+            for l in range(1, len(ws)):
+                w = torch.from_numpy(rng.standard_normal(tuple(ws[l].shape))).float()
+                ws[l] = w / w.flatten(1).norm(dim=1).view(-1, 1, 1, 1)
+        return ws, tags
+    return weights, dtcwt_Q
 
 
 # Rows: analytic (0, 3) and anti-analytic (1, 2) combinations of the trees
@@ -236,8 +314,14 @@ def dtcwt_Q(tags):
     return torch.from_numpy(Q)
 
 
-# name -> (weights builder, Q builder); `WaveletLPDSNet(family=...)` reads this
+# name -> (weights builder, Q builder); `WaveletLPDSNet(family=...)` reads this,
+# and a LIST of names stacks them as one union of frames.  A new family only
+# needs both builders on the shared 4-tree layout (`_carried_cascade`); a new
+# DT-CWT variant is one `dtcwt_family(h0, h1)` line.
 FAMILIES = {
-    "dtcwt": (dtcwt_weights, dtcwt_Q),
+    "dtcwt": dtcwt_family(LEGALL_H0, LEGALL_H1),            # LeGall 5/3
+    "dtcwt57": dtcwt_family(NEAR_SYM_A_H0, NEAR_SYM_A_H1),  # near-symmetric 5/7
     "haar": (haar_weights, haar_Q),
+    "random": random_family(seed=0),        # DT-CWT layout, random filters
+    "random_full": random_family(seed=0, full=True),   # + random carries (carry="conv")
 }

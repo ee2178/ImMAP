@@ -257,12 +257,19 @@ class WaveletLPDSLayer(nn.Module):
         self.analysis, self.synthesis = nn.ModuleList(), nn.ModuleList()
         for l in range(len(built[0][0])):
             parts = []
-            for weights, _ in built:
+            for weights_family, (weights, _) in zip(self.families, built):
                 w = weights[l]
                 if l > 0 and carry == "unshuffle":
-                    # keep rows 0-3 (the LL split) of each tree, reading LL only
-                    w = w.view(NTREES, -1, *w.shape[1:])[:, :4, :1].reshape(
-                        4 * NTREES, 1, P, P)
+                    # keep rows 0-3 (the LL split) of each tree, reading LL only;
+                    # the rest must be the fixed one-hot carries it replaces
+                    v = w.view(NTREES, -1, *w.shape[1:])
+                    ref = FAMILIES["haar"][0](P, levels=3)[0][l]
+                    ref = ref.view(NTREES, -1, *ref.shape[1:])
+                    if v[:, :4, 1:].abs().sum() > 0 or not torch.equal(v[:, 4:], ref[:, 4:]):
+                        raise ValueError(
+                            "family %r learns its carries, which carry='unshuffle' "
+                            "would drop; use carry='conv'" % (weights_family,))
+                    w = v[:, :4, :1].reshape(4 * NTREES, 1, P, P)
                 parts.append(w)
             w = torch.cat(parts, 0)
             cout, cin_g = w.shape[:2]

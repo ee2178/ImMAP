@@ -54,7 +54,8 @@ def walsh(y: torch.Tensor, ks: int = 5, stride: int = 2):
     # Normalize
     norm = smaps.abs().pow(2).sum(dim=1, keepdim=True)
     smaps /= (norm.sqrt() + 1e-8)
-    return smaps.conj()
+    # resolve_conj: a lazy conj view breaks view_as_real downstream (E2EVarNet)
+    return smaps.conj().resolve_conj()
 
 def espirit(
     kspace: torch.Tensor,  # (B, C, Nx, Ny)
@@ -200,7 +201,9 @@ def espirit(
     cref = energy.argmax(dim=1)                                 # (B,)
     ref = smaps[torch.arange(B, device=device), cref][:, None]  # (B, 1, Nx, Ny)
     smaps = smaps * (ref / (ref.abs() + 1e-12)).conj()
-    return smaps
+    # A product of conj views can come back as a lazy conj view on torch 2.x,
+    # and view_as_real refuses those (E2EVarNet's given-maps path).
+    return smaps.resolve_conj()
 
 def espirit_soft(
     kspace: torch.Tensor,  # (B, C, Nx, Ny)
@@ -292,4 +295,6 @@ def espirit_soft(
     cref = energy.argmax(dim=1)                                  # (B,)
     ref = smaps[torch.arange(B, device=device), :, cref][:, :, None]
     smaps = smaps * (ref / (ref.abs() + 1e-12)).conj()
-    return smaps                                                 # (B, M, C, Nx, Ny)
+    # A product of conj views can come back as a lazy conj view on torch 2.x,
+    # and view_as_real refuses those (E2EVarNet's given-maps path).
+    return smaps.resolve_conj()                                                 # (B, M, C, Nx, Ny)

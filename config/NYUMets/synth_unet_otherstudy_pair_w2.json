@@ -1,0 +1,133 @@
+{
+    "task": "synthesis",
+    "experiment": {
+        "name": "Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2"
+    },
+    "model": {
+        "type": "Unet2D",
+        "params": {
+            "in_chans": 13,
+            "out_chans": 1,
+            "chans": 32,
+            "num_pool_layers": 4,
+            "max_chans": 256,
+            "convs_per_block": 2,
+            "norm": "group",
+            "act": "relu",
+            "group_size": 4,
+            "up_mode": "nearest",
+            "up_conv": true,
+            "head": "conv"
+        }
+    },
+    "data": {
+        "train": {
+            "name": "nyumets_synth",
+            "root": "../datasets/NYUMets_h5_train",
+            "image_key": "img_raw",
+            "scales": [
+                2800.0,
+                2500.0,
+                2390.0,
+                2370.0
+            ],
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                0,
+                1,
+                3
+            ],
+            "slice_range": [
+                40,
+                110
+            ],
+            "crop_size": 128,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8,
+            "deterministic": false,
+            "guide_mode": "other_study",
+            "guide_idx": [
+                1,
+                2
+            ],
+            "guide_window": 2,
+            "n_guides": 1,
+            "guide_slice": "index"
+        },
+        "val": {
+            "name": "nyumets_synth",
+            "root": "../datasets/NYUMets_h5_val",
+            "image_key": "img_raw",
+            "scales": [
+                2800.0,
+                2500.0,
+                2390.0,
+                2370.0
+            ],
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                0,
+                1,
+                3
+            ],
+            "slice_range": [
+                40,
+                110
+            ],
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8,
+            "deterministic": true,
+            "guide_mode": "other_study",
+            "guide_idx": [
+                1,
+                2
+            ],
+            "guide_window": 2,
+            "n_guides": 1,
+            "guide_slice": "index"
+        }
+    },
+    "training": {
+        "num_epochs": 1500,
+        "steps_per_epoch": 200,
+        "val_every_epochs": 25,
+        "clip_grad": 1.0,
+        "backtrack_thresh": 1000,
+        "backtrack_factor": 0.9,
+        "loss_type": "complex-mse",
+        "use_mask": false,
+        "psnr_only": false,
+        "residual_mode": false,
+        "residual_src_idx": 1,
+        "et_weight": 1.0,
+        "pretrained": null,
+        "data_range": 2.0,
+        "display_orient": "radiological"
+    },
+    "paths": {
+        "save_dir": "trained_nets/nyumets/Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2",
+        "ckpt": null
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0001
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "schrodinger-bridge",
+        "id": null,
+        "name": "Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2"
+    }
+}

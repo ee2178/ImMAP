@@ -13,7 +13,7 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
-#SBATCH --array=0-2
+#SBATCH --array=0-5
 #
 # EXPERIMENT 7 -- DT-CWT LPDS baseline.  BRAIN R16.
 #
@@ -22,6 +22,14 @@
 #                (band_norm="equal"; DT-CWT's bands otherwise differ ~2.3x)
 #   2  wdh32     DT-CWT + Haar stacked as one union of frames: 8 trees,
 #                32/128/512, one dual -- does a SECOND family help? (vs 0)
+#   3  wdhn48    wdh32 + a third family, the near-symmetric 5/7 DT-CWT
+#                ("dtcwt57"): 12 trees, 48/192/768 -- does a third family keep
+#                helping? (vs 2). Only this cell:  sbatch --array=3 ...
+#   4  wrand16   wlpds16's dual-tree structure with RANDOM filters ("random"):
+#                does the structure alone do the work? (vs 0)
+#   5  wrandf16  the tree FULLY random ("random_full", carry="conv"): no one-hot
+#                carries, every deep weight learned -- is the fixed carry what
+#                limits expressiveness? (vs 4)
 #
 #   reference: mllpds64 (exp4 cell 3)  and  lpdsnet (exp3 cell 0)
 #
@@ -62,7 +70,7 @@
 # torch/ the job dies before the script runs.
 
 ANATOMY=brain
-ONLY="${ONLY:-wlpds16 wlpds16eq wdh32}"
+ONLY="${ONLY:-wlpds16 wlpds16eq wdh32 wdhn48 wrand16 wrandf16}"
 ACCELS="${ACCELS:-16}"
 # ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the
 # support of the STORED ESPIRiT maps (organ_mask_source="smaps"). Regeneration

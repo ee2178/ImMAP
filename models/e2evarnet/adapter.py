@@ -157,7 +157,7 @@ class E2EVarNet(nn.Module):
             raise ValueError(f"expected complex k-space, got {y.dtype}.")
 
         mask = self._mask_to_varnet(get_mask(E), y.shape[0], y.device)
-        ks = torch.view_as_real(y.contiguous())            # (B, C, H, W, 2)
+        ks = torch.view_as_real(y.resolve_conj().contiguous())  # (B, C, H, W, 2)
 
         if not self.use_smaps:
             nlf = self.acs_lines
@@ -177,7 +177,8 @@ class E2EVarNet(nn.Module):
             raise ValueError(
                 f"coil maps {tuple(sm.shape)} do not match the k-space "
                 f"{tuple(y.shape)}; E must carry the maps for THIS batch.")
-        sens = torch.view_as_real(sm.contiguous())         # (B, C, H, W, 2)
+        # resolve_conj: maps built as a conj() view cannot be viewed as real
+        sens = torch.view_as_real(sm.resolve_conj().contiguous())  # (B, C, H, W, 2)
 
         kspace_pred = ks.clone()
         for cascade in self.net.cascades:

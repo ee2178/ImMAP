@@ -523,11 +523,32 @@ MODELS.update({
     # ||K_f|| = 1 before the global ||K|| = 1. Twice wlpds16's redundancy.
     "wdh32": dict(type="WaveletLPDSNet", params=dict(
         MODELS["wlpds16"]["params"], M=32, family=["dtcwt", "haar"])),
+    # wdh32 plus a THIRD family: the DT-CWT with Kingsbury's near-symmetric 5/7
+    # at level 1 ("dtcwt57"; qshift_06 after, like "dtcwt"; its 7-tap highpass
+    # loses one +-0.0107 tap in the parity-1 trees to fit P=7). 12 trees,
+    # 48/192/768, each family at ||K_f|| = 1, one dual. Read against wdh32: does
+    # a third family keep helping, or was the gain Haar's specifically?
+    "wdhn48": dict(type="WaveletLPDSNet", params=dict(
+        MODELS["wlpds16"]["params"], M=48, family=["dtcwt", "haar", "dtcwt57"])),
+    # wlpds16's STRUCTURE with random filters ("random": groups, one-hot
+    # carries, Q and LL^3 thresholds at 0 all as the DT-CWT; every filter row a
+    # unit-norm Gaussian draw, fixed seed). The DT-CWT's four trees start as
+    # one-pixel shifts of one another, and the trained deep filters come out
+    # nearly identical; this asks whether the structure alone does the work.
+    "wrand16": dict(type="WaveletLPDSNet", params=dict(
+        MODELS["wlpds16"]["params"], family="random")),
+    # The tree FULLY at random ("random_full"): only the grouping by tree and Q
+    # are kept. Under carry="unshuffle" the carries are a fixed permutation, so
+    # each tree's only deep filters are its 4 LL-split rows per level; here
+    # carry="conv" makes every level-2/3 weight a learned (Gaussian-init) filter
+    # over all of its tree's channels. ~15x the unshuffle path's conv FLOPs.
+    "wrandf16": dict(type="WaveletLPDSNet", params=dict(
+        MODELS["wlpds16"]["params"], family="random_full", carry="conv")),
 })
 
 OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnetmaps",
           # the wavelet-LPDS cells (exp7), and the cascade ablation (not in exp7)
-          "wlpds16", "whaar16", "wlpds16eq", "wdh32", "clpds16",
+          "wlpds16", "whaar16", "wlpds16eq", "wdh32", "wdhn48", "wrand16", "wrandf16", "clpds16",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",

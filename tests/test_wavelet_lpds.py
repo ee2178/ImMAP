@@ -17,7 +17,8 @@ import torch.nn.functional as F
 
 from models import build_model
 from models.wavelet_lpds import WaveletLPDSLayer, WaveletLPDSNet
-from models.wavelets import _qshift_taps, dtcwt_Q, dtcwt_weights
+from models.wavelets import (FAMILIES, NEAR_SYM_A_H0, NEAR_SYM_A_H1, _biort_level1,
+                             _qshift_taps, dtcwt_Q, dtcwt_weights)
 
 torch.manual_seed(0)
 
@@ -37,13 +38,13 @@ def _unshuffle_inv(m):
     return m[0]
 
 
-def test_matches_dtcwt(P=11, N=128, margin=6):
+def test_matches_dtcwt(P=11, N=128, margin=6, family="dtcwt", biort="legall"):
     try:
         import dtcwt
     except ImportError:
         print("[skip] test_matches_dtcwt -- dtcwt not installed")
         return
-    weights, tags = dtcwt_weights(P)
+    weights, tags = FAMILIES[family][0](P)
     Q = dtcwt_Q(tags).to(torch.complex128)
     X = np.random.default_rng(0).standard_normal((N, N))
     h = torch.tensor(X)[None, None]
@@ -54,7 +55,7 @@ def test_matches_dtcwt(P=11, N=128, margin=6):
     z = torch.einsum("cij,bjchw->bichw", Q,
                      h.to(torch.complex128).view(B, 4, len(tags), H, W))[0]
 
-    pyr = dtcwt.Transform2d(biort="legall", qshift="qshift_06").forward(X, nlevels=3)
+    pyr = dtcwt.Transform2d(biort=biort, qshift="qshift_06").forward(X, nlevels=3)
     slots = {1: (2, 3), 2: (0, 5), 3: (1, 4)}     # our band -> dtcwt (p-q, p+q)
     err = 0.0
     for level in (1, 2, 3):
@@ -65,7 +66,7 @@ def test_matches_dtcwt(P=11, N=128, margin=6):
                 ref = pyr.highpasses[level - 1][:, :, k]
                 s = slice(margin, ref.shape[0] - margin)
                 err = max(err, np.abs(ours[s, s] - ref[s, s]).max() / np.abs(ref).max())
-    check("P=11 cascade + Q reproduces dtcwt (3 levels, 6 orientations)",
+    check(f"{family}: P=11 cascade + Q reproduces dtcwt({biort}) (3 levels, 6 orientations)",
           err < 1e-6, f"max rel err {err:.1e}")
 
 
@@ -79,6 +80,20 @@ def test_truncation():
             ok &= np.allclose(full[2:-2], short)
             ok &= np.allclose(np.sort(np.abs(dropped)), [0, 0, 0, 0.0351638366])
     check("P=7 drops only the 0.0352 end tap", bool(ok))
+
+
+def test_dtcwt57_crop():
+    """P = 7 crops only the +-0.0107 outer highpass tap, in the parity-1 trees."""
+    taps = _biort_level1(NEAR_SYM_A_H0, NEAR_SYM_A_H1)
+    ok = True
+    for hi in (False, True):
+        for parity in (0, 1):
+            full, short = taps(hi, parity, 9), taps(hi, parity, 7)
+            dropped = np.abs(np.concatenate([full[:1], full[-1:]]))
+            ok &= np.allclose(full[1:-1], short)
+            lost = 0.0107142857 if (hi and parity == 1) else 0.0
+            ok &= np.allclose(np.sort(dropped), [0.0, lost])
+    check("dtcwt57: P=7 drops only the 0.0107 tap of the parity-1 highpass", bool(ok))
 
 
 def test_Q():
@@ -335,9 +350,150 @@ def test_union():
             check(f"family={bad!r} is refused", True)
 
 
+def test_union_three():
+    """Any number of families: ["dtcwt", "haar", "dtcwt57"] is 12 trees,
+    48/192/768, and K is exactly the three transforms stacked."""
+    fams = ["dtcwt", "haar", "dtcwt57"]
+    x = torch.randn(2, 1, 32, 32, dtype=torch.complex128)
+    z = torch.randn(2, 768, 4, 4, dtype=torch.complex128)
+    for carry in ("unshuffle", "conv"):
+        u = WaveletLPDSLayer(P=7, spectral_init=False, carry=carry, family=fams).double()
+        parts = [WaveletLPDSLayer(P=7, spectral_init=False, carry=carry,
+                                  family=f).double() for f in fams]
+        ku = u.analyse(x)
+        e = max((ku[:, 256 * i:256 * (i + 1)] - p.analyse(x)).abs().max().item()
+                for i, p in enumerate(parts))
+        check(f"3 families ({carry}): K = [K_dtcwt; K_haar; K_dtcwt57] exactly",
+              e < 1e-12, f"{e:.1e}")
+        ref = sum(p.adjoint(z[:, 256 * i:256 * (i + 1)]) for i, p in enumerate(parts))
+        e = (u.adjoint(z) - ref).abs().max().item()
+        check(f"3 families ({carry}): K^H = sum of the three adjoints", e < 1e-12, f"{e:.1e}")
+
+    u = WaveletLPDSLayer(P=7, family=fams)
+    check("3 families: grouped into 12 trees", [a.groups for a in u.analysis] == [1, 12, 12])
+    nf = [u.op_norm2(family=f) for f in range(3)]
+    check("3 families: equal ||K_f||", max(nf) / min(nf) - 1 < 2e-2,
+          ", ".join(f"{v:.4f}" for v in nf))
+    n2 = u.op_norm2()
+    check("3 families: ||K|| = 1", abs(n2 - 1) < 1e-2, f"||K||^2 = {n2:.4f}")
+    check("3 families: 12 unpenalised LL^3 channels",
+          u.ll_channels == [t * 64 for t in range(12)]
+          and bool((u.prox.prox.tau.weight[:, u.ll_channels] == 0).all()))
+    convs = list(u.analysis) + list(u.synthesis)
+    before = [c.weight.clone() for c in convs]
+    u.project_()
+    check("3 families: project() is a no-op at init",
+          all(torch.allclose(b_, c.weight, atol=1e-5) for b_, c in zip(before, convs)))
+
+    net = build_model({"model": {"type": "WaveletLPDSNet", "params": dict(
+        K=3, M=48, P=7, s=2, degrees=1, preproc="identity", family=fams)}})
+    y = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+    x_hat, (_, zz) = net(y, sigma=torch.full((1, 1, 1, 1), 0.05))
+    check("3-family net: dual is 768 channels on the depth-3 grid",
+          tuple(zz.shape) == (1, 768, 4, 4) and x_hat.shape == y.shape)
+
+
+def test_random_family():
+    """"random": the DT-CWT layout (groups, one-hot carries, tags, Q) with every
+    filter drawn at random -- so the trees no longer start as shifts."""
+    rw, rtags = FAMILIES["random"][0](7)
+    dw, dtags = dtcwt_weights(7)
+    check("random: same shapes and tags as dtcwt",
+          [w.shape for w in rw] == [w.shape for w in dw] and rtags == dtags)
+    carries_same = all(torch.equal(r.view(4, -1, *r.shape[1:])[:, 4:],
+                                   d.view(4, -1, *d.shape[1:])[:, 4:])
+                       for r, d in zip(rw[1:], dw[1:]))
+    check("random: carries are dtcwt's one-hot kernels", carries_same)
+    rows = [rw[0][:, 0]] + [w.view(4, -1, *w.shape[1:])[:, :4, 0].reshape(16, 7, 7)
+                            for w in rw[1:]]
+    unit = all(torch.allclose(r.flatten(1).norm(dim=1), torch.ones(16)) for r in rows)
+    check("random: every filter row at unit norm", unit)
+    flat = torch.cat(rows).flatten(1)
+    flat = flat / flat.norm(dim=1, keepdim=True)
+    off = (flat @ flat.T - torch.eye(len(flat))).abs().max().item()
+    check("random: all 48 filters distinct (no tree is a copy)", off < 0.9, f"max |cos| {off:.2f}")
+    again, _ = FAMILIES["random"][0](7)
+    check("random: deterministic in its seed",
+          all(torch.equal(a_, b_) for a_, b_ in zip(rw, again)))
+
+    for carry in ("unshuffle", "conv"):
+        lay = WaveletLPDSLayer(P=7, lam0=1e-3, degrees=1, family="random", carry=carry)
+        n2 = lay.op_norm2()
+        check(f"random ({carry}): ||K|| = 1", abs(n2 - 1) < 1e-2, f"||K||^2 = {n2:.4f}")
+        convs = list(lay.analysis) + list(lay.synthesis)
+        before = [c.weight.clone() for c in convs]
+        lay.project_()
+        check(f"random ({carry}): project() is a no-op at init",
+              all(torch.allclose(b_, c.weight, atol=1e-5) for b_, c in zip(before, convs)))
+        x = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+        z = torch.randn(1, 256, 4, 4, dtype=torch.complex64)
+        lhs, rhs = (lay.analyse(x).conj() * z).sum(), (x.conj() * lay.adjoint(z)).sum()
+        check(f"random ({carry}): B = A^H", abs(lhs - rhs).item() < 1e-4 * abs(lhs).item())
+    check("random: LL^3 thresholds start at 0",
+          bool((lay.prox.prox.tau.weight[:, lay.ll_channels] == 0).all()))
+
+    u = WaveletLPDSLayer(P=7, family=["dtcwt", "random"])
+    nf = [u.op_norm2(family=f) for f in (0, 1)]
+    check("random in a union: equal ||K_f||", max(nf) / min(nf) - 1 < 2e-2,
+          ", ".join(f"{v:.4f}" for v in nf))
+
+
+def test_random_full():
+    """"random_full": the tree grouping and Q only -- every weight of every
+    level random, no one-hot carries.  Needs carry="conv"."""
+    fw, ftags = FAMILIES["random_full"][0](7)
+    dw, dtags = dtcwt_weights(7)
+    check("random_full: same shapes and tags as dtcwt",
+          [w.shape for w in fw] == [w.shape for w in dw] and ftags == dtags)
+    dense = all(bool((w != 0).all()) for w in fw)
+    check("random_full: every weight nonzero (no one-hot carries, no zero blocks)", dense)
+    rows = all(torch.allclose(w.flatten(1).norm(dim=1), torch.ones(w.shape[0]), atol=1e-5)
+               for w in fw[1:])
+    slices = max(w.flatten(2).norm(dim=2).max().item() for w in fw)
+    check("random_full: deep output rows at unit norm, every slice inside the ball",
+          rows and slices <= 1.0 + 1e-6, f"max slice norm {slices:.3f}")
+    again, _ = FAMILIES["random_full"][0](7)
+    check("random_full: deterministic in its seed",
+          all(torch.equal(a_, b_) for a_, b_ in zip(fw, again)))
+    for fam in ("random_full", ["dtcwt", "random_full"]):
+        try:
+            WaveletLPDSLayer(P=7, family=fam, carry="unshuffle")
+            check(f"{fam!r} with carry='unshuffle' is refused", False)
+        except ValueError:
+            check(f"{fam!r} with carry='unshuffle' is refused", True)
+
+    lay = WaveletLPDSLayer(P=7, lam0=1e-3, degrees=1, family="random_full", carry="conv")
+    n2 = lay.op_norm2()
+    check("random_full (conv): ||K|| = 1", abs(n2 - 1) < 1e-2, f"||K||^2 = {n2:.4f}")
+    convs = list(lay.analysis) + list(lay.synthesis)
+    before = [c.weight.clone() for c in convs]
+    lay.project_()
+    check("random_full (conv): project() is a no-op at init",
+          all(torch.allclose(b_, c.weight, atol=1e-5) for b_, c in zip(before, convs)))
+    x = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+    z = torch.randn(1, 256, 4, 4, dtype=torch.complex64)
+    lhs, rhs = (lay.analyse(x).conj() * z).sum(), (x.conj() * lay.adjoint(z)).sum()
+    check("random_full (conv): B = A^H", abs(lhs - rhs).item() < 1e-4 * abs(lhs).item())
+
+    net = build_model({"model": {"type": "WaveletLPDSNet", "params": dict(
+        K=3, M=16, P=7, s=2, degrees=1, preproc="identity", family="random_full",
+        carry="conv")}})
+    y = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
+    x_hat, _ = net(y, sigma=torch.full((1, 1, 1, 1), 0.05))
+    x_hat.abs().pow(2).sum().backward()
+    g = net.layer(1).analysis[2].conv_real.weight.grad.view(4, 64, 16, -1).abs().sum(-1)
+    # row 0 of each tree feeds LL^3, whose threshold starts at 0: its dual is
+    # clipped to 0, so that row learns only once the threshold leaves 0
+    check("random_full net: every level-3 block but the LL^3 rows gets gradient",
+          bool((g[:, 1:] > 0).all()) and bool((g[:, 0] == 0).all()))
+
+
 def test_dual_step():
     """dual_step="learned": filters at wavelet normalisation, the redundancy in
     sigma_d -- and the SAME algorithm as "absorbed" at init, exactly."""
+    # Seeded here, not by test order: the power-iteration error is ~1e-3 of the
+    # move and depends on y, so a y drawn after other tests can cross the bound.
+    torch.manual_seed(0)
     y = torch.randn(2, 1, 32, 32, dtype=torch.complex64)
     sig = torch.full((2, 1, 1, 1), 0.015)
     cases = [("dtcwt", dict(M=16)), ("haar", dict(M=16, family="haar")),
@@ -407,7 +563,9 @@ def test_net_forward_backward():
 
 if __name__ == "__main__":
     test_matches_dtcwt()
+    test_matches_dtcwt(family="dtcwt57", biort="near_sym_a")
     test_truncation()
+    test_dtcwt57_crop()
     test_Q()
     test_layer_init()
     test_carry_unshuffle_matches_conv()
@@ -416,6 +574,9 @@ if __name__ == "__main__":
     test_haar()
     test_band_norm()
     test_union()
+    test_union_three()
+    test_random_family()
+    test_random_full()
     test_dual_step()
     test_net_forward_backward()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
