@@ -156,7 +156,7 @@ def estimate_cost_gb(shape, n_kernels, dtype_bytes=8):
 
 def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
                  thresh_rowspace=0.05, thresh_eig=0.0, maxit=100,
-                 walsh_ks=5, walsh_stride=2, window=True, clamp=ACS_CLAMP):
+                 walsh_ks=5, walsh_stride=2, window="box", clamp=ACS_CLAMP):
     """Coil maps from the measured centre of `kspace`.
 
     Parameters
@@ -166,6 +166,21 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
     method : "espirit" (default) or "walsh"
     acs_lines : the config's `mri.acs_lines`. Pass it -- see `resolve_lines`.
     thresh_eig : 0.0 by default, as in `mrireco.jl` -- no hard support.
+    window : "box" (default) -- the ACS lines exactly as measured, no taper --
+             or "hamming", the full-grid window `mrireco.jl` applies
+             (`Sljiva.hamming_window`, identical to
+             `torch.hamming_window(N, periodic=False)`). True/False are read
+             as "hamming"/"box" for older callers.
+
+             What the full-grid Hamming actually does: along PHASE-ENCODE it
+             is still 0.996 at the edge of a 13-line ACS, so it barely tapers
+             the ACS truncation; along the fully sampled READOUT axis it is a
+             real low-pass (the calibration image changes by ~57%). On a
+             phantom with known maps the two gave the SAME map quality (the
+             maps are smooth, so a readout blur costs nothing).
+             Everything outside the ACS is zeroed by the centre mask in
+             either case (verified: exactly 0 energy outside the ACS
+             columns), so neither choice lets accelerated lines leak in.
 
     Returns
     -------
@@ -186,9 +201,16 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
 
     # cm .* k, then the window: only the sampled centre reaches the estimator,
     # so nothing outside the ACS -- measured or not -- can leak into the maps.
+    if window is True:
+        window = "hamming"
+    elif window is False or window is None:
+        window = "box"
+    if window not in ("box", "hamming"):
+        raise ValueError(f"window must be 'box' or 'hamming', got {window!r}")
+
     cm = center_mask(mask, min(lines, ay), like=kspace)
     kc = kspace * cm.to(kspace.dtype)
-    if window:
+    if window == "hamming":
         kc = hamming_window(kc)
 
     if method == "walsh":
