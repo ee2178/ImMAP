@@ -24,8 +24,8 @@ import torch
 from operators.fourier import fftc, ifftc
 from physics.mask import make_acc_mask
 from physics.online_smaps import (
-    acs_block, acs_line_count, center_mask, estimate_cost_gb, hamming_window,
-    online_smaps, resolve_lines,
+    acs_block, acs_line_count, acs_taper, center_mask, estimate_cost_gb,
+    hamming_window, online_smaps, resolve_lines,
 )
 
 FAIL = []
@@ -119,6 +119,53 @@ def test_only_the_acs_reaches_the_estimator():
     check("the window keeps the centre and tapers the edge",
           float(w[0, 0, 32, 24].abs()) > float(w[0, 0, 0, 0].abs()),
           "centre is not the brightest sample after windowing")
+
+    # the ACS-width taper: same support as the centre mask, tapered ACROSS it
+    t = acs_taper(m, lines)
+    check("the ACS taper has exactly the centre mask's support",
+          torch.equal(t > 0, cm > 0))
+    tl = t[cm > 0]
+    check("the ACS taper actually tapers the ACS (edge << centre)",
+          float(tl[0]) < 0.1 and float(tl.max()) > 0.99,
+          f"edge {float(tl[0]):.3f}, peak {float(tl.max()):.3f}")
+
+
+def test_walsh_window_default():
+    """Walsh defaults to the ACS taper, ESPIRiT to the box.
+
+    Checked through what reaches the estimator, by stubbing it out.
+    """
+    import physics.online_smaps as osm
+    k, _, _ = phantom()
+    m = make_acc_mask((64, 48), accel=4, acs_lines=8, dim=1, mode="uniform")
+    lines = acs_line_count(m)
+    seen = {}
+    real_walsh, real_espirit, real_ifftc = osm.walsh, osm.espirit, osm.ifftc
+    try:
+        osm.ifftc = lambda x: x                   # hand walsh k-space as-is
+        osm.walsh = lambda x, **kw: seen.__setitem__("walsh", x) or x
+        osm.espirit = lambda x, **kw: seen.__setitem__("espirit", x) or x
+        osm.online_smaps(k, m, method="walsh", acs_lines=lines)
+        osm.online_smaps(k, m, method="espirit", acs_lines=lines)
+        osm.online_smaps(k, m, method="walsh", acs_lines=lines, window="box")
+        box_walsh = seen["walsh"]
+        osm.online_smaps(k, m, method="walsh", acs_lines=lines)
+    finally:
+        osm.walsh, osm.espirit, osm.ifftc = real_walsh, real_espirit, real_ifftc
+    cm = center_mask(m, lines)
+    kc = k * cm.to(k.dtype)
+    t = acs_taper(m, lines)
+    check("walsh gets the ACS-tapered calibration data by default",
+          torch.allclose(seen["walsh"], k * t.to(k.dtype)))
+    check("espirit gets the untapered ACS by default",
+          torch.equal(seen["espirit"], kc))
+    check("window='box' still reaches walsh untapered",
+          torch.equal(box_walsh, kc))
+    try:
+        online_smaps(k, m, window="nope")
+        check("an unknown window is rejected", False, "no error")
+    except ValueError:
+        check("an unknown window is rejected", True)
 
 
 def test_cost_bound():
@@ -238,7 +285,8 @@ def test_bad_inputs():
 
 def main():
     for fn in (test_acs_line_count, test_acs_block_is_asymmetric,
-               test_only_the_acs_reaches_the_estimator, test_cost_bound,
+               test_only_the_acs_reaches_the_estimator,
+               test_walsh_window_default, test_cost_bound,
                test_estimators_run, test_walsh_phase_reference,
                test_bad_inputs):
         print(f"\n--- {fn.__name__}")

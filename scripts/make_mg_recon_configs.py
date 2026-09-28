@@ -255,7 +255,8 @@ MODELS = {
     # combination `sum_c conj(s_c) x_c` rather than RSS.
     #
     # Which maps that is depends on the protocol. Under `measured` (the
-    # default) it is the ONLINE estimate from the measurement's ACS (Walsh) --
+    # default) it is the ONLINE estimate from the measurement's ACS (ESPIRiT at
+    # ONLINE_ESPIRIT_KWS, or Walsh with --online-smaps walsh) --
     # exactly what the unrolled nets get, so the two differ only in the prior.
     # Under `legacy` it was the dataset's ESPIRiT maps, and the output was then
     # comparable to the ground truth in phase too. Online maps carry their own
@@ -269,14 +270,16 @@ MODELS = {
     # variant rather than a construction invented here.
     #
     # It is also SMALLER than `varnet`: dropping SensitivityModel removes its
-    # ~1.1M parameters, so a win here is not a capacity win.
+    # 0.48M parameters (29.9M -> 29.5M), so a win here is not a capacity win
+    # over `varnet` -- but it is still ~30x lpdsnet (1.0M) and ~8x mglpds
+    # (3.6M), so against the unrolled nets capacity is NOT held fixed.
     "varnetmaps": dict(
         type="E2EVarNet",
         params=dict(num_cascades=12, sens_chans=8, sens_pools=4,
                     chans=18, pools=4, mask_center=True,
                     use_smaps=True, output="sense"),
         note=("E2E-VarNet cascades on the operator's maps (no "
-              "SensitivityModel) -- online Walsh under the measured protocol, "
+              "SensitivityModel) -- online ESPIRiT under the measured protocol, "
               "the same maps the unrolled nets get -- returning the SENSE coil "
               "combination. The map-asymmetry control for `varnet`, not the "
               "published baseline."),
@@ -557,10 +560,13 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnetmaps",
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
-# 16 is exp3's deep-acceleration arm; 8 and 4 are exp1/exp2's. All three are
-# in one list so every cell exists for every R and the launchers select with
-# ACCELS -- which also RENUMBERS, so each experiment keeps a dense array.
-ACCELS = [8, 4, 16]
+# 16 is exp3's deep-acceleration arm; 8 and 4 are exp1/exp2's; 12 (added
+# 2026-09-28) sits between 8 and 16 for the capacity question. All are in one
+# list so every cell exists for every R and the launchers select with ACCELS --
+# which also RENUMBERS, so each experiment keeps a dense array. New rates go at
+# the END: cells are enumerated R-major, so appending leaves every existing
+# index (and every launcher's --array) where it was.
+ACCELS = [8, 4, 16, 12]
 
 ANATOMIES = {
     "knee": dict(

@@ -260,6 +260,8 @@ if os.path.exists(out) and not force:
             return {p: d}
         acc = {}
         for k, v in d.items():
+            if k == "_comment":                       # documentation, not setup
+                continue
             if p or k not in ("paths", "wandb"):      # bookkeeping, not setup
                 acc.update(_flat(v, f"{p}.{k}" if p else k))
         return acc

@@ -44,6 +44,7 @@ from operators.fourier import ifftc
 from physics.smaps import espirit, walsh
 
 METHODS = ("espirit", "walsh")
+WINDOWS = ("box", "hamming", "hamming-acs")
 ACS_CLAMP = 32          # mrireco.jl:246, `clamp.(acs_size, 1, 32)`
 
 
@@ -123,6 +124,26 @@ def center_mask(mask, lines, like=None):
     return cm
 
 
+def acs_taper(mask, lines, like=None):
+    """`center_mask` with a Hamming taper ACROSS the `lines` centre columns.
+
+    The ACS is a hard cut of k-space along phase-encode, so the calibration
+    image rings (sinc, ~9% sidelobes, period W/lines). Near an object edge that
+    ringing differs coil to coil -- it is each coil's (s_c * rho) that is
+    truncated, not rho -- so it does not divide out of the maps: Walsh shows it
+    as hatching around the edges and streaks inside (confirmed in
+    espirit_acs_check: finer ripple at 31 lines than 13, gone with this
+    taper). A taper over the ACS WIDTH is what removes it; the full-grid
+    `hamming_window` is ~1 across a 13-line ACS and does not.
+    """
+    n = mask.shape[-1]
+    lo = n // 2 - lines // 2
+    w = torch.zeros(n, device=mask.device, dtype=torch.float32)
+    w[lo:lo + lines] = torch.hamming_window(lines, periodic=False,
+                                            device=mask.device)
+    return w
+
+
 def hamming_window(k, dims=(-2, -1)):
     """Separable Hamming window over `dims`, centred on k-space DC.
 
@@ -157,7 +178,7 @@ def estimate_cost_gb(shape, n_kernels, dtype_bytes=8):
 def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
                  thresh_rowspace=0.05, thresh_eig=0.0, maxit=100,
                  walsh_ks=5, walsh_stride=2, walsh_phase_ref="virtual",
-                 window="box", clamp=ACS_CLAMP):
+                 window=None, clamp=ACS_CLAMP):
     """Coil maps from the measured centre of `kspace`.
 
     Parameters
@@ -170,7 +191,14 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
     walsh_phase_ref : "virtual" (default) or "strongest" (Sljiva's
              `walsh_smaps`); see `physics.smaps.walsh`. The strongest-coil
              reference is noise wherever that coil is dark.
-    window : "box" (default) -- the ACS lines exactly as measured, no taper --
+    window : None (default) -- "hamming-acs" for walsh, "box" for espirit.
+             "hamming-acs" tapers across the ACS lines themselves
+             (`acs_taper`): Walsh reads the calibration IMAGE, so the ACS
+             truncation's Gibbs ringing lands directly in its maps. ESPIRiT
+             keeps "box": its kernels assume the calibration data IS k-space
+             of s_c * rho, and a taper (an image-domain convolution) breaks
+             that relation.
+             "box" -- the ACS lines exactly as measured, no taper --
              or "hamming", the full-grid window `mrireco.jl` applies
              (`Sljiva.hamming_window`, identical to
              `torch.hamming_window(N, periodic=False)`). True/False are read
@@ -205,14 +233,19 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
 
     # cm .* k, then the window: only the sampled centre reaches the estimator,
     # so nothing outside the ACS -- measured or not -- can leak into the maps.
-    if window is True:
+    if window is None:
+        window = "hamming-acs" if method == "walsh" else "box"
+    elif window is True:
         window = "hamming"
-    elif window is False or window is None:
+    elif window is False:
         window = "box"
-    if window not in ("box", "hamming"):
-        raise ValueError(f"window must be 'box' or 'hamming', got {window!r}")
+    if window not in WINDOWS:
+        raise ValueError(f"window must be one of {WINDOWS}, got {window!r}")
 
-    cm = center_mask(mask, min(lines, ay), like=kspace)
+    if window == "hamming-acs":
+        cm = acs_taper(mask, min(lines, ay), like=kspace)
+    else:
+        cm = center_mask(mask, min(lines, ay), like=kspace)
     kc = kspace * cm.to(kspace.dtype)
     if window == "hamming":
         kc = hamming_window(kc)
