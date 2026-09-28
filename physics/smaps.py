@@ -66,6 +66,7 @@ def espirit(
     rtol: float = 1e-3,
     maxit: int = 100,
     block_size: int = 8192,
+    method = "eigdecomp",
 ):
     B, C, Nx, Ny = kspace.shape
     ks = kernel_size
@@ -135,42 +136,61 @@ def espirit(
     Vk = Vk.reshape(B, C, Nbasis, -1).permute(0, 3, 1, 2)
     P = Vk.shape[1]
 
-    # 6) Power method
-    Q = torch.randn(B, P, C, device=device, dtype=dtype)
-    Q = Q / (Q.norm(dim=-1, keepdim=True) + 1e-12)
+    if method == "power":
+        # 6) Power method
+        Q = torch.randn(B, P, C, device=device, dtype=dtype)
+        Q = Q / (Q.norm(dim=-1, keepdim=True) + 1e-12)
 
-    for _ in range(maxit):
-        Q_new = torch.empty_like(Q)
+        for _ in range(maxit):
+            Q_new = torch.empty_like(Q)
+
+            for p0 in range(0, P, block_size):
+                p1 = min(p0 + block_size, P)
+                Vblk = Vk[:, p0:p1]   # (B, Pb, C, K)
+                Qblk = Q[:, p0:p1]    # (B, Pb, C)
+
+                tmp = torch.einsum("bpck,bpc->bpk", Vblk.conj(), Qblk)
+                Q_new[:, p0:p1] = torch.einsum("bpck,bpk->bpc", Vblk, tmp)
+
+            Q_new = Q_new / (Q_new.norm(dim=-1, keepdim=True) + 1e-12)
+
+            # still a sync (Python if), but only once per iter
+            if (Q_new - Q).norm() < rtol:
+                Q = Q_new
+                break
+            Q = Q_new
+
+        # 7) Eigenvalue estimate
+        lam = torch.empty(B, P, device=device, dtype=torch.float32)
 
         for p0 in range(0, P, block_size):
             p1 = min(p0 + block_size, P)
-            Vblk = Vk[:, p0:p1]   # (B, Pb, C, K)
-            Qblk = Q[:, p0:p1]    # (B, Pb, C)
+            Vblk = Vk[:, p0:p1]
+            Qblk = Q[:, p0:p1]
 
             tmp = torch.einsum("bpck,bpc->bpk", Vblk.conj(), Qblk)
-            Q_new[:, p0:p1] = torch.einsum("bpck,bpk->bpc", Vblk, tmp)
+            lam[:, p0:p1] = (tmp.abs() ** 2).sum(dim=-1).real / (ks ** 2)
 
-        Q_new = Q_new / (Q_new.norm(dim=-1, keepdim=True) + 1e-12)
+        lam = lam.reshape(B, Nx, Ny)
+        Q = Q.reshape(B, Nx, Ny, C)
+    elif method == "eigdecomp":
+        # STOLEN FROM ESPIRIT_SOFT
+        # 6) Pointwise Hermitian eigendecomposition (replaces power method)
+        #    G_q = (1/ks^2) Vk Vk^H is C×C, PSD; eigh gives ALL eigenpairs.
+        M = 1
+        Q = torch.empty(B, P, C, M, device=device, dtype=dtype)
+        lam = torch.empty(B, P, M, device=device, dtype=torch.float32)
+        for p0 in range(0, P, block_size):
+            p1 = min(p0 + block_size, P)
+            Vblk = Vk[:, p0:p1]                                      # (B, Pb, C, K)
+            Gq = torch.einsum("bpck,bpdk->bpcd",
+                          Vblk, Vblk.conj()) / (ks ** 2)         # (B, Pb, C, C)
+            w, v = torch.linalg.eigh(Gq)                             # w ascending
+            lam[:, p0:p1] = w[..., -M:].flip(-1)                    # [λ1, λ2, ...] desc
+            Q[:, p0:p1] = v[..., -M:].flip(-1)                    # matching vectors
 
-        # still a sync (Python if), but only once per iter
-        if (Q_new - Q).norm() < rtol:
-            Q = Q_new
-            break
-        Q = Q_new
-
-    # 7) Eigenvalue estimate
-    lam = torch.empty(B, P, device=device, dtype=torch.float32)
-
-    for p0 in range(0, P, block_size):
-        p1 = min(p0 + block_size, P)
-        Vblk = Vk[:, p0:p1]
-        Qblk = Q[:, p0:p1]
-
-        tmp = torch.einsum("bpck,bpc->bpk", Vblk.conj(), Qblk)
-        lam[:, p0:p1] = (tmp.abs() ** 2).sum(dim=-1).real / (ks ** 2)
-
-    lam = lam.reshape(B, Nx, Ny)
-    Q = Q.reshape(B, Nx, Ny, C)
+        Q = Q.reshape(B, Nx, Ny, C)
+        lam = lam.reshape(B, Nx, Ny)
 
     # 8) Threshold & normalize
     mask = lam > thresh_eig
