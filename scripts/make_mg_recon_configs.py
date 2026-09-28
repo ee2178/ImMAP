@@ -714,12 +714,13 @@ def _apply_protocol(args):
             args.center_frac = 0.04
         args.adjust_accel = True
         if args.online_smaps is None:
-            # Walsh since 2026-09-25: what Sljiva's multigrid experiments ran
-            # (`makeconfigs_mglpds.jl`, `:online_smaps=>[true,]`), and cheap --
-            # online ESPIRiT is GBs per slice at 640x320x20. Neither applies a
-            # support: Sljiva's `walsh_smaps` has a `thresh_eig` hook but
-            # `genobs` never passes it.
-            args.online_smaps = "walsh"
+            # ESPIRiT again since 2026-09-28, at ONLINE_ESPIRIT_KWS
+            # (thresh_eig 0.95, maxit 10) -- the user's finding that this is
+            # enough for good maps on the fly, and cheap enough at 10
+            # power-method iterations. It was Walsh 2026-09-25..28 (what
+            # Sljiva's multigrid runs used, and cheaper still);
+            # `--online-smaps walsh` restores that.
+            args.online_smaps = "espirit"
     else:
         args.kspace_type = "simulated"
         if args.target == "rss":
@@ -732,6 +733,25 @@ def _apply_protocol(args):
     if args.online_smaps == "off":
         args.online_smaps = None
     return args
+
+
+# THE ONLINE ESPIRiT PROTOCOL for every mg experiment (the user's settings,
+# 2026-09-28): what the operator's maps are estimated with, every step.
+#
+#   thresh_eig 0.95  the maps get a hard eigenvalue support, as offline ESPIRiT
+#                    does. (Julia's online call passes 0; this departs from it
+#                    on purpose.) Pixels outside the support have ZERO
+#                    sensitivity in the operator, so no unrolled net can put
+#                    signal there -- where the ground truth (stored maps, their
+#                    own support) is nonzero, that is error only the unrolled
+#                    nets are charged; VarNet estimates its own maps.
+#   maxit 10         power-method iterations. The eigenvalue the threshold
+#                    reads is estimated from this iterate, so the two interact:
+#                    an under-converged pixel reads low and can be cut.
+#
+# Written into `mri.online_smaps_kws`, which training and both eval paths pass
+# straight to physics/online_smaps.py::online_smaps. Walsh takes neither.
+ONLINE_ESPIRIT_KWS = {"thresh_eig": 0.95, "maxit": 10}
 
 
 def _opt_mri(args):
@@ -752,6 +772,8 @@ def _opt_mri(args):
         out["adjust_accel"] = True
     if getattr(args, "online_smaps", None):
         out["online_smaps"] = args.online_smaps
+        if args.online_smaps == "espirit":
+            out["online_smaps_kws"] = dict(ONLINE_ESPIRIT_KWS)
     return out
 
 
@@ -1102,8 +1124,8 @@ def make_config(anatomy, r, model, args):
             # WHERE THE NETWORK'S COIL MAPS COME FROM.
             #   None       the dataset's precomputed maps (current behaviour)
             #   "espirit"  re-estimated from the ACS of each measurement
-            #   (the measured protocol's default is "walsh" -- see
-            #   _apply_protocol)
+            #   (the measured protocol's default, at ONLINE_ESPIRIT_KWS --
+            #   see _apply_protocol)
             #   "walsh"    the same, with the cheap estimator
             #
             # Online maps are what Sljiva's `genobs` does, and they change the

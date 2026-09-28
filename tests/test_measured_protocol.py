@@ -223,8 +223,32 @@ def test_generator_protocols():
           "target" not in data, f"target={data.get('target')!r}")
     check("measured: Julia masks (center_frac 0.04, adjust_accel)",
           mri.get("center_frac") == 0.04 and mri.get("adjust_accel") is True)
-    check("measured: operator maps estimated online with Walsh",
-          mri.get("online_smaps") == "walsh")
+    check("measured: operator maps estimated online with ESPIRiT",
+          mri.get("online_smaps") == "espirit")
+    check("measured: online ESPIRiT runs at thresh_eig 0.95, maxit 10",
+          mri.get("online_smaps_kws") == {"thresh_eig": 0.95, "maxit": 10},
+          f"{mri.get('online_smaps_kws')}")
+
+    # ...and those settings reach espirit() itself, through prepare_measurement
+    from training.common import prepare_measurement
+    import physics.online_smaps as om
+    got, real = {}, om.espirit
+    om.espirit = lambda kk, **kw: (got.update(kw), torch.ones_like(kk))[1]
+    try:
+        from physics.mask import make_acc_mask as _mask   # a later local import
+        mk = _mask((32, 64), accel=4, center_frac=0.25, dim=1,  # shadows the name
+                   mode="uniform", adjust_accel=True)
+        prepare_measurement(
+            image=torch.zeros(1, 1, 32, 64, dtype=torch.complex64),
+            kspace=torch.randn(1, 4, 32, 64, dtype=torch.complex64), mask=mk,
+            smaps=torch.ones(1, 4, 32, 64, dtype=torch.complex64),
+            kspace_type="measurement_awgn", noise_std=[0.05, 0.05],
+            noise_dist="uniform", whiten_kspace=False, online_smaps="espirit",
+            online_smaps_kws=dict(mri["online_smaps_kws"], acs_lines=15))
+    finally:
+        om.espirit = real
+    check("the config's thresh_eig and maxit reach espirit()",
+          got.get("thresh_eig") == 0.95 and got.get("maxit") == 10, f"{got}")
 
     check("measured: acs_lines is null -- derived from center_frac, not a fixed 20",
           mri.get("acs_lines", "absent") is None, f"acs_lines={mri.get('acs_lines')!r}")
@@ -272,9 +296,10 @@ def test_generator_protocols():
           f"mri keys {sorted(mri)}")
 
     walsh = _dry_run("--online-smaps", "walsh")
-    check("--online-smaps walsh keeps everything else",
+    check("--online-smaps walsh keeps everything else, and writes no ESPIRiT kws",
           walsh["mri"]["online_smaps"] == "walsh"
-          and walsh["mri"]["kspace_type"] == "measurement_awgn")
+          and walsh["mri"]["kspace_type"] == "measurement_awgn"
+          and "online_smaps_kws" not in walsh["mri"])
 
 
 def main():
