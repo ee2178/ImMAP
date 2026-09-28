@@ -61,6 +61,7 @@ import math
 
 import numpy as np
 import torch
+from visualization.image import orient_tensor
 from visualization.wandb_image import wandb_image
 import torch.nn as nn
 import torchvision.utils as vutils
@@ -146,7 +147,8 @@ def diverging_rgb(x, vmax=None, eps=1e-8):
     return torch.cat([1.0 - neg, 1.0 - neg - pos, 1.0 - pos], dim=1)
 
 
-def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False):
+def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False,
+                      data_range=1.0):
     """Metrics for one already-brain-masked (target, pred) pair.
 
     Plain mode (`src is None`): metrics on the network's own target.
@@ -155,12 +157,14 @@ def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False):
     masked anchor to both sides -- i.e. exactly the numbers a non-residual run reports.
     """
     if src is None:
-        mets = compute_metrics(target, pred, psnr_only=psnr_only)
+        mets = compute_metrics(target, pred, psnr_only=psnr_only, data_range=data_range)
     else:
         mets = {f"delta_{k}": v
-                for k, v in compute_metrics(target, pred, psnr_only=psnr_only).items()}
+                for k, v in compute_metrics(target, pred, psnr_only=psnr_only,
+                                            data_range=data_range).items()}
         src = src * organ_mask if use_mask else src    # mask*(y-src) + mask*src == mask*y
-        mets.update(compute_metrics(target + src, pred + src, psnr_only=psnr_only))
+        mets.update(compute_metrics(target + src, pred + src, psnr_only=psnr_only,
+                                    data_range=data_range))
 
         # rms(predicted residual) / rms(true residual). This is the collapse detector: the
         # degenerate solution in residual mode is to predict 0 everywhere, which reconstructs
@@ -193,6 +197,15 @@ def train_synthesis(
     loss_type="l1",
     use_mask=True,
     psnr_only=False,
+    data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
+                                     # data in [-1, 1]. Default 1.0 keeps every existing caller
+                                     # bit-identical, but a run whose data is NOT in [0, 1] reports
+                                     # every dB offset by 20*log10(data_range) -- which makes its
+                                     # PSNR incomparable with an i2sb run on the same data.
+    display_orient=None,             # rotate the wandb panels for display only ("radiological" /
+                                     # "neurological"); NYUMets stores canonical RAS, so a raw grid
+                                     # puts the eyes on the image's right. Never touches the pixels
+                                     # the loss sees.
     residual_mode=False,             # supervise on y - X[:, residual_src_idx] (see docstring)
     residual_src_idx=0,              # which INPUT channel is the anchor; with
                                      # input_idx=[0,1,3] (flair,t1,t2) the T1 anchor is 1
@@ -296,7 +309,8 @@ def train_synthesis(
         nonfinite = not math.isfinite(avg_loss)
 
         train_metrics = synthesis_metrics(target_m, pred_m, src, organ_mask,
-                                          use_mask, psnr_only=psnr_only)
+                                          use_mask, psnr_only=psnr_only,
+                                          data_range=data_range)
         train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
         # ---- averaged-loss backtracking ----
@@ -363,7 +377,8 @@ def train_synthesis(
                     # yv_m = (yv + 2)/4
                     # pv_m = (pv + 2)/4
                     mets = synthesis_metrics(target_vm, pv_m, src_v, organ_maskv,
-                                             use_mask, psnr_only=psnr_only)
+                                             use_mask, psnr_only=psnr_only,
+                                             data_range=data_range)
                     mets = {k: float(v.detach()) for k, v in mets.items()}
                     # same total the training step optimizes, so val/loss stays comparable
                     mets["loss"] = float(weighted_loss(loss_type, pv_m, target_vm,
@@ -398,6 +413,12 @@ def train_synthesis(
                 res = (gt_img - pred_img).abs()
                 res = res / res.max().clamp(min=1e-8)
 
+                # DISPLAY ONLY, after all normalization and masking: the pixels the loss saw
+                # are untouched. NYUMets stores canonical RAS, so a raw grid has the eyes on the
+                # image's right.
+                grid = orient_tensor(grid, display_orient)
+                res = orient_tensor(res, display_orient)
+
                 in_cap = f"T1 anchor(ch{residual_src_idx})" if residual_mode else "Input(ch0)"
                 log = {
                     "val/example": wandb_image(vutils.make_grid(grid, nrow=3),
@@ -420,6 +441,7 @@ def train_synthesis(
                     delta = torch.cat([diverging_rgb(d_gt, vmax),
                                        diverging_rgb(d_pred, vmax),
                                        diverging_rgb(etv[:1], 1.0)], dim=0)
+                    delta = orient_tensor(delta, display_orient)
                     rr = mean_metrics.get("resid_ratio", float("nan"))
                     log["val/delta"] = wandb_image(
                         vutils.make_grid(delta, nrow=3),

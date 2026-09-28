@@ -1,6 +1,8 @@
 #!/bin/bash
 #
-# Every NYUMets I2SB experiment as one job array: one config per task, one A100 per task.
+# Every NYUMets bridge and end-to-end experiment as one job array: one config per task, one
+# A100 per task. 0-11 are task: i2sb (Schrodinger bridge); 12-15 are task: synthesis (direct
+# regression). The runner is task-agnostic -- it picks a config by index and calls train.py.
 #
 #   idx  config                               model             inputs to the bridge regressor
 #   ---  -----------------------------------  ----------------  ------------------------------------
@@ -18,6 +20,16 @@
 #    9   i2sb_unet_otherstudy_pair.json       SBUnet   C=6      FLAIR, T1, T2 + other-study T1, CT1
 #   10   i2sb_unet_otherstudy_pair_w1.json    SBUnet   C=10     ... + other-study T1/CT1 at z-1..z+1
 #   11   i2sb_unet_otherstudy_pair_w2.json    SBUnet   C=14     ... + other-study T1/CT1 at z-2..z+2
+#   12   synth_unet_all.json                  Unet2D  in=3      FLAIR, T1, T2
+#   13   synth_unet_otherstudy_pair.json      Unet2D  in=5      ... + other-study T1, CT1
+#   14   synth_unet_otherstudy_pair_w1.json   Unet2D  in=9      ... at z-1..z+1
+#   15   synth_unet_otherstudy_pair_w2.json   Unet2D  in=13     ... at z-2..z+2
+#
+# END-TO-END (12-15) is `task: synthesis`: one forward pass, pred = net(X), no bridge and no
+# schedule. The conditioning is lifted from the matching i2sb config, so 12 vs 1, 13 vs 9,
+# 14 vs 10 and 15 vs 11 differ in the OBJECTIVE -- and in the one input channel a bridge needs
+# and a direct regressor does not (in_chans = C - 1). Loader: nyumets_synth.
+#   sbatch --array=12-15 bigpurple/i2sb_nyumets_array.sbatch
 #
 # Paired comparisons: 1 vs 2 isolates the other-study CT1 channel; 3 vs 4 is conditioning
 # channels vs guided prox; 4 vs 5 swaps same-session guides for the other-study CT1; 2 vs 8 is
@@ -28,8 +40,11 @@
 # prox models pay per guide plane, the UNet only widens its first conv.
 #   sbatch --array=2,9-11 bigpurple/i2sb_nyumets_array.sbatch
 #
-# The LONGITUDINAL subset -- the ones that use another study of the same patient -- is 2, 5, 8-11:
+# The LONGITUDINAL subset -- the ones that use another study of the same patient -- is 2, 5, 8-11
+# (13-15 for the end-to-end twins):
 #   sbatch --array=2,5,8-11 bigpurple/i2sb_nyumets_array.sbatch
+# The BRIDGE-vs-END-TO-END comparison is 1, 9-11 against 12-15 -- eight runs, four pairs:
+#   sbatch --array=1,9-15 bigpurple/i2sb_nyumets_array.sbatch
 # (SB-LGGCDL with all 3 guides + other CT1 was dropped: it OOMs on one A100.)
 #
 # Submit all (at most 4 GPUs at once):
@@ -47,7 +62,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-11%4
+#SBATCH --array=0-15%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -79,6 +94,10 @@ CONFIGS=(
     config/NYUMets/i2sb_unet_otherstudy_pair.json
     config/NYUMets/i2sb_unet_otherstudy_pair_w1.json
     config/NYUMets/i2sb_unet_otherstudy_pair_w2.json
+    config/NYUMets/synth_unet_all.json
+    config/NYUMets/synth_unet_otherstudy_pair.json
+    config/NYUMets/synth_unet_otherstudy_pair_w1.json
+    config/NYUMets/synth_unet_otherstudy_pair_w2.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
