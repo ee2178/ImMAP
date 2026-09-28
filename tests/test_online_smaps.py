@@ -159,6 +159,63 @@ def test_estimators_run():
           f"{float((sm.abs().sum(1) > 0).float().mean()):.1%} of the FOV is nonzero")
 
 
+def test_walsh_phase_reference():
+    """Localised coils: the strongest coil is dark over part of the object.
+
+    Referencing each patch's eigenvector to that coil (Sljiva's `walsh_smaps`,
+    phase_ref="strongest") takes the phase of noise there, and neighbouring
+    patches blended by the upsampling come out with unrelated phases -- jumps
+    of radians in the combined image. The virtual-coil reference has signal
+    everywhere the object does, so the phase stays smooth.
+    """
+    if not have_lapack():
+        print("[skip] walsh needs LAPACK (svd)")
+        return
+    import math
+    from physics.smaps import walsh
+    N, C = 96, 8
+    g = torch.Generator().manual_seed(0)
+    yy = (torch.arange(N)[:, None] - N / 2).double()
+    xx = (torch.arange(N)[None, :] - N / 2).double()
+    obj = (((yy / 0.42) ** 2 + (xx / 0.35) ** 2) < N ** 2 / 4).double()
+    obj = obj * (1 + 0.3 * torch.cos(xx / 7.0))
+    sm = []
+    for c in range(C):
+        a = 2 * math.pi * c / C
+        cy, cx = 0.45 * N * math.sin(a), 0.45 * N * math.cos(a)
+        mag = torch.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 8.0 ** 2))
+        ph = (2 * math.pi * torch.rand(1, generator=g, dtype=torch.float64)
+              + 0.04 * (yy * math.sin(a) + xx * math.cos(a)))
+        sm.append(mag * torch.exp(1j * ph))
+    sm = torch.stack(sm)
+    sm = sm / sm.abs().pow(2).sum(0, keepdim=True).sqrt()
+    y = sm * obj + 1e-3 * (torch.randn((C, N, N), generator=g, dtype=torch.float64)
+                           + 1j * torch.randn((C, N, N), generator=g,
+                                              dtype=torch.float64))
+    y = y[None].to(torch.complex64)
+    inner = obj > 0                      # away from the edge, where bilinear
+    for _ in range(4):                   # upsampling smears across it
+        inner = (inner & torch.roll(inner, 1, 0) & torch.roll(inner, -1, 0)
+                 & torch.roll(inner, 1, 1) & torch.roll(inner, -1, 1))
+    pair = inner[1:, :] & inner[:-1, :]
+
+    jump = {}
+    for ref in ("strongest", "virtual"):
+        s = walsh(y, phase_ref=ref)[0]
+        x = (s.conj() * y[0]).sum(0)
+        jump[ref] = float(torch.angle(x[1:, :] * x[:-1, :].conj())[pair].abs().max())
+    check("walsh strongest-coil reference breaks on localised coils "
+          "(the fixture is not vacuous)", jump["strongest"] > 1.0,
+          f"max phase jump {jump['strongest']:.2f} rad")
+    check("walsh virtual-coil reference keeps the phase smooth",
+          jump["virtual"] < 0.2, f"max phase jump {jump['virtual']:.2f} rad")
+    try:
+        walsh(y, phase_ref="nope")
+        check("an unknown walsh phase_ref is rejected", False, "no error")
+    except ValueError:
+        check("an unknown walsh phase_ref is rejected", True)
+
+
 def test_bad_inputs():
     k, _, _ = phantom()
     m = make_acc_mask((64, 48), accel=4, acs_lines=8, dim=1, mode="uniform")
@@ -182,7 +239,8 @@ def test_bad_inputs():
 def main():
     for fn in (test_acs_line_count, test_acs_block_is_asymmetric,
                test_only_the_acs_reaches_the_estimator, test_cost_bound,
-               test_estimators_run, test_bad_inputs):
+               test_estimators_run, test_walsh_phase_reference,
+               test_bad_inputs):
         print(f"\n--- {fn.__name__}")
         fn()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")

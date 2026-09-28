@@ -156,7 +156,8 @@ def estimate_cost_gb(shape, n_kernels, dtype_bytes=8):
 
 def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
                  thresh_rowspace=0.05, thresh_eig=0.0, maxit=100,
-                 walsh_ks=5, walsh_stride=2, window="box", clamp=ACS_CLAMP):
+                 walsh_ks=5, walsh_stride=2, walsh_phase_ref="virtual",
+                 window="box", clamp=ACS_CLAMP):
     """Coil maps from the measured centre of `kspace`.
 
     Parameters
@@ -166,6 +167,9 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
     method : "espirit" (default) or "walsh"
     acs_lines : the config's `mri.acs_lines`. Pass it -- see `resolve_lines`.
     thresh_eig : 0.0 by default, as in `mrireco.jl` -- no hard support.
+    walsh_phase_ref : "virtual" (default) or "strongest" (Sljiva's
+             `walsh_smaps`); see `physics.smaps.walsh`. The strongest-coil
+             reference is noise wherever that coil is dark.
     window : "box" (default) -- the ACS lines exactly as measured, no taper --
              or "hamming", the full-grid window `mrireco.jl` applies
              (`Sljiva.hamming_window`, identical to
@@ -214,7 +218,8 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
         kc = hamming_window(kc)
 
     if method == "walsh":
-        return walsh(ifftc(kc), ks=walsh_ks, stride=walsh_stride)
+        return walsh(ifftc(kc), ks=walsh_ks, stride=walsh_stride,
+                     phase_ref=walsh_phase_ref)
 
     return espirit(kc, acs_size=(ax, ay), kernel_size=kernel_size,
                    thresh_rowspace=thresh_rowspace, thresh_eig=thresh_eig,

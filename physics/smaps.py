@@ -6,16 +6,54 @@ from typing import Tuple
 
 ### Sensitivity Map Estimation
 
-def walsh(y: torch.Tensor, ks: int = 5, stride: int = 2):
+def _virtual_coil(y: torch.Tensor, iters: int = 30):
+    """Leading eigenvector of the image-wide coil covariance, (B, C).
+
+    `sum_pixels y y^H` -- the coil combination with the most signal, i.e. the
+    "virtual body coil" of Buehrer et al. (MRM 2007). Power iteration, not
+    eigh: it is C x C and needs no LAPACK. Started from the strongest coil and
+    rotated so that coil's weight is real, so the result (and hence the maps'
+    global phase) is deterministic.
+    """
+    B, C = y.shape[:2]
+    yf = y.reshape(B, C, -1)
+    cov = yf @ yf.conj().transpose(-1, -2)                      # (B, C, C)
+    cref = yf.abs().pow(2).sum(-1).argmax(dim=1)                # (B,)
+    v = torch.zeros(B, C, 1, dtype=y.dtype, device=y.device)
+    v[torch.arange(B, device=y.device), cref] = 1
+    for _ in range(iters):
+        v = cov @ v
+        v = v / (v.abs().pow(2).sum(dim=1, keepdim=True).sqrt() + 1e-30)
+    v = v[..., 0]
+    ref = v[torch.arange(B, device=y.device), cref][:, None]
+    return v * (ref / (ref.abs() + 1e-12)).conj()
+
+
+def walsh(y: torch.Tensor, ks: int = 5, stride: int = 2,
+          phase_ref: str = "virtual"):
     """
     Computes coil sensitivity maps using the Walsh method.
     Args:
         y: complex tensor of shape (B, C, H, W)
         ks: patch size
         stride: patch stride
+        phase_ref: how each patch's eigenvector (defined only up to a phase)
+            is rotated before the patches are interpolated together.
+            "virtual" (default): so the maps' projection onto the virtual
+                body coil (`_virtual_coil`) is real. That combination has
+                signal wherever any coil does, so the reference is never
+                noise.
+            "strongest": so the strongest coil's map is real -- Sljiva's
+                `walsh_smaps` exactly. With localised coils that coil is dark
+                over part of the FOV, its phase there is noise, and the
+                bilinear upsampling blends patches with unrelated phases:
+                the dark regions come out with cancellation artifacts.
     Returns:
         smaps: sensitivity maps of shape (B, C, H, W)
     """
+    if phase_ref not in ("virtual", "strongest"):
+        raise ValueError(
+            f"phase_ref must be 'virtual' or 'strongest', got {phase_ref!r}")
     B, C, H, W = y.shape
 
     # Handle unfolding for complex tensors
@@ -34,12 +72,18 @@ def walsh(y: torch.Tensor, ks: int = 5, stride: int = 2):
     U, S, Vh = torch.linalg.svd(X, full_matrices=False)
     Q = U[..., 0]  # (B, Npatch, C)
 
-    # Reference coil alignment per batch
-    power = y.abs().pow(2).sum(dim=(2, 3))  # (B, C)
-    Cref = power.argmax(dim=1)
-    for b in range(B):
-        ref = Q[b, :, Cref[b]]
-        Q[b] *= ref.conj().sgn().unsqueeze(-1)
+    # Phase alignment per patch. Q is conj(s) up to a phase, so rotating Q by
+    # conj(sgn(t)) makes s's reference component real and positive.
+    if phase_ref == "virtual":
+        w = _virtual_coil(y)                                     # (B, C)
+        t = (Q * w[:, None, :]).sum(dim=-1, keepdim=True)        # (B, Npatch, 1)
+        Q = Q * t.conj().sgn()
+    else:
+        power = y.abs().pow(2).sum(dim=(2, 3))  # (B, C)
+        Cref = power.argmax(dim=1)
+        for b in range(B):
+            ref = Q[b, :, Cref[b]]
+            Q[b] *= ref.conj().sgn().unsqueeze(-1)
 
     # Reshape to low-res maps
     Hp = (H - ks) // stride + 1
