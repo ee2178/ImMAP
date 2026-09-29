@@ -225,8 +225,9 @@ def test_generator_protocols():
           mri.get("center_frac") == 0.04 and mri.get("adjust_accel") is True)
     check("measured: operator maps estimated online with ESPIRiT",
           mri.get("online_smaps") == "espirit")
-    check("measured: online ESPIRiT runs at thresh_eig 0.95, maxit 10",
-          mri.get("online_smaps_kws") == {"thresh_eig": 0.95, "maxit": 10},
+    check("measured: online ESPIRiT runs at thresh_eig 0, kernel 4x4, maxit 10",
+          mri.get("online_smaps_kws") == {"thresh_eig": 0.0, "kernel_size": 4,
+                                          "maxit": 10},
           f"{mri.get('online_smaps_kws')}")
 
     # ...and those settings reach espirit() itself, through prepare_measurement
@@ -247,8 +248,9 @@ def test_generator_protocols():
             online_smaps_kws=dict(mri["online_smaps_kws"], acs_lines=15))
     finally:
         om.espirit = real
-    check("the config's thresh_eig and maxit reach espirit()",
-          got.get("thresh_eig") == 0.95 and got.get("maxit") == 10, f"{got}")
+    check("the config's thresh_eig, kernel_size and maxit reach espirit()",
+          got.get("thresh_eig") == 0.0 and got.get("kernel_size") == 4
+          and got.get("maxit") == 10, f"{got}")
 
     check("measured: acs_lines is null -- derived from center_frac, not a fixed 20",
           mri.get("acs_lines", "absent") is None, f"acs_lines={mri.get('acs_lines')!r}")

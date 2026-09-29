@@ -17,8 +17,12 @@
 #
 # PROBE -- does the online ESPIRiT support threshold hurt the unrolled net?
 #
-#   0   lpdsnet  brain R16  online ESPIRiT thresh_eig 0.0    (no hard support)
-#   1   lpdsnet  brain R16  online ESPIRiT thresh_eig 0.95   (the grid's setting)
+#   0   lpdsnet  brain R16  online ESPIRiT thresh_eig 0.0    (the grid's setting
+#                                                            since 2026-09-29)
+#   1   lpdsnet  brain R16  online ESPIRiT thresh_eig 0.95   (the old setting)
+#
+# Both at kernel_size 4, the grid's kernel since 2026-09-29. ONLINE_SMAPS_KWS
+# REPLACES the config's kws wholesale, so the kernel is spelled out below.
 #
 # 5000 gradient steps each (SWEEP_EPOCHS=100 x 50 steps/epoch for brain),
 # cosine-annealed over those 5000, validated ONCE at the end (val fires when
@@ -61,7 +65,7 @@ REGENERATE=1
 SWEEP_EPOCHS=100                     # x 50 steps/epoch (brain) = 5000 steps
 VAL_EVERY=100                        # = SWEEP_EPOCHS: validate once, at the end
 RUN_TAG="${TAGS[${TASK}]}"
-ONLINE_SMAPS_KWS="{\"thresh_eig\": ${THRESH[${TASK}]}, \"maxit\": 10}"
+ONLINE_SMAPS_KWS="{\"thresh_eig\": ${THRESH[${TASK}]}, \"kernel_size\": 4, \"maxit\": 10}"
 export VAL_EVERY ONLINE_SMAPS_KWS
 
 # The body picks its cell by SLURM_ARRAY_TASK_ID. This array indexes the

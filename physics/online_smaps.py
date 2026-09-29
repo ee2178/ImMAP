@@ -175,7 +175,7 @@ def estimate_cost_gb(shape, n_kernels, dtype_bytes=8):
     return b * c * int(n_kernels) * nx * ny * dtype_bytes / 2 ** 30
 
 
-def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
+def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=4,
                  thresh_rowspace=0.05, thresh_eig=0.0, maxit=100,
                  walsh_ks=5, walsh_stride=2, walsh_phase_ref="virtual",
                  window=None, clamp=ACS_CLAMP, phase_correct=False):
@@ -229,10 +229,11 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
     -------
     (B, C, H, W) complex, unit-RSS wherever the maps are nonzero.
 
-    `kernel_size` defaults to 6 rather than `espirit`'s 8: the ACS is at most
-    32 x lines here, and an 8x8 kernel leaves too few patches to estimate a
-    null space from (at 32x20: 325 rows for ks=6 against 169 for ks=8, with
-    ks^2 * C columns either way).
+    `kernel_size` defaults to 4 (since 2026-09-29; was 6) rather than
+    `espirit`'s 8: the ACS is at most 32 x lines here, and the Hankel matrix
+    has (32-ks+1)(lines-ks+1) rows against ks^2 * C columns. At the grid's
+    32 x 13 block and 20 coils that is 290 rows vs 320 columns for ks=4,
+    216 vs 720 for ks=6, and 150 vs 1280 for ks=8.
     """
     if method not in METHODS:
         raise ValueError(f"method must be one of {METHODS}, got {method!r}")

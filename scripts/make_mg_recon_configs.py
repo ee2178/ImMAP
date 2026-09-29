@@ -745,23 +745,26 @@ def _apply_protocol(args):
     return args
 
 
-# THE ONLINE ESPIRiT PROTOCOL for every mg experiment (the user's settings,
-# 2026-09-28): what the operator's maps are estimated with, every step.
+# THE ONLINE ESPIRiT PROTOCOL for every mg experiment (the user's settings):
+# what the operator's maps are estimated with, every step.
 #
-#   thresh_eig 0.95  the maps get a hard eigenvalue support, as offline ESPIRiT
-#                    does. (Julia's online call passes 0; this departs from it
-#                    on purpose.) Pixels outside the support have ZERO
-#                    sensitivity in the operator, so no unrolled net can put
-#                    signal there -- where the ground truth (stored maps, their
-#                    own support) is nonzero, that is error only the unrolled
-#                    nets are charged; VarNet estimates its own maps.
-#   maxit 10         power-method iterations. The eigenvalue the threshold
-#                    reads is estimated from this iterate, so the two interact:
-#                    an under-converged pixel reads low and can be cut.
+#   thresh_eig 0     no hard support, as in Julia's online call (`mrireco.jl`).
+#                    Since 2026-09-29; it was 0.95 from 09-28, which zeroed the
+#                    operator maps outside the eigenvalue support -- nothing
+#                    could be put there while the SENSE ground truth (stored
+#                    maps) could still be nonzero, and CG-SENSE on the testbench
+#                    reconstructed better at 0.
+#   kernel_size 4    since 2026-09-29 (was online_smaps' default, 6). The
+#                    online ACS is 32 x 13 at R=16/center_frac 0.04, so the
+#                    Hankel matrix has (32-ks+1)(13-ks+1) rows against ks^2 * C
+#                    columns: ks=6 gives 216 rows vs 720 at 20 coils, ks=4
+#                    gives 290 vs 320 -- far closer to determined.
+#   maxit 10         power-method iterations. Read ONLY by method="power";
+#                    `espirit()` defaults to "eigdecomp", which ignores it.
 #
 # Written into `mri.online_smaps_kws`, which training and both eval paths pass
-# straight to physics/online_smaps.py::online_smaps. Walsh takes neither.
-ONLINE_ESPIRIT_KWS = {"thresh_eig": 0.95, "maxit": 10}
+# straight to physics/online_smaps.py::online_smaps. Walsh takes none of these.
+ONLINE_ESPIRIT_KWS = {"thresh_eig": 0.0, "kernel_size": 4, "maxit": 10}
 
 
 def _opt_mri(args):
