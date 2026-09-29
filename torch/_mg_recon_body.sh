@@ -82,6 +82,11 @@ ONLY="${ONLY:-}"
 ACCELS="${ACCELS:-}"
 ATTN="${ATTN:-}"
 ORGAN_MASK="${ORGAN_MASK:-}"
+# PHASE_CORRECT  "" = off; 1 phase-corrects the online coil maps
+#                (--online-phase-correct). Like ORGAN_MASK, regeneration writes
+#                every config of the anatomy, so set it the same in every
+#                launcher of that anatomy.
+PHASE_CORRECT="${PHASE_CORRECT:-}"
 
 source ~/.bashrc
 conda activate gcdl
@@ -134,7 +139,7 @@ if [ "${REGENERATE}" = "1" ]; then
     # generator's default (measured). See the generator's module docstring.
     python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
         --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} \
-        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"} >/dev/null
+        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"}         ${PHASE_CORRECT:+--online-phase-correct} >/dev/null
 fi
 
 if [ ! -f "${BASE_CONFIG}" ]; then

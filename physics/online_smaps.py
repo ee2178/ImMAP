@@ -178,7 +178,7 @@ def estimate_cost_gb(shape, n_kernels, dtype_bytes=8):
 def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
                  thresh_rowspace=0.05, thresh_eig=0.0, maxit=100,
                  walsh_ks=5, walsh_stride=2, walsh_phase_ref="virtual",
-                 window=None, clamp=ACS_CLAMP):
+                 window=None, clamp=ACS_CLAMP, phase_correct=False):
     """Coil maps from the measured centre of `kspace`.
 
     Parameters
@@ -213,6 +213,17 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
              Everything outside the ACS is zeroed by the centre mask in
              either case (verified: exactly 0 energy outside the ACS
              columns), so neither choice lets accelerated lines leak in.
+
+    phase_correct : False (default) or True -- `Sljiva`'s `phase_correct`.
+             Rotate the maps by the phase of the coil-combined calibration
+             image, `sgn(sum_c conj(s_c) acs_c)`, computed with the SAME maps
+             (see `phase_correct_maps`).  Removes whatever per-pixel phase
+             the estimator's reference convention put in the maps -- the
+             strongest coil's, noise where that coil is dark -- and with it
+             the object's low-resolution phase, so the image the net must
+             reconstruct is near-real.  Invisible to SENSE and to any
+             magnitude image; it changes only what a complex-valued prior
+             sees.
 
     Returns
     -------
@@ -251,9 +262,32 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=6,
         kc = hamming_window(kc)
 
     if method == "walsh":
-        return walsh(ifftc(kc), ks=walsh_ks, stride=walsh_stride,
-                     phase_ref=walsh_phase_ref)
+        smaps = walsh(ifftc(kc), ks=walsh_ks, stride=walsh_stride,
+                      phase_ref=walsh_phase_ref)
+    else:
+        smaps = espirit(kc, acs_size=(ax, ay), kernel_size=kernel_size,
+                        thresh_rowspace=thresh_rowspace, thresh_eig=thresh_eig,
+                        maxit=maxit)
+    if phase_correct:
+        smaps = phase_correct_maps(smaps, ifftc(kc))
+    return smaps
 
-    return espirit(kc, acs_size=(ax, ay), kernel_size=kernel_size,
-                   thresh_rowspace=thresh_rowspace, thresh_eig=thresh_eig,
-                   maxit=maxit)
+
+def phase_correct_maps(smaps, calib):
+    """`s_c <- s_c * sgn(sum_c' conj(s_c') calib_c')` -- `Sljiva`'s phase_correct.
+
+    Maps are defined only up to a per-pixel phase shared by all coils, and each
+    estimator fixes it by some convention (ESPIRiT here: the strongest coil is
+    real, per pixel).  Whatever that phase e^{i phi} is, the calibration image
+    combined with the SAME maps carries e^{-i phi} too, so multiplying by its
+    phase cancels phi exactly.  The implied image becomes
+    `x conj(sgn(x_lowres))`: the convention -- and any noise in it -- is gone,
+    and so is the object's smooth low-resolution phase.
+
+    Magnitude, unit-RSS and support are unchanged.  Where the combination is
+    exactly 0 (outside a thresholded support) the maps are left as they are.
+    """
+    t = (smaps.conj() * calib).sum(dim=1, keepdim=True)
+    a = t.abs()
+    pf = torch.where(a > 0, t / a.clamp_min(1e-30), torch.ones_like(t))
+    return smaps * pf

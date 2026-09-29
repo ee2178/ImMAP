@@ -283,12 +283,60 @@ def test_bad_inputs():
         check("a mask with no sampled centre is rejected", True)
 
 
+# ---------------------------------------------------------------------------
+def test_phase_correct():
+    """`phase_correct`: the maps' per-pixel phase convention cancels EXACTLY.
+
+    Whatever phase e^{i phi(r)} an estimator leaves in the maps, the phase-
+    corrected maps must come out identical -- that is what makes the choice of
+    reference (strongest coil, virtual coil, noise) irrelevant to the image the
+    net reconstructs.  Magnitude, unit-RSS and a thresholded support survive.
+    """
+    import math
+    from physics.online_smaps import phase_correct_maps
+    k, sm, obj = phantom()
+    H, W = obj.shape
+    yy = torch.arange(H)[:, None].float() / H
+    xx = torch.arange(W)[None, :].float() / W
+    x = obj * torch.exp(1j * (2.0 * yy + 1.5 * xx ** 2)).to(torch.complex64)
+    coils = sm * x
+    sm = torch.where(obj.abs()[None, None] > 0, sm, torch.zeros_like(sm))   # a hard support
+    calib = ifftc(center_mask(torch.ones(1, 1, 1, W), 9).to(torch.complex64) * fftc(coils))
+
+    g = torch.Generator().manual_seed(1)
+    phi = 2 * math.pi * torch.rand(1, 1, H, W, generator=g)
+    a = phase_correct_maps(sm, calib)
+    b = phase_correct_maps(sm * torch.exp(1j * phi), calib)
+    check("any per-pixel map phase cancels exactly", torch.allclose(a, b, atol=1e-5),
+          f"max diff {float((a - b).abs().max()):.1e}")
+    check("magnitudes (so unit-RSS) unchanged", torch.allclose(a.abs(), sm.abs(), atol=1e-6))
+    check("a zeroed (thresholded) support stays zero",
+          bool((a[:, :, obj.abs() == 0] == 0).all()))
+
+    implied = (a.conj() * coils).sum(1)[0]                  # the image these maps imply
+    ph = torch.angle(implied)[obj.abs() > 0].abs()
+    check("the implied image is near-real (its low-res phase removed)",
+          float(ph.quantile(0.95)) < 0.3, f"95th pct |phase| {float(ph.quantile(0.95)):.3f} rad")
+
+    if not have_lapack():
+        print("[skip] online_smaps(phase_correct=True) needs LAPACK (svd)")
+        return
+    m = make_acc_mask((H, W), 4, acs_lines=9).reshape(1, 1, H, W)
+    y = m * fftc(coils)
+    for method in ("walsh", "espirit"):
+        kw = dict(kernel_size=4) if method == "espirit" else {}
+        s0 = online_smaps(y, m, method=method, acs_lines=9, **kw)
+        s1 = online_smaps(y, m, method=method, acs_lines=9, phase_correct=True, **kw)
+        check(f"{method}: phase_correct changes phase only",
+              torch.allclose(s0.abs(), s1.abs(), atol=1e-5))
+
+
 def main():
     for fn in (test_acs_line_count, test_acs_block_is_asymmetric,
                test_only_the_acs_reaches_the_estimator,
                test_walsh_window_default, test_cost_bound,
                test_estimators_run, test_walsh_phase_reference,
-               test_bad_inputs):
+               test_phase_correct, test_bad_inputs):
         print(f"\n--- {fn.__name__}")
         fn()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")

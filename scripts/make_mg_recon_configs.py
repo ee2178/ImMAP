@@ -778,8 +778,16 @@ def _opt_mri(args):
         out["adjust_accel"] = True
     if getattr(args, "online_smaps", None):
         out["online_smaps"] = args.online_smaps
-        if args.online_smaps == "espirit":
-            out["online_smaps_kws"] = dict(ONLINE_ESPIRIT_KWS)
+        kws = dict(ONLINE_ESPIRIT_KWS) if args.online_smaps == "espirit" else {}
+        if getattr(args, "online_phase_correct", False):
+            # Sljiva's phase_correct: re-reference the maps' phase to the
+            # coil-combined calibration image, which cancels the estimator's
+            # per-pixel reference convention exactly (ESPIRiT's strongest-
+            # coil phase is noise wherever that coil is dark). Written only
+            # when on, so configs without it stay byte-identical.
+            kws["phase_correct"] = True
+        if kws:
+            out["online_smaps_kws"] = kws
     return out
 
 
@@ -1204,6 +1212,11 @@ def main():
                         "cheap one its experiments actually used, and the "
                         "default under --protocol measured. Changes the "
                         "problem -- see the `mri.online_smaps` comment.")
+    p.add_argument("--online-phase-correct", action="store_true",
+                   help="rotate the online maps by the phase of the coil-"
+                        "combined calibration image (Sljiva's phase_correct; "
+                        "physics/online_smaps.py::phase_correct_maps). Changes "
+                        "only what the complex priors see, not SENSE.")
     p.add_argument("--only", nargs="*", default=None,
                    help="restrict to these model tags")
     p.add_argument("--anatomy", choices=("knee", "brain"), default=None,
