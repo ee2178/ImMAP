@@ -11,8 +11,8 @@
 #SBATCH --job-name=MGDump
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%A_%a.out
-#SBATCH --error=logs/slurm_%A_%a.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
 #SBATCH --array=0-1            # 0 = brain, 1 = knee
 #
 # Dump per-volume reconstructions for the figure viewer (scripts/dump_eval.py).

@@ -11,8 +11,8 @@
 #SBATCH --job-name=SBCDLNet-grid
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%A_%a.out
-#SBATCH --error=logs/slurm_%A_%a.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
 #SBATCH --array=0-15          # MUST equal len(BETAS)*len(ET_WEIGHTS) - 1; checked at runtime
 #
 # 2-D grid over the I2SB schedule scale (beta_max) and the enhancing-tumor loss weight

@@ -11,8 +11,8 @@
 #SBATCH --job-name=Exp2-KneeGrp-H200
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%A_%a.out
-#SBATCH --error=logs/slurm_%A_%a.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
 #SBATCH --array=0
 #
 # EXPERIMENT 2, GROUP CELL -- knee R8 mggrouplpds, on an H200.

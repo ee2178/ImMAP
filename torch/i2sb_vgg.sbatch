@@ -11,8 +11,8 @@
 #SBATCH --job-name=I2SB-SBCDLNet-VGG
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%j.out
-#SBATCH --error=logs/slurm_%j.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.err
 #
 # Perceptual-loss run: SBCDLNet with the VGG16 relu4_3 feature loss from the CCL work, alongside
 # the pixel MSE. Only SBCDLNet for now -- the same `loss_type` / `loss_params` block drops into

@@ -11,8 +11,8 @@
 #SBATCH --job-name=LatentI2SB-imgwsweep
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%A_%a.out
-#SBATCH --error=logs/slurm_%A_%a.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
 #SBATCH --array=0-6          # ONE TASK PER WEIGHT below -- keep this 0-(len(IMAGE_WEIGHTS)-1) in sync
 #
 # Latent-I2SB mixed-loss sweep over the IMAGE-domain loss weight. In loss_mode="mixed" the loss is

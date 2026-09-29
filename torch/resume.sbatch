@@ -11,8 +11,8 @@
 #SBATCH --job-name=resume
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%j.out
-#SBATCH --error=logs/slurm_%j.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.err
 #
 # Resume ONE run. Task-agnostic: it does not care whether the run is recon,
 # denoising, i2sb or synthesis -- it hands the config back to train.py, which

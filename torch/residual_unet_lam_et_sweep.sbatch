@@ -11,8 +11,8 @@
 #SBATCH --job-name=ResUNet-lamET-sweep
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%A_%a.out
-#SBATCH --error=logs/slurm_%A_%a.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
 #SBATCH --array=0-5          # ONE TASK PER LAMBDA BELOW -- keep 0-(len(LAMS)-1) in sync with LAMS
 #
 # et_weight sweep over the RESIDUAL U-NET task (config/BraTS/residual_synthesis_unet.json:

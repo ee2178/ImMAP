@@ -11,8 +11,8 @@
 #SBATCH --job-name=WLPDSBench
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=logs/slurm_%j.out
-#SBATCH --error=logs/slurm_%j.err
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.err
 #
 # Wavelet-LPDS K / K^H: the original Gauss-trick path vs the interleaved one
 # (one real conv per level), with and without torch.compile, for both carry
