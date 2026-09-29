@@ -18,11 +18,11 @@
 # EXPERIMENT 2, GROUP CELL -- knee R8 mggrouplpds, on an H200.
 #
 # THE OTHER CELLS ARE IN torch/exp2_knee_group.sbatch (lpdsnet, mglpds and the
-# varnet baseline). This is one experiment split across two files, and both
+# varnetmaps baseline). This is one experiment split across two files, and both
 # must be submitted -- the claim is a comparison BETWEEN the group cell here and
 # the local cell there, so either half alone says nothing:
 #
-#     sbatch torch/exp2_knee_group.sbatch        # lpdsnet, mglpds, varnet  (L40S)
+#     sbatch torch/exp2_knee_group.sbatch        # lpdsnet, mglpds, varnetmaps  (L40S)
 #     sbatch torch/exp2_knee_mggroup.sbatch      # mggrouplpds              (H200)
 #
 # WHY A SEPARATE FILE AND NOT AN ARRAY INDEX

@@ -19,10 +19,10 @@
 #
 #   0   brain  R8  lpdsnet      flat LPDS, K=30
 #   1   brain  R8  mglpds       V-cycle, K=[6,[4,4,6]]
-#   2   brain  R8  varnet       E2E-VarNet baseline
+#   2   brain  R8  varnetmaps   E2E-VarNet baseline, on the operator's maps
 #   3   brain  R4  lpdsnet
 #   4   brain  R4  mglpds
-#   5   brain  R4  varnet
+#   5   brain  R4  varnetmaps
 #
 # Every arm trains here, from scratch: no existing brain run uses the
 # regenerated ESPIRiT maps (torch/espirit_smaps.sbatch, which also rewrites the
@@ -31,10 +31,14 @@
 # Every cell is launched once, however many launchers list it: a run dir that
 # already holds an identical launch is skipped, a stale one is refused
 # (LAUNCH-ONCE in torch/_mg_recon_body.sh). exp4 runs at R=16 by default; with
-# ACCELS=8 its lpdsnet / mglpds / varnet cells are these.
+# ACCELS=8 its lpdsnet / mglpds / varnetmaps cells are these.
 #
-# VarNet is the "is any of this competitive" check, not part of the hypothesis
-# (its asymmetries are in the `varnet` entry of scripts/make_mg_recon_configs.py).
+# VarNet is the "is any of this competitive" check, not part of the hypothesis.
+# The VarNet baseline is `varnetmaps` (since 2026-09-29): the E2E-VarNet
+# cascades on the SAME online ESPIRiT maps the unrolled nets get, so the arms
+# differ only in the prior. The published `varnet` (own SensitivityModel, RSS
+# out) turned out to owe its lead to map estimation alone; it stays runnable
+# by name (ONLY=varnet) but is no longer the reference.
 #
 # WHAT MAKES THE PAIR A CLEAN ABLATION
 # ------------------------------------
@@ -66,10 +70,10 @@
 #
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
-#       --accels 8 4 --only lpdsnet mglpds varnet
+#       --accels 8 4 --only lpdsnet mglpds varnetmaps
 
 ANATOMY=brain
-ONLY="lpdsnet mglpds varnet"
+ONLY="lpdsnet mglpds varnetmaps"
 ACCELS="8 4"                         # PINNED. Was "" (= all), which
                                      # silently grew to include R16 when
                                      # exp3 added it to the global list.

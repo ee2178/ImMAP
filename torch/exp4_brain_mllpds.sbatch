@@ -19,7 +19,7 @@
 #
 #   0   brain  R16 lpdsnet    flat LPDS, K=30
 #   1   brain  R16 mglpds     V-cycle, K=[6,[4,4,6]]
-#   2   brain  R16 varnet     E2E-VarNet baseline
+#   2   brain  R16 varnetmaps E2E-VarNet baseline, on the operator's maps
 #
 # BOTH MULTILEVEL CELLS ARE OUT FOR NOW (2026-09-22): mllpds64 (ML-LPDS) pending
 # a revision, and mlcdlw2 (ML-CDLNet). Their configs are still generated; run
@@ -34,7 +34,7 @@
 # adjust_accel -> R=16 is the EFFECTIVE rate, where every earlier run sampled at
 # ~R=8); the operators' coil maps estimated per step by ESPIRiT from each
 # measurement's ACS; the stored SENSE combination as ground truth; NO organ
-# mask. VarNet calibrates its own maps from the same 13 lines. None of the
+# mask. VarNet (varnetmaps) runs on those same online maps. None of the
 # pre-2026-09-22 exp4 numbers are comparable to these.
 #
 # R=16 leaves ~6% of k-space, where exp3 expects the coarse grids to matter
@@ -71,6 +71,11 @@
 # K=30 IS lpdsnet's K, so (lpdsnet vs mllpds64) takes the same 29
 # data-consistency steps and differs only in the prior. VarNet is the "is any
 # of this competitive" check, not part of the question.
+# The VarNet baseline is `varnetmaps` (since 2026-09-29): the E2E-VarNet
+# cascades on the SAME online ESPIRiT maps the unrolled nets get, so the arms
+# differ only in the prior. The published `varnet` (own SensitivityModel, RSS
+# out) turned out to owe its lead to map estimation alone; it stays runnable
+# by name (ONLY=varnet) but is no longer the reference.
 #
 # CELL 3 IS mllpds64, the winner of exp5's width/depth sweep (64/128/256,
 # K=30; that sweep ran the cascade init, this grid now runs per-filter). It
@@ -93,7 +98,7 @@
 # so the full grid's indices (which mg_recon_brain.sbatch uses) are unchanged.
 # They are listed only when named:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
-#       --accels 16 --only lpdsnet mglpds varnet
+#       --accels 16 --only lpdsnet mglpds varnetmaps
 #
 # SHORT RUNS AND OTHER ACCELERATIONS
 # ----------------------------------
@@ -119,8 +124,8 @@
 #     coarse Grams run at full resolution:
 #       SWEEP_EPOCHS=20 sbatch --array=1 torch/exp4_brain_mllpds.sbatch
 #     (tagged, so it lands in mglpds_R16_20ep; a repeat is skipped -- FORCE_RESTART=1)
-#     varnet (cell 2) does NOT run online ESPIRiT: it estimates its own maps,
-#     so the loop skips the estimate for it (`uses_operator_smaps`).
+#     varnetmaps (cell 2) DOES run online ESPIRiT, like the unrolled nets
+#     (only the opt-in `varnet`, which estimates its own maps, skips it).
 #   * if the multilevel cells come back: `python -m tests.test_ml_lpds` covers
 #     ML-LPDS; `tests.test_ml_cdlnet` currently FAILS ON IMPORT (it expects a
 #     `check_iters` the model file no longer has -- pre-existing).
@@ -129,7 +134,7 @@
 # SUBMIT directory; from torch/ the job dies before the script runs.
 
 ANATOMY=brain
-ONLY="${ONLY:-lpdsnet mglpds varnet}"
+ONLY="${ONLY:-lpdsnet mglpds varnetmaps}"
 ACCELS="${ACCELS:-16}"
 # ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the
 # support of the STORED ESPIRiT maps (organ_mask_source="smaps"). Regeneration

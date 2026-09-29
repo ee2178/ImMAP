@@ -20,6 +20,12 @@
 #                   otherwise. Set it to "" explicitly to put a shortened run in
 #                   the canonical dir anyway.
 #   REGENERATE      1 = regenerate configs from the generator before running
+#   ONLINE_SMAPS_KWS  JSON replacing mri.online_smaps_kws for this launch only,
+#                   e.g. '{"thresh_eig": 0.0, "maxit": 10}'. A PROBE knob: it
+#                   REQUIRES an explicit non-empty RUN_TAG, so a probe with other
+#                   maps can never land in (or block) the cell's own run dir.
+#   VAL_EVERY       overrides training.val_every_epochs (e.g. 5 for a short
+#                   probe that should still validate and log panels).
 #   ONLY            "" = every model tag; e.g. "mglpds mggrouplpds" for a subset
 #   ACCELS          "" = every acceleration; e.g. "8" for R=8 only
 #   ATTN            "" = the generator default (flex); triton|gather to override.
@@ -250,6 +256,22 @@ cfg.setdefault("wandb", {})["id"] = None
 if epochs:
     cfg["training"]["num_epochs"] = int(epochs)
     cfg["scheduler"]["params"]["T_max"] = int(epochs) * cfg["training"]["steps_per_epoch"]
+# Probe overrides. ONLINE_SMAPS_KWS changes the OPERATOR (the maps every step
+# sees), so it is refused without an explicit tag: under the default tag a
+# 0.95 and a 0.0 probe of the same length would share one run dir.
+_kws = os.environ.get("ONLINE_SMAPS_KWS", "").strip()
+if _kws:
+    if not os.environ.get("RUN_TAG"):
+        raise SystemExit("[grid] ONLINE_SMAPS_KWS needs an explicit RUN_TAG "
+                         "(e.g. RUN_TAG=te0), so the probe gets its own run dir.")
+    if cfg["mri"].get("online_smaps") != "espirit":
+        raise SystemExit(f"[grid] ONLINE_SMAPS_KWS set, but {base} has "
+                         f"online_smaps={cfg['mri'].get('online_smaps')!r}; the "
+                         f"kws are ESPIRiT's.")
+    cfg["mri"]["online_smaps_kws"] = json.loads(_kws)
+_ve = os.environ.get("VAL_EVERY", "").strip()
+if _ve:
+    cfg["training"]["val_every_epochs"] = int(_ve)
 # The tag goes in the wandb name as well as the run dir: a shortened run must
 # not share a name with the full-length cell it samples.
 if tag:
@@ -292,6 +314,7 @@ write_config(cfg, out)
 _acs = (f"cf{mri['center_frac']}" if mri.get("center_frac") is not None
         else mri.get("acs_lines"))
 _r = f"{mri['R']}{'(eff)' if mri.get('adjust_accel') else '(nominal)'}"
+print(f"[grid] online_smaps={mri.get('online_smaps')} kws={mri.get('online_smaps_kws')}")
 print(f"[grid] {cfg['model']['type']} R={_r} acs={_acs} "
       f"sigma~U{cfg['training']['noise_std']} epochs={cfg['training']['num_epochs']} -> {out}")
 PY

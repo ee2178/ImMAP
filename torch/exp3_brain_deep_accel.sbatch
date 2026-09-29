@@ -13,15 +13,14 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-3
+#SBATCH --array=0-2
 #
 # EXPERIMENT 3 -- does the V-cycle pay off at DEEP acceleration?  brain, R = 16.
 #
 #   0   brain  R16  lpdsnet     flat LPDS, K=30
 #   1   brain  R16  mglpds      V-cycle, K=[6,[4,4,6]]
-#   2   brain  R16  varnet      E2E-VarNet baseline
-#   3   brain  R16  varnetmaps  E2E-VarNet on the operator's maps (online Walsh
-#                               under the measured protocol) -- the map control
+#   2   brain  R16  varnetmaps  E2E-VarNet baseline, on the operator's maps
+#                               (online ESPIRiT under the measured protocol)
 #
 # THE HYPOTHESIS
 # --------------
@@ -36,9 +35,13 @@
 # is interpretable alone.
 #
 # VarNet is here as the "is any of this competitive" check, not as part of the
-# hypothesis. It estimates its own coil maps and returns RSS magnitude; see the
-# `varnet` entry in scripts/make_mg_recon_configs.py for the asymmetries that
-# carries. Like every cell it is launched once: a run dir that already holds an
+# hypothesis.
+# The VarNet baseline is `varnetmaps` (since 2026-09-29): the E2E-VarNet
+# cascades on the SAME online ESPIRiT maps the unrolled nets get, so the arms
+# differ only in the prior. The published `varnet` (own SensitivityModel, RSS
+# out) turned out to owe its lead to map estimation alone; it stays runnable
+# by name (ONLY=varnet) but is no longer the reference.
+# Like every cell it is launched once: a run dir that already holds an
 # identical launch is skipped, a stale one is refused (LAUNCH-ONCE in
 # torch/_mg_recon_body.sh; FORCE_RESTART=1 overrides).
 #
@@ -62,10 +65,10 @@
 #
 # Index map:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy brain \
-#       --accels 16 --only lpdsnet mglpds varnet varnetmaps
+#       --accels 16 --only lpdsnet mglpds varnetmaps
 
 ANATOMY=brain
-ONLY="lpdsnet mglpds varnet varnetmaps"
+ONLY="lpdsnet mglpds varnetmaps"
 ACCELS="16"
 ATTN="flex"
 # ORGAN MASK ON (2026-09-25), in EVERY launcher: loss and metrics run over the

@@ -19,7 +19,7 @@
 #
 #   0   knee  R8  lpdsnet       flat LPDS, K=30
 #   1   knee  R8  mglpds        V-cycle, K=[6,[4,4,6]], local prox
-#   2   knee  R8  varnet        E2E-VarNet baseline
+#   2   knee  R8  varnetmaps    E2E-VarNet baseline, on the operator's maps
 #
 # THE GROUP CELL LIVES IN torch/exp2_knee_mggroup.sbatch.
 # `mggrouplpds` does not fit an L40S -- attention at three grid levels with a
@@ -29,7 +29,7 @@
 # the SAME experiment and MUST be submitted together; the comparison is
 # meaningless with either half missing:
 #
-#     sbatch torch/exp2_knee_group.sbatch        # lpdsnet, mglpds, varnet  (L40S)
+#     sbatch torch/exp2_knee_group.sbatch        # lpdsnet, mglpds, varnetmaps  (L40S)
 #     sbatch torch/exp2_knee_mggroup.sbatch      # mggrouplpds              (H200)
 #
 # THE HYPOTHESIS, AND WHAT WOULD FALSIFY IT
@@ -51,8 +51,13 @@
 # to match -- neither is in this submit.
 #
 # VarNet (cell 2) is the "is any of this competitive" check, not part of the
-# hypothesis; its asymmetries are in the `varnet` entry of
-# scripts/make_mg_recon_configs.py. Like every cell it is launched once: a run
+# hypothesis.
+# The VarNet baseline is `varnetmaps` (since 2026-09-29): the E2E-VarNet
+# cascades on the SAME online ESPIRiT maps the unrolled nets get, so the arms
+# differ only in the prior. The published `varnet` (own SensitivityModel, RSS
+# out) turned out to owe its lead to map estimation alone; it stays runnable
+# by name (ONLY=varnet) but is no longer the reference.
+# Like every cell it is launched once: a run
 # dir that already holds an identical launch is skipped, a stale one is refused
 # (LAUNCH-ONCE in torch/_mg_recon_body.sh; FORCE_RESTART=1 overrides).
 #
@@ -115,10 +120,10 @@
 #
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
-#       --accels 8 --only lpdsnet mglpds varnet
+#       --accels 8 --only lpdsnet mglpds varnetmaps
 
 ANATOMY=knee
-ONLY="lpdsnet mglpds varnet"         # mggrouplpds -> exp2_knee_mggroup.sbatch
+ONLY="lpdsnet mglpds varnetmaps"     # mggrouplpds -> exp2_knee_mggroup.sbatch
 ACCELS="8"
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it

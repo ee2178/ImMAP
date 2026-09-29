@@ -549,7 +549,11 @@ MODELS.update({
         MODELS["wlpds16"]["params"], family="random_full", carry="conv")),
 })
 
-OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnetmaps",
+# `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
+# VarNet's lead over the unrolled nets was its own map estimation, so the
+# baseline in every default grid is now VarNet on the operator's maps. The two
+# are adjacent in MODELS, so the swap keeps every default-grid index.
+OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # the wavelet-LPDS cells (exp7), and the cascade ablation (not in exp7)
           "wlpds16", "whaar16", "wlpds16eq", "wdh32", "wdhn48", "wrand16", "wrandf16", "clpds16",
           # the ML-LPDS width/depth sweep (exp5) -- OPT_IN so adding them does
