@@ -56,6 +56,7 @@ shape-tolerant load. It is applied ONLY on a fresh run (start_epoch == 0) so it 
 overrides a resumed checkpoint. Reuses training.common + training.metrics like the others.
 """
 
+import contextlib
 import os
 import math
 
@@ -67,7 +68,8 @@ import torch.nn as nn
 import torchvision.utils as vutils
 from tqdm import tqdm
 
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, POSTFIX_EVERY
+from training.common import (save_ckpt, save_ema_ckpt, load_ckpt, get_lr, set_lr,
+                            apply_loss_mask, EMA, POSTFIX_EVERY)
 
 # Backtracking bookkeeping. `backtrack` is the whole restore-and-drop-the-LR
 # operation; `resync_schedule` re-applies an already-earned reduction on resume.
@@ -197,6 +199,14 @@ def train_synthesis(
     loss_type="l1",
     use_mask=True,
     psnr_only=False,
+    accum_steps=1,                   # gradient accumulation: the EFFECTIVE batch is
+                                     # data.batch_size * accum_steps. One "step" stays one
+                                     # OPTIMIZER step, so steps_per_epoch and the
+                                     # scheduler's T_max keep their meaning.
+    ema_decay=None,                  # None/0 = no EMA (the pre-2026-09-29 behaviour). With
+                                     # it set, validation runs under the averaged weights
+                                     # and net_ema.ckpt is written beside net.ckpt.
+    ema_warmup=True,                 # ramp as min(decay, (1+n)/(10+n)) over ~900 updates
     data_range=1.0,                  # peak-to-peak range of the data, for PSNR and SSIM. 2.0 for
                                      # data in [-1, 1]. Default 1.0 keeps every existing caller
                                      # bit-identical, but a run whose data is NOT in [0, 1] reports
@@ -234,8 +244,32 @@ def train_synthesis(
     net.train()
     # best_loss is a PARAMETER now, carried in from the checkpoint: see
     # the note in the signature.
+    if accum_steps < 1:
+        raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
+    ema = None
+    if ema_decay:
+        ema = EMA(net.parameters(), decay=float(ema_decay), use_num_updates=bool(ema_warmup))
+        print(f"[synthesis] EMA decay={float(ema_decay)} warmup={bool(ema_warmup)} over "
+              f"{len(ema.shadow)} parameter tensors -- validation and net_ema.ckpt use the "
+              f"average; net.ckpt keeps the live weights for resume")
+    if accum_steps > 1:
+        print(f"[synthesis] gradient accumulation x{accum_steps}: one optimizer step per "
+              f"{accum_steps} micro-batches")
+
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
+    ema_ckpt_path = os.path.join(save_dir, "net_ema.ckpt")
+
+    # Resume the average: train.py restores the model before dispatching here, so without this the
+    # shadow would be re-seeded and the decay ramp restarted on every requeue.
+    if ema is not None and start_epoch > 0:
+        resume_from = ckpt if ckpt else ckpt_path
+        if os.path.exists(resume_from):
+            load_ckpt(resume_from, ema=ema, device=device)
+            print(f"[synthesis] resumed EMA from {resume_from} at {ema.num_updates} updates")
+        else:
+            print(f"[synthesis] WARNING: resuming at epoch {start_epoch} but no checkpoint at "
+                  f"{resume_from}; the EMA restarts from the loaded weights")
 
     train_iter = iter(train_loader)
     total_steps = num_epochs * steps_per_epoch
@@ -255,54 +289,64 @@ def train_synthesis(
         running_loss, n_batches = 0.0, 0
 
         for _ in range(steps_per_epoch):
-            try:
-                X, y, organ_mask, et = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                X, y, organ_mask, et = next(train_iter)
-            X = X.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            organ_mask = organ_mask.to(device, non_blocking=True)
-            et = et.to(device, non_blocking=True)
-
-            # residual mode: the net predicts y - src, not y. Everything downstream
-            # (mask, loss, backtracking) is unchanged; `src` carries the anchor forward
-            # so metrics and images can be lifted back to the T1ce domain.
-            src = anchor_channel(X, residual_src_idx) if residual_mode else None
-            target = y - src if residual_mode else y
-
             opt.zero_grad()
-            pred = predict(net, X)              # (B, 1, H, W)
+            step_loss = 0.0
+            # `accum_steps` micro-batches make up ONE optimizer step. Each micro-batch's loss is
+            # divided by accum_steps before backward, so the accumulated gradient is the MEAN over
+            # the effective batch -- summing instead would scale the effective LR by accum_steps.
+            for _ in range(accum_steps):
+                try:
+                    X, y, organ_mask, et = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    X, y, organ_mask, et = next(train_iter)
+                X = X.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                organ_mask = organ_mask.to(device, non_blocking=True)
+                et = et.to(device, non_blocking=True)
 
-            target_m, pred_m = apply_loss_mask(
-                target, pred, organ_mask, use_mask,
-            )
+                # residual mode: the net predicts y - src, not y. Everything downstream
+                # (mask, loss, backtracking) is unchanged; `src` carries the anchor forward
+                # so metrics and images can be lifted back to the T1ce domain.
+                src = anchor_channel(X, residual_src_idx) if residual_mode else None
+                target = y - src if residual_mode else y
 
-            # ET pixels counted et_weight times as heavily inside the ordinary loss;
-            # et_weight = 1 is the plain unweighted loss.
-            loss = weighted_loss(loss_type, pred_m, target_m, et, et_weight)
+                pred = predict(net, X)              # (B, 1, H, W)
 
-            if et_weight != 1 and not et_warned and float(et.sum()) == 0:
-                et_warned = True
-                print("[synthesis] WARNING: et_weight != 1 but the first batch's ET mask is "
-                      "entirely zero. Set et_mask: true in the data config (and make sure "
-                      "the h5 has an 'et' dataset), or the weighting is a no-op.")
+                target_m, pred_m = apply_loss_mask(
+                    target, pred, organ_mask, use_mask,
+                )
 
-            loss.backward()
+                # ET pixels counted et_weight times as heavily inside the ordinary loss;
+                # et_weight = 1 is the plain unweighted loss.
+                loss = weighted_loss(loss_type, pred_m, target_m, et, et_weight)
+
+                if et_weight != 1 and not et_warned and float(et.sum()) == 0:
+                    et_warned = True
+                    print("[synthesis] WARNING: et_weight != 1 but the first batch's ET mask is "
+                          "entirely zero. Set et_mask: true in the data config (and make sure "
+                          "the h5 has an 'et' dataset), or the weighting is a no-op.")
+
+                (loss / accum_steps).backward()
+                step_loss = step_loss + loss.detach() / accum_steps
+
             if clip_grad is not None:
+                # once per OPTIMIZER step, on the accumulated gradient
                 nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
             opt.step()
+            if ema is not None:
+                ema.update()                    # after the step, once per optimizer step
             if hasattr(net, "project"):         # CDLNet-family constraint projection
                 net.project()
 
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
-            running_loss += loss.detach()          # on-device; no sync
+            running_loss += step_loss              # on-device; no sync
             n_batches += 1
             pbar.update(1)
             if n_batches % POSTFIX_EVERY == 0:
-                pbar.set_postfix(loss=f"{loss.item():.3e}", epoch=epoch)
+                pbar.set_postfix(loss=f"{float(step_loss):.3e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
         avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
@@ -336,7 +380,9 @@ def train_synthesis(
         elif save_ckpt_fn and avg_loss < best_loss:
             save_ckpt_fn(ckpt_path, model=net, optimizer=opt, scheduler=sched,
                          step=global_step, backtrack_count=backtrack_count,
-                         best_loss=avg_loss)
+                         best_loss=avg_loss, ema=ema)
+            if ema is not None:
+                save_ema_ckpt(ema_ckpt_path, ema, net, step=global_step, best_loss=avg_loss)
             best_loss = avg_loss
 
         # ---- logging ----
@@ -350,117 +396,123 @@ def train_synthesis(
 
         # ---- validation ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
-            net.eval()
-            agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0}
-            if residual_mode:
-                agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0,
-                            "resid_ratio": 0.0})
-            n_samples = 0
-            with torch.no_grad():
-                for Xv, yv, organ_maskv, etv in val_loader:
-                    Xv = Xv.to(device, non_blocking=True)
-                    yv = yv.to(device, non_blocking=True)
-                    organ_maskv = organ_maskv.to(device, non_blocking=True)
-                    etv = etv.to(device, non_blocking=True)
-
-                    src_v = anchor_channel(Xv, residual_src_idx) if residual_mode else None
-                    target_v = yv - src_v if residual_mode else yv
-
-                    pv = predict(net, Xv)
-                    bs = Xv.shape[0]
-                    # Apply mask
-                    target_vm, pv_m = apply_loss_mask(
-                        target_v, pv, organ_maskv, use_mask,
-                    )
-                    # DO NOT CALL .ABS(), WE HAVE NEGATIVE NUMBERS
-                    # Generally speaking, our data is mean 0 variance 1, so for the purposes of metric computations, We can do the following
-                    # yv_m = (yv + 2)/4
-                    # pv_m = (pv + 2)/4
-                    mets = synthesis_metrics(target_vm, pv_m, src_v, organ_maskv,
-                                             use_mask, psnr_only=psnr_only,
-                                             data_range=data_range)
-                    mets = {k: float(v.detach()) for k, v in mets.items()}
-                    # same total the training step optimizes, so val/loss stays comparable
-                    mets["loss"] = float(weighted_loss(loss_type, pv_m, target_vm,
-                                                       etv, et_weight).item())
-                    for k in agg:
-                        if k in mets:
-                            agg[k] += mets[k] * bs
-                    n_samples += bs
-            mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
-            val_loss = mean_metrics["loss"]      # <-- capture for the scheduler
-
-            if wandb:
-                mask = organ_maskv[:1]
-                in_img = Xv[:1, residual_src_idx:residual_src_idx + 1] if residual_mode \
-                    else Xv[:1, :1]
+            # Under the AVERAGED weights when EMA is on, so the reported metrics describe the
+            # checkpoint you will sample from. average_parameters restores the live weights in
+            # a finally, so training continues from them either way.
+            val_ctx = ema.average_parameters() if ema is not None \
+                else contextlib.nullcontext()
+            with val_ctx:
+                net.eval()
+                agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0}
                 if residual_mode:
-                    # lift both sides back to T1ce; the anchor is masked to match
-                    src_m = (src_v[:1] * mask) if use_mask else src_v[:1]
-                    gt_img = target_vm[:1] + src_m
-                    pred_img = pv_m[:1] + src_m
+                    agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0,
+                                "resid_ratio": 0.0})
+                n_samples = 0
+                with torch.no_grad():
+                    for Xv, yv, organ_maskv, etv in val_loader:
+                        Xv = Xv.to(device, non_blocking=True)
+                        yv = yv.to(device, non_blocking=True)
+                        organ_maskv = organ_maskv.to(device, non_blocking=True)
+                        etv = etv.to(device, non_blocking=True)
+
+                        src_v = anchor_channel(Xv, residual_src_idx) if residual_mode else None
+                        target_v = yv - src_v if residual_mode else yv
+
+                        pv = predict(net, Xv)
+                        bs = Xv.shape[0]
+                        # Apply mask
+                        target_vm, pv_m = apply_loss_mask(
+                            target_v, pv, organ_maskv, use_mask,
+                        )
+                        # DO NOT CALL .ABS(), WE HAVE NEGATIVE NUMBERS
+                        # Generally speaking, our data is mean 0 variance 1, so for the purposes of metric computations, We can do the following
+                        # yv_m = (yv + 2)/4
+                        # pv_m = (pv + 2)/4
+                        mets = synthesis_metrics(target_vm, pv_m, src_v, organ_maskv,
+                                                 use_mask, psnr_only=psnr_only,
+                                                 data_range=data_range)
+                        mets = {k: float(v.detach()) for k, v in mets.items()}
+                        # same total the training step optimizes, so val/loss stays comparable
+                        mets["loss"] = float(weighted_loss(loss_type, pv_m, target_vm,
+                                                           etv, et_weight).item())
+                        for k in agg:
+                            if k in mets:
+                                agg[k] += mets[k] * bs
+                        n_samples += bs
+                mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
+                val_loss = mean_metrics["loss"]      # <-- capture for the scheduler
+
+                if wandb:
+                    mask = organ_maskv[:1]
+                    in_img = Xv[:1, residual_src_idx:residual_src_idx + 1] if residual_mode \
+                        else Xv[:1, :1]
+                    if residual_mode:
+                        # lift both sides back to T1ce; the anchor is masked to match
+                        src_m = (src_v[:1] * mask) if use_mask else src_v[:1]
+                        gt_img = target_vm[:1] + src_m
+                        pred_img = pv_m[:1] + src_m
+                    else:
+                        gt_img = target_vm[:1]; pred_img = pv_m[:1]
+
+                    # Input | GT | Pred, shared scale from input+GT (unchanged)
+                    grid = torch.cat([in_img, gt_img, pred_img], dim=0)
+                    grid = grid - grid[0:2].min(); grid = grid / grid[0:2].max().clamp(min=1e-8)
+
+                    # Mask our grid after normalization
+                    grid = mask*grid
+                    # Residual on its own symmetric scale: 0.5 = zero error, 0/1 = -/+ max|error|
+                    # (identical in both modes -- the anchor cancels out of GT - Pred)
+                    res = (gt_img - pred_img).abs()
+                    res = res / res.max().clamp(min=1e-8)
+
+                    # DISPLAY ONLY, after all normalization and masking: the pixels the loss saw
+                    # are untouched. NYUMets stores canonical RAS, so a raw grid has the eyes on the
+                    # image's right.
+                    grid = orient_tensor(grid, display_orient)
+                    res = orient_tensor(res, display_orient)
+
+                    in_cap = f"T1 anchor(ch{residual_src_idx})" if residual_mode else "Input(ch0)"
+                    log = {
+                        "val/example": wandb_image(vutils.make_grid(grid, nrow=3),
+                                                   caption=f"{in_cap} | T1ce GT | Predicted"),
+                        "val/residual": wandb_image(vutils.make_grid(res, nrow=1),
+                                                    caption="| GT - Pred |"),
+                        **{f"val/{k}": v for k, v in mean_metrics.items()},
+                    }
+
+                    if residual_mode:
+                        # The supervised quantity itself, GT vs prediction, on ONE shared
+                        # symmetric scale so over-/under-shoot is readable at a glance. The ET
+                        # mask rides along as a third panel on the same scale (it is 0/1, so it
+                        # renders solid red on white): without it you cannot tell whether a weak
+                        # prediction is missing the tumor or the tumor is simply not in view.
+                        d_gt, d_pred = target_vm[:1], pv_m[:1]
+                        vmax = torch.maximum(d_gt.abs().amax(), d_pred.abs().amax())
+                        vmin = torch.minimum(d_gt.abs().amin(), d_pred.abs().amin())
+
+                        delta = torch.cat([diverging_rgb(d_gt, vmax),
+                                           diverging_rgb(d_pred, vmax),
+                                           diverging_rgb(etv[:1], 1.0)], dim=0)
+                        delta = orient_tensor(delta, display_orient)
+                        rr = mean_metrics.get("resid_ratio", float("nan"))
+                        log["val/delta"] = wandb_image(
+                            vutils.make_grid(delta, nrow=3),
+                            caption=f"residual (T1ce - T1): GT | Pred | ET mask  "
+                                    f"[bwr, white=0, ±{float(vmax):.3f}] "
+                                    f"rms(pred)/rms(gt)={rr:.3f}")
+
+                    wandb.log(log, step=global_step)
+                    # Parameter values ride the VALIDATION cadence: walking the model costs a
+                    # host transfer per tensor, and thresholds / step sizes drift on the
+                    # timescale of training, not of an epoch. Grads are still populated here --
+                    # every loop zero_grads at the TOP of the next step -- so grad_norm reports
+                    # the last training step's gradients rather than being absent.
+                    wandb.log(get_param_logs(net), step=global_step)
+
                 else:
-                    gt_img = target_vm[:1]; pred_img = pv_m[:1]
-
-                # Input | GT | Pred, shared scale from input+GT (unchanged)
-                grid = torch.cat([in_img, gt_img, pred_img], dim=0)
-                grid = grid - grid[0:2].min(); grid = grid / grid[0:2].max().clamp(min=1e-8)
-
-                # Mask our grid after normalization
-                grid = mask*grid
-                # Residual on its own symmetric scale: 0.5 = zero error, 0/1 = -/+ max|error|
-                # (identical in both modes -- the anchor cancels out of GT - Pred)
-                res = (gt_img - pred_img).abs()
-                res = res / res.max().clamp(min=1e-8)
-
-                # DISPLAY ONLY, after all normalization and masking: the pixels the loss saw
-                # are untouched. NYUMets stores canonical RAS, so a raw grid has the eyes on the
-                # image's right.
-                grid = orient_tensor(grid, display_orient)
-                res = orient_tensor(res, display_orient)
-
-                in_cap = f"T1 anchor(ch{residual_src_idx})" if residual_mode else "Input(ch0)"
-                log = {
-                    "val/example": wandb_image(vutils.make_grid(grid, nrow=3),
-                                               caption=f"{in_cap} | T1ce GT | Predicted"),
-                    "val/residual": wandb_image(vutils.make_grid(res, nrow=1),
-                                                caption="| GT - Pred |"),
-                    **{f"val/{k}": v for k, v in mean_metrics.items()},
-                }
-
-                if residual_mode:
-                    # The supervised quantity itself, GT vs prediction, on ONE shared
-                    # symmetric scale so over-/under-shoot is readable at a glance. The ET
-                    # mask rides along as a third panel on the same scale (it is 0/1, so it
-                    # renders solid red on white): without it you cannot tell whether a weak
-                    # prediction is missing the tumor or the tumor is simply not in view.
-                    d_gt, d_pred = target_vm[:1], pv_m[:1]
-                    vmax = torch.maximum(d_gt.abs().amax(), d_pred.abs().amax())
-                    vmin = torch.minimum(d_gt.abs().amin(), d_pred.abs().amin())
-
-                    delta = torch.cat([diverging_rgb(d_gt, vmax),
-                                       diverging_rgb(d_pred, vmax),
-                                       diverging_rgb(etv[:1], 1.0)], dim=0)
-                    delta = orient_tensor(delta, display_orient)
-                    rr = mean_metrics.get("resid_ratio", float("nan"))
-                    log["val/delta"] = wandb_image(
-                        vutils.make_grid(delta, nrow=3),
-                        caption=f"residual (T1ce - T1): GT | Pred | ET mask  "
-                                f"[bwr, white=0, ±{float(vmax):.3f}] "
-                                f"rms(pred)/rms(gt)={rr:.3f}")
-
-                wandb.log(log, step=global_step)
-                # Parameter values ride the VALIDATION cadence: walking the model costs a
-                # host transfer per tensor, and thresholds / step sizes drift on the
-                # timescale of training, not of an epoch. Grads are still populated here --
-                # every loop zero_grads at the TOP of the next step -- so grad_norm reports
-                # the last training step's gradients rather than being absent.
-                wandb.log(get_param_logs(net), step=global_step)
-
-            else:
-                print(f"[VAL] epoch={epoch} " +
-                      " ".join(f"{k}={v:.4f}" for k, v in mean_metrics.items()))
-            net.train()
+                    print(f"[VAL] epoch={epoch} " +
+                          " ".join(f"{k}={v:.4f}" for k, v in mean_metrics.items()))
+                net.train()
                     # ReduceLROnPlateau: metric-driven, one step per epoch on the val loss
 
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:

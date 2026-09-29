@@ -44,7 +44,7 @@
             ],
             "crop_size": 128,
             "random_flips": true,
-            "batch_size": 8,
+            "batch_size": 32,
             "num_workers": 8,
             "deterministic": false,
             "guide_mode": "other_study",
@@ -78,7 +78,7 @@
                 110
             ],
             "random_flips": false,
-            "batch_size": 8,
+            "batch_size": 32,
             "num_workers": 8,
             "deterministic": true,
             "guide_mode": "other_study",
@@ -92,6 +92,9 @@
         }
     },
     "training": {
+        "ema_warmup": true,
+        "ema_decay": 0.99,
+        "accum_steps": 8,
         "num_epochs": 1500,
         "steps_per_epoch": 200,
         "val_every_epochs": 25,
@@ -115,7 +118,7 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 0.0001
+            "lr": 2.0e-4
         }
     },
     "scheduler": {

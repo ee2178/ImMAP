@@ -21,6 +21,7 @@ Two optional loss weightings compose on top of the plain objective (see `_bridge
 `loss_weight` reweights each sample by its noise level. Both default to off.
 """
 
+import contextlib
 import os
 import time
 import math
@@ -35,7 +36,8 @@ from tqdm import tqdm
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from training.common import save_ckpt, load_ckpt, get_lr, set_lr, apply_loss_mask, snr_loss_weight, POSTFIX_EVERY
+from training.common import (save_ckpt, save_ema_ckpt, load_ckpt, get_lr, set_lr,
+                            apply_loss_mask, snr_loss_weight, EMA, POSTFIX_EVERY)
 
 # Backtracking bookkeeping. `backtrack` is the whole restore-and-drop-the-LR
 # operation; `resync_schedule` re-applies an already-earned reduction on resume.
@@ -72,7 +74,7 @@ def masked_mse(pred, target, organ_mask, use_mask):
 
 
 def _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
-                 std_fwd, loss_weight, loss_params=None):
+                 std_fwd, loss_weight, loss_params=None, loss_weight_max=None):
     """The x0-regression objective, with two INDEPENDENT weightings composed on top of it:
 
         per-pixel   w_pix = 1 + (et_weight - 1) * et      enhancing-tumor upweighting
@@ -112,7 +114,8 @@ def _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
     if et_weight != 1:
         err = (1.0 + (et_weight - 1.0) * et.expand_as(err)) * err
     per_sample = err.flatten(1).mean(dim=1)                                # (B,)
-    return (snr_loss_weight(std_fwd, loss_weight) * per_sample).mean()
+    return (snr_loss_weight(std_fwd, loss_weight, w_max=loss_weight_max)
+            * per_sample).mean()
 
 
 def _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params):
@@ -268,6 +271,22 @@ def train_i2sb(
     deterministic=False,             # drop the bridge / posterior noise (the OT-ODE limit)
     posterior="ddpm",                # reverse update: "ddpm" (moving average) | "interpolant" (x1<->x0_hat)
     clip_denoise=False,
+    loss_weight_max=None,            # cap on the raw 'snr' / 't1' weight before its batch
+                                     # normalization; see training.common.snr_loss_weight.
+                                     # 1000 on the brownian tau=0.1 schedule clamps the top
+                                     # 2.5% of steps and cuts the weight range 1000x -> 40x.
+    accum_steps=1,                   # gradient accumulation: the EFFECTIVE batch is
+                                     # data.batch_size * accum_steps. One "step" stays one
+                                     # OPTIMIZER step, so steps_per_epoch and the scheduler's
+                                     # T_max keep their meaning and an epoch just costs more.
+                                     # The NVlabs reference trains at an effective batch of 256
+                                     # this way (batch_size 256, microbatch 2).
+    ema_decay=None,                  # None/0 = no EMA (the pre-2026-09-29 behaviour). The NVlabs
+                                     # reference uses 0.99 and SAMPLES from the average; with it
+                                     # set, validation runs under the averaged weights and
+                                     # `net_ema.ckpt` is written beside `net.ckpt`.
+    ema_warmup=True,                 # ramp the decay as min(decay, (1+n)/(10+n)) over the first
+                                     # ~900 updates, as torch_ema does by default
     val_mode="single_pass",          # "single_pass" (one random-step denoise) or "full_recon"
     val_seed=None,
     val_nfe=20,                      # only used when val_mode == "full_recon"
@@ -323,8 +342,35 @@ def train_i2sb(
     if hasattr(net, "assert_schedule_matches"):
         net.assert_schedule_matches(bridge)
 
+    if accum_steps < 1:
+        raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
+    ema = None
+    if ema_decay:
+        ema = EMA(net.parameters(), decay=float(ema_decay), use_num_updates=bool(ema_warmup))
+        print(f"[i2sb] EMA decay={float(ema_decay)} warmup={bool(ema_warmup)} over "
+              f"{len(ema.shadow)} parameter tensors -- validation and net_ema.ckpt use the "
+              f"average; net.ckpt keeps the live weights for resume")
+    if accum_steps > 1:
+        print(f"[i2sb] gradient accumulation x{accum_steps}: one optimizer step per "
+              f"{accum_steps} micro-batches")
+
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, "net.ckpt")
+    ema_ckpt_path = os.path.join(save_dir, "net_ema.ckpt")
+
+    # RESUME THE AVERAGE. train.py loads the model / optimizer / scheduler before dispatching here,
+    # so the EMA -- which is built above, after that load -- would otherwise start over: its shadow
+    # re-seeded from the current weights and its decay ramp restarted. On a requeued 7-day job that
+    # silently makes net_ema.ckpt worse after every restart. `ckpt` is cfg["paths"]["ckpt"], which
+    # train.py stamps once a run has started.
+    if ema is not None and start_epoch > 0:
+        resume_from = ckpt if ckpt else ckpt_path
+        if os.path.exists(resume_from):
+            load_ckpt(resume_from, ema=ema, device=device)
+            print(f"[i2sb] resumed EMA from {resume_from} at {ema.num_updates} updates")
+        else:
+            print(f"[i2sb] WARNING: resuming at epoch {start_epoch} but no checkpoint at "
+                  f"{resume_from}; the EMA restarts from the loaded weights")
 
     if val_loader is not None and val_slices:
         from training.forward_op import fixed_val_subset
@@ -364,38 +410,52 @@ def train_i2sb(
         running_loss, n_batches = 0.0, 0
 
         for _ in range(steps_per_epoch):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
-            x0, x1, cond, mask, et, guide = _split_batch(batch, device)
-
-            # ----- sample a bridge point and regress the clean endpoint x0 -----
-            b = x0.shape[0]
-            step = torch.randint(0, interval, (b,), device=device)
-            xt = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
-            std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])   # (B,1,1,1) noise level
-
             opt.zero_grad()
-            pred_x0 = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels,
-                                 guide=guide, dc=dc, x1=x1)
-            if report_balance:
-                report_balance = False
-                _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params)
-            loss = _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et, et_weight,
-                                std_fwd, loss_weight, loss_params)
+            step_loss = 0.0
+            # `accum_steps` micro-batches make up ONE optimizer step. Each micro-batch's loss is
+            # divided by accum_steps before backward, so the accumulated gradient is the mean over
+            # the whole effective batch -- not its sum, which would scale the LR by accum_steps.
+            for _ in range(accum_steps):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
+                x0, x1, cond, mask, et, guide = _split_batch(batch, device)
 
-            loss.backward()
+                # ----- sample a bridge point and regress the clean endpoint x0 -----
+                b = x0.shape[0]
+                step = torch.randint(0, interval, (b,), device=device)
+                xt = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
+                std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])   # (B,1,1,1) noise level
+
+                pred_x0 = predict_x0(net, xt, std_fwd, cond=cond,
+                                     target_channels=target_channels,
+                                     guide=guide, dc=dc, x1=x1)
+                if report_balance:
+                    report_balance = False
+                    _report_loss_balance(loss_type, x0, pred_x0, mask, use_mask, loss_params)
+                loss = _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et,
+                                    et_weight, std_fwd, loss_weight, loss_params,
+                                    loss_weight_max=loss_weight_max)
+
+                (loss / accum_steps).backward()
+                step_loss = step_loss + loss.detach() / accum_steps
+
             if clip_grad is not None:
+                # once per OPTIMIZER step, on the accumulated gradient -- clipping each
+                # micro-batch would clip a 1/accum_steps-scaled gradient and change the
+                # effective threshold
                 torch.nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
             opt.step()
+            if ema is not None:
+                ema.update()                       # after the step, once per optimizer step
             # Important for our unrolled models
             if hasattr(net, "project"): net.project()
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
 
-            running_loss += loss.detach()          # on-device; no sync
+            running_loss += step_loss              # on-device; no sync
             n_batches += 1
             pbar.update(1)
             if n_batches % POSTFIX_EVERY == 0:
@@ -433,7 +493,12 @@ def train_i2sb(
         elif save_ckpt_fn and avg_loss < best_loss:
             save_ckpt_fn(ckpt_path, model=net, optimizer=opt, scheduler=sched,
                          step=global_step, backtrack_count=backtrack_count,
-                         best_loss=avg_loss)
+                         best_loss=avg_loss, ema=ema)
+            if ema is not None:
+                # the averaged weights as a plain model checkpoint: this is the one to SAMPLE
+                # from. net.ckpt keeps the live weights, because resuming from an average would
+                # discard the optimizer's actual trajectory.
+                save_ema_ckpt(ema_ckpt_path, ema, net, step=global_step, best_loss=avg_loss)
             best_loss = avg_loss
 
         # ---- logging ----
@@ -448,17 +513,22 @@ def train_i2sb(
         # ---- validation ----
         if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
             t_val = time.time()
-            val_loss = _validate(
-                net, bridge, val_loader, device, interval=interval, val_mode=val_mode,
-                val_seed=val_seed, use_mask=use_mask, deterministic=deterministic,
-                posterior=posterior, clip_denoise=clip_denoise, val_nfe=val_nfe,
-                target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
-                loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
-                data_range=data_range, wandb=wandb, global_step=global_step,
-                display_window=display_window, display_orient=display_orient,
-                display_mask=display_mask,
-                loss_params=loss_params, val_lpips=val_lpips, dc=dc,
-            )
+            # Under the AVERAGED weights when EMA is on, so the reported metrics describe the
+            # checkpoint you will actually sample from. `average_parameters` restores the live
+            # weights in a finally, so training continues from them either way.
+            val_ctx = ema.average_parameters() if ema is not None else contextlib.nullcontext()
+            with val_ctx:
+                val_loss = _validate(
+                    net, bridge, val_loader, device, interval=interval, val_mode=val_mode,
+                    val_seed=val_seed, use_mask=use_mask, deterministic=deterministic,
+                    posterior=posterior, clip_denoise=clip_denoise, val_nfe=val_nfe,
+                    target_channels=target_channels, psnr_only=psnr_only, loss_fn=loss_fn,
+                    loss_type=loss_type, loss_weight=loss_weight, et_weight=et_weight,
+                    data_range=data_range, wandb=wandb, global_step=global_step,
+                    display_window=display_window, display_orient=display_orient,
+                    display_mask=display_mask, loss_weight_max=loss_weight_max,
+                    loss_params=loss_params, val_lpips=val_lpips, dc=dc,
+                )
             # wall-clock cost of this validation, next to the training throughput it competes with
             val_sec = time.time() - t_val
             print(f"[epoch {epoch}] validation took {val_sec:.0f}s on {len(val_loader.dataset)} slices")
@@ -554,7 +624,8 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
               use_mask, deterministic, posterior, clip_denoise, val_nfe,
               target_channels, psnr_only, loss_fn, loss_type, loss_weight, et_weight,
               data_range, wandb, global_step, loss_params=None, val_lpips=False, dc=None,
-              display_window=None, display_orient=None, display_mask=None):
+              display_window=None, display_orient=None, display_mask=None,
+              loss_weight_max=None):
     """Validate. Two modes:
       "single_pass" (default) -- draw one random step per batch, run ONE network forward, and
                                   score the single-pass pred_x0 (mirrors the training objective;
@@ -598,7 +669,8 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             pred = predict_x0(net, xt, std_fwd, cond=cond, target_channels=target_channels,
                               guide=guide, dc=dc, x1=x1)
             loss = _bridge_loss(loss_fn, loss_type, x0, pred, mask, use_mask, et, et_weight,
-                                std_fwd, loss_weight, loss_params)
+                                std_fwd, loss_weight, loss_params,
+                                loss_weight_max=loss_weight_max)
 
         x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
         mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only, data_range=data_range)

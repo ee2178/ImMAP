@@ -1,5 +1,6 @@
 # training/common.py
 
+import contextlib
 import os
 import re
 from collections import defaultdict
@@ -75,6 +76,110 @@ def set_lr(optimizer, lr):
         pg["lr"] = lr[i]
 
 
+class EMA:
+    """Exponential moving average of a model's parameters, and the weights you should SAMPLE from.
+
+    The NVlabs I2SB reference keeps one of these at decay 0.99 and evaluates inside
+    `with ema.average_parameters()`; the averaged weights are what its released checkpoints
+    contain. It matters most in exactly our regime -- a bridge regressor trained with a noisy
+    gradient, where each step sees only `batch_size` of `interval` timesteps -- because the
+    average cancels the per-step timestep lottery that the raw weights carry.
+
+    API mirrors `torch_ema.ExponentialMovingAverage` (update / copy_to / store / restore /
+    average_parameters / state_dict / load_state_dict) so it can be swapped for that package
+    without touching callers. It is written out here instead of taking the dependency: it is
+    forty lines, and the cluster env does not have torch_ema.
+
+    `use_num_updates` reproduces torch_ema's default bias correction,
+
+        decay_eff = min(decay, (1 + n) / (10 + n)),
+
+    which ramps the decay in over the first ~900 updates. Without it the average is dominated by
+    the random initialisation for thousands of steps, and an EMA validation early in training
+    looks catastrophically worse than the raw model for no real reason.
+
+    Only FLOATING-POINT parameters are tracked. Buffers are not: a running mean or a schedule
+    table is not a learned parameter, and averaging integer buffers would fail outright.
+    """
+
+    def __init__(self, parameters, decay=0.999, use_num_updates=True):
+        if not 0.0 <= decay <= 1.0:
+            raise ValueError(f"EMA decay must be in [0, 1], got {decay}")
+        self.decay = float(decay)
+        self.use_num_updates = bool(use_num_updates)
+        self.num_updates = 0
+        self._params = [p for p in parameters if p.is_floating_point()]
+        self.shadow = [p.detach().clone() for p in self._params]
+        self._stored = None
+
+    def _effective_decay(self):
+        if not self.use_num_updates:
+            return self.decay
+        return min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+
+    @torch.no_grad()
+    def update(self):
+        """Call AFTER optimizer.step(), once per optimizer step (not per micro-batch)."""
+        self.num_updates += 1
+        d = self._effective_decay()
+        for sh, p in zip(self.shadow, self._params):
+            # in-place: sh += (1 - d) * (p - sh)
+            sh.mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def copy_to(self, parameters=None):
+        """Overwrite the live parameters with the averaged ones."""
+        target = self._params if parameters is None else \
+            [p for p in parameters if p.is_floating_point()]
+        for sh, p in zip(self.shadow, target):
+            p.detach().copy_(sh)
+
+    @torch.no_grad()
+    def store(self):
+        self._stored = [p.detach().clone() for p in self._params]
+
+    @torch.no_grad()
+    def restore(self):
+        if self._stored is None:
+            raise RuntimeError("EMA.restore() without a preceding store()")
+        for st, p in zip(self._stored, self._params):
+            p.detach().copy_(st)
+        self._stored = None
+
+    @contextlib.contextmanager
+    def average_parameters(self):
+        """Run a block with the averaged weights in place, then put the live ones back.
+
+        The restore runs in a `finally`, so an exception inside the block cannot leave the model
+        holding the averaged weights -- which would silently continue TRAINING from the average.
+        """
+        self.store()
+        self.copy_to()
+        try:
+            yield
+        finally:
+            self.restore()
+
+    def to(self, device=None, dtype=None):
+        self.shadow = [sh.to(device=device, dtype=dtype) for sh in self.shadow]
+        return self
+
+    def state_dict(self):
+        return {"decay": self.decay, "use_num_updates": self.use_num_updates,
+                "num_updates": self.num_updates, "shadow": self.shadow}
+
+    def load_state_dict(self, sd):
+        self.decay = float(sd["decay"])
+        self.use_num_updates = bool(sd.get("use_num_updates", True))
+        self.num_updates = int(sd["num_updates"])
+        shadow = sd["shadow"]
+        if len(shadow) != len(self.shadow):
+            raise ValueError(f"EMA checkpoint holds {len(shadow)} tensors but the model has "
+                             f"{len(self.shadow)} floating-point parameters")
+        for sh, new in zip(self.shadow, shadow):
+            sh.copy_(new.to(sh.device))
+
+
 def save_ckpt(
     path,
     model=None,
@@ -83,6 +188,7 @@ def save_ckpt(
     scheduler=None,
     backtrack_count=None,
     best_loss=None,
+    ema=None,
 ):
     """
     Save checkpoint.
@@ -110,9 +216,24 @@ def save_ckpt(
             "scheduler_state_dict": get_state_dict(scheduler),
             "backtrack_count": backtrack_count,
             "best_loss": best_loss,
+            # The averaged weights, NOT a substitute for model_state_dict: resuming has to
+            # continue from the live parameters, so both are stored. `save_ema_ckpt` writes the
+            # average out as a loadable model checkpoint for sampling.
+            "ema_state_dict": get_state_dict(ema),
         },
         path,
     )
+
+
+def save_ema_ckpt(path, ema, model, **meta):
+    """Write the AVERAGED weights as an ordinary model checkpoint, for sampling and eval.
+
+    A separate file rather than a flag on `save_ckpt`, because the two have different jobs and
+    conflating them is how you end up resuming training from an average. `net.ckpt` is for
+    resume; `net_ema.ckpt` is what you sample from.
+    """
+    with ema.average_parameters():
+        save_ckpt(path, model=model, **meta)
 
 
 def load_ckpt(
@@ -121,6 +242,7 @@ def load_ckpt(
     optimizer=None,
     scheduler=None,
     device="cpu",
+    ema=None,
 ):
     """
     Load checkpoint.
@@ -149,6 +271,16 @@ def load_ckpt(
     model = load_state_dict(model, "model")
     optimizer = load_state_dict(optimizer, "optimizer")
     scheduler = load_state_dict(scheduler, "scheduler")
+    # A resume that silently starts the average from scratch is worse than no EMA at all: the
+    # shadow would be re-seeded from the current weights and the decay ramp would restart, so the
+    # averaged checkpoint would get worse after every requeue. Say so rather than shrug.
+    if ema is not None:
+        if ckpt.get("ema_state_dict") is None:
+            print("[ckpt] WARNING: ema requested but this checkpoint has no ema_state_dict; "
+                  "the average restarts from the loaded weights (was the run started without "
+                  "ema_decay?)")
+        else:
+            load_state_dict(ema, "ema")
 
     step = ckpt.get("step", 0) + 1
 
@@ -480,7 +612,7 @@ def region_psnr(gt, pred, region, eps=1e-12):
     return -10 * torch.log10(mse + eps)
 
 
-def snr_loss_weight(std_fwd, mode="uniform"):
+def snr_loss_weight(std_fwd, mode="uniform", w_max=None):
     """Per-sample I2SB loss weight as a function of the forward std sigma_t = std_fwd, normalized to
     batch-mean 1 (so the loss scale, and thus LR / backtrack_thresh, stays comparable across modes):
 
@@ -488,6 +620,17 @@ def snr_loss_weight(std_fwd, mode="uniform"):
         "snr"     -> 1 / sigma_t^2   (emphasize LOW sigma_t ~ t=0; == the eps objective's implicit
                                       weight -- parameterization="eps" is the numerically stabler route)
         "t1"      -> sigma_t^2       (emphasize HIGH sigma_t ~ t=1; trains the initial reverse steps)
+
+    `w_max` caps the RAW weight before normalization (Min-SNR-style clamping). It exists because
+    the normalization above is per BATCH, and 1/sigma_t^2 has a heavy tail: on the brownian tau=0.1
+    schedule it spans 25 to 25,000, a 1000x range, and the batch mean is set by whichever sample
+    drew the smallest t. Measured on that schedule, the normalizer's p99/median is 18.6x at batch 8
+    and 7.6x at batch 32 -- so in one step in a hundred EVERY sample is down-weighted ~8x relative
+    to a typical step, which is noise in the objective rather than the intended t-weighting.
+
+    Clamping at w_max=1000 (sigma_t >= 0.0316, the top 2.5% of steps) cuts the range to 40x and
+    leaves the weighting over the other 97.5% untouched. Default None = no cap, i.e. the exact
+    1/sigma_t^2 the eps objective implies.
 
     std_fwd: (B, ...) or (B,) tensor of per-sample sigma_t. Returns a (B,) weight.
     """
@@ -500,6 +643,10 @@ def snr_loss_weight(std_fwd, mode="uniform"):
         w = s2
     else:
         raise ValueError(f"loss_weight must be 'uniform', 'snr', or 't1'; got {mode!r}")
+    if w_max is not None:
+        if float(w_max) <= 0:
+            raise ValueError(f"loss_weight_max must be positive, got {w_max}")
+        w = w.clamp(max=float(w_max))
     return w / w.mean().clamp_min(1e-12)
 
 

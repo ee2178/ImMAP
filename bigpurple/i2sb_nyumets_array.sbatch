@@ -24,6 +24,51 @@
 #   13   synth_unet_otherstudy_pair.json      Unet2D  in=5      ... + other-study T1, CT1
 #   14   synth_unet_otherstudy_pair_w1.json   Unet2D  in=9      ... at z-1..z+1
 #   15   synth_unet_otherstudy_pair_w2.json   Unet2D  in=13     ... at z-2..z+2
+#   16   i2sb_unet_all_bs256.json             SBUnet   C=4      as 1,  LARGE BATCH + EMA
+#   17   i2sb_unet_otherstudy_pair_bs256.json SBUnet   C=6      as 9,  LARGE BATCH + EMA
+#   18   ..._pair_w1_bs256.json               SBUnet   C=10     as 10, LARGE BATCH + EMA
+#   19   ..._pair_w2_bs256.json               SBUnet   C=14     as 11, LARGE BATCH + EMA
+#
+# LARGE BATCH + EMA + SIGMA WEIGHTING (16-19) moves our recipe toward the NVlabs reference,
+# which trains at an effective batch of 256, samples from an EMA at decay 0.99, and regresses the
+# SCORE (xt - x0)/sigma -- an MSE whose implicit weight on the x0 error is 1/sigma^2. Read against
+# 1 and 9-11:
+#
+#                       batch   optimizer steps   samples   lr      EMA     loss weight
+#   1, 9-11 (existing)      8           300,000      2.4M   1e-4    no      uniform
+#   16-19 (these)         256           300,000     76.8M   2e-4    0.99    snr (1/sigma^2)
+#
+# 76.8M samples is 32x the compute of the existing runs. That is the point, and it is why these
+# are meant to run for DAYS across several allocations -- resume with the same command, the
+# checkpoint carries the optimizer, the scheduler, best_loss AND the EMA state, so nothing
+# restarts. (A resume that re-seeded the EMA would make net_ema.ckpt worse after every requeue;
+# training/i2sb.py reloads it explicitly and says so in the log.)
+#
+# The 256 is `data.batch_size 32` x `training.accum_steps 8`. If 32 does not fit, or if it leaves
+# headroom, change both so the PRODUCT stays 256 -- that is the only number the optimizer sees.
+#
+# SIGMA WEIGHTING is `loss_weight: "snr"`, the 1/sigma^2 per-sample weight, with
+# `loss_weight_max: 1000.0`. The cap is not cosmetic: on the brownian tau=0.1 schedule 1/sigma^2
+# spans 25..25,000 and the weight is normalized by the BATCH mean, which is then set by whichever
+# sample drew the smallest t. Measured, the normalizer's p99/median is 7.6x at micro-batch 32 --
+# one step in a hundred down-weights every sample ~8x for no reason related to the objective.
+# Capping at 1000 (sigma >= 0.0316) clamps the top 2.5% of steps and cuts the range to 40x.
+# `loss_weight: "snr"` normalizes to batch-mean 1, which is why clip_grad and backtrack_thresh
+# keep their meaning; `loss_type: "sigma-scaled-complex-mse"` is the un-normalized alternative and
+# would need clip_grad retuned.
+#
+# NOTE this is one variable more than 12-15 change: sigma weighting has no analogue in
+# `task: synthesis`, which has no timestep at all. Bridge-vs-end-to-end across 16-19 and 12-15 is
+# therefore no longer a single-variable comparison; use 9-11 vs 12-15 for that.
+#
+# `lr 2e-4` is the least-defensible number here. sqrt-scaling 8 -> 256 would say 5.7e-4 and
+# linear scaling 3.2e-3; upstream uses 5e-5 at batch 256 but FINE-TUNES from a pretrained ADM
+# checkpoint, so its LR says little about a from-scratch run. If the loss spikes early, halve it
+# or add a warmup before blaming the batch size.
+#
+# Each of these writes TWO checkpoints: net.ckpt (live weights, for resume) and net_ema.ckpt
+# (the average -- SAMPLE FROM THIS ONE). Validation metrics are reported under the average.
+#   sbatch --array=16-19 bigpurple/i2sb_nyumets_array.sbatch
 #
 # END-TO-END (12-15) is `task: synthesis`: one forward pass, pred = net(X), no bridge and no
 # schedule. The conditioning is lifted from the matching i2sb config, so 12 vs 1, 13 vs 9,
@@ -62,7 +107,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-15%4
+#SBATCH --array=0-19%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -98,6 +143,10 @@ CONFIGS=(
     config/NYUMets/synth_unet_otherstudy_pair.json
     config/NYUMets/synth_unet_otherstudy_pair_w1.json
     config/NYUMets/synth_unet_otherstudy_pair_w2.json
+    config/NYUMets/i2sb_unet_all_bs256.json
+    config/NYUMets/i2sb_unet_otherstudy_pair_bs256.json
+    config/NYUMets/i2sb_unet_otherstudy_pair_w1_bs256.json
+    config/NYUMets/i2sb_unet_otherstudy_pair_w2_bs256.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
