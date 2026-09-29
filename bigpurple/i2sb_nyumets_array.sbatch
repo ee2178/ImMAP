@@ -25,18 +25,16 @@
 #   14   synth_unet_otherstudy_pair_w1.json   Unet2D  in=9      ... at z-1..z+1
 #   15   synth_unet_otherstudy_pair_w2.json   Unet2D  in=13     ... at z-2..z+2
 #   16   i2sb_unet_all_bs256.json             SBUnet   C=4      as 1,  LARGE BATCH + EMA
-#   17   i2sb_unet_otherstudy_pair_bs256.json SBUnet   C=6      as 9,  LARGE BATCH + EMA
-#   18   ..._pair_w1_bs256.json               SBUnet   C=10     as 10, LARGE BATCH + EMA
-#   19   ..._pair_w2_bs256.json               SBUnet   C=14     as 11, LARGE BATCH + EMA
+#   17   i2sb_unet_otherstudy_pair_w2_bs256   SBUnet   C=14     as 11, LARGE BATCH + EMA
 #
-# LARGE BATCH + EMA + SIGMA WEIGHTING (16-19) moves our recipe toward the NVlabs reference,
+# LARGE BATCH + EMA + SIGMA WEIGHTING (16-17) moves our recipe toward the NVlabs reference,
 # which trains at an effective batch of 256, samples from an EMA at decay 0.99, and regresses the
 # SCORE (xt - x0)/sigma -- an MSE whose implicit weight on the x0 error is 1/sigma^2. Read against
 # 1 and 9-11:
 #
 #                       batch   optimizer steps   samples   lr      EMA     loss weight
 #   1, 9-11 (existing)      8           300,000      2.4M   1e-4    no      uniform
-#   16-19 (these)         256           300,000     76.8M   2e-4    0.99    snr (1/sigma^2)
+#   16-17 (these)         256           300,000     76.8M   2e-4    0.99    snr (1/sigma^2)
 #
 # 76.8M samples is 32x the compute of the existing runs. That is the point, and it is why these
 # are meant to run for DAYS across several allocations -- resume with the same command, the
@@ -57,9 +55,14 @@
 # keep their meaning; `loss_type: "sigma-scaled-complex-mse"` is the un-normalized alternative and
 # would need clip_grad retuned.
 #
+# ONLY TWO of the four settings are trained at this recipe, to save GPU time: the no-prior
+# baseline (16) and the widest context (17, +-2 slices = 5 slices of the prior study). If the prior
+# scan helps at all it should show between those two; the w=0 and w=1 midpoints are already covered
+# at batch 8 by 9 and 10.
+#
 # NOTE this is one variable more than 12-15 change: sigma weighting has no analogue in
-# `task: synthesis`, which has no timestep at all. Bridge-vs-end-to-end across 16-19 and 12-15 is
-# therefore no longer a single-variable comparison; use 9-11 vs 12-15 for that.
+# `task: synthesis`, which has no timestep at all. Bridge-vs-end-to-end across 16-17 and 12-15 is
+# therefore not a single-variable comparison; use 9-11 vs 12-15 for that.
 #
 # `lr 2e-4` is the least-defensible number here. sqrt-scaling 8 -> 256 would say 5.7e-4 and
 # linear scaling 3.2e-3; upstream uses 5e-5 at batch 256 but FINE-TUNES from a pretrained ADM
@@ -68,7 +71,7 @@
 #
 # Each of these writes TWO checkpoints: net.ckpt (live weights, for resume) and net_ema.ckpt
 # (the average -- SAMPLE FROM THIS ONE). Validation metrics are reported under the average.
-#   sbatch --array=16-19 bigpurple/i2sb_nyumets_array.sbatch
+#   sbatch --array=16,17 bigpurple/i2sb_nyumets_array.sbatch
 #
 # END-TO-END (12-15) is `task: synthesis`: one forward pass, pred = net(X), no bridge and no
 # schedule. The conditioning is lifted from the matching i2sb config, so 12 vs 1, 13 vs 9,
@@ -107,7 +110,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-19%4
+#SBATCH --array=0-17%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -144,9 +147,10 @@ CONFIGS=(
     config/NYUMets/synth_unet_otherstudy_pair_w1.json
     config/NYUMets/synth_unet_otherstudy_pair_w2.json
     config/NYUMets/i2sb_unet_all_bs256.json
-    config/NYUMets/i2sb_unet_otherstudy_pair_bs256.json
-    config/NYUMets/i2sb_unet_otherstudy_pair_w1_bs256.json
     config/NYUMets/i2sb_unet_otherstudy_pair_w2_bs256.json
+    # NOT LISTED, to save GPU time: i2sb_unet_otherstudy_pair_bs256.json (w=0) and
+    # i2sb_unet_otherstudy_pair_w1_bs256.json (w=1). Both configs still exist; append them
+    # here (and widen --array) for the full large-batch width sweep.
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
