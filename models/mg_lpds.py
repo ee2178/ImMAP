@@ -64,10 +64,11 @@ from models.lpds import LPDSLayer, LPDSStack, make_lpds_layer
 from models.multigrid import (_ChannelScale, identity_widen_weight,
                               widen_filter, widen_prox_)
 from models.prox import GroupThreshold, PixelConv
+from operators.coarse import COARSE_OPS, coarsen
 from operators.identity import Identity
 from operators.projections import uball_project
-from operators.resample import (GridTransfer, _check_filter, galerkin,
-                                prolong, restrict, restrict_noise)
+from operators.resample import (GridTransfer, _check_filter, prolong,
+                                restrict, restrict_noise)
 from preprocessing.image import post_process, pre_process
 from preprocessing.kspace import kspace_post_process, kspace_pre_process
 
@@ -131,10 +132,11 @@ class PDObjectiveDownsample(nn.Module):
     """
 
     def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False,
-                 transfer_filter=None, transfer=None):
+                 transfer_filter=None, transfer=None, coarse_op="galerkin"):
         super().__init__()
         self.widen = int(widen)
         self.julia_compat = bool(julia_compat)
+        self.coarse_op = coarse_op
         self.transfer_filter = _check_filter(transfer_filter)
         # LATENT-grid transfer, shared with the enclosing V-cycle. Only the
         # DUAL variable z lives there; the primal x is on the image grid and
@@ -183,7 +185,8 @@ class PDObjectiveDownsample(nn.Module):
             z_c = self.widen_z(restrict(z, **R))
             Rrz = self.widen_z(restrict(rz_fine, **R))
 
-        y_c, E_c, sigma_c = _restrict_measurement(y, E, sigma, R, static)
+        y_c, E_c, sigma_c = _restrict_measurement(y, E, sigma, R, static,
+                                                  self.coarse_op)
 
         # ---- coarse-level primal-dual residual ------------------------------
         # Handed on to the coarse level, whose first sweep needs the same Gram.
@@ -208,8 +211,17 @@ def gram_or_x(E, x):
     return x if (E is None or isinstance(E, Identity)) else E.gram(x)
 
 
-def _restrict_measurement(y, E, sigma, R, static):
+def _restrict_measurement(y, E, sigma, R, static, coarse_op="galerkin"):
     """Coarsen `(y, E, sigma)` -- the parts of the level that never move.
+
+    `coarse_op` picks the coarse forward model (operators/coarse.py):
+    "galerkin" is `E . P`, whose Gram runs the FINE multicoil FFTs at every
+    level; "rediscretize" poses the SENSE model on the coarse grid itself
+    (restricted maps, centre-cropped mask, coarse FFTs), falling back to
+    Galerkin for an operator it cannot express. `y_c` stays `restrict(y~)`
+    either way: it enters the coarse level only through the FAS correction
+    `pi_x = (G_c x_c - y_c + ...) - R(G x - y + ...)`, where it cancels, so
+    only the coarse GRAM differs between the two.
 
     These depend on the measurement alone, not on the iterate, so the `K_outer`
     V-cycles at a level all want the same three objects and were each building
@@ -223,7 +235,7 @@ def _restrict_measurement(y, E, sigma, R, static):
         if hit is not None and hit[0] == key:
             return hit[1]
 
-    val = (restrict(y, **R), galerkin(E, filter=R["filter"]),
+    val = (restrict(y, **R), coarsen(E, coarse_op, filter=R["filter"]),
            restrict_noise(sigma, **R))
     if static is not None:
         # The memo holds `val` alive, which is what keeps the ids in the next
@@ -245,9 +257,12 @@ class PDVCycle(nn.Module):
 
     def __init__(self, iters, C, M, widen=1, alpha0=1e-1, julia_compat=False,
                  spectral_init=True, transfer_filter=None,
-                 learn_transfer=False, **layer_kws):
+                 learn_transfer=False, coarse_op="galerkin", **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
+        if coarse_op not in COARSE_OPS:
+            raise ValueError(f"coarse_op must be one of {COARSE_OPS}, got {coarse_op!r}")
+        self.coarse_op = coarse_op
         assert iters[0] % 2 == 0, \
             f"non-coarsest level iters must be even, got {iters[0]}"
         self.widen = int(widen)
@@ -302,6 +317,7 @@ class PDVCycle(nn.Module):
                                     spectral_init=False,
                                     transfer_filter=self.transfer_filter,
                                     learn_transfer=learn_transfer,
+                                    coarse_op=coarse_op,
                                     **coarse_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
@@ -314,7 +330,8 @@ class PDVCycle(nn.Module):
                                         widen=self.widen,
                                         julia_compat=julia_compat,
                                         transfer_filter=self.transfer_filter,
-                                        transfer=self.transfer)
+                                        transfer=self.transfer,
+                                        coarse_op=coarse_op)
 
         # Two coarse-correction steps. Left unclamped by `project_`: they are
         # signed step sizes, unlike tau / theta.
@@ -392,7 +409,8 @@ class PDVCycle(nn.Module):
 
     def extra_repr(self):
         return (f"depth={self.depth}, iters_per_level={self.iters_per_level}, "
-                f"M={self.M} x widen^l (widen={self.widen})")
+                f"M={self.M} x widen^l (widen={self.widen}), "
+                f"coarse_op={self.coarse_op}")
 
 
 # ===========================================================================
@@ -421,9 +439,18 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  init_strategy="spectral_norm", subgrad_mode="rigorous",
                  attn_backend="gather", flex_block_size=128,
                  preproc="kspace", resize_noise=False, julia_compat=False,
-                 transfer_filter=None, learn_transfer=False):
+                 transfer_filter=None, learn_transfer=False,
+                 coarse_op="galerkin"):
         super().__init__()
         K_outer, iters = _parse_K(K)
+        # The coarse levels' forward model -- "galerkin" (E . P: exact, but
+        # every coarse Gram runs the full-resolution multicoil FFTs) or
+        # "rediscretize" (SENSE posed on the coarse grid; see
+        # operators/coarse.py and tests/test_coarse_operator.py). Changes no
+        # parameter, so either can load the other's checkpoint.
+        if coarse_op not in COARSE_OPS:
+            raise ValueError(f"coarse_op must be one of {COARSE_OPS}, got {coarse_op!r}")
+        self.coarse_op = coarse_op
         self.K, self.iters = K_outer, iters
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)
         self.preproc, self.resize_noise = preproc, bool(resize_noise)
@@ -455,7 +482,8 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 iters, C, M, widen=widen, alpha0=alpha0,
                 julia_compat=julia_compat,
                 transfer_filter=self.transfer_filter,
-                learn_transfer=self.learn_transfer, **layer_kws))
+                learn_transfer=self.learn_transfer, coarse_op=coarse_op,
+                **layer_kws))
 
     # ----------------------------------------------------------------------
     def forward(self, y, E=None, sigma=None, state=None):
@@ -512,7 +540,8 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 m.project_()
 
     def extra_repr(self):
-        return f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}"
+        return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "
+                f"coarse_op={self.coarse_op}")
 
 
 class _OuterStack(nn.Module):

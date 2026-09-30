@@ -74,7 +74,8 @@ from physics.mask import make_acc_mask              # noqa: E402
 #  synthetic measurement
 # ===========================================================================
 def build_problems_from_data(cfg, split, n_volumes, R, acs_lines, sigma,
-                            device, pad_stride, seed=0):
+                            device, pad_stride, seed=0, center_frac=None,
+                            adjust_accel=False):
     """Real fastMRI slices, as a LIST of `(y, E, sigma)` problems.
 
     A list, not one problem, because the point of timing on real data is the
@@ -113,7 +114,8 @@ def build_problems_from_data(cfg, split, n_volumes, R, acs_lines, sigma,
         H, W = image.shape[-2:]
 
         mask = make_acc_mask(shape=(H, W), accel=R, acs_lines=acs_lines,
-                             mode="uniform", offset=0)
+                             mode="uniform", offset=0, center_frac=center_frac,
+                             adjust_accel=adjust_accel)
         mask = mask.reshape(1, 1, H, W).float().to(device)
         E = Mask(mask) @ FFT2D() @ Sense(smaps)
 
@@ -127,7 +129,8 @@ def build_problems_from_data(cfg, split, n_volumes, R, acs_lines, sigma,
     return problems, shapes
 
 
-def build_problem(size, coils, batch, R, acs_lines, sigma, device, seed=0):
+def build_problem(size, coils, batch, R, acs_lines, sigma, device, seed=0,
+                  center_frac=None, adjust_accel=False):
     """A SENSE measurement of the requested shape.
 
     The maps are smooth and unit-RSS (which is the assumption `mri_awgn` and
@@ -146,8 +149,11 @@ def build_problem(size, coils, batch, R, acs_lines, sigma, device, seed=0):
     smaps = smaps + 1.0
     smaps = smaps / smaps.abs().pow(2).sum(1, keepdim=True).sqrt()
 
+    # center_frac / adjust_accel: the measured protocol's Julia masks, whose
+    # ACS width comes from center_frac (mri.acs_lines is null in those configs)
     mask = make_acc_mask(shape=(H, W), accel=R, acs_lines=acs_lines,
-                         mode="uniform", offset=0).reshape(1, 1, H, W).float()
+                         mode="uniform", offset=0, center_frac=center_frac,
+                         adjust_accel=adjust_accel).reshape(1, 1, H, W).float()
 
     image = torch.randn(batch, 1, H, W, dtype=torch.complex64, generator=g)
 
@@ -162,9 +168,11 @@ def build_problem(size, coils, batch, R, acs_lines, sigma, device, seed=0):
     return y, E, sigma
 
 
-def load_model(cfg_path, device, seed=0):
+def load_model(cfg_path, device, seed=0, overrides=None):
     with open(cfg_path) as f:
         cfg = json.load(f)
+    if overrides:
+        cfg["model"]["params"] = dict(cfg["model"]["params"], **overrides)
     # Seeded so the two `--ab` modes build bit-identical weights: without this
     # the A/B would compare two different random draws, and the equivalence
     # check below would have nothing to say.
@@ -173,7 +181,10 @@ def load_model(cfg_path, device, seed=0):
     if getattr(model, "attn_backend", None) == "flex" and device.type == "cuda":
         model.compile_flex()
     p = cfg["model"]["params"]
-    label = f"{cfg['model']['type']} K={p.get('K', p.get('denoiser_kws', {}).get('K'))}"
+    K = p.get("K", p.get("denoiser_kws", {}).get("K"))
+    if K is None and "num_cascades" in p:
+        K = f"{p['num_cascades']}casc" + ("+maps" if p.get("use_smaps") else "")
+    label = f"{cfg['model']['type']} K={K}"
     n_par = sum(q.numel() for q in model.parameters())
     return model, label, n_par
 
@@ -388,6 +399,29 @@ def breakdown_run(model, y, E, sigma, device, by_level=False):
     return dict(totals), dict(counts), wall
 
 
+def time_online_smaps(problems, mri, device, reps, warmup):
+    """Median ms of one online coil-map estimate, as training runs it."""
+    from operators.accessors import get_mask
+    from physics.mask import resolve_acs_lines
+    from physics.online_smaps import online_smaps
+    cuda = device.type == "cuda"
+    y, E, _ = problems[0]
+    mask = get_mask(E)
+    kws = dict(mri.get("online_smaps_kws") or {},
+               acs_lines=resolve_acs_lines(y.shape[-1], mri.get("acs_lines"),
+                                           mri.get("center_frac")))
+    samples = []
+    with torch.no_grad():
+        for i in range(warmup + reps):
+            t0 = time.perf_counter()
+            online_smaps(y, mask, method=mri["online_smaps"], **kws)
+            if cuda:
+                torch.cuda.synchronize()
+            if i >= warmup:
+                samples.append((time.perf_counter() - t0) * 1e3)
+    return statistics.median(samples)
+
+
 def time_run(model, problems, reps, warmup, device):
     """Uninstrumented wall clock. This is the number to quote.
 
@@ -461,6 +495,20 @@ def main():
     ap.add_argument("--data-split", default="train", choices=("train", "val"))
     ap.add_argument("--data-volumes", type=int, default=4,
                     help="how many volumes to cycle through with --data")
+    ap.add_argument("--ab-coarse", action="store_true",
+                    help="also run every V-cycle MGLPDSNet config with "
+                         "coarse_op='rediscretize' (coarse levels' SENSE posed "
+                         "on the coarse grid) -- same seed, same weights, so "
+                         "the pair differs only in the coarse Gram")
+    ap.add_argument("--json-out", default=None,
+                    help="also write one record per (config, mode) -- name, "
+                         "model K, params, median/min/max ms, peak MB -- for "
+                         "fitting a cost model")
+    ap.add_argument("--time-online-smaps", action="store_true",
+                    help="also time the per-slice online coil-map estimate "
+                         "(mri.online_smaps / online_smaps_kws) on each "
+                         "config's problem; paid once per slice by every "
+                         "model that uses the operator's maps")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -491,13 +539,18 @@ def main():
               f"sigma={args.sigma}, {args.reps} reps after {args.warmup} warmup")
     print(f"cudnn.benchmark : {torch.backends.cudnn.benchmark}\n")
 
-    rows, first_median, outputs = [], {}, {}
+    rows, first_median, outputs, records = [], {}, {}, []
     for cfg_path in args.configs:
         with open(cfg_path) as f:
             full_cfg = json.load(f)
         mri = full_cfg.get("mri", {})
         R = args.R if args.R is not None else mri.get("R", 4)
         acs = args.acs_lines if args.acs_lines is not None else mri.get("acs_lines", 20)
+        cf = None if args.acs_lines is not None else mri.get("center_frac")
+        adj = bool(mri.get("adjust_accel", False))
+        if acs is None and cf is None:
+            raise SystemExit(f"[profile] {cfg_path}: mri.acs_lines is null and "
+                             f"there is no center_frac; pass --acs-lines")
 
         name = os.path.splitext(os.path.basename(cfg_path))[0]
         modes = [("optimised", contextlib.nullcontext)]
@@ -505,17 +558,25 @@ def main():
             modes.append(("pre-Tier1", tier1_disabled))
         if args.ab_prox:
             modes.append(("subtracted-prox", direct_prox_disabled))
+        _p = full_cfg["model"]["params"]
+        _vcycle = (full_cfg["model"]["type"] in ("MGLPDSNet", "MGGroupLPDS")
+                   and isinstance(_p.get("K"), list) and len(_p["K"][1]) > 1)
+        if args.ab_coarse and _vcycle:
+            modes.append(("rediscretize", contextlib.nullcontext))
 
         for mode, ctx in modes:
             with ctx():
                 # rebuilt inside the context: the fused-Gram matcher runs in
                 # CompositeOperator.__init__
-                model, label, n_par = load_model(cfg_path, device, args.seed)
+                model, label, n_par = load_model(
+                    cfg_path, device, args.seed,
+                    overrides=({"coarse_op": "rediscretize"}
+                               if mode == "rediscretize" else None))
                 if args.data:
                     problems, shapes = build_problems_from_data(
                         full_cfg, args.data_split, args.data_volumes, R, acs,
                         args.sigma, device, int(getattr(model, "pad_stride", 1) or 1),
-                        args.seed)
+                        args.seed, center_frac=cf, adjust_accel=adj)
                     if mode == modes[0][0]:
                         print(f"--- real slices timed ({name}, "
                               f"{args.data_split}) ---")
@@ -525,7 +586,8 @@ def main():
                         print()
                 else:
                     problems = [build_problem(size, args.coils, args.batch, R, acs,
-                                              args.sigma, device, args.seed)]
+                                              args.sigma, device, args.seed,
+                                              center_frac=cf, adjust_accel=adj)]
                 y, E, sigma = problems[0]
                 stats = time_run(model, problems, args.reps, args.warmup, device)
                 if args.ab or args.ab_prox:
@@ -533,10 +595,22 @@ def main():
                         outputs[(name, mode)] = model(y, E=E, sigma=sigma)[0].clone()
             rows.append((name, label, n_par, mode, stats))
             first_median.setdefault((name, mode), stats["median"])
+            records.append(dict(config=cfg_path, name=name, label=label,
+                                K=full_cfg["model"]["params"].get("K"),
+                                type=full_cfg["model"]["type"], params=n_par,
+                                mode=mode, R=R, **stats))
 
-            if args.counts and mode == "optimised":
+            if (args.time_online_smaps and mode == modes[0][0]
+                    and mri.get("online_smaps")):
+                t_on = time_online_smaps(problems, mri, device, args.reps,
+                                         args.warmup)
+                print(f"--- online maps ({mri['online_smaps']}, "
+                      f"{mri.get('online_smaps_kws')}): median {t_on:.1f} ms "
+                      f"per slice ({name}) ---\n")
+
+            if args.counts and mode in ("optimised", "rediscretize"):
                 counts, grids = count_run(model, y, E, sigma)
-                print(f"--- counts: {name} ---")
+                print(f"--- counts: {name} [{mode}] ---")
                 for k in ("gram", "fft", "fftshift", "conv", "resample"):
                     if counts.get(k):
                         print(f"    {k:<10} {counts[k]:>6}")
@@ -548,11 +622,11 @@ def main():
                       "does not,\n     the coarse levels are running full-resolution "
                       "physics)\n")
 
-            if args.breakdown and mode == "optimised":
+            if args.breakdown and mode in ("optimised", "rediscretize"):
                 totals, ncalls, wall = breakdown_run(model, y, E, sigma, device,
                                                      by_level=args.by_level)
                 clean = stats["median"]
-                print(f"--- breakdown: {name}  (instrumented {wall:.1f} ms vs "
+                print(f"--- breakdown: {name} [{mode}]  (instrumented {wall:.1f} ms vs "
                       f"clean {clean:.1f} ms; the {wall - clean:.1f} ms of wrapper "
                       f"overhead lands in the remainder) ---")
                 head = f"    {'family':<28}{'ms':>9}{'%':>7}{'calls':>8}{'us/call':>10}"
@@ -570,6 +644,23 @@ def main():
     for name, label, n_par, mode, s in rows:
         print(f"{name:<16}{label:<28}{n_par:>10,}  {mode:<17}"
               f"{s['median']:>8.2f}{s['lo']:>8.2f}{s['hi']:>8.2f}{s['peak_mb']:>10.0f}")
+
+    if args.json_out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.json_out)), exist_ok=True)
+        with open(args.json_out, "w") as f:
+            json.dump(dict(size=list(size), coils=args.coils, batch=args.batch,
+                           cudnn_benchmark=bool(args.cudnn_benchmark),
+                           device=str(device), records=records), f, indent=1)
+        print(f"\n[profile] wrote {len(records)} records -> {args.json_out}")
+
+    if args.ab_coarse:
+        print()
+        for name in dict.fromkeys(r[0] for r in rows):
+            a = first_median.get((name, "optimised"))
+            b = first_median.get((name, "rediscretize"))
+            if a and b:
+                print(f"  {'coarse Gram rediscretized':<27}{name:<16} {a / b:.2f}x   "
+                      f"({a:.2f} -> {b:.2f} ms)")
 
     subject = os.path.splitext(os.path.basename(args.configs[0]))[0]
     for mode in ("optimised", "pre-Tier1"):
