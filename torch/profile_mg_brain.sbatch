@@ -71,6 +71,11 @@ mkdir -p "${OUT}/configs"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo "[profile] R=${R} img=${IMG} coils=${COILS} reps=${REPS} warmup=${WARMUP} -> ${OUT}"
 
+# correctness first: a wrong coarse operator makes the rediscretized timings
+# meaningless (set -e stops the job if either fails)
+python -m tests.test_coarse_operator
+python -m tests.test_mg_coarse_op
+
 # ---- configs: the generator's current brain grid, then the V-cycle variants ----
 python scripts/make_mg_recon_configs.py --out "${OUT}/gen" --anatomy brain > /dev/null
 BASE="${OUT}/gen/brain/mg"
