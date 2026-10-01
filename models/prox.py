@@ -45,6 +45,7 @@ from models.circulant_attention import Circulant, circ_adjacency, _abs2
 from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
                                    get_block_mask)
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency
+from models.clip_triton import clip_modulus
 
 TRITON_SIMS = ("pidistance", "pidot")
 
@@ -172,6 +173,13 @@ class SoftThreshold(nn.Module):
     # z = 0 is exact regardless.
     fenchel_eps = 1e-12
 
+    # Route `fenchel` through the fused Triton kernel when it applies -- CUDA,
+    # complex64, contiguous, no autograd graph (see models/clip_triton.py).
+    # Class-level so it can be flipped globally, matching `FenchelProx.DIRECT`
+    # and `_GaussConvNd.INPLACE_COMBINE`: a kill switch, and what an A/B run
+    # toggles to measure what it is worth.
+    FUSED = True
+
     def __init__(self, channels, tau0=1e-2, degrees=0):
         super().__init__()
         self.tau = Polynomial(channels, degrees=degrees, tau0=tau0)
@@ -199,8 +207,18 @@ class SoftThreshold(nn.Module):
         `clamp_min` on the modulus keeps `t / |z|` finite at z = 0. The value
         there is unaffected: `|z| <= t` means `prox_g(z) = 0`, so the conjugate
         returns `z` -- and `min(1, t/eps) = 1` gives exactly that.
+
+        Even in that form it is four kernels and ~12 passes over the latent for
+        a map whose irreducible traffic is one read and one write.  `FUSED`
+        routes it to a single Triton kernel (`models/clip_triton.py`) wherever
+        that is expressible -- forward only, since the kernel has no backward.
+        Under autograd, and on CPU, the chain below runs unchanged.
         """
         t = self.threshold(z, sigma)
+        if self.FUSED and not torch.is_grad_enabled():
+            out = clip_modulus(z, t, self.fenchel_eps)
+            if out is not None:
+                return out, cache
         a = z.abs().clamp_min(self.fenchel_eps)
         return z * (t / a).clamp_max(1.0), cache
 

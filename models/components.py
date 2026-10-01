@@ -25,17 +25,89 @@ def CLIP(z, t):
 # ============================================================
 # Complex-valued convolution block
 # ============================================================
+def to_planar(x):
+    """A complex `(B, C, H, W)` as real `(B, 2C, H, W)` = `[re; im]`.
+
+    One pass.  `x.real` / `x.imag` are stride-2 views of the interleaved
+    storage, so this is also the contiguous-ification `F.conv2d` would
+    otherwise do twice.  A real input is returned unchanged.
+    """
+    if not torch.is_complex(x):
+        return x
+    return torch.cat((x.real, x.imag), dim=1)
+
+
+def to_complex(xp):
+    """Inverse of `to_planar` -- re-interleaves `[re; im]` into one complex tensor."""
+    if torch.is_complex(xp):
+        return xp
+    n = xp.shape[1] // 2
+    return torch.complex(xp[:, :n], xp[:, n:])
+
+
 class _GaussConvNd(nn.Module):
-    """Real/complex conv via Gauss's 3-multiply trick.
+    """Real/complex conv, either via Gauss's 3-multiply trick or as one real conv.
 
     Learnable params live in conv_real.weight / conv_imag.weight.
     Subclasses set up self.conv_real / self.conv_imag and define _op().
+
+    Two formulations of the same map, selected by `COMPLEX_MODE`:
+
+    "gauss"    three real convs on the de-interleaved halves, combined by
+               subtraction (`t1 - t2`, `t3 - t1 - t2`).  Fewest FLOPs.
+    "planar"   ONE real conv on the halves stacked along the channel axis,
+               against the block weight that *is* the complex multiply:
+
+                   [re_out]   [ wr  -wi ] [re_in]
+                   [im_out] = [ wi   wr ] [im_in]
+
+               i.e. `conv2d(cat([x.real, x.imag], 1), W)` with W of shape
+               (2M, 2C, P, P).  Four convs' worth of FLOPs instead of three.
+
+    Why "planar" is faster despite the extra FLOPs
+    ----------------------------------------------
+    At these shapes nothing here is compute-bound.  An L40S retires ~400 FLOPs
+    per element in the time it takes to READ that element, and a P=7 conv does
+    49 MACs, so even the convolutions are limited by memory traffic -- one
+    elementwise pass over an M=169 latent costs about what the whole analysis
+    conv costs.  "gauss" wraps its three convs in five such passes: `x.real`
+    and `x.imag` are stride-2 views of an interleaved complex tensor, so each
+    is copied contiguous before cuDNN sees it; then `xr + xi`; then the two
+    combining subtractions; then `torch.complex` re-interleaves the result.
+    "planar" pays one `cat` and one `torch.complex` and nothing else.
+
+    On the brain grid (640x320, M=169, s=2) that is ~534 -> ~198 MB moved for
+    an analysis conv and ~403 -> ~200 MB for a synthesis conv.  The remaining
+    conversions are the complex<->planar round trip at the module boundary;
+    they vanish only if the latent is CARRIED planar between layers, which is a
+    change to the dtype contract of `LPDSLayer`'s state, not to this class.
+
+    Numerics: "planar" is the better-conditioned of the two -- `t3 - t1 - t2`
+    subtracts quantities of similar size, which "planar" never forms.  The two
+    agree to ~4e-07 relative in fp32.  The default is "gauss" so that runs in
+    flight keep their bit pattern; flip it once the A/B has been measured
+    (`scripts/profile_mg.py --ab-planar`).
+
+    Not every case is expressible: `groups > 1` would need the block weight to
+    mix channels across group boundaries, and a bias is handled INCONSISTENTLY
+    by "gauss" (it applies `br - bi` to the real part and drops `bi` from the
+    imaginary part -- see `_planar_bias`).  Both fall back to "gauss" so that
+    nothing silently changes answer; every conv in the LPDS / multigrid family
+    is `groups=1, bias=False` and takes the planar path.
     """
     # Combine the Gauss trick's three convolutions in place when no autograd
     # graph is being built. Class-level so it can be flipped globally -- a kill
     # switch if it ever misbehaves, and what `scripts/profile_mg.py` toggles to
     # measure what it is worth.
     INPLACE_COMBINE = True
+
+    # "gauss" (default, bit-compatible with every existing run's forward) or
+    # "planar". Class-level for the same reason as above.
+    COMPLEX_MODE = "gauss"
+
+    # Set by the subclass: conv_transpose2d's weight is (in, out, ...) rather
+    # than (out, in, ...), which transposes the block pattern.
+    _PLANAR_TRANSPOSED = False
 
     def __init__(self, complex=True):
         super().__init__()
@@ -61,9 +133,68 @@ class _GaussConvNd(nn.Module):
     def _op(self, x, weight, bias=None):
         raise NotImplementedError
 
+    # -- planar formulation ---------------------------------------------------
+    def _planar_weight(self):
+        """The (2M, 2C, P, P) real block weight.
+
+        Rebuilt per call rather than cached: `models/base.py::set_weight` writes
+        through `conv_real.weight.data.copy_(...)`, which does NOT bump the
+        parameter's `_version`, so a version-keyed cache would go stale after
+        `project_` / `init_filters` / `preload_with_widening` and be wrong in a
+        way nothing would catch.  The weight is (2M, 2C, P, P) -- 132 KB at
+        M=169, C=1, P=7 -- against the tens of MB the conv itself moves, and
+        under autograd the `cat`s are what carry gradients back to conv_real /
+        conv_imag, so they have to be in the graph anyway.
+        """
+        wr, wi = self.conv_real.weight, self.conv_imag.weight
+        if self._PLANAR_TRANSPOSED:
+            # weight is (in, out, ...), so the block pattern transposes
+            top = torch.cat((wr, wi), dim=1)
+            bot = torch.cat((-wi, wr), dim=1)
+        else:
+            top = torch.cat((wr, -wi), dim=1)
+            bot = torch.cat((wi, wr), dim=1)
+        return torch.cat((top, bot), dim=0)
+
+    def _planar_bias(self):
+        """`cat([br, bi])` -- the bias a complex `br + i bi` actually implies.
+
+        This is NOT what the "gauss" branch computes.  There, with
+        `t1 = wr xr + br`, `t2 = wi xi + bi`, `t3 = (wr+wi)(xr+xi) + br + bi`:
+
+            real = t1 - t2         ->  bias  br - bi
+            imag = t3 - t1 - t2    ->  bias  0
+
+        so "gauss" offsets the real part by `-bi` and drops the imaginary bias
+        entirely.  Every conv in this repo is built `bias=False`, so the two
+        have never disagreed; `_planar_ok` nonetheless routes a biased conv to
+        "gauss" so that enabling "planar" cannot change an answer.  Kept for
+        when that inconsistency is fixed on the gauss side too.
+        """
+        br, bi = self.conv_real.bias, self.conv_imag.bias
+        if br is None and bi is None:
+            return None
+        n = self.conv_real.weight.shape[1 if self._PLANAR_TRANSPOSED else 0]
+        z = torch.zeros(n, device=self.conv_real.weight.device,
+                        dtype=self.conv_real.weight.dtype)
+        return torch.cat((br if br is not None else z,
+                          bi if bi is not None else z))
+
+    def _planar_ok(self):
+        """Can this conv take the planar path?  See the class docstring."""
+        return (self.COMPLEX_MODE == "planar" and self.groups == 1
+                and self.conv_real.bias is None and self.conv_imag.bias is None)
+
+    def _forward_planar(self, x):
+        out = self._op(to_planar(x), self._planar_weight(), None)
+        return to_complex(out)
+
     def forward(self, x):
         if not self.complex:
             return self._op(x, self.conv_real.weight, self.conv_real.bias)
+
+        if x.is_complex() and self._planar_ok():
+            return self._forward_planar(x)
 
         wr, br = self.conv_real.weight, self.conv_real.bias
         wi, bi = self.conv_imag.weight, self.conv_imag.bias
@@ -105,6 +236,8 @@ class Conv2d(_GaussConvNd):
 
 
 class ConvTranspose2d(_GaussConvNd):
+    _PLANAR_TRANSPOSED = True
+
     def __init__(self, M, C, P, stride=1, bias=False, complex=True, groups=1):
         super().__init__(complex=complex)
         self.padding = (P - 1) // 2

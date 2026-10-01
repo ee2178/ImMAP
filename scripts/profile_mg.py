@@ -63,6 +63,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import models.components as components_mod          # noqa: E402
 import models.lpds as lpds_mod                      # noqa: E402
 import models.mg_lpds as mg_mod                     # noqa: E402
+import models.clip_triton as clip_mod                # noqa: E402
 import models.prox as prox_mod                       # noqa: E402
 import operators.base as base_mod                   # noqa: E402
 from models import build_model                      # noqa: E402
@@ -212,6 +213,63 @@ def direct_prox_disabled():
         yield
     finally:
         prox_mod.FenchelProx.DIRECT = orig
+@contextlib.contextmanager
+def planar_conv():
+    """Every complex conv as ONE real conv on a `[re; im]` channel stacking.
+
+    `models/components.py::_GaussConvNd.COMPLEX_MODE`. Gauss's 3-multiply trick
+    needs five elementwise passes around its three convs (two contiguous copies
+    of the stride-2 `.real` / `.imag` views, `xr + xi`, two combining
+    subtractions, and the `torch.complex` re-interleave); the planar block
+    weight needs one `cat` and one `torch.complex`. Four convs' worth of FLOPs
+    instead of three, which is the cheap half of the trade at these shapes.
+
+    Flipped at the class attribute, so the A/B measures this one change and
+    nothing has to be rebuilt.
+    """
+    orig = components_mod._GaussConvNd.COMPLEX_MODE
+    components_mod._GaussConvNd.COMPLEX_MODE = "planar"
+    try:
+        yield
+    finally:
+        components_mod._GaussConvNd.COMPLEX_MODE = orig
+
+
+@contextlib.contextmanager
+def fused_prox():
+    """The Fenchel clip as a single Triton kernel (`models/clip_triton.py`).
+
+    `z * min(1, t/|z|)` is four kernels and ~12 passes over the M-channel
+    latent in eager; the kernel is one read and one write. Forward only, which
+    is what this script measures. Enabled by default in the model, so this
+    context manager exists for symmetry with `fused_prox_disabled`.
+    """
+    orig = prox_mod.SoftThreshold.FUSED
+    prox_mod.SoftThreshold.FUSED = True
+    try:
+        yield
+    finally:
+        prox_mod.SoftThreshold.FUSED = orig
+
+
+@contextlib.contextmanager
+def fused_prox_disabled():
+    """Restore the eager four-kernel Fenchel chain."""
+    orig = prox_mod.SoftThreshold.FUSED
+    prox_mod.SoftThreshold.FUSED = False
+    try:
+        yield
+    finally:
+        prox_mod.SoftThreshold.FUSED = orig
+
+
+@contextlib.contextmanager
+def planar_and_fused():
+    """Both of the above -- the configuration the byte model predicts."""
+    with planar_conv(), fused_prox():
+        yield
+
+
 @contextlib.contextmanager
 def tier1_disabled():
     """Restore the pre-optimisation behaviour of every Tier-1 change.
@@ -478,6 +536,23 @@ def main():
     ap.add_argument("--ab-prox", action="store_true",
                     help="also run with the direct Fenchel prox disabled, i.e. "
                          "z - prox_g(z) spelled out; measures that change alone")
+    ap.add_argument("--planar", action="store_true",
+                    help="run EVERY mode with the planar complex conv enabled "
+                         "(_GaussConvNd.COMPLEX_MODE='planar'), rather than as "
+                         "a separate A/B arm; this is how to re-fit the "
+                         "per-level cost model under the new configuration")
+    ap.add_argument("--fused-prox", action="store_true",
+                    help="run EVERY mode with the fused Fenchel clip enabled "
+                         "(SoftThreshold.FUSED); see --planar")
+    ap.add_argument("--ab-planar", action="store_true",
+                    help="also run with every complex conv as ONE real conv on "
+                         "a [re; im] channel stacking "
+                         "(_GaussConvNd.COMPLEX_MODE='planar') instead of "
+                         "Gauss's 3-multiply trick")
+    ap.add_argument("--ab-fused-prox", action="store_true",
+                    help="also run with the Fenchel clip fused into one Triton "
+                         "kernel (SoftThreshold.FUSED); with --ab-planar, a "
+                         "third arm runs both")
     ap.add_argument("--counts", action="store_true",
                     help="exact op counts and the grid each ran at")
     ap.add_argument("--breakdown", action="store_true",
@@ -520,6 +595,21 @@ def main():
         args.breakdown = True
         print("[profile] --by-level implies --breakdown; enabling it.")
 
+    # Force-on switches are applied for the whole run, before any model is
+    # built. They compose with the A/B contexts (which save and restore), but
+    # an arm that enables what is already on measures nothing, so drop it.
+    if args.planar:
+        components_mod._GaussConvNd.COMPLEX_MODE = "planar"
+        if args.ab_planar:
+            args.ab_planar = False
+            print("[profile] --planar is on for every mode; dropping the "
+                  "redundant --ab-planar arm.")
+    prox_mod.SoftThreshold.FUSED = bool(args.fused_prox) or not args.ab_fused_prox
+    if args.fused_prox and args.ab_fused_prox:
+        args.ab_fused_prox = False
+        print("[profile] --fused-prox is on for every mode; dropping the "
+              "redundant --ab-fused-prox arm.")
+
     device = torch.device(args.device)
     size = (args.size[0], args.size[-1])
     torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
@@ -537,7 +627,10 @@ def main():
     else:
         print(f"problem  : {args.batch}x{args.coils} coils, {size[0]}x{size[1]}, "
               f"sigma={args.sigma}, {args.reps} reps after {args.warmup} warmup")
-    print(f"cudnn.benchmark : {torch.backends.cudnn.benchmark}\n")
+    print(f"cudnn.benchmark : {torch.backends.cudnn.benchmark}")
+    print(f"complex conv    : {components_mod._GaussConvNd.COMPLEX_MODE}"
+          f"   fused prox: {prox_mod.SoftThreshold.FUSED}"
+          f"   (triton: {clip_mod.HAVE_TRITON})\n")
 
     rows, first_median, outputs, records = [], {}, {}, []
     for cfg_path in args.configs:
@@ -563,6 +656,18 @@ def main():
                    and isinstance(_p.get("K"), list) and len(_p["K"][1]) > 1)
         if args.ab_coarse and _vcycle:
             modes.append(("rediscretize", contextlib.nullcontext))
+        # Forward-pass memory-traffic cuts. Unlike the Tier-1 arms these are
+        # OFF in the model by default (planar changes the fp32 rounding of
+        # every conv, so runs in flight keep their bit pattern), hence the
+        # mode turns them ON and the ratio is read the other way round.
+        if args.ab_planar:
+            modes.append(("planar-conv", planar_conv))
+        if args.ab_fused_prox:
+            # `SoftThreshold.FUSED` was set False above for exactly this case,
+            # so "optimised" is the eager chain and this arm is the kernel.
+            modes.append(("fused-prox", fused_prox))
+        if args.ab_planar and args.ab_fused_prox:
+            modes.append(("planar+fused", planar_and_fused))
 
         for mode, ctx in modes:
             with ctx():
@@ -590,7 +695,7 @@ def main():
                                               center_frac=cf, adjust_accel=adj)]
                 y, E, sigma = problems[0]
                 stats = time_run(model, problems, args.reps, args.warmup, device)
-                if args.ab or args.ab_prox:
+                if args.ab or args.ab_prox or args.ab_planar or args.ab_fused_prox:
                     with torch.no_grad():
                         outputs[(name, mode)] = model(y, E=E, sigma=sigma)[0].clone()
             rows.append((name, label, n_par, mode, stats))
@@ -608,7 +713,8 @@ def main():
                       f"{mri.get('online_smaps_kws')}): median {t_on:.1f} ms "
                       f"per slice ({name}) ---\n")
 
-            if args.counts and mode in ("optimised", "rediscretize"):
+            if args.counts and mode in ("optimised", "rediscretize", "planar+fused",
+                                    "planar-conv"):
                 counts, grids = count_run(model, y, E, sigma)
                 print(f"--- counts: {name} [{mode}] ---")
                 for k in ("gram", "fft", "fftshift", "conv", "resample"):
@@ -622,7 +728,8 @@ def main():
                       "does not,\n     the coarse levels are running full-resolution "
                       "physics)\n")
 
-            if args.breakdown and mode in ("optimised", "rediscretize"):
+            if args.breakdown and mode in ("optimised", "rediscretize", "planar+fused",
+                                       "planar-conv"):
                 totals, ncalls, wall = breakdown_run(model, y, E, sigma, device,
                                                      by_level=args.by_level)
                 clean = stats["median"]
@@ -661,6 +768,35 @@ def main():
             if a and b:
                 print(f"  {'coarse Gram rediscretized':<27}{name:<16} {a / b:.2f}x   "
                       f"({a:.2f} -> {b:.2f} ms)")
+
+    # These arms make the model FASTER than "optimised", so the ratio reads
+    # optimised -> mode rather than mode -> optimised.
+    speedups = [("planar-conv", "planar conv"),
+                ("fused-prox", "fused prox"),
+                ("planar+fused", "planar + fused prox")]
+    if args.ab_planar or args.ab_fused_prox:
+        print()
+        for mode, tag in speedups:
+            for name in dict.fromkeys(r[0] for r in rows):
+                a = first_median.get((name, "optimised"))
+                b = first_median.get((name, mode))
+                if a and b:
+                    print(f"  {tag + ' speedup':<30}{name:<16} {a / b:.2f}x   "
+                          f"({a:.2f} -> {b:.2f} ms)")
+        print()
+        for mode, tag in speedups:
+            for name in dict.fromkeys(r[0] for r in rows):
+                u = outputs.get((name, "optimised"))
+                v = outputs.get((name, mode))
+                if u is None or v is None:
+                    continue
+                err = ((u - v).abs().max() / (u.abs().max() + 1e-12)).item()
+                # `planar` reassociates every complex multiply, so fp32
+                # roundoff -- not bit-identity -- is the bar here.
+                verdict = ("bit-identical" if err == 0.0 else
+                           "exact to fp roundoff" if err < 1e-5 else "MISMATCH")
+                print(f"  {tag + ' equivalence':<32}{name:<16} "
+                      f"max rel err = {err:.3e}  {verdict}")
 
     subject = os.path.splitext(os.path.basename(args.configs[0]))[0]
     for mode in ("optimised", "pre-Tier1"):
