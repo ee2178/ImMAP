@@ -65,12 +65,13 @@ import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.guided_prox import (GuidedGroupThreshold, as_guide_list,
                                 build_guided_prox)
 from models.lpds import LPDSLayer, gram
 from operators.identity import Identity
-from operators.padding import calc_pad_2d
+from operators.padding import calc_pad_2d, unpad
 from preprocessing.image import post_process, pre_process
 from preprocessing.kspace import (_pad_complex, kspace_post_process,
                                   kspace_pre_process)
@@ -134,8 +135,14 @@ class GuidedLPDSLayer(LPDSLayer):
         tau = self.tau(sigma, ref=x)
         theta = self.theta(sigma, ref=x)
 
-        Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x)
-        residual = Ex - y_tilde + self.synthesis(z)
+        if getattr(E, "nonlinear", False):
+            # learned operator: the data gradient is ONE call at the current iterate,
+            # J_E(x)^H (E(x) - y). `E^H E x - E^H y` would need a point-free adjoint it lacks.
+            data = E.grad(x)
+        else:
+            Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x)
+            data = Ex - y_tilde
+        residual = data + self.synthesis(z)
         if pi_x is not None:
             residual = residual - pi_x
         x_new = x - tau * residual
@@ -157,6 +164,28 @@ def make_guided_lpds_layer(C, M, spectral_init=True, **kws):
     if spectral_init:
         layer.spectral_normalize()
     return layer
+
+
+class _PaddedDataGrad:
+    """A learned operator's data gradient, seen from the PREPROCESSED grid.
+
+    The layers iterate on x~ = pad(x - mean). E was trained on x itself, so the gradient is
+    evaluated at unpad(x~) + mean and the pad band gets zeros (no data term lives there).
+    """
+
+    nonlinear = True
+
+    def __init__(self, E, y, xmean, pad):
+        self.E, self.y, self.xmean, self.pad = E, y, xmean, tuple(int(p) for p in pad)
+
+    def grad(self, x):
+        xr = (unpad(x, self.pad) if any(self.pad) else x) + self.xmean
+        g = self.E.data_grad(xr, self.y)
+        if not any(self.pad):
+            return g
+        if torch.is_complex(g):
+            return torch.complex(F.pad(g.real, self.pad), F.pad(g.imag, self.pad))
+        return F.pad(g, self.pad)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +267,8 @@ class LGGSNet(nn.Module):
     def forward(self, y, guide=None, E=None, sigma=None, state=None):
         if E is None:
             E = Identity()
+        if getattr(E, "nonlinear", False):
+            return self._forward_nonlinear(y, guide, E, sigma, state)
 
         if self.preproc == "kspace":
             y_tilde, E, params = kspace_pre_process(y, E, self.pad_stride)
@@ -259,6 +290,46 @@ class LGGSNet(nn.Module):
                                  sigma=sigma, cache=cache)
         x, z = state
         x_hat = x if params is None else post(x, params)
+        return x_hat, (x, z)
+
+    def _forward_nonlinear(self, y, guide, E, sigma, state):
+        """The same K guided sweeps with a LEARNED (nonlinear) data operator.
+
+        Mirrors `CDLNet._forward_nonlinear`. Three things differ from the linear path, all
+        forced by E having no point-free adjoint (operators/learned.py):
+
+          * the start is `E.init(y)`, the operator's own image-domain estimate, not E^H y;
+          * each sweep's data gradient is one `E.data_grad(x, y)` at the current iterate;
+          * the image preprocessing (mean removal, stride padding) does not commute with a
+            learned E, which was trained on real intensities at the true frame size. So the
+            gradient is taken at unpad(x) + mean and zero-padded back -- the exact gradient
+            w.r.t. the padded iterate, since the pad band carries no data term.
+
+        `sigma` for the noise-adaptive prox is E.noise_level(y) when the operator defines one
+        (BridgeDCOperator does), else the caller's.
+        """
+        if self.preproc == "kspace":
+            raise ValueError("a learned operator acts in the image domain; use preproc='image' "
+                             "or 'identity', not 'kspace'")
+        y0 = E.init(y) if hasattr(E, "init") else y
+        if self.preproc == "identity":
+            self._check_grid(y0.shape[-2:])
+            y_tilde, params = y0, None
+            xmean, pad = 0.0, (0, 0, 0, 0)
+        else:
+            y_tilde, params = pre_process(y0, self.pad_stride)
+            xmean, pad = params
+        if hasattr(E, "noise_level"):
+            sigma = E.noise_level(y)
+
+        dc = _PaddedDataGrad(E, y, xmean, pad)
+        guides = self._prep_guides(guide, y_tilde)
+        cache = {}
+        for layer in self.layers:
+            state, cache = layer(state, y_tilde, guide=guides, E=dc,
+                                 sigma=sigma, cache=cache)
+        x, z = state
+        x_hat = x if params is None else post_process(x, list(params))
         return x_hat, (x, z)
 
     def _check_grid(self, hw):

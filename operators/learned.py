@@ -62,6 +62,51 @@ class LearnedOperator(Operator):
         return self.net.data_grad(x, y, self.cond, create_graph=torch.is_grad_enabled())
 
 
+class MagnitudeOperator(LearnedOperator):
+    """E(x) = net(|x|; c): a REAL learned operator applied to the magnitude of a COMPLEX iterate.
+
+    The "magnitude approach" for complex-weighted unrolled nets (LGGS with is_complex=True) on
+    real-valued contrasts. It needs data that is a pure SCALE of the scanner magnitude -- the
+    2026-09 switch from median/MAD to `img_raw / scales` -- so that background is 0 and |x| is a
+    meaningful intensity. A median/MAD-normalised image has a negative background, and the
+    magnitude of that is not an image anyone trained E on.
+
+    The data term depends on |x| only, so the phase of the iterate is left to the prior: E sees
+    the magnitude, the loss (magnitude-mse) scores the magnitude, and the complex dictionaries are
+    free to use the imaginary channel as working space.
+
+    `data_grad` is grad_x 1/2 || y - net(|x|) ||^2 through autograd on the complex leaf, so it
+    is the gradient w.r.t. (Re x, Im x) packed as Re + i Im -- the direction a primal step
+    x <- x - tau g descends (tests/test_lggs_learned_dc.py pins this against the real-pair
+    gradient). |x| is smoothed as sqrt(|x|^2 + eps) so the gradient x/|x| exists at x = 0.
+    """
+
+    def __init__(self, net, cond=None, eps=1e-12):
+        super().__init__(net, cond)
+        self.eps = float(eps)
+
+    def magnitude(self, x):
+        if not torch.is_complex(x):
+            return x
+        return (x.real ** 2 + x.imag ** 2 + self.eps).sqrt()
+
+    def forward(self, x):
+        return self.net(self.magnitude(x), self.cond)
+
+    def data_grad(self, x, y):
+        create = torch.is_grad_enabled()
+        with torch.enable_grad():
+            xin = x if (create and x.requires_grad) else x.detach().requires_grad_(True)
+            r = self.net(self.magnitude(xin), self.cond) - y
+            (g,) = torch.autograd.grad(r, xin, grad_outputs=r, create_graph=create,
+                                       allow_unused=True)
+        return torch.zeros_like(x) if g is None else g
+
+    def init(self, y):
+        """The image the unrolled net starts from: the measurement itself (T1 for T1 -> CT1)."""
+        return y
+
+
 class LinearizedOperator(Operator):
     """The Jacobian J of a learned operator at a FIXED point x_bar -- a genuine LINEAR Operator.
 
