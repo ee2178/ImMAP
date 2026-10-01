@@ -59,6 +59,8 @@ def find_runs(root):
 def load_run(run_dir, device):
     with open(os.path.join(run_dir, "config.json")) as f:
         cfg = json.load(f)
+    from models.components import set_complex_mode
+    set_complex_mode(cfg.get("training", {}).get("complex_conv"))
 
     model = build_model(cfg).to(device)
 

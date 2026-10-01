@@ -25,6 +25,25 @@ def CLIP(z, t):
 # ============================================================
 # Complex-valued convolution block
 # ============================================================
+COMPLEX_MODES = ("gauss", "planar")
+
+
+def set_complex_mode(mode=None):
+    """Set `_GaussConvNd.COMPLEX_MODE` for the process; None leaves it alone.
+
+    Read from a config's `training.complex_conv` by train.py and the eval
+    scripts. Changes no parameter -- both modes use conv_real / conv_imag --
+    so a checkpoint trained under one evaluates under the other (they agree
+    to ~4e-07 in fp32; see tests/test_planar_conv.py).
+    """
+    if mode is None:
+        return _GaussConvNd.COMPLEX_MODE
+    if mode not in COMPLEX_MODES:
+        raise ValueError(f"complex_conv must be one of {COMPLEX_MODES}, got {mode!r}")
+    _GaussConvNd.COMPLEX_MODE = mode
+    return mode
+
+
 def to_planar(x):
     """A complex `(B, C, H, W)` as real `(B, 2C, H, W)` = `[re; im]`.
 

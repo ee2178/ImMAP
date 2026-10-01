@@ -549,6 +549,40 @@ MODELS.update({
         MODELS["wlpds16"]["params"], family="random_full", carry="conv")),
 })
 
+# ---------------------------------------------------------------------------
+#  EXP8: multigrid architecture sweep (2026-10-01), brain R=12
+#
+#  A 3 x 3 grid over dictionary width M and the number of V-cycles, each cycle
+#  the current [4, 4, 6] per level, plus one single-V-cycle "U-Net-like" cell
+#  at LPDSNet's 30 layers. All with the REDISCRETIZED coarse Gram
+#  (coarse_op="rediscretize": coarse SENSE on the coarse grid, see
+#  operators/coarse.py) and the PLANAR complex conv (`training.complex_conv`).
+#
+#  mg169v6 is the current `mglpds` K with those two switches on -- the anchor
+#  linking this grid to every earlier mglpds number.
+#
+#  mgunet: K=[1,[8,8,14]]. The user's [1,[5,5,10]] cannot be built (PDVCycle
+#  splits a non-coarsest level into equal pre/post smoothing, so those counts
+#  must be even) and totals 20, not 30; [8,8,14] keeps the ~1:1:2 split at 30.
+# ---------------------------------------------------------------------------
+EXP8_M = (169, 121, 81)
+EXP8_VCYCLES = (2, 4, 6)
+EXP8_ITERS = [4, 4, 6]
+EXP8_UNET_K = [1, [8, 8, 14]]
+_EXP8 = dict(coarse_op="rediscretize")
+_EXP8_TRAINING = dict(complex_conv="planar")
+
+MODELS.update({
+    f"mg{m}v{v}": dict(type="MGLPDSNet",
+                       params=dict(LPDS_COMMON, M=m, K=[v, list(EXP8_ITERS)], **_EXP8),
+                       training=dict(_EXP8_TRAINING))
+    for m in EXP8_M for v in EXP8_VCYCLES
+})
+MODELS["mgunet"] = dict(type="MGLPDSNet",
+                        params=dict(LPDS_COMMON, K=EXP8_UNET_K, **_EXP8),
+                        training=dict(_EXP8_TRAINING))
+EXP8_CELLS = tuple(f"mg{m}v{v}" for m in EXP8_M for v in EXP8_VCYCLES) + ("mgunet",)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -560,7 +594,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
-          "mllpds48k54", "mllpds64k40")
+          "mllpds48k54", "mllpds64k40") + EXP8_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -896,6 +930,17 @@ def _display_name(spec_type, params):
         if params.get("band_norm", "none") != "none":
             tag += "_bn" + params["band_norm"]
         return "%s%s_%s" % (spec_type, tag, variant)
+    if spec_type == "MGLPDSNet" and variant == "mg" and (
+            params.get("M", 169) != 169 or params.get("K") != LPDS_VCYCLE_K
+            or params.get("coarse_op", "galerkin") != "galerkin"):
+        # exp8's cells are all MGLPDSNet V-cycles; plain `mglpds` keeps its
+        # name, anything else carries what differs.
+        k_out, iters = params["K"]
+        tag = "M%dK%dx%s" % (params.get("M", 169), k_out,
+                             "-".join(str(i) for i in iters))
+        if params.get("coarse_op", "galerkin") != "galerkin":
+            tag += "_rd"
+        return "MGLPDSNet_%s" % tag
     if spec_type == "E2EVarNet" and params.get("use_smaps"):
         # `varnet` and `varnetmaps` are the same class with the same variant,
         # so the table below cannot separate them -- and two cells under one
@@ -1105,6 +1150,10 @@ def make_config(anatomy, r, model, args):
             # is large enough to never fire for mag_nl1_nl2.
             "backtrack_thresh": None,
             "backtrack_factor": 0.9,
+            # Per-cell overrides, written only when a cell sets them, so every
+            # other config is byte-identical (the launch guard reads an absent
+            # key as None). exp8: complex_conv="planar".
+            **dict(spec.get("training") or {}),
         },
         "mri": {
             "R": r,

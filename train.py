@@ -122,6 +122,11 @@ def main(config_path):
     # unbounded sizes.
     torch.backends.cudnn.benchmark = bool(
         cfg.get("training", {}).get("cudnn_benchmark", True))
+    # Complex conv formulation (models/components.py): "planar" = one real conv
+    # on [re; im], "gauss" = the 3-multiply trick (the class default). Absent
+    # leaves the default, so existing configs are unchanged.
+    from models.components import set_complex_mode
+    set_complex_mode(cfg.get("training", {}).get("complex_conv"))
     # Init model from scratch if no ckpt provided
     model = build_model(cfg).to(device)
     optimizer = build_optimizer(model, cfg)
