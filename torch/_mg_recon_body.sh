@@ -54,21 +54,35 @@
 # against the filtered list, so a stale --array fails loudly rather than
 # silently training the wrong cell.
 #
-# LAUNCH-ONCE
-# -----------
-# Launching a cell here always starts it FROM SCRATCH, under a new wandb id --
-# and one cell is often listed by several launchers (brain R8 lpdsnet, mglpds
-# and varnet are in both exp1 and exp4; the full grids list everything). So
-# when the run dir already holds a config.gen.json:
+# LAUNCH-ONCE, WITH AUTO-RESUME
+# -----------------------------
+# One cell is often listed by several launchers (brain R8 lpdsnet, mglpds and
+# varnetmaps are in both exp1 and exp4; the full grids list everything), and a
+# launcher is often resubmitted after a walltime kill. So when the run dir
+# already holds a config.gen.json:
 #
-#   * identical to what would be written now -> SKIP (exit 0). It was launched
-#     already; if it did not finish, resume it with torch/mg_recon_resume.sbatch.
+#   * identical to what would be written now -> the cell was launched before,
+#     and what happens depends on where that launch got to:
+#       - its job is still RUNNING or QUEUED   -> SKIP. The launching job's id
+#         is kept in <run dir>/.launch_job and checked with squeue, so two jobs
+#         never train one run dir at once.
+#       - its checkpoint has reached num_epochs -> SKIP (complete).
+#       - it has a checkpoint short of that     -> RESUME, from the run's own
+#         config.json: same wandb run, optimizer, scheduler, step and
+#         backtracking state -- what torch/mg_recon_resume.sbatch does, without
+#         the listing step. The checkpoint is written only on an IMPROVING
+#         epoch, so a resume restarts from the last improvement, not the last
+#         epoch.
+#       - it never wrote a checkpoint (killed or crashed before its first
+#         improving epoch) -> started FRESH from config.gen.json; nothing is
+#         lost.
 #   * different (a noise, mask or smap_root change, ...) -> REFUSE, naming the
 #     keys that differ. Never silently kept, never silently overwritten.
 #
-# FORCE_RESTART=1 overrides both. A repeated SWEEP_EPOCHS probe is a repeated
-# launch of the same tagged cell, so it is skipped too -- force it, or delete
-# the probe's run dir.
+# So resubmitting the same launcher is how an unfinished experiment continues.
+# FORCE_RESTART=1 overrides all of it and retrains from scratch, overwriting
+# the run. A repeated SWEEP_EPOCHS probe is the same tagged cell, so it resumes
+# or skips like any other -- force it, or delete the probe's run dir.
 #
 # WHAT THIS CANNOT SEE: data regenerated IN PLACE. Sensitivity maps (or any
 # other input) rewritten under the same path leave the config identical, so a
@@ -156,7 +170,21 @@ fi
 
 RUN_DIR="trained_nets/mg_recon/${ANATOMY}/${MODEL}_${RTAG}${RUN_TAG:+_${RUN_TAG}}"
 GEN_CONFIG="${RUN_DIR}/config.gen.json"
+LAUNCH_LOCK="${RUN_DIR}/.launch_job"     # SLURM job id of the last launch
 mkdir -p "${RUN_DIR}"
+
+# Is SLURM job $1 still queued or running (and not this job)?
+_job_alive() {
+    local id="$1"
+    [ -n "${id}" ] || return 1
+    [ "${id}" = "${SLURM_JOB_ID:-}" ] && return 1
+    if ! command -v squeue >/dev/null 2>&1; then
+        echo "[grid] WARNING: squeue not found; cannot tell whether job ${id}" \
+             "still owns ${RUN_DIR}. Assuming it does not." >&2
+        return 1
+    fi
+    [ -n "$(squeue -h -j "${id}" 2>/dev/null)" ]
+}
 
 # ---- per-cell bookkeeping (epoch override, run tag, fresh wandb run, launch-once) ---------
 # Exit status 3 means "already launched with this exact config -- nothing to do";
@@ -296,9 +324,9 @@ if os.path.exists(out) and not force:
     a, b = _flat(old), _flat(cfg)
     diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
     if not diff:
-        print(f"[grid] SKIP {save_dir}: already launched with this exact config "
-              f"(possibly by another launcher). If it did not finish, resume it "
-              f"with torch/mg_recon_resume.sbatch; FORCE_RESTART=1 starts it over.")
+        print(f"[grid] {save_dir}: already launched with this exact config "
+              f"(possibly by another launcher) -- checking whether to skip or "
+              f"resume it. FORCE_RESTART=1 starts it over.")
         sys.exit(3)
     raise SystemExit(
         f"[grid] {save_dir} was already launched, under a config that no longer "
@@ -320,10 +348,58 @@ print(f"[grid] {cfg['model']['type']} R={_r} acs={_acs} "
 PY
 _rc=$?
 set -e
+TRAIN_CONFIG="${GEN_CONFIG}"
 if [ "${_rc}" -eq 3 ]; then
-    exit 0
+    # Launched before under this exact config: running, complete, resumable,
+    # or never checkpointed. See LAUNCH-ONCE at the top.
+    _owner="$(cat "${LAUNCH_LOCK}" 2>/dev/null || true)"
+    if _job_alive "${_owner}"; then
+        echo "[grid] SKIP ${RUN_DIR}: still queued/running as job ${_owner}."
+        exit 0
+    fi
+    _state="$(python - "${RUN_DIR}" <<'PY'
+import json, os, sys
+import torch
+
+run = sys.argv[1]
+cfg_path, ckpt = os.path.join(run, "config.json"), os.path.join(run, "net.ckpt")
+if not os.path.exists(cfg_path):
+    print("fresh no config.json (train.py never got past wandb.init)"); sys.exit()
+if not os.path.exists(ckpt):
+    print("fresh no net.ckpt (stopped before its first improving epoch)"); sys.exit()
+t = json.load(open(cfg_path))["training"]
+def _load(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:            # torch < 1.13 has no weights_only
+        return torch.load(path, map_location="cpu")
+try:
+    step = _load(ckpt).get("step") or 0
+except Exception as e:                                            # noqa: BLE001
+    # Never restart over an unreadable checkpoint: that would discard the run.
+    sys.exit(f"[grid] cannot read {ckpt} ({e}); not resuming, not restarting. "
+             f"Inspect it, or FORCE_RESTART=1 to retrain from scratch.")
+ep, nep = int(step) // int(t["steps_per_epoch"]), int(t["num_epochs"])
+print(f"{'done' if ep >= nep else 'resume'} epoch {ep}/{nep} (step {step})")
+PY
+)"
+    case "${_state%% *}" in
+        done)
+            echo "[grid] SKIP ${RUN_DIR}: complete -- ${_state#* }."
+            exit 0 ;;
+        resume)
+            echo "[grid] RESUME ${RUN_DIR} at ${_state#* } from its config.json"
+            TRAIN_CONFIG="${RUN_DIR}/config.json" ;;
+        fresh)
+            echo "[grid] RESTART ${RUN_DIR} from scratch: launched before, but" \
+                 "${_state#* }." ;;
+        *)
+            echo "[grid] could not determine the state of ${RUN_DIR}" >&2
+            exit 1 ;;
+    esac
 elif [ "${_rc}" -ne 0 ]; then
     exit "${_rc}"
 fi
 
-python train.py "${GEN_CONFIG}"
+echo "${SLURM_JOB_ID:-}" > "${LAUNCH_LOCK}"
+python train.py "${TRAIN_CONFIG}"

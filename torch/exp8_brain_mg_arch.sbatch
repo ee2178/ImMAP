@@ -7,7 +7,7 @@
 #SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96GB
-#SBATCH --time=05:00:00
+#SBATCH --time=08:00:00
 #SBATCH --job-name=Exp8-MGArch
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
@@ -39,11 +39,12 @@
 # Otherwise the grid's measured protocol: online ESPIRiT operator maps, SENSE
 # ground truth, Julia masks at R=12 (effective ~11.9), organ mask on.
 #
-# 500 EPOCHS (x 50 steps = 25k steps), not the config's 6000, in a 5 h slot.
+# 500 EPOCHS (x 50 steps = 25k steps), not the config's 6000, in an 8 h slot.
 # The runs are TAGGED <model>_R12_500ep, so they never block a full-length run
-# of the same cell. If a heavy cell (V=6 at M=169) does not finish in 5 h, it
-# stops at its last checkpoint: resume it with torch/mg_recon_resume.sbatch, or
-# raise --time below. Probe one cell's throughput first if unsure:
+# of the same cell. If a heavy cell (V=6 at M=169) does not finish in 8 h, it
+# stops at its last checkpoint, and RESUBMITTING THIS FILE resumes it (the
+# launch body auto-resumes unfinished cells and skips finished or still-running
+# ones). Probe one cell's throughput first if unsure:
 #     SWEEP_EPOCHS=10 RUN_TAG=probe sbatch --array=2 torch/exp8_brain_mg_arch.sbatch
 #
 # THE QUESTION: how far can the full-size MGLPDS be DOWNSIZED before it loses
