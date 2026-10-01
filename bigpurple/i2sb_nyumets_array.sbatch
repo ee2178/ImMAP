@@ -26,6 +26,17 @@
 #   15   synth_unet_otherstudy_pair_w2.json   Unet2D  in=13     ... at z-2..z+2
 #   16   i2sb_unet_all_bs256.json             SBUnet   C=4      as 1,  LARGE BATCH + EMA
 #   17   i2sb_unet_otherstudy_pair_w2_bs256   SBUnet   C=14     as 11, LARGE BATCH + EMA
+#   18   synth_cycle_shallowF_w2.json         CycleSynth        as 15 + cycle, F = 1-level UNet
+#   19   synth_cycle_sameF_w2.json            CycleSynth        as 15 + cycle, F = G's architecture
+#
+# CYCLE (18-19): G (T1 & co -> CT1) trained jointly with F (CT1, FLAIR, T2 -> T1) on
+#     L = loss(G(X), CT1) + cycle_weight * loss(F(G(X)), T1) + backward_weight * loss(F(CT1), T1)
+# The last term supervises F directly on the TRUE CT1; without it F learns only from G's outputs
+# and can learn to decode whatever G hides in them. G is config 15's Unet2D unchanged, so 15 is
+# the no-cycle control; 18 vs 19 asks how big the backward path should be. F never sees T1
+# (models/cycle.py refuses it), or both T1 terms would be satisfied by copying. Logged separately
+# as train/cycle, train/backward, val/cycle, val/backward.
+#   sbatch --array=15,18,19 bigpurple/i2sb_nyumets_array.sbatch
 #
 # LARGE BATCH + EMA + SIGMA WEIGHTING (16-17) moves our recipe toward the NVlabs reference,
 # which trains at an effective batch of 256, samples from an EMA at decay 0.99, and regresses the
@@ -77,6 +88,11 @@
 # schedule. The conditioning is lifted from the matching i2sb config, so 12 vs 1, 13 vs 9,
 # 14 vs 10 and 15 vs 11 differ in the OBJECTIVE -- and in the one input channel a bridge needs
 # and a direct regressor does not (in_chans = C - 1). Loader: nyumets_synth.
+#
+# 12-15 and 18-19 train at an effective batch of 64 (one physical batch, no accumulation), LR
+# 1e-4 (square-root scaled from 2e-4 at 256), EMA 0.99, 300,000 steps -- the bridge runs' recipe
+# at a quarter of the batch, since 256 looked like more than this dataset's variation needs.
+# The bridge runs 16-17 are still at 256: compare within a batch size, not across.
 #   sbatch --array=12-15 bigpurple/i2sb_nyumets_array.sbatch
 #
 # Paired comparisons: 1 vs 2 isolates the other-study CT1 channel; 3 vs 4 is conditioning
@@ -110,7 +126,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-17%4
+#SBATCH --array=0-19%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -148,6 +164,8 @@ CONFIGS=(
     config/NYUMets/synth_unet_otherstudy_pair_w2.json
     config/NYUMets/i2sb_unet_all_bs256.json
     config/NYUMets/i2sb_unet_otherstudy_pair_w2_bs256.json
+    config/NYUMets/synth_cycle_shallowF_w2.json
+    config/NYUMets/synth_cycle_sameF_w2.json
     # NOT LISTED, to save GPU time: i2sb_unet_otherstudy_pair_bs256.json (w=0) and
     # i2sb_unet_otherstudy_pair_w1_bs256.json (w=1). Both configs still exist; append them
     # here (and widen --array) for the full large-batch width sweep.

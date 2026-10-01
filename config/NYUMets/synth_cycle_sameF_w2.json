@@ -1,23 +1,50 @@
 {
     "task": "synthesis",
     "experiment": {
-        "name": "Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2"
+        "name": "Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2_cycle_sameF"
     },
     "model": {
-        "type": "Unet2D",
+        "type": "CycleSynth",
         "params": {
-            "in_chans": 13,
-            "out_chans": 1,
-            "chans": 32,
-            "num_pool_layers": 4,
-            "max_chans": 256,
-            "convs_per_block": 2,
-            "norm": "group",
-            "act": "relu",
-            "group_size": 4,
-            "up_mode": "nearest",
-            "up_conv": true,
-            "head": "conv"
+            "forward": {
+                "type": "Unet2D",
+                "params": {
+                    "in_chans": 13,
+                    "out_chans": 1,
+                    "chans": 32,
+                    "num_pool_layers": 4,
+                    "max_chans": 256,
+                    "convs_per_block": 2,
+                    "norm": "group",
+                    "act": "relu",
+                    "group_size": 4,
+                    "up_mode": "nearest",
+                    "up_conv": true,
+                    "head": "conv"
+                }
+            },
+            "backward": {
+                "type": "Unet2D",
+                "params": {
+                    "in_chans": 3,
+                    "out_chans": 1,
+                    "chans": 32,
+                    "num_pool_layers": 4,
+                    "max_chans": 256,
+                    "convs_per_block": 2,
+                    "norm": "group",
+                    "act": "relu",
+                    "group_size": 4,
+                    "up_mode": "nearest",
+                    "up_conv": true,
+                    "head": "conv"
+                }
+            },
+            "src_idx": 1,
+            "side_idx": [
+                0,
+                2
+            ]
         }
     },
     "data": {
@@ -92,6 +119,7 @@
         }
     },
     "training": {
+        "backward_weight": 1.0,
         "ema_warmup": true,
         "ema_decay": 0.99,
         "accum_steps": 1,
@@ -109,10 +137,11 @@
         "et_weight": 1.0,
         "pretrained": null,
         "data_range": 2.0,
-        "display_orient": "radiological"
+        "display_orient": "radiological",
+        "cycle_weight": 1.0
     },
     "paths": {
-        "save_dir": "trained_nets/nyumets/Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2",
+        "save_dir": "trained_nets/nyumets/Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2_cycle_sameF",
         "ckpt": null
     },
     "optimizer": {
@@ -131,6 +160,6 @@
     "wandb": {
         "project": "schrodinger-bridge",
         "id": null,
-        "name": "Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2"
+        "name": "Synth_Unet_NYUMets_CT1_from_all_plus_otherT1CT1_w2_cycle_sameF"
     }
 }

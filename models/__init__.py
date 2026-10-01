@@ -282,4 +282,10 @@ def build_model(cfg):
     elif model_type == "ForwardOp":
         return ForwardOp(**params)
 
+    # Synthesis net G trained jointly with a backward map F through a cycle loss
+    # (models/cycle.py; the loss term is training/synthesis.py's cycle_weight).
+    elif model_type == "CycleSynth":
+        from .cycle import CycleSynth
+        return CycleSynth(**params)
+
     raise ValueError

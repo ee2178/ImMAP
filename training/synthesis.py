@@ -149,6 +149,34 @@ def diverging_rgb(x, vmax=None, eps=1e-8):
     return torch.cat([1.0 - neg, 1.0 - neg - pos, 1.0 - pos], dim=1)
 
 
+def cycle_term(net, X, pred, src, organ_mask, use_mask, loss_type):
+    """loss(F(G(X)), T1): the T1 -> CT1 -> T1 path of a CycleSynth net.
+
+    F is fed the CT1-DOMAIN estimate. In residual mode `pred` is the residual CT1 - T1, so the
+    anchor is added back first -- F was never asked to map residuals, and handing it one would
+    make the cycle term measure the wrong thing while still training.
+    """
+    ct1_hat = pred + src if src is not None else pred
+    t1_hat = net.back(ct1_hat, X)
+    t1 = net.t1(X)
+    t1_m, t1_hat_m = apply_loss_mask(t1, t1_hat, organ_mask, use_mask)
+    return LOSS_REGISTRY[loss_type](t1_hat_m, t1_m, None)
+
+
+def backward_term(net, X, ct1, organ_mask, use_mask, loss_type):
+    """loss(F(CT1), T1): F supervised DIRECTLY on the true CT1, with G not involved.
+
+    Without it F is trained only through the cycle, i.e. only on G's outputs -- so it can learn to
+    decode whatever G encodes rather than the real CT1 -> T1 mapping (the classic cycle-consistency
+    degeneracy). Anchoring F on real pairs makes "F(G(X)) ~ T1" mean "G(X) looks like a CT1 that
+    produces this T1". `ct1` must be the ground-truth CT1 in the CT1 domain, never a residual.
+    """
+    t1_hat = net.back(ct1, X)
+    t1 = net.t1(X)
+    t1_m, t1_hat_m = apply_loss_mask(t1, t1_hat, organ_mask, use_mask)
+    return LOSS_REGISTRY[loss_type](t1_hat_m, t1_m, None)
+
+
 def synthesis_metrics(target, pred, src, organ_mask, use_mask, psnr_only=False,
                       data_range=1.0):
     """Metrics for one already-brain-masked (target, pred) pair.
@@ -199,6 +227,12 @@ def train_synthesis(
     loss_type="l1",
     use_mask=True,
     psnr_only=False,
+    cycle_weight=0.0,                # > 0 adds cycle_weight * loss(F(G(X)), T1) -- the
+                                     # T1 -> CT1 -> T1 path -- for a models.cycle.CycleSynth net.
+                                     # 0 is the plain synthesis objective, bit-identical.
+    cycle_loss_type=None,            # loss for the cycle and backward terms; None = loss_type
+    backward_weight=0.0,             # > 0 adds backward_weight * loss(F(CT1), T1): F supervised
+                                     # directly on the TRUE CT1 (see backward_term)
     accum_steps=1,                   # gradient accumulation: the EFFECTIVE batch is
                                      # data.batch_size * accum_steps. One "step" stays one
                                      # OPTIMIZER step, so steps_per_epoch and the
@@ -246,6 +280,21 @@ def train_synthesis(
     # the note in the signature.
     if accum_steps < 1:
         raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
+    cycle_loss_type = cycle_loss_type or loss_type
+    if backward_weight and not hasattr(net, "back"):
+        raise ValueError(f"backward_weight={backward_weight} needs a model with a backward map "
+                         f"(model.type CycleSynth); got {type(net).__name__}")
+    if backward_weight:
+        print(f"[synthesis] backward term: {backward_weight} * {cycle_loss_type}(F(CT1), T1)")
+    if cycle_weight:
+        if not hasattr(net, "back"):
+            raise ValueError(f"cycle_weight={cycle_weight} needs a model with a backward map "
+                             f"(model.type CycleSynth); got {type(net).__name__}")
+        if cycle_loss_type not in LOSS_REGISTRY:
+            raise ValueError(f"unknown cycle_loss_type {cycle_loss_type!r}")
+        print(f"[synthesis] cycle term: {cycle_weight} * {cycle_loss_type}(F(G(X)), T1) with "
+              f"F = {getattr(net, 'backward_type', '?')}, T1 = X[:, {net.src_idx}], "
+              f"side = X[:, {net.side_idx}]")
     ema = None
     if ema_decay:
         ema = EMA(net.parameters(), decay=float(ema_decay), use_num_updates=bool(ema_warmup))
@@ -286,11 +335,11 @@ def train_synthesis(
 
     for epoch in range(start_epoch, num_epochs):
         net.train()
-        running_loss, n_batches = 0.0, 0
+        running_loss, running_cyc, running_bwd, n_batches = 0.0, 0.0, 0.0, 0
 
         for _ in range(steps_per_epoch):
             opt.zero_grad()
-            step_loss = 0.0
+            step_loss, step_cyc, step_bwd = 0.0, 0.0, 0.0
             # `accum_steps` micro-batches make up ONE optimizer step. Each micro-batch's loss is
             # divided by accum_steps before backward, so the accumulated gradient is the MEAN over
             # the effective batch -- summing instead would scale the effective LR by accum_steps.
@@ -327,6 +376,17 @@ def train_synthesis(
                           "entirely zero. Set et_mask: true in the data config (and make sure "
                           "the h5 has an 'et' dataset), or the weighting is a no-op.")
 
+                if cycle_weight:
+                    # the T1 -> CT1 -> T1 path; gradients reach BOTH G (through pred) and F
+                    cyc = cycle_term(net, X, pred, src, organ_mask, use_mask, cycle_loss_type)
+                    loss = loss + cycle_weight * cyc
+                    step_cyc = step_cyc + cyc.detach() / accum_steps
+                if backward_weight:
+                    # F on the TRUE CT1; reaches F only
+                    bwd = backward_term(net, X, y, organ_mask, use_mask, cycle_loss_type)
+                    loss = loss + backward_weight * bwd
+                    step_bwd = step_bwd + bwd.detach() / accum_steps
+
                 (loss / accum_steps).backward()
                 step_loss = step_loss + loss.detach() / accum_steps
 
@@ -343,6 +403,8 @@ def train_synthesis(
                 sched.step()
 
             running_loss += step_loss              # on-device; no sync
+            running_cyc += step_cyc
+            running_bwd += step_bwd
             n_batches += 1
             pbar.update(1)
             if n_batches % POSTFIX_EVERY == 0:
@@ -356,6 +418,11 @@ def train_synthesis(
                                           use_mask, psnr_only=psnr_only,
                                           data_range=data_range)
         train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
+        if cycle_weight:
+            # the T1 -> CT1 -> T1 term alone, so its trend is visible apart from the total
+            train_metrics["cycle"] = float(running_cyc) / max(n_batches, 1)
+        if backward_weight:
+            train_metrics["backward"] = float(running_bwd) / max(n_batches, 1)
 
         # ---- averaged-loss backtracking ----
         if nonfinite or (avg_loss > best_loss + backtrack_thresh):
@@ -404,6 +471,10 @@ def train_synthesis(
             with val_ctx:
                 net.eval()
                 agg = {"psnr": 0.0, "ssim": 0.0, "nrmse": 0.0, "loss": 0.0}
+                if cycle_weight:
+                    agg["cycle"] = 0.0
+                if backward_weight:
+                    agg["backward"] = 0.0
                 if residual_mode:
                     agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0,
                                 "resid_ratio": 0.0})
@@ -435,6 +506,16 @@ def train_synthesis(
                         # same total the training step optimizes, so val/loss stays comparable
                         mets["loss"] = float(weighted_loss(loss_type, pv_m, target_vm,
                                                            etv, et_weight).item())
+                        if cycle_weight:
+                            cyc_v = float(cycle_term(net, Xv, pv, src_v, organ_maskv, use_mask,
+                                                     cycle_loss_type))
+                            mets["cycle"] = cyc_v
+                            mets["loss"] += cycle_weight * cyc_v
+                        if backward_weight:
+                            bwd_v = float(backward_term(net, Xv, yv, organ_maskv, use_mask,
+                                                        cycle_loss_type))
+                            mets["backward"] = bwd_v
+                            mets["loss"] += backward_weight * bwd_v
                         for k in agg:
                             if k in mets:
                                 agg[k] += mets[k] * bs

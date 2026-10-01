@@ -44,7 +44,7 @@
             ],
             "crop_size": 128,
             "random_flips": true,
-            "batch_size": 32,
+            "batch_size": 64,
             "num_workers": 8
         },
         "val": {
@@ -69,14 +69,14 @@
                 110
             ],
             "random_flips": false,
-            "batch_size": 32,
+            "batch_size": 64,
             "num_workers": 8
         }
     },
     "training": {
         "ema_warmup": true,
         "ema_decay": 0.99,
-        "accum_steps": 8,
+        "accum_steps": 1,
         "num_epochs": 1500,
         "steps_per_epoch": 200,
         "val_every_epochs": 25,
@@ -100,7 +100,7 @@
     "optimizer": {
         "type": "Adam",
         "params": {
-            "lr": 2.0e-4
+            "lr": 1.0e-4
         }
     },
     "scheduler": {
