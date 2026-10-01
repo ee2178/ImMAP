@@ -156,6 +156,16 @@ def main():
         params["K"] = cfg.K
     if cfg.attn_backend is not None:
         params["attn_backend"] = cfg.attn_backend
+    # A fused attention backend normalises ONE window per softmax, so it cannot run the joint
+    # simplex over the self window and the guide window together (models/guided_prox.py refuses
+    # the pair). The only valid fused configuration is joint_softmax=False: one softmax per branch
+    # plus the learned blend omega. That is a slightly different prox, so it is switched over
+    # loudly rather than silently -- the timings are then for THAT prox, not the gather one.
+    js_note = ""
+    if params.get("attn_backend", "gather") != "gather" and params.get("joint_softmax", True):
+        params["joint_softmax"] = False
+        js_note = (f"  [joint_softmax -> False: backend {params['attn_backend']!r} cannot run the "
+                   f"joint self+guide softmax; this times the per-branch prox with the omega blend]")
     net = build_model({"model": {"type": "LGGS", "params": params}}).to(device)
     if getattr(net, "attn_backend", None) == "flex":
         net.compile_flex()
@@ -184,7 +194,8 @@ def main():
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     print(f"LGGS from {cfg.config}: K={K} M={net.M} P={net.P} s={net.s} "
           f"guide_window={params.get('guide_window')} backend={params.get('attn_backend')} "
-          f"complex=True preproc={params.get('preproc')}")
+          f"joint_softmax={params.get('joint_softmax', True)} "
+          f"complex=True preproc={params.get('preproc')}" + js_note)
     print(f"frame {H}x{H}, batch {B}, {cfg.guides} guide(s), E cond={cfg.cond}, "
           f"{'bare MagnitudeOperator' if cfg.plain else f'BridgeDCOperator at t={cfg.t}'}, "
           f"median of {cfg.reps} after {cfg.warmup} warmup\n")
