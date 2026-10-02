@@ -69,6 +69,7 @@ import operators.base as base_mod                   # noqa: E402
 from models import build_model                      # noqa: E402
 from operators import FFT2D, Mask, Sense            # noqa: E402
 from physics.mask import make_acc_mask              # noqa: E402
+import scripts.op_profile as op_profile             # noqa: E402
 
 
 # ===========================================================================
@@ -544,6 +545,11 @@ def main():
     ap.add_argument("--fused-prox", action="store_true",
                     help="run EVERY mode with the fused Fenchel clip enabled "
                          "(SoftThreshold.FUSED); see --planar")
+    ap.add_argument("--no-fused-prox", action="store_true",
+                    help="run EVERY mode with the eager four-kernel Fenchel "
+                         "chain. SoftThreshold.FUSED defaults to True, so this "
+                         "is what establishes a pre-change baseline -- without "
+                         "it a 'gauss' run is already half optimised")
     ap.add_argument("--ab-planar", action="store_true",
                     help="also run with every complex conv as ONE real conv on "
                          "a [re; im] channel stacking "
@@ -553,6 +559,14 @@ def main():
                     help="also run with the Fenchel clip fused into one Triton "
                          "kernel (SoftThreshold.FUSED); with --ab-planar, a "
                          "third arm runs both")
+    ap.add_argument("--ops", action="store_true",
+                    help="attribute the 'elementwise / overhead' remainder to "
+                         "individual aten ops: per-(op, shape) device time from "
+                         "torch.profiler, exact bytes from a TorchDispatchMode "
+                         "pass, and each op's achieved bandwidth -- which is "
+                         "what says whether an op is DRAM-bound (bytes worth "
+                         "removing), L2-resident (not worth it) or launch-bound "
+                         "(cut kernel count instead)")
     ap.add_argument("--counts", action="store_true",
                     help="exact op counts and the grid each ran at")
     ap.add_argument("--breakdown", action="store_true",
@@ -604,7 +618,14 @@ def main():
             args.ab_planar = False
             print("[profile] --planar is on for every mode; dropping the "
                   "redundant --ab-planar arm.")
-    prox_mod.SoftThreshold.FUSED = bool(args.fused_prox) or not args.ab_fused_prox
+    if args.no_fused_prox:
+        prox_mod.SoftThreshold.FUSED = False
+        if args.fused_prox or args.ab_fused_prox:
+            raise SystemExit("[profile] --no-fused-prox contradicts "
+                             "--fused-prox / --ab-fused-prox")
+    else:
+        prox_mod.SoftThreshold.FUSED = (bool(args.fused_prox)
+                                        or not args.ab_fused_prox)
     if args.fused_prox and args.ab_fused_prox:
         args.ab_fused_prox = False
         print("[profile] --fused-prox is on for every mode; dropping the "
@@ -698,52 +719,61 @@ def main():
                 if args.ab or args.ab_prox or args.ab_planar or args.ab_fused_prox:
                     with torch.no_grad():
                         outputs[(name, mode)] = model(y, E=E, sigma=sigma)[0].clone()
-            rows.append((name, label, n_par, mode, stats))
-            first_median.setdefault((name, mode), stats["median"])
-            records.append(dict(config=cfg_path, name=name, label=label,
-                                K=full_cfg["model"]["params"].get("K"),
-                                type=full_cfg["model"]["type"], params=n_par,
-                                mode=mode, R=R, **stats))
+                # INSIDE the context: `planar-conv` / `fused-prox` are class
+                # attributes, so counting or timing out here would re-measure
+                # the baseline and report it under the arm's name.
+                rows.append((name, label, n_par, mode, stats))
+                first_median.setdefault((name, mode), stats["median"])
+                records.append(dict(config=cfg_path, name=name, label=label,
+                                    K=full_cfg["model"]["params"].get("K"),
+                                    type=full_cfg["model"]["type"], params=n_par,
+                                    mode=mode, R=R, **stats))
 
-            if (args.time_online_smaps and mode == modes[0][0]
-                    and mri.get("online_smaps")):
-                t_on = time_online_smaps(problems, mri, device, args.reps,
-                                         args.warmup)
-                print(f"--- online maps ({mri['online_smaps']}, "
-                      f"{mri.get('online_smaps_kws')}): median {t_on:.1f} ms "
-                      f"per slice ({name}) ---\n")
+                if (args.time_online_smaps and mode == modes[0][0]
+                        and mri.get("online_smaps")):
+                    t_on = time_online_smaps(problems, mri, device, args.reps,
+                                             args.warmup)
+                    print(f"--- online maps ({mri['online_smaps']}, "
+                          f"{mri.get('online_smaps_kws')}): median {t_on:.1f} ms "
+                          f"per slice ({name}) ---\n")
 
-            if args.counts and mode in ("optimised", "rediscretize", "planar+fused",
-                                    "planar-conv"):
-                counts, grids = count_run(model, y, E, sigma)
-                print(f"--- counts: {name} [{mode}] ---")
-                for k in ("gram", "fft", "fftshift", "conv", "resample"):
-                    if counts.get(k):
-                        print(f"    {k:<10} {counts[k]:>6}")
-                for k in ("gram", "fft"):
-                    if grids.get(k):
-                        hist = dict(sorted(grids[k].items(), reverse=True))
-                        print(f"    {k} by grid: {hist}")
-                print("    (if `gram by grid` spans several sizes but `fft by grid` "
-                      "does not,\n     the coarse levels are running full-resolution "
-                      "physics)\n")
+                if args.counts and mode in ("optimised", "rediscretize", "planar+fused",
+                                        "planar-conv"):
+                    counts, grids = count_run(model, y, E, sigma)
+                    print(f"--- counts: {name} [{mode}] ---")
+                    for k in ("gram", "fft", "fftshift", "conv", "resample"):
+                        if counts.get(k):
+                            print(f"    {k:<10} {counts[k]:>6}")
+                    for k in ("gram", "fft"):
+                        if grids.get(k):
+                            hist = dict(sorted(grids[k].items(), reverse=True))
+                            print(f"    {k} by grid: {hist}")
+                    print("    (if `gram by grid` spans several sizes but `fft by grid` "
+                          "does not,\n     the coarse levels are running full-resolution "
+                          "physics)\n")
 
-            if args.breakdown and mode in ("optimised", "rediscretize", "planar+fused",
-                                       "planar-conv"):
-                totals, ncalls, wall = breakdown_run(model, y, E, sigma, device,
-                                                     by_level=args.by_level)
-                clean = stats["median"]
-                print(f"--- breakdown: {name} [{mode}]  (instrumented {wall:.1f} ms vs "
-                      f"clean {clean:.1f} ms; the {wall - clean:.1f} ms of wrapper "
-                      f"overhead lands in the remainder) ---")
-                head = f"    {'family':<28}{'ms':>9}{'%':>7}{'calls':>8}{'us/call':>10}"
-                print(head)
-                for k, v in sorted(totals.items(), key=lambda kv: -kv[1]):
-                    n = ncalls.get(k, 0)
-                    per = f"{1e3 * v / n:>10.1f}" if n else " " * 10
-                    print(f"    {k:<28}{v:>9.2f}{100 * v / wall:>7.1f}"
-                          f"{n if n else '':>8}{per}")
-                print()
+                if args.ops:
+                    print(f"--- ops: {name} [{mode}] ---")
+                    op_profile.report(model, y, E, sigma, device,
+                                      clean_ms=stats["median"])
+                    print()
+
+                if args.breakdown and mode in ("optimised", "rediscretize", "planar+fused",
+                                           "planar-conv"):
+                    totals, ncalls, wall = breakdown_run(model, y, E, sigma, device,
+                                                         by_level=args.by_level)
+                    clean = stats["median"]
+                    print(f"--- breakdown: {name} [{mode}]  (instrumented {wall:.1f} ms vs "
+                          f"clean {clean:.1f} ms; the {wall - clean:.1f} ms of wrapper "
+                          f"overhead lands in the remainder) ---")
+                    head = f"    {'family':<28}{'ms':>9}{'%':>7}{'calls':>8}{'us/call':>10}"
+                    print(head)
+                    for k, v in sorted(totals.items(), key=lambda kv: -kv[1]):
+                        n = ncalls.get(k, 0)
+                        per = f"{1e3 * v / n:>10.1f}" if n else " " * 10
+                        print(f"    {k:<28}{v:>9.2f}{100 * v / wall:>7.1f}"
+                              f"{n if n else '':>8}{per}")
+                    print()
 
     print(f"{'config':<16}{'model':<28}{'params':>10}  {'mode':<17}"
           f"{'median':>9}{'min':>8}{'max':>8}{'peak MB':>10}")

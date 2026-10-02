@@ -234,6 +234,15 @@ def main(config_path):
     # --------------------------------------------------
     # Training dispatch
     # --------------------------------------------------
+    # Keys train.py consumes itself, above. They stay in `cfg` -- and so in the
+    # saved config.json, which eval_mg_recon.py / dump_eval.py re-read to restore
+    # `complex_conv` -- but must not reach the train_* functions, none of which
+    # take **kwargs. Filtered here rather than popped: a pop before save_config
+    # would drop them from the file.
+    _TRAIN_PY_KEYS = ("complex_conv", "cudnn_benchmark")
+    train_kws = {k: v for k, v in cfg["training"].items()
+                 if k not in _TRAIN_PY_KEYS}
+
     if task == "denoiser":
         steps_per_epoch = cfg["training"]["steps_per_epoch"]
 
@@ -247,7 +256,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["paths"],
         )
 
@@ -264,7 +273,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["mri"],
             **cfg["paths"],
         )
@@ -282,7 +291,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["mri"],
             **cfg["paths"],
         )
@@ -302,7 +311,7 @@ def main(config_path):
             # train_ipalm scores on PSNR (higher is better), so its bar is
             # best_psnr; load_ckpt_meta carries it in the same checkpoint slot.
             best_psnr=best_loss,
-            **cfg["training"],
+            **train_kws,
             **cfg["mri"],
             **cfg["paths"],
         )
@@ -319,7 +328,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["paths"],
             )
     elif task == "synthesis":
@@ -335,7 +344,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["paths"],
             )
     elif task == "dt_synthesis":
@@ -351,7 +360,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["paths"],
             )
     elif task == "i2sb":
@@ -367,7 +376,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step//steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["i2sb"],
             **cfg["paths"],
             )
@@ -387,7 +396,7 @@ def main(config_path):
             start_epoch=start_step//steps_per_epoch,
             **backtrack_state,
             **cfg["dicts"],
-            **cfg["training"],
+            **train_kws,
             **cfg["i2sb"],
             **cfg["paths"],
             )
@@ -405,7 +414,7 @@ def main(config_path):
             wandb=wandb,
             start_epoch=start_step // steps_per_epoch,
             **backtrack_state,
-            **cfg["training"],
+            **train_kws,
             **cfg["paths"],
             )
     else:

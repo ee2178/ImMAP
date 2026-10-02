@@ -124,20 +124,31 @@ PY
 # and "rediscretize" (coarse SENSE on the coarse grid; operators/coarse.py).
 CFGS=("${OUT}/configs/mglpds.json" "${OUT}/configs/lpdsnet.json" "${OUT}/configs/varnetmaps.json")
 for f in "${OUT}"/configs/mg_*.json; do CFGS+=("${f}"); done
+# --no-fused-prox: SoftThreshold.FUSED defaults to TRUE, so without it this
+# "baseline" would already carry one of the two traffic cuts, and step 5 would
+# understate what the pair is worth together.
 python scripts/profile_mg.py --configs "${CFGS[@]}" --size ${IMG} --coils "${COILS}" \
     --R "${R}" --reps "${REPS}" --warmup "${WARMUP}" --cudnn-benchmark --ab-coarse \
-    --json-out "${OUT}/timings.json"
+    --no-fused-prox --json-out "${OUT}/timings.json"
 
 # ---- 2. where mglpds's time goes, per level, under BOTH coarse operators; ----
 #      and the online-map cost
 python scripts/profile_mg.py --configs "${OUT}/configs/mglpds.json" "${OUT}/configs/lpdsnet.json" \
     --size ${IMG} --coils "${COILS}" --R "${R}" --reps 20 --warmup "${WARMUP}" \
-    --cudnn-benchmark --ab-coarse --counts --by-level --time-online-smaps
+    --cudnn-benchmark --ab-coarse --no-fused-prox --counts --by-level --time-online-smaps
 
 # ---- 2b. planar conv / fused prox, A/B against the current formulation ----
 # Same weights, same seed; the equivalence line at the end is the check that
 # these are the same map (planar is fp-roundoff equal, not bit-equal).
-# --by-level on the planar arm shows where the elementwise remainder went.
+# --by-level is now taken INSIDE each arm's context, so the conv / convT call
+# counts fall to a third where planar applies -- which is the check that the
+# arm is really active. The grid transfers do NOT fall: `_apply_complex` in
+# operators/resample.py splits re/im on its own path that COMPLEX_MODE does not
+# reach, so `pad` and the transfer convs are unchanged, and are the next target.
+#
+# Read the CLEAN median, not the breakdown's percentages. The instrumented run
+# is launch-bound at a roughly fixed wall time, so a real saving shows up as
+# GROWTH in "wrapper overhead" rather than as a smaller elementwise bucket.
 python scripts/profile_mg.py --configs "${OUT}/configs/mglpds.json" "${OUT}/configs/lpdsnet.json" \
     --size ${IMG} --coils "${COILS}" --R "${R}" --reps "${REPS}" --warmup "${WARMUP}" \
     --cudnn-benchmark --ab-planar --ab-fused-prox --counts --by-level
