@@ -583,6 +583,25 @@ MODELS["mgunet"] = dict(type="MGLPDSNet",
                         training=dict(_EXP8_TRAINING))
 EXP8_CELLS = tuple(f"mg{m}v{v}" for m in EXP8_M for v in EXP8_VCYCLES) + ("mgunet",)
 
+# ---------------------------------------------------------------------------
+#  EXP9: width follow-up (2026-10-02), brain R=12
+#
+#  exp8 read: no V-cycle can be cut (V=2/4 lose to V=6 at every M), M=81 drops
+#  slightly, and M=121 matches or slightly beats M=169. So the width knee is
+#  between 81 and 121; M=100 (10^2, like 169/121/81) bisects it. V=6 only, and
+#  identical to the exp8 cells otherwise, so it runs under exp8's launcher and
+#  lands next to them:
+#      ONLY="mg100v6" sbatch --array=0 torch/exp8_brain_mg_arch.sbatch
+# ---------------------------------------------------------------------------
+EXP9_M = (100,)
+MODELS.update({
+    f"mg{m}v6": dict(type="MGLPDSNet",
+                     params=dict(LPDS_COMMON, M=m, K=[6, list(EXP8_ITERS)], **_EXP8),
+                     training=dict(_EXP8_TRAINING))
+    for m in EXP9_M
+})
+EXP9_CELLS = tuple(f"mg{m}v6" for m in EXP9_M)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -594,7 +613,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
-          "mllpds48k54", "mllpds64k40") + EXP8_CELLS
+          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
