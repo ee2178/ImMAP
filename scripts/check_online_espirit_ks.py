@@ -119,10 +119,12 @@ def main():
     per = {ks: {k: [] for k in ("ms", "kept", "gb", "coh", "coh_p1", "cons", "xerr")}
            for ks in args.ks}
     pair = {(a, b): {"coh": [], "x": []} for i, a in enumerate(args.ks) for b in args.ks[i + 1:]}
+    shapes = []
 
     for si, (kspace, smaps_ref, image) in enumerate(slices):
         kspace, smaps_ref, image = (t.to(device) for t in (kspace, smaps_ref, image))
         H, W = kspace.shape[-2:]
+        shapes.append(f"{H}x{W}/{kspace.shape[1]}c")
         cf = mri.get("center_frac")
         mask = make_acc_mask((H, W), accel=R, acs_lines=None if cf is not None else mri["acs_lines"],
                              dim=1, mode=mri.get("mask_dist", "uniform"),
@@ -178,6 +180,8 @@ def main():
               f" {mean(p['xerr']):>10.4f}")
     print(f"\n  per-slice ms: " + "   ".join(
         f"ks={ks}: " + " ".join(f"{t:.0f}" for t in per[ks]["ms"]) for ks in args.ks))
+    # the per-pixel eigh is C x C, so time follows each slice's coil count and size
+    print("  per-slice shape/coils: " + " ".join(shapes))
     if pair:
         print("\n  between kernel sizes (inside the stored support):")
         for (a, b), acc in pair.items():

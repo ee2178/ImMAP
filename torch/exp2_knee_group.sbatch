@@ -21,6 +21,30 @@
 #   1   knee  R8  mglpds        V-cycle, K=[6,[4,4,6]], local prox
 #   2   knee  R8  varnetmaps    E2E-VarNet baseline, on the operator's maps
 #
+# PROTOCOL (checked 2026-10-05): the SAME as the brain experiments. The knee
+# configs differ from brain's only in the data block (roots, slices 12-25,
+# scale_fac 5000) and R:
+#   * measured k-space + AWGN, sigma ~ U[0.01, 0.02] (val pinned at 0.015)
+#   * Julia masks: center_frac 0.04 (15 ACS lines at 368/372 columns),
+#     adjust_accel -> R=8 is the EFFECTIVE rate (7.7-7.8)
+#   * operator maps estimated ONLINE per step: ESPIRiT, thresh_eig 0, 4x4 kernel
+#     (the 32x15 ACS block gives 348 calibration rows vs 240 columns at 15 coils)
+#   * ground truth = the stored SENSE combination; organ mask on (stored maps)
+#   * 6000 epochs x 50 steps. A walltime kill is fine: RESUBMIT THE SAME FILE and
+#     LAUNCH-ONCE resumes the cell from its checkpoint.
+# Two things that are NOT the same as the brain architecture sweeps (exp8/exp9):
+#   * mglpds / mggrouplpds here use the GALERKIN coarse Gram and gauss convs --
+#     the full-length `mglpds` settings -- not exp8's rediscretized Gram + planar
+#     convs. Both V-cycle arms share them, so the group-vs-local comparison is
+#     clean; the V-cycle cells are just slower than they could be.
+#   * the stored knee maps (knee_coil_combined/pd/) are the ORIGINAL files. Brain's
+#     were regenerated with the fixed ESPIRiT (the *_espirit roots); knee's were
+#     not, and torch/espirit_smaps.sbatch is brain-only. They define the ground
+#     truth and the organ mask.
+# Runs from before the measured protocol are refused by LAUNCH-ONCE (the config
+# differs); move them aside first:
+#     mv trained_nets/mg_recon/knee trained_nets/mg_recon/knee_legacy
+#
 # THE GROUP CELL LIVES IN torch/exp2_knee_mggroup.sbatch.
 # `mggrouplpds` does not fit an L40S -- attention at three grid levels with a
 # 15x15 window is the memory cost -- so it needs an H200, and `--constraint` is

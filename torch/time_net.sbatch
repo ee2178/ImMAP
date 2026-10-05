@@ -28,15 +28,16 @@
 # No training, no checkpoints. Output: this job's log, plus time_net.json and
 # the figure time_net.png under
 #   trained_nets/profile/time_net_<jobid>/
-# Redraw the figure later (dark theme, per-segment values, pdf) without a GPU:
+# The figure is one column per network: forward, with backward stacked on top.
+# Redraw it later (dark theme, pdf) without a GPU:
 #   python scripts/time_net.py --from-json <dir>/time_net.json \
-#       --fig-out <dir>/time_net_dark.png --fig-theme dark --fig-values
+#       --fig-out <dir>/time_net_dark.png --fig-theme dark
 #
 # Submit (from the repo root):   sbatch torch/time_net.sbatch
 # Options:
 #   R=12 KS="2 4" N_SLICES=6      the ESPIRiT check
 #   IMG="640 320" COILS=20 REPS=30
-#   MODELS="lpdsnet varnetmaps mglpds mg169v6 mg121v4 mg81v2 mgunet"
+#   MODELS="lpdsnet varnetmaps mglpds mg121v6"
 #   SKIP_ESPIRIT=1 / SKIP_NETS=1  run only one half
 
 R="${R:-12}"
@@ -45,7 +46,9 @@ N_SLICES="${N_SLICES:-6}"
 IMG="${IMG:-640 320}"
 COILS="${COILS:-20}"
 REPS="${REPS:-30}"
-MODELS="${MODELS:-lpdsnet varnetmaps mglpds mg169v2 mg169v4 mg169v6 mg121v2 mg121v4 mg121v6 mg81v2 mg81v4 mg81v6 mgunet}"
+# V=6 only: exp8 showed V=2/4 lose too much to be worth timing, and mgunet
+# needs more work. Any generated cell can still be named in MODELS.
+MODELS="${MODELS:-lpdsnet varnetmaps mglpds mg169v6 mg121v6 mg100v6 mg81v6}"
 
 source ~/.bashrc
 conda activate gcdl

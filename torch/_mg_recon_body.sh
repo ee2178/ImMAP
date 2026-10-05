@@ -27,7 +27,8 @@
 #   VAL_EVERY       overrides training.val_every_epochs (e.g. 5 for a short
 #                   probe that should still validate and log panels).
 #   ONLY            "" = every model tag; e.g. "mglpds mggrouplpds" for a subset
-#   ACCELS          "" = every acceleration; e.g. "8" for R=8 only
+#   ACCELS          "" = every acceleration; e.g. "8" for R=8 only, "8 12" for
+#                   two (space-separated; commas are accepted too)
 #   ATTN            "" = the generator default (flex); triton|gather to override.
 #   FORCE_RESTART   1 = start the cell from scratch even though its run dir
 #                   already holds a launch, overwriting it. See LAUNCH-ONCE.
@@ -100,6 +101,10 @@ FORCE_RESTART="${FORCE_RESTART:-}"
 REGENERATE="${REGENERATE:-1}"
 ONLY="${ONLY:-}"
 ACCELS="${ACCELS:-}"
+# Lists are space-separated; accept commas too ("8,12"), which otherwise reach
+# the generator as one unparsable argument.
+ONLY="${ONLY//,/ }"
+ACCELS="${ACCELS//,/ }"
 ATTN="${ATTN:-}"
 ORGAN_MASK="${ORGAN_MASK:-}"
 # PHASE_CORRECT  "" = off; 1 phase-corrects the online coil maps

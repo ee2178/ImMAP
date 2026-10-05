@@ -42,7 +42,7 @@ ANATOMIES=(brain knee)
 
 # Substring filters on the run path, passed to --only. The trailing underscore
 # keeps `lpdsnet_` from also selecting a future cell whose name contains it.
-ONLY="${ONLY:-lpdsnet_ mglpds_}"
+ONLY="${ONLY:-lpdsnet_ mglpds_ varnetmaps_}"
 
 # Slice range and volume count PER ANATOMY, index-matched to ANATOMIES above.
 # These are the ranges each cell actually trained on -- brain 0-7 (train

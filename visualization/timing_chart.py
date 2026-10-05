@@ -1,23 +1,22 @@
 """
-The figure for `scripts/time_net.py`: one row per network, two panels.
+The figure for `scripts/time_net.py`: one upright column per network, stacked.
 
-    left    inference forward (eval mode, no autograd)      one hue, one bar
-    right   one training step, stacked                      forward | backward
-                                                            | optimizer + projection
+    bottom   forward     the train-mode forward pass
+    top      backward    loss + backward pass
 
-Both panels are milliseconds but on SEPARATE axes -- an inference forward and a
-training step are different quantities, and one shared axis would squash the
-smaller. Rows keep the order the configs were given in (it is usually a grid),
-so a network is found by position, not by rank.
+The column's height is forward + backward: the network's share of one training
+step, which is what Sljiva's `loss_time` wraps (its `fwdtime` is the forward
+alone). Nothing else is drawn -- the inference forward, the optimizer and the
+projection stay in the printed table and the JSON. Columns keep the order the
+configs were given in.
 
-Colours are the three leading categorical slots of the dataviz reference
-palette, validated for both themes (lightness band, chroma floor, colour-vision
-separation, contrast): blue = a forward pass in either panel, orange = backward,
-aqua = optimizer + projection. Text is never coloured; identity comes from the
-legend swatches and the value labels.
+Colours are the two leading categorical slots of the dataviz reference palette,
+validated for both themes: blue = forward, orange = backward. Text is never
+coloured; identity comes from the legend swatches. Each segment carries its
+value where it fits, and the total sits on top of the column.
 
-matplotlib only, imported lazily by the caller. Bars are drawn in pixel space
-so the 4 px rounded data-end and the 2 px gap between stacked segments are
+matplotlib only, imported lazily by the caller. Columns are drawn in pixel
+space so the 4 px rounded top and the 2 px gap between the two segments are
 exact at any figure size.
 """
 
@@ -35,10 +34,10 @@ from matplotlib.transforms import IdentityTransform               # noqa: E402
 THEMES = {
     "light": dict(surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e", muted="#898781",
                   grid="#e1e0d9", axis="#c3c2b7",
-                  forward="#2a78d6", backward="#eb6834", step="#1baf7a"),
+                  forward="#2a78d6", backward="#eb6834"),
     "dark": dict(surface="#1a1a19", ink="#ffffff", ink2="#c3c2b7", muted="#898781",
                  grid="#2c2c2a", axis="#383835",
-                 forward="#3987e5", backward="#d95926", step="#199e70"),
+                 forward="#3987e5", backward="#d95926"),
 }
 FONT = ["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"]
 
@@ -49,6 +48,8 @@ def _font():
     from matplotlib import font_manager
     have = {f.name for f in font_manager.fontManager.ttflist}
     return next((f for f in FONT if f in have), "DejaVu Sans")
+
+
 DPI = 200
 PX = DPI / 96.0                      # one CSS px in figure pixels
 
@@ -65,20 +66,21 @@ def _on(fill):
     return "#ffffff" if (1.05) / (lf + 0.05) >= (lf + 0.05) / 0.05 else "#0b0b0b"
 
 
-def _bar(x0, x1, y0, y1, round_end):
-    """Bar outline in pixels: square at the baseline, rounded at the data end."""
-    r = min(4 * PX, (x1 - x0) / 2, (y1 - y0) / 2) if round_end else 0.0
+def _column(x0, x1, y0, y1, round_top):
+    """Column outline in pixels: square at the bottom, rounded at the top."""
+    r = min(4 * PX, (x1 - x0) / 2, (y1 - y0) / 2) if round_top else 0.0
     if r <= 0:
         return Path([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
                     [Path.MOVETO, Path.LINETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY])
-    v = [(x0, y0), (x1 - r, y0), (x1, y0), (x1, y0 + r), (x1, y1 - r), (x1, y1),
-         (x1 - r, y1), (x0, y1), (x0, y0)]
-    c = [Path.MOVETO, Path.LINETO, Path.CURVE3, Path.CURVE3, Path.LINETO, Path.CURVE3,
-         Path.CURVE3, Path.LINETO, Path.CLOSEPOLY]
+    v = [(x0, y0), (x1, y0), (x1, y1 - r), (x1, y1), (x1 - r, y1), (x0 + r, y1),
+         (x0, y1), (x0, y1 - r), (x0, y0)]
+    c = [Path.MOVETO, Path.LINETO, Path.LINETO, Path.CURVE3, Path.CURVE3, Path.LINETO,
+         Path.CURVE3, Path.CURVE3, Path.CLOSEPOLY]
     return Path(v, c)
 
 
-def _k_label(r):
+def _arch_lines(r):
+    """Two muted lines under a network's name: its depth, then width and size."""
     K = r.get("K")
     if isinstance(K, (list, tuple)) and len(K) == 2 and isinstance(K[1], (list, tuple)):
         k = f"{K[0]} V-cycle{'s' if K[0] != 1 else ''} × [{', '.join(str(i) for i in K[1])}]"
@@ -88,11 +90,8 @@ def _k_label(r):
         k = f"{K[:-4]} cascades"
     else:
         k = str(K) if K is not None else ""
-    parts = [k] if k else []
-    if r.get("M"):
-        parts.append(f"M = {r['M']}")
-    parts.append(f"{r['params'] / 1e6:.2f}M params")
-    return "  ·  ".join(parts)
+    size = f"{r['params'] / 1e6:.2f}M params"
+    return k, (f"M = {r['M']}  ·  {size}" if r.get("M") else size)
 
 
 def _split_common_suffix(names):
@@ -105,106 +104,85 @@ def _split_common_suffix(names):
     return list(names), None
 
 
-def save_timing_figure(rows, meta, path, theme="light", segment_values=False):
-    """Render `rows` (time_net.py records) to `path` (.png / .pdf / .svg).
-
-    `segment_values` also prints each stacked segment's value inside it, where
-    it fits. Off by default: the total at the bar's tip is the comparison, and
-    the script's printed table carries every number.
-    """
+def save_timing_figure(rows, meta, path, theme="light"):
+    """Render `rows` (time_net.py records) to `path` (.png / .pdf / .svg)."""
     t = THEMES[theme]
     plt.rcParams.update({"font.family": _font(), "font.size": 9})
     n = len(rows)
     names, r_note = _split_common_suffix([r["name"] for r in rows])
-    with_step = all("opt" in r and "project" in r for r in rows)
 
     med = lambda r, k: float(r[k]["median"])                       # noqa: E731
-    infer = [med(r, "infer") for r in rows]
     segs = [[("forward", med(r, "forward")), ("backward", med(r, "backward"))]
-            + ([("step", med(r, "opt") + med(r, "project"))] if with_step else [])
             for r in rows]
     totals = [sum(v for _, v in s) for s in segs]
 
     # ---- layout, in inches -------------------------------------------------
-    row_h, top, bottom = 0.50, 1.55, 0.62
-    W = 12.0
-    fig_h = top + n * row_h + bottom
+    col_w, left, right = 1.50, 0.80, 0.35
+    top, plot_h, bottom = 1.35, 3.60, 1.05
+    W = max(left + n * col_w + right, 7.5)                         # room for the title
+    fig_h = top + plot_h + bottom
     fig = plt.figure(figsize=(W, fig_h), dpi=DPI, facecolor=t["surface"])
-    label_w, gutter, right = 3.35, 0.55, 0.35
-    plot_w = W - label_w - gutter - right
-    wa, wb = 0.36 * plot_w, 0.64 * plot_w
-    y0 = bottom / fig_h
-    h = n * row_h / fig_h
-    axa = fig.add_axes([label_w / W, y0, wa / W, h])
-    axb = fig.add_axes([(label_w + wa + gutter) / W, y0, wb / W, h])
+    ax = fig.add_axes([left / W, bottom / fig_h, n * col_w / W, plot_h / fig_h])
 
-    for ax, vals in ((axa, infer), (axb, totals)):
-        ax.set_facecolor(t["surface"])
-        ax.set_xlim(0, max(vals) * 1.17)
-        ax.set_ylim(n - 0.5, -0.5)                                 # first config on top
-        ax.set_yticks([])
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]))
-        ax.tick_params(axis="x", length=0, pad=6, labelsize=8, labelcolor=t["muted"])
-        ax.grid(axis="x", color=t["grid"], linewidth=0.8, linestyle="-")
-        ax.set_axisbelow(True)
-        for s in ("top", "right", "bottom"):
-            ax.spines[s].set_visible(False)
-        ax.spines["left"].set_color(t["axis"])
-        ax.spines["left"].set_linewidth(0.9)
-        ax.set_xlabel("milliseconds", fontsize=8, color=t["muted"], labelpad=6)
+    ax.set_facecolor(t["surface"])
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylim(0, max(totals) * 1.10)
+    ax.set_xticks([])
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=6, steps=[1, 2, 2.5, 5, 10]))
+    ax.tick_params(axis="y", length=0, pad=6, labelsize=8, labelcolor=t["muted"])
+    ax.grid(axis="y", color=t["grid"], linewidth=0.8, linestyle="-")
+    ax.set_axisbelow(True)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color(t["axis"])
+    ax.spines["bottom"].set_linewidth(0.9)
+    ax.set_ylabel("milliseconds", fontsize=8, color=t["muted"], labelpad=8)
 
     fig.canvas.draw()                                              # freeze transforms
     renderer = fig.canvas.get_renderer()
-    bar_h, gap = 19 * PX, 2 * PX
+    bar_w, gap = 58 * PX, 2 * PX
+    fw, fh = fig.bbox.width, fig.bbox.height
 
-    def text_w(s, size, weight="normal"):
-        tx = fig.text(0, 0, s, fontsize=size, fontweight=weight)
-        w = tx.get_window_extent(renderer).width
+    def text_h(size):
+        tx = fig.text(0, 0, "0", fontsize=size)
+        h = tx.get_window_extent(renderer).height
         tx.remove()
-        return w
+        return h
 
-    def draw_row(ax, i, parts):
-        """parts: [(colour, value)] stacked from the baseline; returns end px."""
-        x_px = lambda v: ax.transData.transform((v, i))[0]         # noqa: E731
-        yc = ax.transData.transform((0, i))[1]
+    inner_h = text_h(8)
+
+    for i, r in enumerate(rows):
+        xc = ax.transData.transform((i, 0))[0]
+        y_px = lambda v: ax.transData.transform((i, v))[1]         # noqa: E731
         acc = 0.0
-        for j, (col, v) in enumerate(parts):
-            a, b = x_px(acc), x_px(acc + v)
-            last = j == len(parts) - 1
+        for j, (key, v) in enumerate(segs[i]):
+            a, b = y_px(acc), y_px(acc + v)
+            last = j == len(segs[i]) - 1
             a2 = a + (gap / 2 if j else 0.0)
             b2 = b - (0.0 if last else gap / 2)
             if b2 > a2:
-                fig.add_artist(PathPatch(_bar(a2, b2, yc - bar_h / 2, yc + bar_h / 2, last),
-                                         transform=IdentityTransform(), facecolor=col,
+                fig.add_artist(PathPatch(_column(xc - bar_w / 2, xc + bar_w / 2, a2, b2, last),
+                                         transform=IdentityTransform(), facecolor=t[key],
                                          edgecolor="none", zorder=3))
-                # a value INSIDE a segment only where it fits with padding
-                if segment_values and len(parts) > 1:
-                    lab = f"{v:.0f}"
-                    if text_w(lab, 7.5) + 12 * PX <= b2 - a2:
-                        fig.text((a2 + b2) / 2 / fig.bbox.width, yc / fig.bbox.height, lab,
-                                 ha="center", va="center_baseline", fontsize=7.5,
-                                 color=_on(col), zorder=4)
+                # the segment's own value, only where it fits with padding
+                if inner_h + 8 * PX <= b2 - a2:
+                    fig.text(xc / fw, (a2 + b2) / 2 / fh, f"{v:.1f}", ha="center",
+                             va="center_baseline", fontsize=8, color=_on(t[key]), zorder=4)
             acc += v
-        return x_px(acc), yc
+        fig.text(xc / fw, (y_px(acc) + 5 * PX) / fh, f"{totals[i]:.1f}", ha="center",
+                 va="bottom", fontsize=9, color=t["ink"], fontweight="semibold")
 
-    for i, r in enumerate(rows):
-        # row label: name in primary ink, architecture in muted ink
-        yc = axa.transData.transform((0, i))[1] / fig.bbox.height
-        x_lab = 0.30 / W
-        fig.text(x_lab, yc + 0.085 / fig_h, names[i], ha="left", va="center",
+        # column label: name in primary ink, architecture in muted ink
+        y0 = bottom / fig_h
+        k_line, size_line = _arch_lines(r)
+        fig.text(xc / fw, y0 - 0.24 / fig_h, names[i], ha="center", va="center",
                  fontsize=10, color=t["ink"], fontweight="semibold")
-        fig.text(x_lab, yc - 0.105 / fig_h, _k_label(r), ha="left", va="center",
+        fig.text(xc / fw, y0 - 0.46 / fig_h, k_line, ha="center", va="center",
+                 fontsize=7.5, color=t["muted"])
+        fig.text(xc / fw, y0 - 0.64 / fig_h, size_line, ha="center", va="center",
                  fontsize=7.5, color=t["muted"])
 
-        xe, ypx = draw_row(axa, i, [(t["forward"], infer[i])])
-        fig.text((xe + 6 * PX) / fig.bbox.width, ypx / fig.bbox.height, f"{infer[i]:.1f}",
-                 ha="left", va="center_baseline", fontsize=8.5, color=t["ink"])
-        xe, ypx = draw_row(axb, i, [(t[k], v) for k, v in segs[i]])
-        fig.text((xe + 6 * PX) / fig.bbox.width, ypx / fig.bbox.height, f"{totals[i]:.1f}",
-                 ha="left", va="center_baseline", fontsize=8.5, color=t["ink"],
-                 fontweight="semibold")
-
-    # ---- titles, legend ------------------------------------------------------
+    # ---- title, legend -------------------------------------------------------
     size = meta.get("size") or [0, 0]
     title = (f"Network speed  ·  {size[0]}×{size[1]}, {meta.get('coils', '?')} coils"
              + (f", {r_note}" if r_note else ""))
@@ -215,35 +193,23 @@ def save_timing_figure(rows, meta, path, theme="light", segment_values=False):
         ("GPU-synchronised around the network only"
          if str(meta.get("device", "cuda")).startswith("cuda")
          else "timed around the network only")) if s)
-    fig.text(0.30 / W, 1 - 0.36 / fig_h, title, ha="left", va="center", fontsize=14,
+    x_left = 0.30 / W
+    fig.text(x_left, 1 - 0.36 / fig_h, title, ha="left", va="center", fontsize=14,
              color=t["ink"], fontweight="bold")
-    fig.text(0.30 / W, 1 - 0.66 / fig_h, sub, ha="left", va="center", fontsize=8.5,
+    fig.text(x_left, 1 - 0.66 / fig_h, sub, ha="left", va="center", fontsize=8.5,
              color=t["ink2"])
 
-    def panel_head(ax, head, note):
-        x = ax.get_position().x0
-        fig.text(x, 1 - 1.08 / fig_h, head, ha="left", va="center", fontsize=10.5,
-                 color=t["ink"], fontweight="semibold")
-        fig.text(x, 1 - 1.30 / fig_h, note, ha="left", va="center", fontsize=8,
-                 color=t["muted"])
-
-    panel_head(axa, "Inference forward", "eval mode, no gradients")
-    panel_head(axb, "Training step", "the network's share: no data loading, no map estimate")
-
-    # legend for the stacked panel (>= 2 series): swatches + secondary ink
-    keys = [("forward", "forward"), ("backward", "loss + backward")]
-    if with_step:
-        keys.append(("step", "optimizer + projection"))
-    x = axb.get_position().x1
-    y = 1 - 1.08 / fig_h
-    sw = 9 * PX / fig.bbox.width
-    for key, lab in reversed(keys):
-        tx = fig.text(x, y, lab, ha="right", va="center", fontsize=8.5, color=t["ink2"])
-        x -= tx.get_window_extent(renderer).width / fig.bbox.width + 5 * PX / fig.bbox.width + sw
+    # legend: swatches + secondary ink, listed top segment first, like the stack
+    x = x_left
+    y = 1 - 1.02 / fig_h
+    sw = 9 * PX / fw
+    for key, lab in (("backward", "backward (loss + gradient)"), ("forward", "forward")):
         fig.add_artist(Rectangle((x, y - sw * W / fig_h / 2), sw, sw * W / fig_h,
                                  transform=fig.transFigure, facecolor=t[key],
                                  edgecolor="none"))
-        x -= 14 * PX / fig.bbox.width
+        x += sw + 5 * PX / fw
+        tx = fig.text(x, y, lab, ha="left", va="center", fontsize=8.5, color=t["ink2"])
+        x += tx.get_window_extent(renderer).width / fw + 16 * PX / fw
 
     fig.savefig(path, dpi=DPI, facecolor=t["surface"])
     plt.close(fig)

@@ -26,8 +26,8 @@ With --step:
     project   net.project()
 
 --fig-out writes a figure of the same numbers (visualization/timing_chart.py):
-one row per network, inference on the left and the training step, stacked by
-phase, on the right. --from-json redraws it from a saved --json-out without
+one upright column per network, the forward pass with the backward pass
+stacked on top of it. --from-json redraws it from a saved --json-out without
 timing anything.
 
 Settings come from each config: `training.complex_conv` (planar / gauss) and
@@ -52,12 +52,20 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import build_model                                 # noqa: E402
-from models.components import set_complex_mode                 # noqa: E402
-from operators import FFT2D, Mask, Sense                       # noqa: E402
-from physics.mask import make_acc_mask                         # noqa: E402
-from training.common import embed_for_net                      # noqa: E402
-from training.losses import LOSS_REGISTRY                      # noqa: E402
+
+
+def _import_repo():
+    """The model stack, imported only when something is timed: --from-json
+    redraws a figure anywhere matplotlib runs (a laptop whose torch is too old
+    to import the models)."""
+    global build_model, set_complex_mode, FFT2D, Mask, Sense
+    global make_acc_mask, embed_for_net, LOSS_REGISTRY
+    from models import build_model
+    from models.components import set_complex_mode
+    from operators import FFT2D, Mask, Sense
+    from physics.mask import make_acc_mask
+    from training.common import embed_for_net
+    from training.losses import LOSS_REGISTRY
 
 
 def build_problem(hw, coils, mri, R, device, seed=0):
@@ -191,8 +199,6 @@ def main():
     ap.add_argument("--fig-out", default=None,
                     help="save a figure of the timings (.png, .pdf or .svg)")
     ap.add_argument("--fig-theme", default="light", choices=("light", "dark"))
-    ap.add_argument("--fig-values", action="store_true",
-                    help="also print each stacked segment's value inside it")
     ap.add_argument("--size", type=int, nargs="+", default=[640, 320], help="H [W]")
     ap.add_argument("--coils", type=int, default=20)
     ap.add_argument("--R", type=int, default=None, help="default: each config's mri.R")
@@ -215,11 +221,11 @@ def main():
             saved = json.load(f)
         from visualization.timing_chart import save_timing_figure
         print("wrote", save_timing_figure(saved["rows"], saved, args.fig_out,
-                                          theme=args.fig_theme,
-                                          segment_values=args.fig_values))
+                                          theme=args.fig_theme))
         return
     if not args.configs:
         raise SystemExit("--configs is required (or --from-json to redraw a figure)")
+    _import_repo()
 
     device = torch.device(args.device)
     hw = (args.size[0], args.size[-1])
@@ -272,8 +278,7 @@ def main():
     if args.fig_out:
         from visualization.timing_chart import save_timing_figure
         os.makedirs(os.path.dirname(os.path.abspath(args.fig_out)), exist_ok=True)
-        print("wrote", save_timing_figure(rows, meta, args.fig_out, theme=args.fig_theme,
-                                          segment_values=args.fig_values))
+        print("wrote", save_timing_figure(rows, meta, args.fig_out, theme=args.fig_theme))
 
 
 if __name__ == "__main__":
