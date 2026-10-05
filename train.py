@@ -25,14 +25,28 @@ import datasets                       # triggers registration via __init__
 from datasets.registry import build_loader
 
 
+def _fused_ok(model):
+    """Can `torch.optim.Adam(fused=True)` take this model's parameters?"""
+    import inspect
+    if "fused" not in inspect.signature(torch.optim.Adam.__init__).parameters:
+        return False
+    ps = [p for p in model.parameters() if p.requires_grad]
+    return bool(ps) and all(p.is_cuda and p.is_floating_point() for p in ps)
+
+
 def build_optimizer(model, cfg):
     opt_cfg = cfg["optimizer"]
 
     if opt_cfg["type"] == "Adam":
-        return torch.optim.Adam(
-            model.parameters(),
-            **opt_cfg["params"]
-        )
+        params = dict(opt_cfg["params"])
+        # FUSED Adam: one kernel per parameter group instead of a handful per
+        # tensor -- the multigrid nets carry ~700 small tensors, so the plain
+        # update is mostly kernel launches. Same update rule. Used whenever it
+        # applies (CUDA, real floating-point parameters, a torch that has it);
+        # an explicit `optimizer.params.fused` in the config wins.
+        if "fused" not in params and _fused_ok(model):
+            params["fused"] = True
+        return torch.optim.Adam(model.parameters(), **params)
 
     raise ValueError(f"Unknown optimizer {opt_cfg['type']}")
 
@@ -178,6 +192,16 @@ def main(config_path):
         )
 
         backtrack_count, best_loss = load_ckpt_meta(ckpt_path, device=device)
+
+        # `optimizer.load_state_dict` restores the SAVED param_groups, flags
+        # included, so a checkpoint written by a non-fused run would quietly
+        # switch a fused optimizer back. The state (step, exp_avg, exp_avg_sq)
+        # is the same either way; re-assert the flag.
+        if (cfg["optimizer"]["type"] == "Adam"
+                and "fused" not in cfg["optimizer"]["params"] and _fused_ok(model)):
+            for group in optimizer.param_groups:
+                group["fused"] = True
+                group["foreach"] = False
 
         print(f"Resuming from step {start_step} "
               f"(backtrack_count={backtrack_count}, best_loss={best_loss})")

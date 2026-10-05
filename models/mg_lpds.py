@@ -205,6 +205,11 @@ class PDObjectiveDownsample(nn.Module):
         for m in (self.analysis_fine, self.synthesis_fine,
                   self.analysis_coarse, self.synthesis_coarse):
             set_weight(m, uball_project(m.weight))
+        # The thresholds too: `MGLPDSNet.project` stops at a module that
+        # defines `project_`, so this one has to cover its whole subtree.
+        for m in (self.prox_fine, self.prox_coarse):
+            if hasattr(m, "project_"):
+                m.project_()
 
 
 def gram_or_x(E, x):
@@ -535,9 +540,32 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
 
     @torch.no_grad()
     def project(self):
-        for m in self.modules():
-            if m is not self and hasattr(m, "project_"):
-                m.project_()
+        """Constraint projection, each constrained module ONCE.
+
+        Top-down: a module that defines `project_` is called and NOT descended
+        into -- it owns its subtree (`LPDSLayer` projects its convs, steps and
+        prox; a prox projects its thresholds; `PDObjectiveDownsample` its convs
+        and proxes). Walking `self.modules()` instead called every owner AND
+        every child the owner had just projected: 744 threshold clamps for 276
+        `Polynomial`s in the [6,[4,4,6]] V-cycle, every training step. Clamps
+        are idempotent, so the result is identical (tests/test_mg_project.py).
+
+        The contract this puts on a new module: if it defines `project_`, that
+        method must reach every constrained module beneath it.
+        """
+        seen = set()
+
+        def walk(mod):
+            for child in mod.children():
+                if id(child) in seen:          # a module shared by two parents
+                    continue
+                seen.add(id(child))
+                if hasattr(child, "project_"):
+                    child.project_()
+                else:
+                    walk(child)
+
+        walk(self)
 
     def extra_repr(self):
         return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "

@@ -1,5 +1,6 @@
 import os
 import math
+import time
 import numpy as np
 import torch
 from visualization.wandb_image import wandb_image
@@ -23,7 +24,8 @@ from training.common import (
 # Backtracking bookkeeping. `backtrack` is the whole restore-and-drop-the-LR
 # operation; `resync_schedule` re-applies an already-earned reduction on resume.
 from training.common import backtrack as do_backtrack, resync_schedule
-from visualization.filters import filter_snapshot, get_filter_grids
+from training.step_profile import StepProfiler
+from visualization.filters import get_filter_grids
 from visualization.image import recon_panel
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
@@ -142,25 +144,29 @@ def train_recon(
         print(f"resuming at backtrack_count={backtrack_count}: LR -> "
               f"{resync_schedule(opt, sched, backtrack_count, backtrack_factor)}")
 
-    # The filters as training finds them: the reference for the drift numbers
-    # (`filters/drift/*`), and one filter log at the start so every later image
-    # has something to be compared with. After a resume both are relative to
-    # the resume point, not to the original init.
-    filter_init = filter_snapshot(net)
+    # One filter log at the start, so every later image has something to be
+    # compared with. Images only: no spread / drift statistics, and so no
+    # snapshot of the whole model held for the length of the run.
     if wandb is not None:
-        wandb.log(get_filter_grids(net, init=filter_init),
-                  step=start_epoch * steps_per_epoch)
+        wandb.log(get_filter_grids(net), step=start_epoch * steps_per_epoch)
+
+    # PROFILE_STEPS=N in the environment times the first N steps per phase
+    # (training/step_profile.py). Off by default, and then every `prof.*` call
+    # below returns at once.
+    prof = StepProfiler(device)
 
     for epoch in range(start_epoch, num_epochs):
         net.train()
         running_loss = 0.0
         n_batches = 0
+        profiling_epoch = prof.on
 
         # ==================================================================
         # ONE EPOCH == steps_per_epoch GRADIENT STEPS
         # ==================================================================
         for _ in range(steps_per_epoch):
 
+            prof.start()
             try:
                 kspace, smaps, image, organ_mask, pad_hw = next(train_iter)
             except StopIteration:
@@ -171,6 +177,7 @@ def train_recon(
             smaps = smaps.to(device, non_blocking=True)
             image = image.to(device, non_blocking=True)
             organ_mask = organ_mask.to(device, non_blocking=True)
+            prof.mark("data")
 
             mask = get_mask(image, R=R, acs_lines=acs_lines, mode=mask_dist,
                             offset=mask_offset, center_frac=center_frac,
@@ -204,11 +211,13 @@ def train_recon(
             # the scanner used. T crops back and its adjoint zero-pads, so
             # E @ T is exact -- no resampled mask, no reflect-padded maps.
             E, T = _embed(net, E, image, pad_hw)
+            prof.mark("measure")
 
             opt.zero_grad(set_to_none=True)
 
             recon, _ = net(y, E=E, sigma=sigma_n)
             recon = T.forward(recon)
+            prof.mark("forward")
 
             if whiten_kspace and "Zinv" in extra:
                 recon = extra["Zinv"] * recon
@@ -219,17 +228,25 @@ def train_recon(
 
             loss = loss_fn(image_l, recon_l, sigma_n)
             loss.backward()
+            prof.mark("backward")
 
             if clip_grad is not None:
                 nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
 
             opt.step()
+            prof.mark("opt")
 
             if hasattr(net, "project"):
                 net.project()
+            prof.mark("project")
 
             if sched is not None:
                 sched.step()
+            prof.mark("opt")
+
+            # one eval-mode forward on this batch, timed apart from the step
+            prof.infer(net, y, E, sigma_n)
+            prof.end(image.shape[-2:], embedded=not T.is_identity)
 
             running_loss += loss.detach()          # on-device; no sync
             n_batches += 1
@@ -243,6 +260,7 @@ def train_recon(
         # ==================================================================
         # END-OF-EPOCH: averaged-loss backtracking + checkpoint + logging
         # ==================================================================
+        t_epoch_end = time.perf_counter()
         avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
         nonfinite = not math.isfinite(avg_loss)
 
@@ -308,12 +326,21 @@ def train_recon(
         elif wandb is None:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 
+        if profiling_epoch:
+            # Not a step, but the progress bar charges it to one: this is the
+            # periodic stall behind a "varying" it/s.
+            print(f"[profile] epoch {epoch}: end-of-epoch work (train metrics + "
+                  f"checkpoint{'' if best_loss == avg_loss else ' [not saved]'} + "
+                  f"logging) took {1e3 * (time.perf_counter() - t_epoch_end):.0f} ms",
+                  flush=True)
+
         # ==================================================================
         # VALIDATION (log-only, every val_every_epochs epochs)
         # ==================================================================
         if val_every_epochs and (epoch + 1) % val_every_epochs == 0:
 
             net.eval()
+            t_val = time.perf_counter()
 
             val_metrics = {
                 "psnr": torch.tensor(0.0, device=device),
@@ -457,9 +484,14 @@ def train_recon(
                 # transfer per tensor, and neither answers a question that needs answering
                 # every epoch -- thresholds and step sizes drift on the timescale of training.
                 wandb.log(get_param_logs(net), step=global_step)
-                wandb.log(get_filter_grids(net, init=filter_init), step=global_step)
+                wandb.log(get_filter_grids(net), step=global_step)
             else:
                 print(f"[VAL] epoch={epoch} {mean_metrics}")
+            # The bar does not advance during validation, so tqdm reads it as
+            # one very slow step and its smoothed it/s sags afterwards.
+            print(f"[VAL] epoch={epoch}: validation + logging took "
+                  f"{time.perf_counter() - t_val:.1f} s over {num_val_batches} "
+                  f"slices", flush=True)
 
             net.train()
 

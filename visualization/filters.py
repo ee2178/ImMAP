@@ -365,8 +365,14 @@ def collect_filter_images(net, scale_each=False, max_channels=4, max_filters=256
         return render_lpds_filters(filters, scale_each=scale_each, max_channels=max_channels)
 
     out = {}
-    for tmpl, stack in filter_banks(net).items():
-        W = _mid(stack)[:max_filters]
+    # Group the MODULES, then move one bank per group to the cpu. `filter_banks`
+    # transfers every iteration's weight (216 host copies for the mglpds
+    # V-cycle) to draw only the middle one of each stack.
+    stacks = {}
+    for name, mod in _gauss_convs(net):
+        stacks.setdefault(_template(name), []).append(mod)
+    for tmpl, mods in stacks.items():
+        W = _weight(_mid(mods))[:max_filters]
         out[_short(tmpl)] = filter_to_grid(W, scale_each=scale_each, max_channels=max_channels)
     for lvl, a in effective_atoms(net, max_atoms=max_atoms).items():
         out[f"atoms/level{lvl}"] = filter_to_grid(a, scale_each=scale_each, max_channels=1)
@@ -377,15 +383,18 @@ def collect_filter_images(net, scale_each=False, max_channels=4, max_filters=256
 # (3) IO / LOGGING LAYER — W&B OR DISK
 # ============================================================
 
-def get_filter_grids(net, scale_each=False, max_channels=4, init=None):
-    """W&B-compatible logging dict: filter images under `filters/...` for ANY net built from
-    `components` convs (or the old A/B/D layout), plus the `filter_stats` scalars.  `init` is a
-    `filter_snapshot` taken before training, for the drift numbers.  Returns {} (never raises)
-    for a net with no such banks (e.g. E2E-VarNet), so unwrapped callers stay safe."""
+def get_filter_grids(net, scale_each=False, max_channels=4, init=None, stats=False):
+    """W&B-compatible logging dict: filter IMAGES under `filters/...` for ANY net built from
+    `components` convs (or the old A/B/D layout).  Returns {} (never raises) for a net with no
+    such banks (e.g. E2E-VarNet), so unwrapped callers stay safe.
+
+    Images only by default.  `stats=True` adds the `filter_stats` scalars (spread / drift),
+    which walk EVERY iteration's weight; `init` is a `filter_snapshot` taken before training,
+    for the drift numbers, and is read only then."""
     grids = collect_filter_images(net, scale_each=scale_each, max_channels=max_channels)
     out = {f"filters/{k}": wandb_image(img.permute(1, 2, 0).numpy())
            for k, img in grids.items()}
-    if not (hasattr(net, "A") and hasattr(net, "B")):
+    if stats and not (hasattr(net, "A") and hasattr(net, "B")):
         out.update(filter_stats(net, init=init))
     return out
 
