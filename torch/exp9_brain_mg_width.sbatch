@@ -52,6 +52,13 @@
 # Probe one cell first if unsure of throughput (tagged, lands in <cell>_R12_20ep):
 #     SWEEP_EPOCHS=20 sbatch --array=0 torch/exp9_brain_mg_width.sbatch
 #
+# OTHER ACCELERATIONS. The same three cells at R=8, full length, in their own
+# run dirs (<cell>_R8), with the same 0/1/2 order:
+#     ACCELS=8 sbatch torch/exp9_brain_mg_width.sbatch
+# Two rates in one array list every cell at the first rate, then the second
+# (0-2 = R8, 3-5 = R12), so widen the array:
+#     ACCELS="8 12" sbatch --array=0-5 torch/exp9_brain_mg_width.sbatch
+#
 # SUBMIT FROM THE REPO ROOT.
 #   sbatch torch/exp9_brain_mg_width.sbatch
 #
@@ -61,7 +68,8 @@
 
 ANATOMY=brain
 ONLY="${ONLY:-mg121v6 mg100v6 mg81v6}"
-ACCELS="12"                          # PINNED: exp8 measured these at R12
+ACCELS="${ACCELS:-12}"               # exp8 measured these at R12; other rates
+                                     # by override (see OTHER ACCELERATIONS)
 ORGAN_MASK=1                         # matches every other brain launcher --
                                      # regeneration rewrites every brain config,
                                      # so a mismatch silently un-masks the anatomy
