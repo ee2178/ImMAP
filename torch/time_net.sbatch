@@ -14,7 +14,7 @@
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.err
 #
-# Two measurements with nothing of the training loop in them.
+# Three measurements with nothing of the training loop in them.
 #
 #   1. ONLINE ESPIRiT KERNEL SIZE on real validation slices
 #      (scripts/check_online_espirit_ks.py): time, kernels kept, memory, and
@@ -25,8 +25,14 @@
 #      call. Brain dimensions, synthetic data, each model's own config
 #      (coarse_op, planar convs), plus the optimizer step and projection.
 #
-# No training, no checkpoints. Output: this job's log, plus time_net.json and
-# the figure time_net.png under
+#   3. WHERE THE FORWARD TIME GOES (scripts/profile_mg.py --by-level --counts):
+#      per network, the inference forward split into conv / FFT / grid transfer
+#      / elementwise + overhead, keyed by grid size so the multigrid levels
+#      separate. Compare PROPORTIONS -- the instrumented total is inflated. A
+#      family that stays the same size between two widths is M-independent.
+#
+# No training, no checkpoints. Output: this job's log, plus time_net.json, the
+# figure time_net.png and breakdown.txt (step 3's tables) under
 #   trained_nets/profile/time_net_<jobid>/
 # The figure is one column per network: forward, with backward stacked on top.
 # Redraw it later (dark theme, pdf) without a GPU:
@@ -38,7 +44,8 @@
 #   R=12 KS="2 4" N_SLICES=6      the ESPIRiT check
 #   IMG="640 320" COILS=20 REPS=30
 #   MODELS="lpdsnet varnetmaps mglpds mg121v6"
-#   SKIP_ESPIRIT=1 / SKIP_NETS=1  run only one half
+#   BREAKDOWN="mg169v6 mg81v6"    nets for step 3 (default: MODELS minus VarNet)
+#   SKIP_ESPIRIT=1 / SKIP_NETS=1 / SKIP_BREAKDOWN=1   leave a step out
 
 R="${R:-12}"
 KS="${KS:-2 4}"
@@ -87,4 +94,26 @@ if [ -z "${SKIP_NETS:-}" ]; then
     python scripts/time_net.py --configs "${CFGS[@]}" --size ${IMG} --coils "${COILS}" \
         --reps "${REPS}" --step --json-out "${OUT}/time_net.json" \
         --fig-out "${OUT}/time_net.png"
+fi
+
+if [ -z "${SKIP_BREAKDOWN:-}" ]; then
+    echo; echo "================ 3. where the forward time goes ================"
+    # Default: every unrolled net in MODELS. VarNet is left out -- the breakdown
+    # instruments this repo's conv / FFT / resample calls, not fastMRI's U-Net.
+    if [ -z "${BREAKDOWN:-}" ]; then
+        for m in ${MODELS}; do
+            case "${m}" in varnet*) ;; *) BREAKDOWN="${BREAKDOWN:+${BREAKDOWN} }${m}" ;; esac
+        done
+    fi
+    : > "${OUT}/breakdown.txt"
+    for m in ${BREAKDOWN}; do
+        f="${CFG}/${m}_R${R}.json"
+        [ -f "${f}" ] || { echo "[time] no config for '${m}' at R=${R} (${f})" >&2; exit 1; }
+        # profile_mg.py takes the conv mode as a flag for the whole run, not
+        # from the config, so each net runs alone with its own setting.
+        PLANAR="$(python -c "import json, sys; print('--planar' if (json.load(open(sys.argv[1])).get('training') or {}).get('complex_conv') == 'planar' else '')" "${f}")"
+        python scripts/profile_mg.py --configs "${f}" --size ${IMG} --coils "${COILS}" \
+            --R "${R}" --reps "${REPS}" --cudnn-benchmark ${PLANAR} --by-level --counts \
+            | tee -a "${OUT}/breakdown.txt"
+    done
 fi

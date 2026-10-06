@@ -30,27 +30,27 @@
 #   19   synth_cycle_sameF_w2.json            CycleSynth        as 15 + cycle, F = G's architecture
 #   20   i2sb_sbcdlnet_sfree.json             SBCDLNet          as 3  + S = D_S z        (bridge + learned DC)
 #   21   i2sb_sbcdlnet_sgate.json             SBCDLNet          as 3  + S = D (m . z)    (bridge + learned DC)
-#   22   synth_sbcdlnet_sfree.json            SBCDLNet          as 20, learned DC ONLY (task: synthesis)
-#   23   synth_sbcdlnet_sgate.json            SBCDLNet          as 21, learned DC ONLY (task: synthesis)
-#   24   i2sb_sbguidedcdl_otherstudy_sfree.json   SBGuidedGroupCDL  FLAIR, T1, T2; guide other-study CT1; free S
-#   25   i2sb_sbguidedcdl_otherstudy_sgate.json   SBGuidedGroupCDL  ... gated S
-#   26   synth_sbguidedcdl_otherstudy_sfree.json  SBGuidedGroupCDL  as 24, learned DC ONLY (task: synthesis)
-#   27   synth_sbguidedcdl_otherstudy_sgate.json  SBGuidedGroupCDL  as 25, learned DC ONLY (task: synthesis)
+#   22   i2sb_sbguidedcdl_otherstudy_sfree.json   SBGuidedGroupCDL  FLAIR, T1, T2; guide other-study CT1; free S
+#   23   i2sb_sbguidedcdl_otherstudy_sgate.json   SBGuidedGroupCDL  ... gated S
 #
-# ENHANCEMENT MAP (20-27): the T1 fidelity becomes a LEARNED DATA-CONSISTENCY term through an
+# ENHANCEMENT MAP (20-23): the T1 fidelity becomes a LEARNED DATA-CONSISTENCY term through an
 # enhancement map S decoded from the same sparse code as CT1 (models/enhancement.py):
 #     free   S = D_S z         T1 = (D - D_S) z        S has its own synthesis dictionary
 #     gate   S = D (m . z)     T1 = D ((1 - m) . z)    m in [0,1] per atom: which textures enhance
-# Trained with  loss(x0_hat, CT1) + s_weight * MSE(S_hat, (CT1 - T1)_+).
-# "bridge + learned DC" keeps the bridge-informed target term; "learned DC ONLY" drops it, so the
-# net never reads the bridge state and runs as a one-pass synthesis net. 3 is the no-S control
-# for 20-23. Each validation logs the val/S image and the collapse/* scalars:
+# Trained with  loss(x0_hat, CT1) + s_weight * MSE(S_hat, (CT1 - T1)_+), on top of the usual
+# bridge-informed target term. The x0 term uses the sigma weighting of 16-17 (loss_weight "snr",
+# loss_weight_max 1000); the S term is NOT sigma-weighted. 3 and 5 predate that and use a uniform
+# weight, so they differ from 20-21 / 22-23 in the weighting as well as in S.
+# Each validation logs the val/S image and the collapse/* scalars:
 #     S = 0                     S_rms_ratio -> 0;  gate_closed -> 1  or  DS_over_D_* -> 0
 #     T1 constrains nothing     T1_resid -> 1;     gate_open -> 1    or  Dy_over_D_min -> 0
 #     a fidelity switched off   step_xi_min / step_eta_min / step_nu_min -> 0
 #     the code died / is dense  code_density -> 0 / -> 1
 #     S is not one-sided        S_neg_frac large
-#   sbatch --array=20-27 bigpurple/i2sb_nyumets_array.sbatch
+# NOT LISTED: the learned-DC-ONLY versions (no bridge term, task: synthesis) --
+# config/NYUMets/synth_sbcdlnet_s{free,gate}.json and synth_sbguidedcdl_otherstudy_s{free,gate}.json.
+# The configs and the code path (bridge_fidelity: false) still exist; append them to CONFIGS to run.
+#   sbatch --array=20-23 bigpurple/i2sb_nyumets_array.sbatch
 #
 # CYCLE (18-19): G (T1 & co -> CT1) trained jointly with F (CT1, FLAIR, T2 -> T1) on
 #     L = loss(G(X), CT1) + cycle_weight * loss(F(G(X)), T1) + backward_weight * loss(F(CT1), T1)
@@ -149,7 +149,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-27%4
+#SBATCH --array=0-23%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -191,12 +191,8 @@ CONFIGS=(
     config/NYUMets/synth_cycle_sameF_w2.json
     config/NYUMets/i2sb_sbcdlnet_sfree.json
     config/NYUMets/i2sb_sbcdlnet_sgate.json
-    config/NYUMets/synth_sbcdlnet_sfree.json
-    config/NYUMets/synth_sbcdlnet_sgate.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_sfree.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_sgate.json
-    config/NYUMets/synth_sbguidedcdl_otherstudy_sfree.json
-    config/NYUMets/synth_sbguidedcdl_otherstudy_sgate.json
     # NOT LISTED, to save GPU time: i2sb_unet_otherstudy_pair_bs256.json (w=0) and
     # i2sb_unet_otherstudy_pair_w1_bs256.json (w=1). Both configs still exist; append them
     # here (and widen --array) for the full large-batch width sweep.

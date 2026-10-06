@@ -91,7 +91,7 @@ fi
 
 # --- knobs --------------------------------------------------------------------------------
 N=config/NYUMets
-CONFIGS="${CONFIGS:-$N/i2sb_unet_all_bs256.json $N/i2sb_sbcdlnet_all.json $N/i2sb_sbcdlnet_sfree.json $N/i2sb_sbcdlnet_sgate.json $N/synth_sbcdlnet_sgate.json $N/i2sb_sbguidedcdl_otherstudy_sgate.json $N/synth_sbguidedcdl_otherstudy_sgate.json}"
+CONFIGS="${CONFIGS:-$N/i2sb_unet_all_bs256.json $N/i2sb_sbcdlnet_all.json $N/i2sb_sbcdlnet_sfree.json $N/i2sb_sbcdlnet_sgate.json $N/i2sb_sbguidedcdl_otherstudy_sfree.json $N/i2sb_sbguidedcdl_otherstudy_sgate.json}"
 BATCHES="${BATCHES:-4 8 16 32 64 128 256}"
 TARGETS="${TARGETS:-8 64 256}"
 SIZE="${SIZE:-128}"
