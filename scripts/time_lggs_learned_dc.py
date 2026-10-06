@@ -227,6 +227,38 @@ def main():
                      peak=base_tmem if cfg.backward else base_mem,
                      sample=base_ms / B * cfg.nfe))
 
+    # ---- control: no E, but the SAME per-sample sigma the bridge DC operator hands the prox ---
+    # BridgeDCOperator.noise_level makes `sigma` a (B,1,1,1) tensor, which switches every
+    # noise-adaptive polynomial in the prox (tau, rho, gamma, ...) from its constant branch to
+    # its sigma branch. `none` runs with sigma=None, so `over` vs `none` charges that switch to
+    # E. This row runs the linear path with that sigma and nothing else changed: the gap between
+    # it and `none` is the adaptive-sigma cost, and only what a UNet row adds on top of THIS row
+    # is the learned operator.
+    if not cfg.plain:
+        m0, sb = col(mu0), col(std_sb)
+        sig = sb * cfg.sigma_E / (cfg.sigma_E ** 2 * m0 ** 2 + sb ** 2).sqrt()
+
+        def f_sig():
+            with torch.no_grad():
+                net.eval()
+                net(x_t, guide=guide, sigma=sig)
+
+        def train_sig():
+            net.train()
+            opt.zero_grad(set_to_none=True)
+            out, _ = net(x_t, guide=guide, sigma=sig)
+            ((out.abs() - target) ** 2).mean().backward()
+            opt.step()
+
+        s_ms, s_mem = guarded(f_sig, device, cfg.warmup, cfg.reps)
+        s_tr, s_tmem = (float("nan"), float("nan"))
+        if cfg.backward:
+            s_tr, s_tmem = guarded(train_sig, device, cfg.warmup, cfg.reps)
+        rows.append(dict(arm="none+sig", E_params=0, E_rf=0, E_fwd=0.0, E_grad=0.0, infer=s_ms,
+                         over=s_ms - base_ms, over_x=s_ms / base_ms if base_ms else float("nan"),
+                         pred=0.0, train=s_tr, peak=s_tmem if cfg.backward else s_mem,
+                         sample=s_ms / B * cfg.nfe))
+
     # ---- one arm per UNet size ------------------------------------------------------------
     for (w, L, c) in cfg.unets:
         E = ForwardOp(kind="unet", width=w, levels=L, convs=c, cond_channels=cfg.cond)

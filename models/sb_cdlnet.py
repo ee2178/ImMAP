@@ -74,6 +74,7 @@ import torch.nn.functional as F
 
 from models.base import BaseUnrolledModel, set_weight
 from models.components import ST, Conv2d, ConvTranspose2d
+from models.enhancement import EnhancementCoupling, step_logit
 from models.sb_schedule import BridgeScheduleMixin, horner as _horner
 from operators.padding import unpad
 from operators.projections import uball_project
@@ -105,13 +106,36 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
     kind, tau, n_points, beta_max
                    the bridge schedule -- MUST match cfg["i2sb"], since sigma is inverted through
                    it to recover (mu_0, mu_1, sigma_eff).
+    s_mode         None (default: the net above, unchanged) | "free" | "gate". Turns the prior
+                   channel's fidelity into a LEARNED DATA-CONSISTENCY term through an enhancement
+                   map S decoded from the same code (models/enhancement.py):
+
+                       free   S = D_S z          x_1 = (D_D - D_S) z
+                       gate   S = D_D (m . z)    x_1 = D_D ((1 - m) . z)     m per atom
+
+                   The prior channel then has NO dictionary of its own; A_P / B_P cover only the
+                   remaining ("side") conditioning channels. The layer becomes
+
+                       z <- ST( z - eta g_D - xi g_y - nu g_P ; tau )
+
+                   with g_y the measurement gradient. `last_S` holds S_hat after every forward.
+    bridge_fidelity
+                   False drops g_D: JUST the learned data consistency (plus the side channels).
+                   The net then never reads the bridge state, so it also runs under
+                   `task: synthesis` as net(cond) -- no sigma, no x_t. Needs s_mode.
+    gate_init      starting value of every gate (s_mode="gate"); 0 = "nothing is enhancement".
     """
 
     def __init__(self, K=30, M=169, P=7, s=2, C=2, prior_idx=0, t0=0.0,
                  deg_eta=0, deg_tau=1,
                  kind="brownian", tau=0.19, n_points=1000, beta_max=0.3,
-                 init=True, complex=False):
+                 init=True, complex=False,
+                 s_mode=None, bridge_fidelity=True, gate_init=0.0):
         super().__init__()
+        if not bridge_fidelity and s_mode is None:
+            raise ValueError("bridge_fidelity=False leaves only the learned data consistency, "
+                             "which needs s_mode='free' or 'gate'.")
+        self.s_mode, self.bridge_fidelity = s_mode, bool(bridge_fidelity)
 
         if C < 2:
             raise ValueError(
@@ -133,7 +157,17 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
         mk_B = lambda cout: nn.ModuleList(
             [ConvTranspose2d(M, cout, P, stride=s, bias=False, complex=complex) for _ in range(K)])
         self.A_D, self.B_D = mk_A(1), mk_B(1)
-        self.A_P, self.B_P = mk_A(self.n_cond), mk_B(self.n_cond)
+        # With an S model the prior channel is explained by (D_D, S), not by a dictionary of its
+        # own, so the P pair covers the SIDE channels only (and vanishes if there are none).
+        self.side_idx = [i for i in range(self.n_cond) if s_mode is None or i != self.prior_idx]
+        self.n_p = len(self.side_idx)
+        self.A_P = mk_A(self.n_p) if self.n_p else nn.ModuleList()
+        self.B_P = mk_B(self.n_p) if self.n_p else nn.ModuleList()
+        self.coupling = None
+        if s_mode is not None:
+            self.coupling = EnhancementCoupling(s_mode, K, M, self.A_D[0], self.B_D[0],
+                                                gate_init=gate_init)
+        self.last_S = self.last_density = None
 
         self.D = self.B_D[0]        # alias, as CDLNet does: the readout dictionary
 
@@ -144,6 +178,14 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
         # single unit step. Starting both at ~1 would double the effective step at mu_0 = 1.
         self.a_eta = nn.Parameter(torch.zeros(K, deg_eta + 1))
         self.a_nu = nn.Parameter(torch.zeros(K, deg_eta + 1))
+        if s_mode is not None:
+            # a third step, for the measurement fidelity; all active steps start at 1/n so the
+            # combined step is still one ISTA step
+            self.a_xi = nn.Parameter(torch.zeros(K, deg_eta + 1))
+            start = step_logit(int(self.bridge_fidelity) + 1 + int(self.n_p > 0))
+            with torch.no_grad():
+                for a in (self.a_eta, self.a_nu, self.a_xi):
+                    a[:, 0] = start
         # Per-atom threshold, shaped like CDLNet's t = (K, deg+1, M, 1, 1).
         t = torch.zeros(K, deg_tau + 1, M, 1, 1)
         t[:, 0] = float(t0)
@@ -180,7 +222,8 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
 
     def init_filters(self, dtype=torch.cfloat):
         self._init_pair(self.A_D, self.B_D, 1, dtype)
-        self._init_pair(self.A_P, self.B_P, self.n_cond, dtype)
+        if self.n_p:
+            self._init_pair(self.A_P, self.B_P, self.n_p, dtype)
 
     @torch.no_grad()
     def _spectral_init_pair(self, A, B, cin):
@@ -199,14 +242,15 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
     @torch.no_grad()
     def spectral_init(self):
         self._spectral_init_pair(self.A_D, self.B_D, 1)
-        self._spectral_init_pair(self.A_P, self.B_P, self.n_cond)
+        if self.n_p:
+            self._spectral_init_pair(self.A_P, self.B_P, self.n_p)
 
     @torch.no_grad()
     def project_filters(self):
         for A, B in ((self.A_D, self.B_D), (self.A_P, self.B_P)):
-            for k in range(self.K):
-                set_weight(A[k], uball_project(A[k].weight))
-                set_weight(B[k], uball_project(B[k].weight))
+            for a, b in zip(A, B):                 # the P pair is empty with no side channels
+                set_weight(a, uball_project(a.weight))
+                set_weight(b, uball_project(b.weight))
 
     @torch.no_grad()
     def project(self):
@@ -214,6 +258,8 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
         # noise -> more shrinkage), the same constraint CDLNet's t.clamp_(0.) imposes.
         self.t.clamp_(0.0)
         self.project_filters()
+        if self.coupling is not None:
+            self.coupling.project()
 
     # -----------------------------------------------------------------
     # logging hook (visualization/params.py picks this up automatically)
@@ -222,11 +268,17 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
     def param_logs(self, probes=(0.0, 0.5, 1.0)):
         """The step sizes and threshold this net will ACTUALLY use, at a few bridge positions.
         See BridgeScheduleMixin._sb_param_logs for why the raw coefficients are not enough."""
-        return self._sb_param_logs({
+        curves = {
             "eta": lambda sl, sh: [torch.sigmoid(_horner(self.a_eta[j], sl)) for j in range(self.K)],
             "nu": lambda sl, sh: [torch.sigmoid(_horner(self.a_nu[j], sl)) for j in range(self.K)],
             "tau": lambda sl, sh: [_horner(self.t[j], sh) for j in range(self.K)],
-        }, probes=probes)
+        }
+        if self.coupling is not None:
+            curves["xi"] = lambda sl, sh: [torch.sigmoid(_horner(self.a_xi[j], sl))
+                                           for j in range(self.K)]
+        # the coupling's collapse indicators are logged under `collapse/` by the trainers
+        # (models.enhancement.CollapseMeter), not here
+        return self._sb_param_logs(curves, probes=probes)
 
     # -----------------------------------------------------------------
     # forward
@@ -234,6 +286,8 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
     def forward(self, y, E=None, sigma=None, step=None):
         """`y = cat([x_t, cond], dim=1)`, the tensor sb.base.predict_x0 builds. `E` is accepted
         for signature parity with the repo's denoisers and ignored. Returns (x0_hat, z)."""
+        if self.s_mode is not None:
+            return self._forward_s(y, sigma, step)
         # split, debias, DC-correct and pad -- all shared with SBGroupCDL
         r, c, dc, pad, mu0, s_log, s_hat = self.bridge_inputs(y, sigma=sigma, step=step)
 
@@ -253,4 +307,44 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
             z = ST(z - eta * g_D - nu * g_P, tau)
 
         x0_hat = unpad(self.B_D[0](z), pad) + dc
+        return x0_hat, z
+
+    # -----------------------------------------------------------------
+    # forward with the shared-code enhancement map (s_mode = "free" | "gate")
+    # -----------------------------------------------------------------
+    def _forward_s(self, y, sigma, step):
+        """Layer:  z <- ST( z - eta g_D - xi g_y - nu g_P ; tau ),  g_D only if bridge_fidelity.
+
+        Input layouts:
+            cat([x_t, cond]) + sigma/step   the i2sb regressor call. With bridge_fidelity=False
+                                            x_t is present and deliberately unread.
+            cond alone, no sigma/step       `task: synthesis` (bridge_fidelity=False only).
+        """
+        if self.bridge_fidelity:
+            r, c, dc, pad, mu0, s_log, s_hat = self.bridge_inputs(y, sigma=sigma, step=step)
+        else:
+            cond = y if (sigma is None and step is None) else y[:, 1:]
+            c, dc, pad, s_log, s_hat = self.static_inputs(cond)
+            r = mu0 = None
+        y_meas = c[:, self.prior_idx:self.prior_idx + 1]           # DC-removed T1
+        c_side = c[:, self.side_idx] if self.n_p else None
+
+        z = torch.zeros_like(self.A_D[0](y_meas))
+        for k in range(self.K):
+            tau = _horner(self.t[k], s_hat)                        # (B,M,1,1); see forward()
+            A, B = self.A_D[k], self.B_D[k]
+            xi = torch.sigmoid(_horner(self.a_xi[k], s_log))
+            u = z - xi * self.coupling.meas_grad(k, A, B, z, y_meas)   # learned data consistency
+            if self.bridge_fidelity:
+                eta = torch.sigmoid(_horner(self.a_eta[k], s_log))
+                u = u - eta * (mu0 * A(mu0 * B(z) - r))            # bridge-informed target term
+            if self.n_p:
+                nu = torch.sigmoid(_horner(self.a_nu[k], s_log))
+                u = u - nu * self.A_P[k](self.B_P[k](z) - c_side)  # side contrasts
+            z = ST(u, tau)
+
+        x0_hat = unpad(self.B_D[0](z), pad) + dc
+        # x and y share `dc`, so S = x - y needs none
+        self.last_S = unpad(self.coupling.decode(self.B_D[0], z), pad)
+        self.last_density = (z.detach() != 0).float().mean()     # a tensor: no sync until read
         return x0_hat, z

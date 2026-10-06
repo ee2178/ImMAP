@@ -77,6 +77,7 @@ from training.common import backtrack as do_backtrack, resync_schedule
 from training.metrics import compute_metrics
 from visualization.params import get_param_logs
 from training.losses import LOSS_REGISTRY, weighted_loss
+from models.enhancement import enhancement_loss, enhancement_panel, CollapseMeter
 
 # For reducing LR on plateau
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -233,6 +234,15 @@ def train_synthesis(
     cycle_loss_type=None,            # loss for the cycle and backward terms; None = loss_type
     backward_weight=0.0,             # > 0 adds backward_weight * loss(F(CT1), T1): F supervised
                                      # directly on the TRUE CT1 (see backward_term)
+    s_weight=0.0,                    # > 0 adds s_weight * MSE(S_hat, (CT1 - T1)_+) for a net
+                                     # with an enhancement map (s_mode "free"/"gate",
+                                     # models/enhancement.py). TRAIN term only.
+    s_src_idx=None,                  # channel of X holding T1 for that term; None = the net's
+                                     # own prior_idx (X is [cond..., guides...])
+    val_slices=None,                 # validate on a FIXED random subset of this many val slices
+                                     # (val_seed picks them), as train_i2sb does. None = the
+                                     # whole split -- hours for a guided unrolled net at batch 1.
+    val_seed=0,
     accum_steps=1,                   # gradient accumulation: the EFFECTIVE batch is
                                      # data.batch_size * accum_steps. One "step" stays one
                                      # OPTIMIZER step, so steps_per_epoch and the
@@ -281,6 +291,22 @@ def train_synthesis(
     if accum_steps < 1:
         raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
     cycle_loss_type = cycle_loss_type or loss_type
+    if val_loader is not None and val_slices:
+        from training.forward_op import fixed_val_subset
+        n_full = len(val_loader.dataset)
+        val_loader = fixed_val_subset(val_loader, int(val_slices), int(val_seed or 0))
+        print(f"[synthesis] validating on {len(val_loader.dataset)}/{n_full} val slices "
+              f"(val_slices={val_slices}, val_seed={val_seed})")
+    # T1's channel in X, for anything that reads the enhancement map. Set whenever the net HAS
+    # one, so val/S and collapse/* are logged even at s_weight = 0.
+    s_src = None
+    if getattr(net, "s_mode", None) is not None:
+        s_src = s_src_idx if s_src_idx is not None else getattr(net, "prior_idx", None)
+    if s_weight:
+        if s_src is None:
+            raise ValueError(f"s_weight={s_weight} needs a model with an enhancement map "
+                             f"(s_mode 'free' or 'gate'); got {type(net).__name__}.")
+        print(f"[synthesis] enhancement-map term: {s_weight} * MSE(S_hat, (CT1 - X[:, {s_src}])_+)")
     if backward_weight and not hasattr(net, "back"):
         raise ValueError(f"backward_weight={backward_weight} needs a model with a backward map "
                          f"(model.type CycleSynth); got {type(net).__name__}")
@@ -386,6 +412,11 @@ def train_synthesis(
                     bwd = backward_term(net, X, y, organ_mask, use_mask, cycle_loss_type)
                     loss = loss + backward_weight * bwd
                     step_bwd = step_bwd + bwd.detach() / accum_steps
+                if s_weight:
+                    # the S map of THIS forward against (CT1 - T1)_+; `y` is the true CT1 even
+                    # in residual mode
+                    t1 = anchor_channel(X, s_src)
+                    loss = loss + s_weight * enhancement_loss(net, y, t1, organ_mask, use_mask)
 
                 (loss / accum_steps).backward()
                 step_loss = step_loss + loss.detach() / accum_steps
@@ -479,6 +510,8 @@ def train_synthesis(
                     agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0,
                                 "resid_ratio": 0.0})
                 n_samples = 0
+                s_last, collapse = None, CollapseMeter()   # enhancement map: the val/S panel
+                                                           # and the collapse/* indicators
                 with torch.no_grad():
                     for Xv, yv, organ_maskv, etv in val_loader:
                         Xv = Xv.to(device, non_blocking=True)
@@ -516,6 +549,13 @@ def train_synthesis(
                                                         cycle_loss_type))
                             mets["backward"] = bwd_v
                             mets["loss"] += backward_weight * bwd_v
+                        # the S map of THIS forward; reported, never added to val/loss
+                        s_last = getattr(net, "last_S", None) if s_src is not None else None
+                        if s_last is not None:
+                            # x_hat = the CT1 estimate (in residual mode pv is CT1 - src)
+                            collapse.add(net, pv + src_v if residual_mode else pv, yv,
+                                         anchor_channel(Xv, s_src),
+                                         organ_maskv if use_mask else None)
                         for k in agg:
                             if k in mets:
                                 agg[k] += mets[k] * bs
@@ -581,6 +621,14 @@ def train_synthesis(
                             caption=f"residual (T1ce - T1): GT | Pred | ET mask  "
                                     f"[bwr, white=0, ±{float(vmax):.3f}] "
                                     f"rms(pred)/rms(gt)={rr:.3f}")
+
+                    if s_last is not None:
+                        s_rgb, s_cap = enhancement_panel(
+                            s_last, yv, anchor_channel(Xv, s_src),
+                            organ_maskv if use_mask else None)
+                        log["val/S"] = wandb_image(vutils.make_grid(
+                            orient_tensor(s_rgb, display_orient), nrow=3), caption=s_cap)
+                        log.update({f"collapse/{k}": v for k, v in collapse.result(net).items()})
 
                     wandb.log(log, step=global_step)
                     # Parameter values ride the VALIDATION cadence: walking the model costs a

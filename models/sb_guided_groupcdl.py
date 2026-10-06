@@ -77,6 +77,7 @@ import torch.nn.functional as F
 
 from models.base import set_weight
 from models.components import Conv2d, ConvTranspose2d
+from models.enhancement import EnhancementCoupling, step_logit
 from models.guided_cdl import make_guided_lista_layer, tie_attention
 from models.guided_prox import as_guide_list
 from models.sb_schedule import BridgeScheduleMixin, horner as _horner
@@ -102,6 +103,13 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
     deg_tau    degree of the threshold polynomial in s_hat = sigma_eff / max(sigma_eff).
     kind, tau, n_points, beta_max
                the bridge schedule -- MUST match cfg["i2sb"].
+    s_mode, bridge_fidelity, gate_init
+               the shared-code enhancement map, exactly as in SBCDLNet (see its docstring and
+               models/enhancement.py): s_mode "free" | "gate" replaces the prior channel's
+               dictionary with a learned data-consistency term through S, adds the step xi, and
+               stores `last_S`; bridge_fidelity=False drops the target term. Under
+               `task: synthesis` the call is net(X) with X = [cond..., guides...] -- the guides
+               are split off and routed to the prox, never into a fidelity.
     """
 
     def __init__(self, K=30, M=169, C=2, P=7, s=2, Mh=64,
@@ -111,8 +119,13 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
                  flex_block_size=128, share_attention=True,
                  prior_idx=0, t0=1e-3, deg_eta=0, deg_tau=1,
                  kind="brownian", tau=0.19, n_points=1000, beta_max=0.3,
-                 spectral_init=True, init=None):
+                 spectral_init=True, init=None,
+                 s_mode=None, bridge_fidelity=True, gate_init=0.0):
         super().__init__()
+        if not bridge_fidelity and s_mode is None:
+            raise ValueError("bridge_fidelity=False leaves only the learned data consistency, "
+                             "which needs s_mode='free' or 'gate'.")
+        self.s_mode, self.bridge_fidelity = s_mode, bool(bridge_fidelity)
         if C < 2:
             raise ValueError(
                 f"SBGuidedGroupCDL needs the bridge prior x_1 as a conditioning channel, so "
@@ -153,23 +166,41 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
         self.share_attention = bool(share_attention)
 
         # ---- prior-domain pair (the conditioning stack) ----
-        self.A_P = nn.ModuleList([Conv2d(n_cond, M, P, stride=s, bias=False, complex=False)
-                                  for _ in range(self.K)])
-        self.B_P = nn.ModuleList([ConvTranspose2d(M, n_cond, P, stride=s, bias=False,
+        # With an S model the prior channel is explained by (target dictionary, S), so this pair
+        # covers the SIDE channels only and is empty when there are none.
+        self.side_idx = [i for i in range(n_cond) if s_mode is None or i != self.prior_idx]
+        self.n_p = n_p = len(self.side_idx)
+        n_layers_p = self.K if n_p else 0
+        self.A_P = nn.ModuleList([Conv2d(n_p, M, P, stride=s, bias=False, complex=False)
+                                  for _ in range(n_layers_p)])
+        self.B_P = nn.ModuleList([ConvTranspose2d(M, n_p, P, stride=s, bias=False,
                                                   complex=False)
-                                  for _ in range(self.K)])
-        W = torch.randn(M, n_cond, P, P)
-        for k in range(self.K):
-            set_weight(self.A_P[k], W)
-            set_weight(self.B_P[k], W.conj())
-        if spectral_init:
-            self._spectral_init_prior()
+                                  for _ in range(n_layers_p)])
+        if n_p:
+            W = torch.randn(M, n_p, P, P)
+            for k in range(self.K):
+                set_weight(self.A_P[k], W)
+                set_weight(self.B_P[k], W.conj())
+            if spectral_init:
+                self._spectral_init_prior()
+
+        self.coupling = None
+        if s_mode is not None:
+            self.coupling = EnhancementCoupling(s_mode, self.K, M, self.layers[0].analysis,
+                                                self.layers[0].synthesis, gate_init=gate_init)
+        self.last_S = self.last_density = None
 
         # ---- bridge steps, identical parameterization to SBGroupCDL ----
         # sigmoid(0) = 0.5 on each of the two fidelities: the combined-step analogue of a single
         # unit ISTA step (each pair is spectrally normalized to a unit step).
         self.a_eta = nn.Parameter(torch.zeros(self.K, deg_eta + 1))
         self.a_nu = nn.Parameter(torch.zeros(self.K, deg_eta + 1))
+        if s_mode is not None:
+            self.a_xi = nn.Parameter(torch.zeros(self.K, deg_eta + 1))
+            start = step_logit(int(self.bridge_fidelity) + 1 + int(n_p > 0))
+            with torch.no_grad():
+                for a in (self.a_eta, self.a_nu, self.a_xi):
+                    a[:, 0] = start
 
         self._init_bridge_tables(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max)
 
@@ -177,7 +208,7 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
     @torch.no_grad()
     def _spectral_init_prior(self):
         L = power_method(lambda x: self.B_P[0](self.A_P[0](x)),
-                         torch.rand(1, self.n_cond, 128, 128),
+                         torch.rand(1, self.n_p, 128, 128),
                          num_iter=200, verbose=False)[0]
         scale = float(np.sqrt(np.abs(L)))
         for k in range(self.K):
@@ -215,6 +246,8 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
     # -----------------------------------------------------------------
     def forward(self, y, E=None, sigma=None, step=None, guide=None):
         """`y = cat([x_t, cond])` as sb.base.predict_x0 builds it. `E` is ignored. -> (x0_hat, z)"""
+        if self.s_mode is not None:
+            return self._forward_s(y, sigma, step, guide)
         r, c, dc, pad, mu0, s_log, s_hat = self.bridge_inputs(y, sigma=sigma, step=step)
         guides = self._prep_guides(guide, pad, r)
 
@@ -235,25 +268,80 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
         return x0_hat, z
 
     # -----------------------------------------------------------------
+    def _forward_s(self, y, sigma, step, guide):
+        """The shared-code enhancement-map layer (see SBCDLNet._forward_s), with the guided prox:
+
+            u = z - eta g_D - xi g_y - nu g_P ;   z = GT( u ; guides, tau )
+
+        Under `task: synthesis` (no sigma/step, bridge_fidelity=False) the input is
+        [cond..., guides...]: the trailing planes are the guides.
+        """
+        if self.bridge_fidelity:
+            r, c, dc, pad, mu0, s_log, s_hat = self.bridge_inputs(y, sigma=sigma, step=step)
+        else:
+            if sigma is None and step is None:
+                cond, extra = y[:, :self.n_cond], y[:, self.n_cond:]
+                if extra.shape[1]:
+                    if guide is not None:
+                        raise ValueError("guides were given both as trailing input channels and "
+                                         "as `guide=`; pass them one way.")
+                    guide = extra
+            else:
+                cond = y[:, 1:]                    # x_t is present and deliberately unread
+            c, dc, pad, s_log, s_hat = self.static_inputs(cond)
+            r = mu0 = None
+        y_meas = c[:, self.prior_idx:self.prior_idx + 1]
+        c_side = c[:, self.side_idx] if self.n_p else None
+        guides = self._prep_guides(guide, pad, y_meas)
+
+        z = torch.zeros_like(self.layers[0].analysis(y_meas))
+        cache = {}
+        for k, layer in enumerate(self.layers):
+            A, B = layer.analysis, layer.synthesis
+            xi = torch.sigmoid(_horner(self.a_xi[k], s_log))
+            u = z - xi * self.coupling.meas_grad(k, A, B, z, y_meas)
+            if self.bridge_fidelity:
+                eta = torch.sigmoid(_horner(self.a_eta[k], s_log))
+                u = u - eta * (mu0 * A(mu0 * B(z) - r))
+            if self.n_p:
+                nu = torch.sigmoid(_horner(self.a_nu[k], s_log))
+                u = u - nu * self.A_P[k](self.B_P[k](z) - c_side)
+            v = layer.analyse_guides(guides) if guides else None
+            z, cache = layer.prox(u, v, s_hat, cache)
+
+        B0 = self.layers[0].synthesis
+        x0_hat = unpad(B0(z), pad) + dc
+        self.last_S = unpad(self.coupling.decode(B0, z), pad)
+        self.last_density = (z.detach() != 0).float().mean()
+        return x0_hat, z
+
+    # -----------------------------------------------------------------
     @torch.no_grad()
     def project(self):
+        if self.coupling is not None:
+            self.coupling.project()
         for layer in self.layers:
             layer.project_()               # unit-ball filters + the prox's tau/gamma/rho/Wbeta
             # re-floor the threshold's CONSTANT term: the prox clamps it at 0, and 0 kills the
             # attention gradient permanently (module docstring).
             layer.prox.tau.weight.data[0].clamp_(min=self.t_floor)
-        for k in range(self.K):
-            set_weight(self.A_P[k], uball_project(self.A_P[k].weight))
-            set_weight(self.B_P[k], uball_project(self.B_P[k].weight))
+        for a, b in zip(self.A_P, self.B_P):       # empty with no side channels
+            set_weight(a, uball_project(a.weight))
+            set_weight(b, uball_project(b.weight))
 
     @torch.no_grad()
     def param_logs(self, probes=(0.0, 0.5, 1.0)):
         """Derived step sizes and threshold at a few bridge positions (see BridgeScheduleMixin)."""
-        return self._sb_param_logs({
+        curves = {
             "eta": lambda sl, sh: [torch.sigmoid(_horner(self.a_eta[j], sl)) for j in range(self.K)],
             "nu": lambda sl, sh: [torch.sigmoid(_horner(self.a_nu[j], sl)) for j in range(self.K)],
             "tau": lambda sl, sh: [self.layers[j].prox.tau(sh, ref=sh) for j in range(self.K)],
-        }, probes=probes)
+        }
+        if self.coupling is not None:
+            curves["xi"] = lambda sl, sh: [torch.sigmoid(_horner(self.a_xi[j], sl))
+                                           for j in range(self.K)]
+        # the coupling's collapse indicators are logged under `collapse/` by the trainers
+        return self._sb_param_logs(curves, probes=probes)
 
     def extra_repr(self):
         return (f"K={self.K}, M={self.M}, C={self.C}, s={self.s}, n_cond={self.n_cond}, "

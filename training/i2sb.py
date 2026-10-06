@@ -46,6 +46,7 @@ from training.losses import (LOSS_REGISTRY, POINTWISE_REGISTRY, LOSS_PARAM_KEYS,
                             weighted_loss, vgg_mse_balance)
 from training.metrics import compute_metrics
 from sb.base import build_schedule, n_steps, forward_sample, forward_std, predict_x0
+from models.enhancement import enhancement_loss, enhancement_panel, CollapseMeter
 from sb.i2sb import i2sb_sample
 from visualization.filters import get_filter_grids
 from visualization.params import get_param_logs
@@ -291,6 +292,12 @@ def train_i2sb(
     val_seed=None,
     val_nfe=20,                      # only used when val_mode == "full_recon"
     target_channels=1,
+    s_weight=0.0,                    # > 0 adds s_weight * MSE(S_hat, (x0 - x1)_+): direct
+                                     # supervision of the enhancement map of a net with
+                                     # s_mode "free"/"gate" (models/enhancement.py). TRAIN term
+                                     # only -- val/loss stays the x0 loss, so runs with and
+                                     # without it remain comparable. Validation logs the val/S
+                                     # image and the collapse/* indicators (CollapseMeter).
     learned_dc=None,                 # {"ckpt": ..., "sigma_E": null|float, "feed_cond": false}:
                                      # a frozen learned operator E supplies data consistency and the
                                      # net gets a nonlinear operator instead of Identity(). See
@@ -438,6 +445,9 @@ def train_i2sb(
                 loss = _bridge_loss(loss_fn, loss_type, x0, pred_x0, mask, use_mask, et,
                                     et_weight, std_fwd, loss_weight, loss_params,
                                     loss_weight_max=loss_weight_max)
+                if s_weight:
+                    # the S map of THIS forward, against the one-sided difference
+                    loss = loss + s_weight * enhancement_loss(net, x0, x1, mask, use_mask)
 
                 (loss / accum_steps).backward()
                 step_loss = step_loss + loss.detach() / accum_steps
@@ -641,6 +651,8 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
                                  # batches contain little or no tumor, so a mean of per-batch
                                  # ET-PSNRs would be dominated by the emptiest ones
     last = None
+    s_last, collapse = None, CollapseMeter()   # enhancement map (nets with s_mode): the val/S
+                                               # panel and the collapse/* indicators
     if val_seed is not None:
         gen = torch.Generator(device=device).manual_seed(val_seed)   # fixed val steps -> comparable
     else:
@@ -674,6 +686,10 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
 
         x0_m, pred_m = apply_loss_mask(x0, pred, mask, use_mask)
         mets = compute_metrics(x0_m, pred_m, psnr_only=psnr_only, data_range=data_range)
+        # The S map of the forward that produced `pred` (full_recon: of its LAST sampler step).
+        # Reported but never added to val/loss, which stays the x0 loss.
+        s_last = getattr(net, "last_S", None)
+        collapse.add(net, pred, x0, x1, mask if use_mask else None)     # no-op without an S map
         if val_lpips:
             v = _val_lpips_sum(x0_m, pred_m)
             if v is not None:
@@ -729,6 +745,15 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         # on the [-1, 1] scale the window assumes (rescale `scales`), while grid_mean ~ 0 with
         # clip_frac ~ 0 means the mask is empty. Cheap scalars, logged every validation.
         inb = x0_m[:1][mask[:1] > 0.5]
+        if s_last is not None:
+            # same sample as val/example; at a single_pass step this is S at THAT bridge step
+            s_rgb, s_cap = enhancement_panel(s_last, x0_u, x1, mask if show_masked else None)
+            if step is not None:
+                s_cap += f"  (step={int(step[0])})"
+            wandb.log({"val/S": wandb_image(vutils.make_grid(
+                orient_tensor(s_rgb, display_orient), nrow=3), caption=s_cap),
+                       **{f"collapse/{k}": v for k, v in collapse.result(net).items()}},
+                      step=global_step)
         wandb.log({
             "val/example": wandb_image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
             "val/residual": wandb_image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),

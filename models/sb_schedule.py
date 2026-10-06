@@ -181,6 +181,23 @@ class BridgeScheduleMixin:
     # logging hook (visualization/params.py picks `param_logs` up automatically)
     # -----------------------------------------------------------------
     @torch.no_grad()
+    def static_inputs(self, cond):
+        """`bridge_inputs` without a bridge: for a net run on the conditioning stack alone.
+
+        Returns (c, dc, pad, s_log, s_hat) with the SAME DC convention as `bridge_inputs` (the
+        prior's mean, re-added at readout). s_log = s_hat = 0: there is no noise level, so the
+        step and threshold polynomials reduce to their constant terms."""
+        if cond.shape[1] != self.n_cond:
+            raise ValueError(
+                f"expected {self.n_cond} conditioning channel(s) (C={self.C}), got {cond.shape[1]}")
+        x1 = cond[:, self.prior_idx:self.prior_idx + 1]
+        dc = x1.mean(dim=(1, 2, 3), keepdim=True)
+        c = cond - cond.mean(dim=(2, 3), keepdim=True)
+        pad = calc_pad_2d(*c.shape[2:], self.s)
+        c = F.pad(c, pad, mode="reflect")
+        zero = cond.new_zeros(cond.shape[0], 1, 1, 1)
+        return c, dc, pad, zero, zero
+
     def _sb_param_logs(self, curves, probes=(0.0, 0.5, 1.0)):
         """Summarize the DERIVED per-layer quantities at a few bridge positions.
 
