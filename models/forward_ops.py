@@ -20,6 +20,14 @@ Kinds, lightest first (receptive field in brackets):
     conv     k x k convs, depth layers of width      [depth*(k-1)+1]  local nonlinear map
     unet     small UNet: `levels` 2x downsamplings,   [grows ~2^levels]  multi-scale nonlinear map
              `convs` 3x3 convs per stage, channels width * min(2^level, max_mult)
+
+Conditionally LINEAR kinds -- affine in x for fixed side information c, exact adjoint, no autograd:
+    gain     E(x; c) = a(c) * x + k * x + b(c)             a per-pixel gain map from a UNet over c
+    kfilter  E(x; c) = sum_j a_j(c) * (B_j x) + b(c)       a TRANSFER FUNCTION sampled on `bands`
+             radial k-space bands B_j (a fixed partition of unity). With cond_channels > 0 a UNet
+             over c predicts one gain map per band -- a spatially varying transfer function; with
+             cond_channels = 0 the a_j are `bands` learned scalars -- ONE global radial transfer
+             function, the direct k-space analogue of `linear`. bands = 1 is exactly `gain`.
 """
 
 import torch
@@ -27,13 +35,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-KINDS = ("affine", "linear", "mlp", "conv", "unet", "gain")
+KINDS = ("affine", "linear", "mlp", "conv", "unet", "gain", "kfilter")
+CLOSED_FORM = ("gain", "kfilter")       # data_grad = A^T (A x + b - y), no autograd
 
 
 def _act(act):
     # smooth on purpose: training THROUGH data_grad differentiates the VJP again, and ReLU's
     # second derivative is zero almost everywhere
     return nn.SiLU() if act == "silu" else nn.GELU()
+
+
+def radial_bands(H, W, n, device=None, dtype=torch.float32):
+    """(n, H, W // 2 + 1) real weights on the rfft2 grid: a partition of unity over |k|.
+
+    Hat functions, linear in |k| (cycles / pixel), on OCTAVE-spaced nodes
+        0, 0.5 / 2^(n-2), ..., 0.125, 0.25, 0.5
+    because image energy is concentrated at low |k|. Band 0 is the DC-centred low-pass; the last
+    band stays 1 beyond Nyquist (the corners of the square grid). The nodes are in cycles / pixel,
+    so the bands mean the same thing at every frame size. Real and even in k, so each
+    B_j = irfft2(beta_j * rfft2(.)) is a real, SELF-ADJOINT circular convolution."""
+    fy = torch.fft.fftfreq(H, device=device, dtype=dtype)
+    fx = torch.fft.rfftfreq(W, device=device, dtype=dtype)
+    r = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
+    if n == 1:
+        return torch.ones_like(r)[None]
+    nodes = [0.0] + [0.5 * 2.0 ** (j - (n - 1)) for j in range(1, n)]
+    beta = r.new_zeros(n, *r.shape)
+    for i in range(n - 1):
+        lo, hi = nodes[i], nodes[i + 1]
+        inside = ((r >= lo) & (r < hi)).to(dtype)
+        t = (r - lo) / (hi - lo)
+        beta[i] += inside * (1 - t)
+        beta[i + 1] += inside * t
+    beta[n - 1] += (r >= nodes[-1]).to(dtype)
+    return beta
 
 
 def _stage(c_in, c_out, convs, act):
@@ -103,7 +138,8 @@ class ForwardOp(nn.Module):
     """
 
     def __init__(self, kind="conv", width=16, depth=3, kernel=3, act="silu", residual=True,
-                 levels=3, convs=2, max_mult=8, cond_channels=0, use_x=True, gain_kernel=0):
+                 levels=3, convs=2, max_mult=8, cond_channels=0, use_x=True, gain_kernel=0,
+                 bands=4, offset=True):
         super().__init__()
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
@@ -117,6 +153,34 @@ class ForwardOp(nn.Module):
         self.kind, self.residual = kind, bool(residual)
         in_ch = int(self.use_x) + self.cond_channels
         self.lin = None
+        self.bands, self.offset = (int(bands) if kind == "kfilter" else 1), bool(offset)
+        self._beta = {}
+
+        if kind == "kfilter":
+            # CONDITIONALLY LINEAR:  E(x; c) = sum_j a_j * (B_j x) + b,   sum_j B_j = I
+            # The gains a_j are the transfer function, sampled on `bands` radial k-space bands.
+            #   cond_channels > 0   a UNet over c emits one gain MAP per band (+ an offset map):
+            #                       a transfer function that varies over the image
+            #   cond_channels = 0   `bands` learned scalars (+ a scalar offset): one global radial
+            #                       transfer function, no network at all
+            # Either way E is affine in x with the exact adjoint  A^T u = sum_j B_j (a_j * u).
+            # offset=False drops b: with no additive path, E cannot synthesise T1 from c alone.
+            if not self.use_x:
+                raise ValueError("kind='kfilter' needs use_x=True")
+            if self.bands < 1:
+                raise ValueError(f"bands must be >= 1, got {bands}")
+            self.residual = False                  # identity start: a_j = 1 + da_j, da_j = 0
+            if self.cond_channels:
+                self.net = SmallUNet(width=width, levels=levels, convs=convs, max_mult=max_mult,
+                                     act=act, in_channels=self.cond_channels,
+                                     out_channels=self.bands + int(self.offset))
+                nn.init.zeros_(self.net.out.weight)
+                nn.init.zeros_(self.net.out.bias)
+            else:
+                self.net = None
+                self.band_gain = nn.Parameter(torch.zeros(self.bands))
+                self.bias = nn.Parameter(torch.zeros(1)) if self.offset else None
+            return
 
         if kind == "gain":
             # CONDITIONALLY LINEAR:  E(x; c) = a(c) * x + k * x + b(c)
@@ -186,26 +250,54 @@ class ForwardOp(nn.Module):
     @property
     def linear_in_x(self):
         """True when E is affine in x for fixed side information, so `adjoint` exists exactly."""
-        return self.kind in ("affine", "linear", "gain")
+        return self.kind in ("affine", "linear") + CLOSED_FORM
 
-    # ---- kind="gain": the pieces an unrolled net needs, with the UNet run ONCE ----------------
-    def coeffs(self, c):
-        """(a, b) for this batch. Call once per image; reuse across every unrolled sweep."""
+    # ---- gain / kfilter: the pieces an unrolled net needs, with the UNet run ONCE -------------
+    def coeffs(self, c=None):
+        """(a, b) for this batch. Call once per image; reuse across every unrolled sweep.
+        gain: a (B,1,H,W). kfilter: a (B,bands,H,W), or (1,bands,1,1) for the global filter."""
+        if self.kind == "kfilter":
+            J = self.bands
+            if self.net is None:
+                return 1.0 + self.band_gain.view(1, J, 1, 1), (self.bias if self.offset else 0.0)
+            out = self.net(c)
+            return 1.0 + out[:, :J], (out[:, J:J + 1] if self.offset else 0.0)
         out = self.net(c)
         return 1.0 + out[:, :1], out[:, 1:2]
 
+    def _bands(self, x):
+        key = (x.shape[-2], x.shape[-1], x.device, x.dtype)
+        if key not in self._beta:
+            self._beta[key] = radial_bands(x.shape[-2], x.shape[-1], self.bands, x.device, x.dtype)
+        return self._beta[key]
+
+    def split(self, x):
+        """(B,1,H,W) -> (B,bands,H,W): x filtered into each radial band. The bands sum to x."""
+        return torch.fft.irfft2(torch.fft.rfft2(x) * self._bands(x), s=x.shape[-2:])
+
+    def merge(self, v):
+        """split's adjoint, (B,bands,H,W) -> (B,1,H,W): filter each channel by its band, sum."""
+        V = (torch.fft.rfft2(v) * self._bands(v)).sum(1, keepdim=True)
+        return torch.fft.irfft2(V, s=v.shape[-2:])
+
     def apply_linear(self, x, a):
-        """The LINEAR part A x = a * x + k * x (no offset)."""
+        """The LINEAR part A x (no offset): a * x + k * x, or sum_j a_j * (B_j x)."""
+        if self.kind == "kfilter":
+            return (a * self.split(x)).sum(1, keepdim=True)
         return a * x if self.lin is None else a * x + self.lin(x)
 
     def adjoint(self, u, a):
-        """A^T u = a * u + k^T * u -- exact, no autograd."""
+        """A^T u -- exact, no autograd: a * u + k^T * u, or sum_j B_j (a_j * u)."""
+        if self.kind == "kfilter":
+            return self.merge(a * u)
         if self.lin is None:
             return a * u
         return a * u + F.conv_transpose2d(u, self.lin.weight, padding=self.lin.padding)
 
     @property
     def receptive_field(self):
+        if self.kind == "kfilter":              # a k-space filter spans the frame: 0 = global
+            return 1 if self.bands == 1 else 0
         if self.kind == "gain":                 # w.r.t. x; the gain UNet's own field is over c
             return 1 if self.lin is None else self.lin.kernel_size[0]
         if self.kind == "unet":
@@ -213,8 +305,8 @@ class ForwardOp(nn.Module):
         return 1 + sum(m.kernel_size[0] - 1 for m in self.net if isinstance(m, nn.Conv2d))
 
     def forward(self, x, c=None):
-        if self.kind == "gain":
-            if c is None or c.shape[1] != self.cond_channels:
+        if self.kind in CLOSED_FORM:
+            if self.cond_channels and (c is None or c.shape[1] != self.cond_channels):
                 got = None if c is None else c.shape[1]
                 raise ValueError(f"operator expects {self.cond_channels} cond channel(s), got {got}")
             a, b = self.coeffs(c)
@@ -238,7 +330,7 @@ class ForwardOp(nn.Module):
         """
         if not self.use_x:                    # E(c) does not see x: the x-gradient is exactly zero
             return torch.zeros_like(x)
-        if self.kind == "gain":
+        if self.kind in CLOSED_FORM:
             # closed form: A^T (A x + b - y). No autograd.grad, so training through it builds an
             # ordinary first-order graph. create_graph=False keeps the old contract: a plain
             # tensor with x treated as a leaf.

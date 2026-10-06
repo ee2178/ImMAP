@@ -9,7 +9,12 @@
         {"name": "gain_w8_l3_k5",   "kind": "gain", "width": 8,  "levels": 3, "convs": 2, "cond_channels": 2, "gain_kernel": 5},
         {"name": "gain_w16_l3",     "kind": "gain", "width": 16, "levels": 3, "convs": 2, "cond_channels": 2},
         {"name": "gain_w16_l3_k5",  "kind": "gain", "width": 16, "levels": 3, "convs": 2, "cond_channels": 2, "gain_kernel": 5},
-        {"name": "unet_w8_l3_x",    "kind": "unet", "width": 8,  "levels": 3, "convs": 2},
+        {"name": "kfilter_global_j8",    "kind": "kfilter", "bands": 8},
+        {"name": "kfilter_w8_l3_j4",     "kind": "kfilter", "bands": 4, "width": 8,  "levels": 3, "convs": 2, "cond_channels": 2},
+        {"name": "kfilter_w8_l3_j8",     "kind": "kfilter", "bands": 8, "width": 8,  "levels": 3, "convs": 2, "cond_channels": 2},
+        {"name": "kfilter_w16_l3_j8",    "kind": "kfilter", "bands": 8, "width": 16, "levels": 3, "convs": 2, "cond_channels": 2},
+        {"name": "kfilter_w8_l3_j8_nob", "kind": "kfilter", "bands": 8, "width": 8,  "levels": 3, "convs": 2, "cond_channels": 2, "offset": false},
+        {"name": "unet_w8_l3_x",   "kind": "unet", "width": 8,  "levels": 3, "convs": 2},
         {"name": "unet_w8_l3_xc",   "kind": "unet", "width": 8,  "levels": 3, "convs": 2, "cond_channels": 2},
         {"name": "unet_w16_l3_xc",  "kind": "unet", "width": 16, "levels": 3, "convs": 2, "cond_channels": 2},
         {"name": "unet_w8_l3_c",    "kind": "unet", "width": 8,  "levels": 3, "convs": 2, "cond_channels": 2, "use_x": false}
