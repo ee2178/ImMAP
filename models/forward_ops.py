@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-KINDS = ("affine", "linear", "mlp", "conv", "unet")
+KINDS = ("affine", "linear", "mlp", "conv", "unet", "gain")
 
 
 def _act(act):
@@ -49,7 +49,8 @@ class SmallUNet(nn.Module):
     2x2 convs down, transposed 2x2 convs up, concatenating skips, zero-initialised 1x1 readout.
     Any H, W: the input is replicate-padded to a multiple of 2^levels and the output cropped."""
 
-    def __init__(self, width=16, levels=3, convs=2, max_mult=8, act="silu", in_channels=1):
+    def __init__(self, width=16, levels=3, convs=2, max_mult=8, act="silu", in_channels=1,
+                 out_channels=1):
         super().__init__()
         if levels < 1 or convs < 1:
             raise ValueError("unet needs levels >= 1 and convs >= 1")
@@ -61,7 +62,7 @@ class SmallUNet(nn.Module):
         self.up = nn.ModuleList(nn.ConvTranspose2d(ch[l + 1], ch[l], 2, stride=2)
                                 for l in range(levels))
         self.dec = nn.ModuleList(_stage(2 * ch[l], ch[l], convs, act) for l in range(levels))
-        self.out = nn.Conv2d(ch[0], 1, 1)
+        self.out = nn.Conv2d(ch[0], out_channels, 1)
 
     @property
     def receptive_field(self):
@@ -102,7 +103,7 @@ class ForwardOp(nn.Module):
     """
 
     def __init__(self, kind="conv", width=16, depth=3, kernel=3, act="silu", residual=True,
-                 levels=3, convs=2, max_mult=8, cond_channels=0, use_x=True):
+                 levels=3, convs=2, max_mult=8, cond_channels=0, use_x=True, gain_kernel=0):
         super().__init__()
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
@@ -115,6 +116,32 @@ class ForwardOp(nn.Module):
             raise ValueError(f"{kind} is 1 -> 1; conditioning needs kind mlp/conv/unet")
         self.kind, self.residual = kind, bool(residual)
         in_ch = int(self.use_x) + self.cond_channels
+        self.lin = None
+
+        if kind == "gain":
+            # CONDITIONALLY LINEAR:  E(x; c) = a(c) * x + k * x + b(c)
+            # A UNet reads the side information ONLY and emits a gain map a and an offset map b;
+            # `k` is an optional shift-invariant conv (gain_kernel > 1). Given c, E is affine in x,
+            # so it has an EXACT adjoint -- a * u + k^T * u -- and its data gradient needs no
+            # autograd and carries no second-order term when an unrolled net trains through it.
+            # The UNet runs once per image, not once per unrolled sweep.
+            # What it gives up: a(c) never sees x, so it can only dim enhancement that the side
+            # information reveals. The x_swap guard still applies -- b(c) alone can synthesise T1.
+            if not self.cond_channels or not self.use_x:
+                raise ValueError("kind='gain' needs cond_channels > 0 (the gain is predicted from "
+                                 "the side information) and use_x=True")
+            self.residual = False                  # identity start comes from a = 1 + da, da = 0
+            self.net = SmallUNet(width=width, levels=levels, convs=convs, max_mult=max_mult,
+                                 act=act, in_channels=self.cond_channels, out_channels=2)
+            nn.init.zeros_(self.net.out.weight)
+            nn.init.zeros_(self.net.out.bias)
+            if gain_kernel and gain_kernel > 1:
+                if gain_kernel % 2 == 0:
+                    raise ValueError(f"gain_kernel must be odd, got {gain_kernel}")
+                # ZERO padding, not replicate: conv_transpose2d is then its exact adjoint
+                self.lin = nn.Conv2d(1, 1, gain_kernel, padding=gain_kernel // 2, bias=False)
+                nn.init.zeros_(self.lin.weight)
+            return
 
         if kind == "unet":
             if not self.residual and self.use_x:
@@ -157,12 +184,41 @@ class ForwardOp(nn.Module):
         return self.kind in ("affine", "linear")
 
     @property
+    def linear_in_x(self):
+        """True when E is affine in x for fixed side information, so `adjoint` exists exactly."""
+        return self.kind in ("affine", "linear", "gain")
+
+    # ---- kind="gain": the pieces an unrolled net needs, with the UNet run ONCE ----------------
+    def coeffs(self, c):
+        """(a, b) for this batch. Call once per image; reuse across every unrolled sweep."""
+        out = self.net(c)
+        return 1.0 + out[:, :1], out[:, 1:2]
+
+    def apply_linear(self, x, a):
+        """The LINEAR part A x = a * x + k * x (no offset)."""
+        return a * x if self.lin is None else a * x + self.lin(x)
+
+    def adjoint(self, u, a):
+        """A^T u = a * u + k^T * u -- exact, no autograd."""
+        if self.lin is None:
+            return a * u
+        return a * u + F.conv_transpose2d(u, self.lin.weight, padding=self.lin.padding)
+
+    @property
     def receptive_field(self):
+        if self.kind == "gain":                 # w.r.t. x; the gain UNet's own field is over c
+            return 1 if self.lin is None else self.lin.kernel_size[0]
         if self.kind == "unet":
             return self.net.receptive_field
         return 1 + sum(m.kernel_size[0] - 1 for m in self.net if isinstance(m, nn.Conv2d))
 
     def forward(self, x, c=None):
+        if self.kind == "gain":
+            if c is None or c.shape[1] != self.cond_channels:
+                got = None if c is None else c.shape[1]
+                raise ValueError(f"operator expects {self.cond_channels} cond channel(s), got {got}")
+            a, b = self.coeffs(c)
+            return self.apply_linear(x, a) + b
         if self.cond_channels:
             if c is None or c.shape[1] != self.cond_channels:
                 got = None if c is None else c.shape[1]
@@ -182,6 +238,17 @@ class ForwardOp(nn.Module):
         """
         if not self.use_x:                    # E(c) does not see x: the x-gradient is exactly zero
             return torch.zeros_like(x)
+        if self.kind == "gain":
+            # closed form: A^T (A x + b - y). No autograd.grad, so training through it builds an
+            # ordinary first-order graph. create_graph=False keeps the old contract: a plain
+            # tensor with x treated as a leaf.
+            def g():
+                a, b = self.coeffs(None if c is None else c.detach())
+                return self.adjoint(self.apply_linear(x, a) + b - y, a)
+            if create_graph:
+                return g()
+            with torch.no_grad():
+                return g()
         with torch.enable_grad():
             xin = x if (create_graph and x.requires_grad) else x.detach().requires_grad_(True)
             cin = None if c is None else c.detach()
