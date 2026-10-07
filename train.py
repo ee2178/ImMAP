@@ -17,6 +17,7 @@ from training import (
     train_dt_synthesis,
     train_i2sb,
     train_latent_i2sb,
+    train_unsb,
     train_forward_op,
 )
 from training.common import load_ckpt, load_ckpt_meta, write_config
@@ -422,6 +423,25 @@ def main(config_path):
             **cfg["dicts"],
             **train_kws,
             **cfg["i2sb"],
+            **cfg["paths"],
+            )
+    elif task == "unsb":
+        # Unpaired Neural SB (sb/unsb.py). `model` is the generator G; the discriminator, entropy
+        # critic and PatchNCE head are built inside the loop from cfg["unsb"].
+        steps_per_epoch = cfg["training"]["steps_per_epoch"]
+
+        train_unsb(
+            net=model,
+            opt=optimizer,
+            sched=scheduler,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            wandb=wandb,
+            start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
+            **train_kws,
+            **cfg["unsb"],
             **cfg["paths"],
             )
     elif task == "forward_op":

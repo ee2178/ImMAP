@@ -44,6 +44,10 @@
 #   R=12 KS="2 4" N_SLICES=6      the ESPIRiT check
 #   IMG="640 320" COILS=20 REPS=30
 #   MODELS="lpdsnet varnetmaps mglpds mg121v6"
+#   COMPILE=1                     step 2 also times every net under torch.compile,
+#                                 paired with its eager timing (COMPILE=reduce-overhead
+#                                 picks a mode). Compiling can take minutes per net:
+#                                 narrow MODELS, e.g. "lpdsnet varnetmaps mg81v6"
 #   BREAKDOWN="mg169v6 mg81v6"    nets for step 3 (default: MODELS minus VarNet)
 #   OPS=1                         step 3 also splits "elementwise / overhead" by
 #                                 individual op, with each op's achieved
@@ -100,8 +104,14 @@ if [ -z "${SKIP_NETS:-}" ]; then
         [ -f "${f}" ] || { echo "[time] no config for '${m}' at R=${R} (${f})" >&2; exit 1; }
         CFGS+=("${f}")
     done
+    COMPILE_FLAG=""
+    case "${COMPILE:-}" in
+        "") ;;
+        1) COMPILE_FLAG="--compile" ;;
+        *) COMPILE_FLAG="--compile ${COMPILE}" ;;
+    esac
     python scripts/time_net.py --configs "${CFGS[@]}" --size ${IMG} --coils "${COILS}" \
-        --reps "${REPS}" --step --json-out "${OUT}/time_net.json" \
+        --reps "${REPS}" --step ${COMPILE_FLAG} --json-out "${OUT}/time_net.json" \
         --fig-out "${OUT}/time_net.png"
 fi
 

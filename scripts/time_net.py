@@ -30,6 +30,13 @@ one upright column per network, the forward pass with the backward pass
 stacked on top of it. --from-json redraws it from a saved --json-out without
 timing anything.
 
+--compile times every net a second time under `torch.compile`, straight after
+its eager timing on the same node, and prints the pair: the one switch that can
+be applied identically to LPDSNet, the multigrid nets and E2E-VarNet. It also
+reports what the compiler could not do (graph breaks and why), how long the
+first calls took, and whether a NEW operator of the same shape forces a
+recompile -- in training every step brings one.
+
 Settings come from each config: `training.complex_conv` (planar / gauss) and
 `model.params` (K, M, coarse_op, ...). `cudnn.benchmark` is on, as in train.py.
 Synthetic SENSE data by default -- timing depends on shapes, not values. A size
@@ -109,7 +116,13 @@ def stats(v):
                 p95=v[min(len(v) - 1, int(round(0.95 * (len(v) - 1))))], hi=v[-1])
 
 
-def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt):
+def _first_line(e, width=160):
+    msg = str(e).strip().splitlines()
+    return f"{type(e).__name__}: {msg[0] if msg else ''}"[:width]
+
+
+def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
+                compile_mode=None):
     with open(cfg_path) as f:
         cfg = json.load(f)
     mode = set_complex_mode(cfg.get("training", {}).get("complex_conv") or "gauss")
@@ -137,56 +150,167 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt):
             net.parameters(), lr=1e-4)
     clip = cfg.get("training", {}).get("clip_grad", 1.0)
 
-    def infer():
-        net.eval()
-        with torch.no_grad():
+    def measure(fwd):
+        """Time `fwd` -- the module itself, or its compiled wrapper. Mode
+        switches, gradients and the optimizer always go to `net`.
+        -> `(stats per column, peak MB, seconds spent in the first calls)`."""
+        def infer(y=y, E=E):
+            net.eval()
+            with torch.no_grad():
+                t0 = clock.now()
+                fwd(y, E=E, sigma=sigma)
+                return {"infer": clock.now() - t0}
+
+        def train_step():
+            net.train()
+            net.zero_grad(set_to_none=True)
             t0 = clock.now()
-            net(y, E=E, sigma=sigma)
-            return {"infer": clock.now() - t0}
+            recon, _ = fwd(y, E=E, sigma=sigma)
+            recon = T.forward(recon)
+            t1 = clock.now()
+            loss = loss_fn(image, recon, sigma)
+            loss.backward()
+            t2 = clock.now()
+            out = {"forward": t1 - t0, "backward": t2 - t1}
+            if opt is not None:
+                if clip is not None:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
+                opt.step()
+                t3 = clock.now()
+                if hasattr(net, "project"):
+                    net.project()
+                out.update(opt=t3 - t2, project=clock.now() - t3)
+            return out
 
-    def train_step():
-        net.train()
-        net.zero_grad(set_to_none=True)
+        # warm-up: every code path once (cuDNN autotune, lazy kernel compiles,
+        # and under torch.compile the compilation itself -- hence `first_s`)
         t0 = clock.now()
-        recon, _ = net(y, E=E, sigma=sigma)
-        recon = T.forward(recon)
-        t1 = clock.now()
-        loss = loss_fn(image, recon, sigma)
-        loss.backward()
-        t2 = clock.now()
-        out = {"forward": t1 - t0, "backward": t2 - t1}
-        if opt is not None:
-            if clip is not None:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
-            opt.step()
-            t3 = clock.now()
-            if hasattr(net, "project"):
-                net.project()
-            out.update(opt=t3 - t2, project=clock.now() - t3)
-        return out
-
-    # warm-up: every code path once (cuDNN autotune, lazy kernel compiles)
-    for _ in range(max(warmup, 1)):
         infer()
         train_step()
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats()
+        first_s = clock.now() - t0
+        for _ in range(max(warmup, 1) - 1):
+            infer()
+            train_step()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
 
-    samples = {}
-    for _ in range(reps):
-        for k, v in {**infer(), **train_step()}.items():
-            samples.setdefault(k, []).append(1e3 * v)
-    peak = torch.cuda.max_memory_allocated() / 2 ** 20 if device.type == "cuda" else float("nan")
+        samples = {}
+        for _ in range(reps):
+            for k, v in {**infer(), **train_step()}.items():
+                samples.setdefault(k, []).append(1e3 * v)
+        peak = (torch.cuda.max_memory_allocated() / 2 ** 20 if device.type == "cuda"
+                else float("nan"))
+        return {k: stats(v) for k, v in samples.items()}, peak, first_s, infer
+
+    cols, peak, first_s, _ = measure(net)
 
     p = cfg["model"]["params"]
     K = p.get("K", p.get("denoiser_kws", {}).get("K"))
     if K is None and "num_cascades" in p:
         K = f"{p['num_cascades']}casc"
-    return dict(name=os.path.splitext(os.path.basename(cfg_path))[0],
-                type=cfg["model"]["type"], K=K, M=p.get("M"), params=n_par,
-                coarse_op=p.get("coarse_op"), complex_conv=mode,
-                embedded=not T.is_identity, peak_mb=peak,
-                **{k: stats(v) for k, v in samples.items()})
+    row = dict(name=os.path.splitext(os.path.basename(cfg_path))[0],
+               type=cfg["model"]["type"], K=K, M=p.get("M"), params=n_par,
+               coarse_op=p.get("coarse_op"), complex_conv=mode,
+               embedded=not T.is_identity, peak_mb=peak, first_s=first_s, **cols)
+    if compile_mode:
+        row["compiled"] = time_compiled(net, measure, compile_mode, row,
+                                        lambda: build_problem(hw, coils, mri, R, device, seed=1))
+        print(f"  {row['name']}: " + (row["compiled"].get("error") or "compiled and timed"),
+              flush=True)
+    return row
+
+
+def time_compiled(net, measure, compile_mode, eager, new_problem):
+    """The same measurement under `torch.compile`, or `{"error": ...}`.
+
+    Two hand-written host-side shortcuts are switched OFF for this arm, because
+    the compiler cannot trace through them and would fall back to eager around
+    each one: the fused Triton prox (`SoftThreshold.FUSED`) and the planar
+    weight cache (`_GaussConvNd.PLANAR_WEIGHT_CACHE`, which reads `data_ptr`).
+    Fusing those chains is the compiler's own job.
+    """
+    from models.components import _GaussConvNd
+    from models.prox import SoftThreshold
+    from training.common import embed_for_net as _embed
+
+    saved = (SoftThreshold.FUSED, _GaussConvNd.PLANAR_WEIGHT_CACHE)
+    SoftThreshold.FUSED = _GaussConvNd.PLANAR_WEIGHT_CACHE = False
+    counters = None
+    try:
+        import torch._dynamo as dynamo
+        dynamo.reset()
+        try:
+            from torch._dynamo.utils import counters
+            counters.clear()
+        except Exception:                                   # private API: best effort
+            counters = None
+        cnet = torch.compile(net, mode=None if compile_mode == "default" else compile_mode)
+        cols, peak, first_s, infer = measure(cnet)
+        out = dict(mode=compile_mode, peak_mb=peak, first_s=first_s, **cols)
+
+        # A fresh operator of the SAME shape, as every training step and every
+        # new slice brings: does the compiled code accept it, or recompile?
+        y2, E02, image2 = new_problem()
+        E2, _ = _embed(net, E02, image2, None)
+        t_new = 1e3 * infer(y2, E2)["infer"]
+        out["new_operator_ms"] = t_new
+        out["new_operator_recompiles"] = bool(t_new > 5.0 * cols["infer"]["median"])
+
+        if counters is not None:
+            try:
+                breaks = counters["graph_break"]
+                out["graphs"] = int(counters["stats"].get("unique_graphs", 0))
+                out["graph_breaks"] = int(sum(breaks.values()))
+                out["graph_break_reasons"] = [[str(k)[:140], int(v)]
+                                              for k, v in breaks.most_common(4)]
+            except Exception:
+                pass
+        return out
+    except Exception as e:                                  # report it, time the rest
+        return dict(mode=compile_mode, error=f"torch.compile failed -- {_first_line(e)}")
+    finally:
+        SoftThreshold.FUSED, _GaussConvNd.PLANAR_WEIGHT_CACHE = saved
+        try:
+            import torch._dynamo as dynamo
+            dynamo.reset()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def print_compiled(rows, mode):
+    """Eager against compiled, per network, from the paired measurement."""
+    print(f"\ntorch.compile (mode={mode}) against eager, each pair timed back to back "
+          f"(ms, median; x = eager / compiled, above 1 is a speedup):")
+    head = (f"  {'config':<16}{'infer':^26}{'forward':^26}{'backward':^26}"
+            f"{'first calls':>12}{'graphs':>8}{'breaks':>8}  new operator")
+    print(head)
+    for r in rows:
+        c = r.get("compiled") or {}
+        if "error" in c or not c:
+            print(f"  {r['name']:<16}{c.get('error', 'not run')}")
+            continue
+        cells = "".join(
+            f"{r[k]['median']:>8.1f} > {c[k]['median']:<8.1f}"
+            f"{r[k]['median'] / c[k]['median']:>5.2f}x "
+            for k in ("infer", "forward", "backward"))
+        new = (f"{c['new_operator_ms']:.0f} ms: RECOMPILES" if c["new_operator_recompiles"]
+               else f"{c['new_operator_ms']:.0f} ms: reused")
+        print(f"  {r['name']:<16}{cells}{c['first_s']:>10.0f} s"
+              f"{str(c.get('graphs', '?')):>8}{str(c.get('graph_breaks', '?')):>8}  {new}")
+    reasons = {}
+    for r in rows:
+        for why, n in (r.get("compiled") or {}).get("graph_break_reasons", []):
+            reasons.setdefault(why, []).append(f"{r['name']} x{n}")
+    if reasons:
+        print("\n  what the compiler could not trace (it runs eager around each of these):")
+        for why, who in reasons.items():
+            print(f"    {why}\n        {', '.join(who)}")
+    print("\n  The compiled arm runs with the fused Triton prox and the planar weight "
+          "cache OFF\n  (untraceable; fusing them is the compiler's job). `first calls` is "
+          "compile time.\n  A net that RECOMPILES for a new operator would recompile on "
+          "every training step.")
 
 
 def main():
@@ -209,6 +333,10 @@ def main():
     ap.add_argument("--ckpt", default=None,
                     help="load these weights (single config only); timing does "
                          "not depend on them unless a prox saturates differently")
+    ap.add_argument("--compile", nargs="?", const="default", default=None,
+                    choices=("default", "reduce-overhead", "max-autotune"),
+                    help="also time each net under torch.compile, right after its "
+                         "eager timing; optionally a compile mode")
     ap.add_argument("--no-cudnn-benchmark", action="store_true")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -238,8 +366,11 @@ def main():
           f" | cudnn.benchmark {torch.backends.cudnn.benchmark}"
           f" | {args.reps} reps after {args.warmup} warm-up\n")
 
+    if args.compile and not hasattr(torch, "compile"):
+        raise SystemExit(f"--compile needs torch >= 2.0 (this is {torch.__version__})")
     rows = [time_config(c, hw, args.coils, args.R, args.reps, args.warmup, device,
-                        args.step, args.ckpt) for c in args.configs]
+                        args.step, args.ckpt, compile_mode=args.compile)
+            for c in args.configs]
 
     cols = ["infer", "forward", "backward"] + (["opt", "project"] if args.step else [])
     head = (f"{'config':<14}{'K':<18}{'M':>4}{'params':>11} {'conv':<7}{'coarse':<13}"
@@ -265,6 +396,8 @@ def main():
             print(f"  {r['name']:<14} infer {r['infer']['median'] / base['infer']['median']:.2f}x"
                   f"   fwd+bwd "
                   f"{(r['forward']['median'] + r['backward']['median']) / (base['forward']['median'] + base['backward']['median']):.2f}x")
+    if args.compile:
+        print_compiled(rows, args.compile)
     meta = dict(size=list(hw), coils=args.coils, device=str(device),
                 device_name=(torch.cuda.get_device_name(0) if device.type == "cuda"
                              else "CPU"),

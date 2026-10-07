@@ -7,6 +7,7 @@ sb/ -- Schrodinger-bridge algorithms for ImMAP.
     latent_i2sb   latent-domain I2SB sampling (designs A and B) + encode/decode/regress helpers
     immap_sb      ImMAP-SB: I2SB + a learned data-consistency prox solved by CG
     immap_sb_ascent  the earlier self-paced annealed ascent (kept for reference)
+    unsb          Unpaired Neural SB: the I2SB sampler, trained on-policy with GAN + transport + PatchNCE
 """
 
 from .base import (
@@ -20,3 +21,8 @@ from .latent_i2sb import (
 )
 from .immap_sb import ImMAPProx, immap_sb
 from .immap_sb_ascent import immap_sb_ascent
+from .unsb import (
+    UNSBState, unsb_steps, sample_stage, bridge_step, bridge_step_coeffs, make_g_fn,
+    unsb_rollout, unsb_forward, unsb_sample, tau_sb, remaining_fraction, set_requires_grad,
+    d_loss, e_loss, g_loss, make_nce_fn,
+)

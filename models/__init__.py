@@ -23,6 +23,7 @@ from .sb_groupcdl import SBGroupCDL
 from .sb_guided_groupcdl import SBGuidedGroupCDL
 from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
+from .unsb_nets import PatchDiscriminator, PatchEncoder, FeatureTap, PatchNCE, build_critics
 from .forward_ops import ForwardOp
 
 
