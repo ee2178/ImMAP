@@ -25,9 +25,10 @@ and, outside the step total,
               inference time, with nothing of the loop in it
 
 The report splits by image shape and by whether the operator was EMBEDDED (a
-measured size that is not a multiple of the model's stride gets `E @ Truncate`,
-for which the rediscretized coarse Gram falls back to Galerkin), and separates
-the FIRST step at each shape (cuDNN autotunes every conv for a new shape).
+measured size that is not a multiple of the model's stride gets `E @ Truncate`;
+the rediscretized coarse Gram covers it, on the measured grid's half and
+quarter), and separates the FIRST step at each shape (cuDNN autotunes every
+conv for a new shape).
 """
 
 from __future__ import annotations
@@ -156,8 +157,8 @@ class StepProfiler:
         by = defaultdict(list)
         for r in warm:
             by[r["shape"]].append(r)
-        print(f"\n[profile] by image shape (p50 ms; embedded = E @ Truncate, where the "
-              f"rediscretized coarse Gram falls back to Galerkin)")
+        print(f"\n[profile] by image shape (p50 ms; embedded = E @ Truncate, a measured "
+              f"size that is not a multiple of the stride)")
         print(f"[profile] {'shape':<14}{'emb':>5}{'n':>6}{'total':>9}{'maps':>9}"
               f"{'forward':>9}{'backward':>10}{'infer':>9}{'infer p95':>11}")
         for (hw, emb), rs in sorted(by.items(), key=lambda kv: -len(kv[1])):

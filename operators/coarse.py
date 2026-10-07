@@ -34,6 +34,7 @@ from operators.fourier import FFT2D
 from operators.mask import Mask
 from operators.resample import DEFAULT_FACTOR, restrict
 from operators.sense import Sense
+from operators.truncate import Truncate
 
 
 def crop_center(t, factor=DEFAULT_FACTOR):
@@ -87,20 +88,64 @@ def coarse_data(y, factor=DEFAULT_FACTOR):
 COARSE_OPS = ("galerkin", "rediscretize")
 
 
-def rediscretize(E, factor=DEFAULT_FACTOR, filter=None):
-    """The rediscretized `E_c` for a PLAIN `Mask @ FFT2D @ Sense`, else None.
+def coarse_truncate(T, factor=DEFAULT_FACTOR):
+    """`(T_c, phase)` for the embedding `T`, or None when it has no coarse form.
 
-    Anything else -- a `Truncate` from the image-domain embedding (a measured
-    size that is not a multiple of the model's stride), a whitening gain, an
-    already-Galerkin `E @ Resample`, a soft (multi-map) Sense -- has no
-    rediscretized form here, and the caller falls back to Galerkin. So does an
-    odd grid, which the centre crop cannot halve.
+    `restrict` is cell-centred: coarse pixel `j` covers fine pixels
+    `[factor*j, factor*j + factor)`. A measured window that starts at fine
+    pixel `left` therefore sits on whole coarse pixels only if `left` is a
+    multiple of `factor`. When it is not, the window's own coarse grid is taken
+    `phase = (-left) % factor` fine pixels in, which is where the next coarse
+    pixel boundary falls:
+
+        fine window     [left, left + W)             on the embedded grid
+        coarse window   [(left + phase) / factor, ... + W / factor)
+
+    and the coil maps have to be restricted on that same shifted lattice (see
+    `rediscretize`). Shifting the lattice inside the measured FOV is a linear
+    phase in k-space, which the Gram `F^H |m|^2 F` does not see, so the coarse
+    mask is the plain centre crop either way.
+
+    A centred 376 -> 372 embedding (left = 2) coarsens to 188 -> 186 at offset
+    1, and that one to 94 -> 93, also at offset 1 (phase 1).
+    """
+    big_c, small_c, off_c, phase = [], [], [], []
+    for big, small, off in zip(T.big, T.small, (T.top, T.left)):
+        if big % factor or small % factor:
+            return None
+        p = (-off) % factor
+        if off + p + small > big:
+            return None
+        big_c.append(big // factor)
+        small_c.append(small // factor)
+        off_c.append((off + p) // factor)
+        phase.append(p)
+    return Truncate(big_c, small_c, offset=off_c), tuple(phase)
+
+
+def rediscretize(E, factor=DEFAULT_FACTOR, filter=None):
+    """The rediscretized `E_c` for `Mask @ FFT2D @ Sense [@ Truncate]`, else None.
+
+    With the image-domain embedding (`E @ Truncate`: a measured size that is
+    not a multiple of the model's stride, solved on a slightly larger grid) the
+    coarse operator keeps the same shape, one level down:
+
+        E   = M   F   S   T          T   : embedded grid -> measured grid
+        E_c = M_c F_c S_c T_c        T_c : their coarse counterparts
+
+    with `S_c` restricted on the lattice `T_c` lands on (`coarse_truncate`).
+    The measured grid only has to be even at the level being coarsened: 372
+    columns go 372 -> 186 -> 93, although 372 is not a multiple of 8.
+
+    Anything else -- a whitening gain, an already-Galerkin `E @ Resample`, a
+    soft (multi-map) Sense, a measured grid that is odd at this level -- has no
+    rediscretized form here, and the caller falls back to Galerkin.
     """
     from operators.accessors import _ops
 
     ops = _ops(E)
-    if len(ops) != 3 or not (isinstance(ops[0], Mask) and isinstance(ops[1], FFT2D)
-                             and type(ops[2]) is Sense):
+    if len(ops) not in (3, 4) or not (isinstance(ops[0], Mask) and isinstance(ops[1], FFT2D)
+                                      and type(ops[2]) is Sense):
         return None
     mask, smaps = ops[0].mask, ops[2].smaps
     if not torch.is_tensor(mask):
@@ -108,8 +153,23 @@ def rediscretize(E, factor=DEFAULT_FACTOR, filter=None):
     H, W = smaps.shape[-2:]
     if H % factor or W % factor:
         return None
+
+    T_c = None
+    if len(ops) == 4:
+        T = ops[3]
+        if type(T) is not Truncate or T.small != (H, W):
+            return None
+        got = coarse_truncate(T, factor)
+        if got is None:
+            return None
+        T_c, phase = got
+        if any(phase):
+            # restrict(roll(S, -p))[j] covers S[factor*j + p, ...): the maps on
+            # the window's shifted coarse lattice (circular, like the FOV)
+            smaps = torch.roll(smaps, shifts=(-phase[0], -phase[1]), dims=(-2, -1))
+
     E_c, _, _ = coarse_sense(mask, smaps, factor, filter=filter)
-    return E_c
+    return E_c if (T_c is None or T_c.is_identity) else E_c @ T_c
 
 
 def coarsen(E, coarse_op="galerkin", filter=None):

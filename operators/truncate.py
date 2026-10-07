@@ -75,17 +75,31 @@ class Truncate(Operator):
 
     `big == small` makes both directions the identity, so composing this
     unconditionally costs nothing when the size already divides.
+
+    `offset=(top, left)` places the window explicitly instead of centring it.
+    The embedding never passes it; `operators/coarse.py` does, because the
+    coarse image of a centred window is not always centred (an odd fine offset
+    rounds up to keep the window on whole coarse pixels).
     """
 
-    def __init__(self, big, small):
+    def __init__(self, big, small, offset=None):
         self.big = (int(big[0]), int(big[1]))
         self.small = (int(small[0]), int(small[1]))
         if self.big[0] < self.small[0] or self.big[1] < self.small[1]:
             raise ValueError(
                 f"Truncate needs big >= small, got {self.big} < {self.small}. "
                 f"The embedding only ever GROWS the image grid.")
-        self.top = (self.big[0] - self.small[0]) // 2
-        self.left = (self.big[1] - self.small[1]) // 2
+        if offset is None:
+            self.top = (self.big[0] - self.small[0]) // 2
+            self.left = (self.big[1] - self.small[1]) // 2
+        else:
+            self.top, self.left = int(offset[0]), int(offset[1])
+            if (self.top < 0 or self.left < 0
+                    or self.top + self.small[0] > self.big[0]
+                    or self.left + self.small[1] > self.big[1]):
+                raise ValueError(
+                    f"Truncate offset {(self.top, self.left)} puts a "
+                    f"{self.small} window outside the {self.big} grid.")
         self.is_identity = self.big == self.small
 
     def forward(self, x):
@@ -117,7 +131,9 @@ class Truncate(Operator):
         return max(0.0, (total - inside) / total)
 
     def __repr__(self):
-        return f"Truncate({self.big[0]}x{self.big[1]}->{self.small[0]}x{self.small[1]})"
+        centred = ((self.big[0] - self.small[0]) // 2, (self.big[1] - self.small[1]) // 2)
+        at = "" if (self.top, self.left) == centred else f" @({self.top},{self.left})"
+        return f"Truncate({self.big[0]}x{self.big[1]}->{self.small[0]}x{self.small[1]}{at})"
 
 
 def embed_operator(E, hw, multiple):

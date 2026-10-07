@@ -34,8 +34,8 @@ Settings come from each config: `training.complex_conv` (planar / gauss) and
 `model.params` (K, M, coarse_op, ...). `cudnn.benchmark` is on, as in train.py.
 Synthetic SENSE data by default -- timing depends on shapes, not values. A size
 that is not a multiple of the model's stride is embedded exactly as training
-does (`E @ Truncate`), which is the case where the rediscretized coarse Gram
-falls back to Galerkin, so pass such a size to see what that costs.
+does (`E @ Truncate`); the rediscretized coarse Gram then runs on the measured
+grid's half and quarter (operators/coarse.py), so pass such a size to time it.
 """
 
 from __future__ import annotations

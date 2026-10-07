@@ -45,6 +45,9 @@
 #   IMG="640 320" COILS=20 REPS=30
 #   MODELS="lpdsnet varnetmaps mglpds mg121v6"
 #   BREAKDOWN="mg169v6 mg81v6"    nets for step 3 (default: MODELS minus VarNet)
+#   OPS=1                         step 3 also splits "elementwise / overhead" by
+#                                 individual op, with each op's achieved
+#                                 bandwidth (launch-bound vs memory-bound)
 #   SKIP_ESPIRIT=1 / SKIP_NETS=1 / SKIP_BREAKDOWN=1   leave a step out
 
 R="${R:-12}"
@@ -114,6 +117,7 @@ if [ -z "${SKIP_BREAKDOWN:-}" ]; then
         PLANAR="$(python -c "import json, sys; print('--planar' if (json.load(open(sys.argv[1])).get('training') or {}).get('complex_conv') == 'planar' else '')" "${f}")"
         python scripts/profile_mg.py --configs "${f}" --size ${IMG} --coils "${COILS}" \
             --R "${R}" --reps "${REPS}" --cudnn-benchmark ${PLANAR} --by-level --counts \
+            ${OPS:+--ops} \
             | tee -a "${OUT}/breakdown.txt"
     done
 fi

@@ -11,8 +11,10 @@ This pins the WIRING:
 2. "rediscretize" really runs the coarse levels' physics on the coarse grids:
    the FFTs recorded during a forward pass land on H x W, H/2 x W/2 and
    H/4 x W/4, where "galerkin" runs every one at H x W;
-3. an operator the rediscretization cannot express (a `Truncate` from the
-   image-domain embedding) falls back to Galerkin rather than failing;
+3. an operator the rediscretization cannot express (an already-Galerkin
+   `E @ Resample`, a measured grid that has become odd) falls back to Galerkin
+   rather than failing -- and the image-domain embedding `E @ Truncate` is NOT
+   one of those: its coarse levels run on the measured grid's half and quarter;
 4. it trains: a backward pass reaches every parameter the Galerkin one does;
 5. the two modes' outputs, from identical weights, are close -- reported, and
    bounded loosely (they are different coarse problems, not the same one).
@@ -126,14 +128,46 @@ def test_fallback():
     E_c = coarsen(E, "rediscretize")
     ok = (type(E_c.ops[-1]) is Sense and tuple(E_c.ops[-1].smaps.shape[-2:]) == (H // 2, W // 2))
     check("plain SENSE is rediscretized to the half grid", ok)
-    E_t, _ = embed_operator(E, (H - 2, W - 2), 8)          # a Truncate appears
-    check("an embedded operator (E @ Truncate) has no rediscretized form",
-          rediscretize(E_t) is None)
-    E_tc = coarsen(E_t, "rediscretize")
+    E_g = coarsen(E, "galerkin")
+    check("galerkin mode is unchanged: E @ Resample", isinstance(E_g.ops[-1], Resample))
+    check("an already-Galerkin operator (E @ Resample) has no rediscretized form",
+          rediscretize(E_g) is None)
+    E_gc = coarsen(E_g, "rediscretize")
     check("...and coarsen falls back to Galerkin for it",
-          isinstance(E_tc.ops[-1], Resample), f"{[type(o).__name__ for o in E_tc.ops]}")
-    check("galerkin mode is unchanged: E @ Resample",
-          isinstance(coarsen(E, "galerkin").ops[-1], Resample))
+          isinstance(E_gc.ops[-1], Resample), f"{[type(o).__name__ for o in E_gc.ops]}")
+    _, E_odd = problem(H, W - 2)                           # 46 columns: 23 is odd
+    check("a measured grid that is odd one level down stops there, not before",
+          rediscretize(E_odd) is not None and rediscretize(rediscretize(E_odd)) is None)
+
+
+def test_embedded_grids():
+    """E @ Truncate (a measured size that is not a multiple of the stride) is
+    rediscretized too: the coarse levels' FFTs run at half and quarter of the
+    MEASURED grid, 44 -> 22 -> 11 columns inside the 48 -> 24 -> 12 image."""
+    h, w = H, W - 4                                        # 64 x 44 -> 64 x 48
+    y, E = problem(h, w)
+    E_t, T = embed_operator(E, (h, w), 8)
+    check("the embedding adds a Truncate", not T.is_identity and len(E_t.ops) == 4, repr(T))
+    E_c = coarsen(E_t, "rediscretize")
+    names = [type(o).__name__ for o in E_c.ops]
+    check("E @ Truncate coarsens to Mask @ FFT2D @ Sense @ Truncate",
+          names == ["Mask", "FFT2D", "Sense", "Truncate"]
+          and tuple(E_c.ops[2].smaps.shape[-2:]) == (h // 2, w // 2), f"{names} {E_c.ops[-1]!r}")
+    sig = torch.full((1, 1, 1, 1), 0.01)
+    grids, out = {}, {}
+    for mode in ("galerkin", "rediscretize"):
+        net = build(mode).eval()
+        with torch.no_grad(), FFTSizes() as rec:
+            out[mode] = net(y, E=E_t, sigma=sig)[0]
+        grids[mode] = dict(rec.sizes)
+        print(f"       {mode:>12}: FFT grids {dict(sorted(rec.sizes.items(), reverse=True))}")
+    g, r = grids["galerkin"], grids["rediscretize"]
+    check("embedded, galerkin: every FFT runs on the measured grid", set(g) == {(h, w)}, f"{g}")
+    check("embedded, rediscretize: FFTs run on the measured grid, its half and its quarter",
+          set(r) == {(h, w), (h // 2, w // 2), (h // 4, w // 4)}, f"{r}")
+    d = float((out["rediscretize"] - out["galerkin"]).norm() / out["galerkin"].norm())
+    check("embedded: outputs of the two modes are close (untrained net, identical weights)",
+          bool(torch.isfinite(out["rediscretize"]).all()) and d < 0.25, f"rel diff {d:.3e}")
 
 
 def test_backward_and_agreement():
@@ -158,6 +192,7 @@ def test_backward_and_agreement():
 
 def main():
     for fn in (test_parameters_identical, test_coarse_grids, test_fallback,
+               test_embedded_grids,
                test_backward_and_agreement):
         print(f"\n--- {fn.__name__}")
         fn()

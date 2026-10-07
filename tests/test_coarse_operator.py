@@ -36,8 +36,10 @@ import math
 import torch
 
 from operators import FFT2D, Mask, Sense
-from operators.coarse import coarse_data, coarse_sense, crop_center
+from operators.coarse import (coarse_data, coarse_sense, coarse_truncate, crop_center,
+                              rediscretize)
 from operators.resample import galerkin, restrict
+from operators.truncate import Truncate, embed_operator
 from physics.mask import effective_accel, make_acc_mask
 
 FAIL = []
@@ -230,8 +232,150 @@ def test_undersampled_report():
           f"2*{C} of {N // 2}x{N // 2} (1/4 the pixels) plus no resampling")
 
 
+# ---------------------------------------------------------------------------
+#  The image-domain embedding: E @ Truncate
+# ---------------------------------------------------------------------------
+def rect_fixtures(h, w, ramp=0.01, fill=0.30, seed=0):
+    """A phantom well inside an h x w FOV and C unit-RSS complex coil maps."""
+    g = torch.Generator().manual_seed(seed)
+    yy = (torch.arange(h)[:, None] - h / 2).double()
+    xx = (torch.arange(w)[None, :] - w / 2).double()
+    head = (((yy / (fill * h)) ** 2 + (xx / (fill * w)) ** 2) < 1).double()
+    blob = ((((yy + 0.06 * h) / (0.2 * h)) ** 2 + ((xx - 0.05 * w) / (0.15 * w)) ** 2) < 1).double()
+    x = head * (1 + 0.3 * torch.cos(xx / 9) * torch.sin(yy / 13)) + 0.5 * blob
+    x = (x * torch.exp(1j * (0.004 * xx + 0.003 * yy))).to(torch.complex128)[None, None]
+    sm = []
+    for c in range(C):
+        a = 2 * math.pi * c / C
+        cy, cx = 0.55 * h * math.sin(a), 0.55 * w * math.cos(a)
+        mag = torch.exp(-((yy - cy) ** 2 / (2 * (0.35 * h) ** 2)
+                          + (xx - cx) ** 2 / (2 * (0.35 * w) ** 2)))
+        ph = (2 * math.pi * torch.rand(1, generator=g, dtype=torch.float64)
+              + ramp * (yy * math.cos(a) - xx * math.sin(a)))
+        sm.append(mag * torch.exp(1j * ph))
+    sm = torch.stack(sm)
+    sm = (sm / sm.abs().pow(2).sum(0, keepdim=True).sqrt()).to(torch.complex128)[None]
+    return x, sm
+
+
+def bump(shape, width=0.10):
+    """A complex Gaussian that is ~0 at the grid's edges (4+ sigma)."""
+    hc, wc = shape
+    yc = (torch.arange(hc)[:, None] - hc / 2).double()
+    xc = (torch.arange(wc)[None, :] - wc / 2).double()
+    g = torch.exp(-(yc ** 2 / (2 * (width * hc) ** 2) + xc ** 2 / (2 * (width * wc) ** 2)))
+    return (g * torch.exp(1j * 0.02 * xc)).to(torch.complex128)[None, None]
+
+
+def sampling(h, w, R):
+    if R == 1:
+        return torch.ones(1, 1, h, w, dtype=torch.float64)
+    return make_acc_mask((h, w), accel=R, center_frac=CENTER_FRAC, dim=1, mode="uniform",
+                         adjust_accel=True).to(torch.float64)
+
+
+def test_embedded_bookkeeping():
+    """Sizes, offsets and the lattice shift -- exact, no physics."""
+    # the knee case: 372 columns embedded to 376, three levels
+    T0 = Truncate((640, 376), (640, 372))
+    T1, p1 = coarse_truncate(T0)
+    T2, p2 = coarse_truncate(T1)
+    check("640x372 in 640x376: level 1 is 320x186 in 320x188 at column 1, no shift",
+          (T1.big, T1.small, T1.top, T1.left, p1) == ((320, 188), (320, 186), 0, 1, (0, 0)),
+          f"{T1!r} phase {p1}")
+    check("...level 2 is 160x93 in 160x94 at column 1, maps shifted one column",
+          (T2.big, T2.small, T2.top, T2.left, p2) == ((160, 94), (160, 93), 0, 1, (0, 1)),
+          f"{T2!r} phase {p2}")
+    check("...and an odd measured grid (93) has no further coarse form",
+          coarse_truncate(T2) is None)
+
+    # R T^H w == T_c^H R(roll(w, -phase)) EXACTLY, for w that vanishes at the
+    # window's edge: the claim the shifted lattice rests on.
+    T = Truncate((80, 76), (78, 74), offset=(1, 1))               # odd offsets
+    Tc, phase = coarse_truncate(T)
+    w = bump(T.small, width=0.06)
+    lhs = restrict(T.adjoint(w))
+    rhs = Tc.adjoint(restrict(torch.roll(w, shifts=(-phase[0], -phase[1]), dims=(-2, -1))))
+    check("odd offset: restrict(T^H w) == T_c^H restrict(shifted w), to roundoff",
+          rel(rhs, lhs) < 1e-10, f"phase {phase}, rel err {rel(rhs, lhs):.1e}")
+    bad = Tc.adjoint(restrict(w))
+    check("  control: without the shift it is off by half a coarse pixel",
+          rel(bad, lhs) > 1e-2, f"rel err {rel(bad, lhs):.2e}")
+    centred = Truncate(Tc.big, Tc.small)
+    check("  control: the centred coarse window is the wrong one here",
+          (centred.top, centred.left) != (Tc.top, Tc.left)
+          and rel(centred.adjoint(restrict(torch.roll(w, (-phase[0], -phase[1]), (-2, -1)))),
+                  lhs) > 1e-2,
+          f"centred {(centred.top, centred.left)} vs {(Tc.top, Tc.left)}")
+
+
+def test_embedded_agreement():
+    """E @ Truncate: the rediscretized Gram against Galerkin, two levels down.
+
+    316 x 300 is embedded to 320 x 304 (both axes: multiples of 4, not of 8),
+    so level 1 has even offsets and level 2 odd ones. The no-embedding problem
+    at 320 x 304 is the reference: the embedding should cost nothing extra on
+    content that stays inside the FOV.
+    """
+    h, w = 316, 300
+    x, sm = rect_fixtures(h, w)
+    xr, smr = rect_fixtures(320, 304)
+    print(f"\n  measured {h}x{w} embedded to 320x304, {C} coils; reference: plain 320x304\n")
+    print(f"  {'R':>3} {'level':>6} | {'smooth':>8} {'phantom':>8} | {'ref smooth':>10} "
+          f"{'ref phantom':>11} | {'edge':>7}")
+    for R in (1, 8):
+        E_t, T = embed_operator(Mask(sampling(h, w, R)) @ FFT2D() @ Sense(sm), (h, w), 8)
+        E_r = Mask(sampling(320, 304, R)) @ FFT2D() @ Sense(smr)
+        x_c, xr_c = restrict(T.adjoint(x)), restrict(xr)
+        for level in (1, 2):
+            red, gal = rediscretize(E_t), galerkin(E_t)
+            red_r, gal_r = rediscretize(E_r), galerkin(E_r)
+            Tc = red.ops[3]
+            want = ((2, 2), (1, 1)) if level == 1 else ((1, 1), (1, 1))
+            check(f"R={R} level {level}: {Tc!r}",
+                  (T.top, T.left) == want[0] and (Tc.top, Tc.left) == want[1]
+                  and tuple(red.ops[2].smaps.shape[-2:]) == Tc.small)
+            grid = Tc.big
+            errs = {k: rel(red.gram(v), gal.gram(v))
+                    for k, v in (("smooth", bump(grid)), ("phantom", x_c))}
+            refs = {k: rel(red_r.gram(v), gal_r.gram(v))
+                    for k, v in (("smooth", bump(grid)), ("phantom", xr_c))}
+            edge = rel(red.gram(bump(grid, 0.25)), gal.gram(bump(grid, 0.25)))
+            print(f"  {R:>3} {level:>6} | {errs['smooth']:>8.4f} {errs['phantom']:>8.4f} | "
+                  f"{refs['smooth']:>10.4f} {refs['phantom']:>11.4f} | {edge:>7.4f}")
+            for k in ("smooth", "phantom"):
+                check(f"R={R} level {level}: embedded Gram matches Galerkin on {k} input "
+                      f"as well as the plain operator does",
+                      errs[k] < 0.05 and errs[k] < 1.5 * refs[k] + 2e-3,
+                      f"{errs[k]:.2e} (plain {refs[k]:.2e})")
+
+            if level == 2:
+                g = torch.Generator().manual_seed(7)
+                rnd = lambda *s: torch.complex(                    # noqa: E731
+                    torch.randn(*s, generator=g, dtype=torch.float64),
+                    torch.randn(*s, generator=g, dtype=torch.float64))
+                a, b = rnd(1, 1, *grid), rnd(1, 1, *grid)
+                hh = (abs(complex(inner(red.gram(a), b) - inner(a, red.gram(b))))
+                      / abs(complex(inner(a, red.gram(b)))))
+                check(f"R={R}: the embedded coarse Gram is Hermitian on an odd "
+                      f"{Tc.small[0]}x{Tc.small[1]} measured grid", hh < 1e-10, f"{hh:.1e}")
+                kb = rnd(1, C, *Tc.small)
+                adj = (abs(complex(inner(red.forward(a), kb) - inner(a, red.adjoint(kb))))
+                       / abs(complex(inner(red.forward(a), kb))))
+                check(f"R={R}: ...and its forward/adjoint are a true adjoint pair",
+                      adj < 1e-10, f"{adj:.1e}")
+
+            # one level down, each side from ITS OWN level-1 rediscretized operator
+            E_t, T, E_r = red, Tc, red_r
+            x_c, xr_c = restrict(x_c), restrict(xr_c)
+    print("\n  `edge`: a wide input that is NOT ~0 at the measured window's border. There\n"
+          "  the two coarse problems differ (Galerkin sees a zero-padded edge, the\n"
+          "  rediscretized FOV is periodic); informational.")
+
+
 def main():
-    for fn in (test_full_sampling, test_undersampled_report):
+    for fn in (test_full_sampling, test_undersampled_report, test_embedded_bookkeeping,
+               test_embedded_agreement):
         print(f"\n--- {fn.__name__}")
         fn()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")
