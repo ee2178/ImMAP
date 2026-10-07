@@ -550,6 +550,10 @@ def main():
                          "chain. SoftThreshold.FUSED defaults to True, so this "
                          "is what establishes a pre-change baseline -- without "
                          "it a 'gauss' run is already half optimised")
+    ap.add_argument("--no-weight-cache", action="store_true",
+                    help="rebuild the planar block weight on every conv call "
+                         "(_GaussConvNd.PLANAR_WEIGHT_CACHE=False), as before "
+                         "2026-10-07: the baseline for what the cache is worth")
     ap.add_argument("--ab-planar", action="store_true",
                     help="also run with every complex conv as ONE real conv on "
                          "a [re; im] channel stacking "
@@ -618,6 +622,8 @@ def main():
             args.ab_planar = False
             print("[profile] --planar is on for every mode; dropping the "
                   "redundant --ab-planar arm.")
+    if args.no_weight_cache:
+        components_mod._GaussConvNd.PLANAR_WEIGHT_CACHE = False
     if args.no_fused_prox:
         prox_mod.SoftThreshold.FUSED = False
         if args.fused_prox or args.ab_fused_prox:
@@ -651,7 +657,8 @@ def main():
     print(f"cudnn.benchmark : {torch.backends.cudnn.benchmark}")
     print(f"complex conv    : {components_mod._GaussConvNd.COMPLEX_MODE}"
           f"   fused prox: {prox_mod.SoftThreshold.FUSED}"
-          f"   (triton: {clip_mod.HAVE_TRITON})\n")
+          f"   (triton: {clip_mod.HAVE_TRITON})"
+          f"   weight cache: {components_mod._GaussConvNd.PLANAR_WEIGHT_CACHE}\n")
 
     rows, first_median, outputs, records = [], {}, {}, []
     for cfg_path in args.configs:

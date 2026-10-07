@@ -128,9 +128,21 @@ class _GaussConvNd(nn.Module):
     # than (out, in, ...), which transposes the block pattern.
     _PLANAR_TRANSPOSED = False
 
+    # Keep the planar block weight between calls when no autograd graph is
+    # being built (inference, validation). See `_planar_weight`. Class-level
+    # like the switches above: a kill switch, and what an A/B run toggles.
+    PLANAR_WEIGHT_CACHE = True
+
     def __init__(self, complex=True):
         super().__init__()
         self.complex = complex
+        self._planar_cache = None
+
+    def train(self, mode=True):
+        # Entering or leaving training: drop the cached block weight, so one
+        # never outlives the phase it was built in.
+        self._planar_cache = None
+        return super().train(mode)
 
     # unified single-tensor view (derived; see weight setter note below)
     @property
@@ -142,6 +154,9 @@ class _GaussConvNd(nn.Module):
 
     @weight.setter
     def weight(self, W):
+        # `.data.copy_` does not bump the parameters' `_version`, which is what
+        # the planar-weight cache keys on -- so invalidate it here by hand.
+        self._planar_cache = None
         if self.complex:
             Wc = W if W.is_complex() else torch.complex(W, torch.zeros_like(W))
             self.conv_real.weight.data.copy_(Wc.real)
@@ -154,17 +169,42 @@ class _GaussConvNd(nn.Module):
 
     # -- planar formulation ---------------------------------------------------
     def _planar_weight(self):
-        """The (2M, 2C, P, P) real block weight.
+        """The (2M, 2C, P, P) real block weight, cached when that is safe.
 
-        Rebuilt per call rather than cached: `models/base.py::set_weight` writes
-        through `conv_real.weight.data.copy_(...)`, which does NOT bump the
-        parameter's `_version`, so a version-keyed cache would go stale after
-        `project_` / `init_filters` / `preload_with_widening` and be wrong in a
-        way nothing would catch.  The weight is (2M, 2C, P, P) -- 132 KB at
-        M=169, C=1, P=7 -- against the tens of MB the conv itself moves, and
-        under autograd the `cat`s are what carry gradients back to conv_real /
-        conv_imag, so they have to be in the graph anyway.
+        Building it is three `cat`s and a negation: microseconds of GPU work,
+        but four kernel LAUNCHES, and a V-cycle net calls 215 different convs per
+        forward -- 860 launches, about a tenth of the forward on a node where
+        the host is the bottleneck (A100 profile, 2026-10-07).
+
+        UNDER AUTOGRAD IT IS ALWAYS REBUILT: the `cat`s are what carry
+        gradients back to conv_real / conv_imag, and every conv is its own
+        module, used once per forward, so there is nothing to reuse within a
+        training step anyway. The cache only serves no-grad calls (inference,
+        validation, timing), where the same weights are read forward after
+        forward.
+
+        Staleness. The key is the two parameters' `_version` (bumped by an
+        optimizer step and by `load_state_dict`), their storage address and
+        their dtype (which change under `.to()` / `.double()`). The one writer
+        those cannot see is `conv_real.weight.data.copy_(...)`, and for these
+        classes that is the `weight` setter above -- which `set_weight`,
+        `project_` and `init_filters` all go through -- so the setter drops the
+        cache itself. `train()` / `eval()` drop it too. A raw in-place write to
+        `conv_real.weight.data` from anywhere else WOULD be missed: go through
+        the setter (tests/test_planar_conv.py pins all of this).
         """
+        if torch.is_grad_enabled() or not self.PLANAR_WEIGHT_CACHE:
+            return self._build_planar_weight()
+        wr, wi = self.conv_real.weight, self.conv_imag.weight
+        key = (wr._version, wi._version, wr.data_ptr(), wi.data_ptr(), wr.dtype)
+        hit = getattr(self, "_planar_cache", None)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        W = self._build_planar_weight()
+        self._planar_cache = (key, W)
+        return W
+
+    def _build_planar_weight(self):
         wr, wi = self.conv_real.weight, self.conv_imag.weight
         if self._PLANAR_TRANSPOSED:
             # weight is (in, out, ...), so the block pattern transposes

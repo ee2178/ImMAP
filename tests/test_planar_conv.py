@@ -201,6 +201,158 @@ def test_network_end_to_end():
           f"rel {rel(p, g):.2e}")
 
 
+class CatCount:
+    """Count `torch.cat` calls in a block (the block weight is three of them)."""
+
+    def __enter__(self):
+        self.n, self._cat = 0, torch.cat
+
+        def cat(*a, **k):
+            self.n += 1
+            return self._cat(*a, **k)
+
+        torch.cat = cat
+        return self
+
+    def __exit__(self, *exc):
+        torch.cat = self._cat
+
+
+def test_weight_cache():
+    """The planar block weight is reused between NO-GRAD calls and never goes
+    stale: every way the weights change in this repo must reach the next call.
+    Each case compares against a freshly built module with the same weights
+    (`fresh`), so a stale cache is a numerical mismatch, not just a flag."""
+    for cls, args, tag in ((Conv2d, (2, 5, 7), "Conv2d"),
+                           (ConvTranspose2d, (5, 2, 7), "ConvTranspose2d")):
+        torch.manual_seed(0)
+        m = cls(*args, stride=2).eval()
+        x = torch.randn(1, args[0], 16, 16, dtype=torch.complex64)
+
+        def fresh():
+            f = cls(*args, stride=2).to(m.conv_real.weight.dtype).eval()
+            f.load_state_dict(m.state_dict())
+            with torch.no_grad():
+                return f(x)
+
+        def run():
+            with torch.no_grad():
+                return m(x)
+
+        def same(a, b):
+            return a.dtype == b.dtype and torch.equal(a, b)
+
+        with CatCount() as c1:
+            a = under("planar", run)
+        with CatCount() as c2:
+            b = under("planar", run)
+        check(f"{tag}: the first no-grad call builds the block weight, the second reuses it",
+              (c1.n, c2.n) == (4, 1) and torch.equal(a, b), f"cat calls {c1.n} then {c2.n}")
+        W1 = under("planar", lambda: torch.no_grad()(m._planar_weight)())
+        check(f"{tag}: ...as the SAME tensor, bit-identical to a rebuild",
+              W1 is under("planar", lambda: torch.no_grad()(m._planar_weight)())
+              and torch.equal(W1, m._build_planar_weight()))
+
+        # -- under autograd: never cached, gradients reach both halves --------
+        with CatCount() as c3:
+            out = under("planar", m, x)
+        out.abs().pow(2).sum().backward()
+        gr, gi = m.conv_real.weight.grad, m.conv_imag.weight.grad
+        check(f"{tag}: with grad the weight is rebuilt and gradients reach real and imag",
+              c3.n == 4 and gr is not None and gi is not None
+              and float(gr.abs().sum()) > 0 and float(gi.abs().sum()) > 0)
+
+        # -- every writer must invalidate -------------------------------------
+        m.weight = m.weight * 0.5                               # the property setter
+        check(f"{tag}: the weight setter (set_weight / project_ / init) invalidates",
+              same(under("planar", run), under("planar", fresh)))
+        with torch.no_grad():                                   # what an optimizer does
+            m.conv_real.weight.add_(0.1)
+            m.conv_imag.weight.mul_(-1.0)
+        check(f"{tag}: an in-place optimizer-style update invalidates",
+              same(under("planar", run), under("planar", fresh)))
+        sd = {k: torch.randn_like(v) for k, v in m.state_dict().items()}
+        m.load_state_dict(sd)
+        check(f"{tag}: load_state_dict invalidates",
+              same(under("planar", run), under("planar", fresh)))
+        m.double()
+        x = x.to(torch.complex128)
+        check(f"{tag}: a dtype change (.double()) invalidates",
+              under("planar", run).dtype == torch.complex128
+              and same(under("planar", run), under("planar", fresh)))
+        m.float()
+        x = x.to(torch.complex64)
+        check(f"{tag}: ...and so does changing back",
+              same(under("planar", run), under("planar", fresh)))
+
+        # -- the documented hole, and what closes it ---------------------------
+        under("planar", run)                                    # cache is warm
+        m.conv_real.weight.data.mul_(3.0)                       # raw .data: no version bump
+        stale = under("planar", run)
+        check(f"{tag}: control -- a raw .data write is NOT seen (so the checks above "
+              f"can fail), and train()/eval() clears it",
+              not same(stale, under("planar", fresh))
+              and same(under("planar", lambda: (m.train(), m.eval(), run())[2]),
+                       under("planar", fresh)))
+
+        # -- kill switch --------------------------------------------------------
+        _GaussConvNd.PLANAR_WEIGHT_CACHE = False
+        try:
+            with CatCount() as c4:
+                off = under("planar", run)
+        finally:
+            _GaussConvNd.PLANAR_WEIGHT_CACHE = True
+        check(f"{tag}: PLANAR_WEIGHT_CACHE=False rebuilds every call, same answer",
+              c4.n == 4 and torch.equal(off, under("planar", run)))
+
+
+def test_weight_cache_network():
+    """End to end: a V-cycle net's no-grad forward is bit-identical with the
+    cache on and off, and the second forward builds no block weight at all."""
+    H, W, C = 32, 32, 4
+    torch.manual_seed(0)
+    sm = torch.randn(1, C, H, W, dtype=torch.complex64)
+    sm = sm / sm.abs().pow(2).sum(1, keepdim=True).sqrt()
+    m = make_acc_mask((H, W), accel=4, acs_lines=8, dim=1, mode="uniform").float()
+    E = Mask(m.reshape(1, 1, H, W)) @ FFT2D() @ Sense(sm)
+    y = E.forward(torch.randn(1, 1, H, W, dtype=torch.complex64))
+    net = MGLPDSNet(K=[2, [2, 2, 2]], M=8, C=1, P=3, s=2, lam0=1e-3, tau0=0.5,
+                    theta0=0.0, alpha0=1.0, is_complex=True, degrees=1,
+                    preproc="kspace", resize_noise=True).eval()
+
+    def run():
+        with torch.no_grad():
+            return net(y, E=E, sigma=0.005)[0]
+
+    with CatCount() as c1:
+        a = under("planar", run)
+    with CatCount() as c2:
+        b = under("planar", run)
+    _GaussConvNd.PLANAR_WEIGHT_CACHE = False
+    try:
+        with CatCount() as c3:
+            off = under("planar", run)
+    finally:
+        _GaussConvNd.PLANAR_WEIGHT_CACHE = True
+    convs = sum(1 for mod in net.modules() if isinstance(mod, _GaussConvNd))
+    check("MGLPDSNet: cached forward is bit-identical to the uncached one",
+          torch.equal(a, b) and torch.equal(a, off))
+    check("MGLPDSNet: the second forward saves three `cat`s per conv call",
+          c1.n == c3.n and c3.n - c2.n == 3 * (c3.n // 4) and c2.n == c3.n // 4,
+          f"{c3.n} uncached, {c2.n} cached; {convs} conv modules")
+    net.project()                                               # what training does
+    check("MGLPDSNet: project() between forwards is picked up",
+          torch.equal(under("planar", run), _uncached(run)))
+
+
+def _uncached(run):
+    _GaussConvNd.PLANAR_WEIGHT_CACHE = False
+    try:
+        return under("planar", run)
+    finally:
+        _GaussConvNd.PLANAR_WEIGHT_CACHE = True
+
+
 def test_fused_prox():
     torch.manual_seed(0)
     z = torch.randn(2, 6, 8, 8, dtype=torch.complex64)
@@ -265,7 +417,7 @@ def test_fused_prox():
 def main():
     for fn in (test_conv_equivalence, test_negative_control, test_gradients,
                test_fallbacks, test_planar_roundtrip, test_network_end_to_end,
-               test_fused_prox):
+               test_weight_cache, test_weight_cache_network, test_fused_prox):
         print(f"\n--- {fn.__name__}")
         fn()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")

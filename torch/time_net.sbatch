@@ -48,6 +48,9 @@
 #   OPS=1                         step 3 also splits "elementwise / overhead" by
 #                                 individual op, with each op's achieved
 #                                 bandwidth (launch-bound vs memory-bound)
+#   NO_WEIGHT_CACHE=1             step 3 with the planar conv weight rebuilt on
+#                                 every call, as before 2026-10-07 (the baseline
+#                                 for what that cache saves at inference)
 #   SKIP_ESPIRIT=1 / SKIP_NETS=1 / SKIP_BREAKDOWN=1   leave a step out
 
 R="${R:-12}"
@@ -117,7 +120,7 @@ if [ -z "${SKIP_BREAKDOWN:-}" ]; then
         PLANAR="$(python -c "import json, sys; print('--planar' if (json.load(open(sys.argv[1])).get('training') or {}).get('complex_conv') == 'planar' else '')" "${f}")"
         python scripts/profile_mg.py --configs "${f}" --size ${IMG} --coils "${COILS}" \
             --R "${R}" --reps "${REPS}" --cudnn-benchmark ${PLANAR} --by-level --counts \
-            ${OPS:+--ops} \
+            ${OPS:+--ops} ${NO_WEIGHT_CACHE:+--no-weight-cache} \
             | tee -a "${OUT}/breakdown.txt"
     done
 fi

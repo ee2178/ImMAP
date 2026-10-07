@@ -37,6 +37,10 @@ optimising -- ACHIEVED BANDWIDTH per op:
     < 100 GB/s    latency- or launch-bound.  Fusing KERNEL COUNT helps; moving
                   fewer bytes does not.
 
+Those cut-offs are the L40S's; the report scales them to the card it ran on
+(`dram_peak`). It also prints how long the GPU was BUSY against the wall time:
+the difference is the host issuing kernels, which no per-op row can show.
+
 A long tail of sub-100 GB/s rows means there is no single expensive elementwise
 op to find, and the lever is kernel count (CUDA graphs, torch.compile) or the
 architecture (M / s^2), not micro-optimisation.
@@ -84,6 +88,26 @@ _FREE = {"view", "view_as", "as_strided", "detach", "expand", "permute",
          "narrow", "t", "unfold", "alias", "_conj", "conj", "view_as_real",
          "view_as_complex", "real", "imag", "resolve_conj", "flatten",
          "empty", "empty_like", "empty_strided", "lift_fresh"}
+
+
+# DRAM peak bandwidth by card, GB/s, from the spec sheets. The bandwidth
+# verdicts are fractions of it, so a row is judged against the card it ran on
+# (they were hard-wired to the L40S, which mislabels an A100 or H200 run).
+# First match wins, so the more specific name goes first.
+_DRAM_PEAK = (("H200", 4800), ("H100", 3350), ("A100-SXM4-80GB", 2039),
+              ("A100", 1555), ("L40S", 864), ("L40", 864))
+_DEFAULT_PEAK = ("L40S (assumed)", 864)
+
+
+def dram_peak(device):
+    """`(card, GB/s)` for the device the profile ran on."""
+    if device.type != "cuda":
+        return _DEFAULT_PEAK
+    name = torch.cuda.get_device_name(device)
+    for key, gbs in _DRAM_PEAK:
+        if key in name:
+            return key, gbs
+    return _DEFAULT_PEAK
 
 
 def short(op):
@@ -134,9 +158,17 @@ def _fmt_shapes(shapes, keep=3, width=34):
 def op_times(model, y, E, sigma, device, iters=3, warmup=3):
     """Per-(op, input shapes) device time, via torch.profiler.
 
-    -> `(rows, total_ms, wall_ms)`, `rows` = list of dicts sorted by time.
+    -> `(rows, total_ms, gpu)`, `rows` = list of dicts sorted by time.
     `total_ms` is the summed SELF device time -- the honest denominator, since
     self time does not double-count an op's children.
+
+    `gpu` is `dict(busy_ms, launches)` on CUDA, else None: the summed execution
+    time and the count of the GPU KERNELS themselves. The profiler lists each
+    kernel as its own event AND credits its time to the aten op that launched
+    it, so keeping both double-counts (it reported 119% of the wall time). The
+    kernel events are therefore not rows; they give the time the GPU was
+    actually busy, and wall minus that is the time it sat idle waiting for the
+    host to issue the next kernel.
     """
     from torch.profiler import ProfilerActivity, profile
 
@@ -155,17 +187,36 @@ def op_times(model, y, E, sigma, device, iters=3, warmup=3):
         if cuda:
             torch.cuda.synchronize()
 
-    rows = []
+    from torch.autograd import DeviceType
+
+    rows, kernel_rows = [], []
     for ev in prof.key_averages(group_by_input_shape=True):
         t = ev.self_device_time_total if cuda else ev.self_cpu_time_total
         if t <= 0 or ev.count == 0:
             continue
-        rows.append(dict(op=short(ev.key), family=family(ev.key),
-                         shapes=_fmt_shapes(ev.input_shapes),
-                         ms=t / 1e3 / iters,
-                         calls=ev.count / iters))
+        row = dict(op=short(ev.key), family=family(ev.key),
+                   shapes=_fmt_shapes(ev.input_shapes),
+                   ms=t / 1e3 / iters,
+                   calls=ev.count / iters)
+        is_kernel = cuda and getattr(ev, "device_type", None) == DeviceType.CUDA
+        (kernel_rows if is_kernel else rows).append(row)
+
+    gpu = None
+    if kernel_rows:
+        busy = sum(r["ms"] for r in kernel_rows)
+        attributed = sum(r["ms"] for r in rows)
+        if attributed < 0.5 * busy:
+            # this torch does not credit kernels to their aten op: the kernel
+            # rows are the only timing there is, so keep them as before
+            rows += kernel_rows
+        else:
+            gpu = dict(busy_ms=busy, launches=sum(r["calls"] for r in kernel_rows))
+            if busy - attributed > 0.05:
+                # kernels no aten op launched, e.g. the fused Triton clip
+                rows.append(dict(op="(kernels outside aten)", family="other", shapes="",
+                                 ms=busy - attributed, calls=0))
     rows.sort(key=lambda r: -r["ms"])
-    return rows, sum(r["ms"] for r in rows)
+    return rows, sum(r["ms"] for r in rows), gpu
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +332,7 @@ def op_bytes(model, y, E, sigma, by_shape=False, macs=False):
 # ---------------------------------------------------------------------------
 def report(model, y, E, sigma, device, clean_ms=None, top=22, iters=3):
     """Print the attributed breakdown. Returns the per-op rows."""
-    rows, total = op_times(model, y, E, sigma, device, iters=iters)
+    rows, total, gpu = op_times(model, y, E, sigma, device, iters=iters)
     mb = op_bytes(model, y, E, sigma)
 
     # bytes are per-op (not per-shape), so fold the per-shape times to match
@@ -296,6 +347,12 @@ def report(model, y, E, sigma, device, clean_ms=None, top=22, iters=3):
     if clean_ms:
         print(f"    summed self time {total:.1f} ms vs clean wall {clean_ms:.1f} ms"
               f"   ({100 * total / clean_ms:.0f}% attributed)")
+        if gpu:
+            idle = clean_ms - gpu["busy_ms"]
+            print(f"    GPU busy {gpu['busy_ms']:.1f} ms in {gpu['launches']:.0f} kernel launches"
+                  f" -> idle {idle:.1f} ms ({100 * idle / clean_ms:.0f}% of the wall):"
+                  f" host-side cost (Python, dispatch, launch),"
+                  f" ~{1e3 * idle / max(gpu['launches'], 1):.1f} us per launch")
     print(f"    {'op':<22}{'family':<10}{'shapes':<34}{'ms':>8}{'%':>6}"
           f"{'calls':>7}{'us/call':>9}")
     for r in rows[:top]:
@@ -319,8 +376,9 @@ def report(model, y, E, sigma, device, clean_ms=None, top=22, iters=3):
         print(f"    {fam:<12}{t:>9.2f}{100 * t / total:>7.1f}{m:>10.0f}"
               f"{(f'{bw:.0f}' if bw else '-'):>9}")
 
+    card, peak = dram_peak(device)
     print(f"\n    per-op bandwidth -- what is worth attacking"
-          f"  (L40S DRAM peak 864 GB/s)")
+          f"  ({card} DRAM peak {peak} GB/s)")
     print(f"    {'op':<22}{'family':<10}{'ms':>8}{'MB/fwd':>9}{'GB/s':>8}  verdict")
     joint = []
     for (op, fam), (m, c) in mb.items():
@@ -329,8 +387,9 @@ def report(model, y, E, sigma, device, clean_ms=None, top=22, iters=3):
             continue
         joint.append((t, op, fam, m, (m / 1024) / (t * 1e-3)))
     for t, op, fam, m, bw in sorted(joint, reverse=True)[:14]:
-        v = ("L2-resident, few bytes to win" if bw > 1000 else
-             "DRAM-bound: bytes -> time" if bw > 350 else
+        # the same fractions of the peak the L40S cut-offs (1000 / 350) were
+        v = ("L2-resident, few bytes to win" if bw > 1.16 * peak else
+             "DRAM-bound: bytes -> time" if bw > 0.4 * peak else
              "launch/latency-bound: cut KERNELS")
         print(f"    {op:<22}{fam:<10}{t:>8.2f}{m:>9.0f}{bw:>8.0f}  {v}")
     return rows, by_op, mb
