@@ -1,0 +1,154 @@
+{
+    "task": "unsb",
+    "experiment": {
+        "name": "UNSB_SBCDLNet_NYUMets_CT1_from_all"
+    },
+    "model": {
+        "type": "SBCDLNet",
+        "params": {
+            "K": 30,
+            "M": 169,
+            "P": 7,
+            "s": 2,
+            "C": 4,
+            "prior_idx": 1,
+            "t0": 0.0,
+            "deg_eta": 2,
+            "deg_tau": 2,
+            "kind": "brownian",
+            "tau": 0.1,
+            "n_points": 1000,
+            "beta_max": 0.3,
+            "init": true,
+            "complex": false
+        }
+    },
+    "unsb": {
+        "kind": "brownian",
+        "tau": 0.1,
+        "n_points": 1000,
+        "beta_max": 0.3,
+        "num_stages": 5,
+        "grid": "uniform",
+        "train_noise_scale": 1.0,
+        "deterministic": false,
+        "target_channels": 1,
+        "cond_d": true,
+        "pairing": "same",
+        "entropy": true,
+        "ndf": 64,
+        "n_layers_d": 3,
+        "spectral_norm": false,
+        "lambda_gan": 1.0,
+        "lambda_sb": 1.0,
+        "lambda_nce": 1.0,
+        "nce": true,
+        "nce_extractor": "encoder",
+        "nce_ch": 32,
+        "nce_levels": 3,
+        "nce_patches": 256,
+        "nce_temperature": 0.07,
+        "nce_mask": true,
+        "ema_decay": 0.999,
+        "ema_warmup": true,
+        "val_seed": 0,
+        "val_swap_cond": true,
+        "log_gan_terms": false
+    },
+    "data": {
+        "train": {
+            "name": "i2sb",
+            "root": "../datasets/NYUMets_h5_train",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                0,
+                1,
+                3
+            ],
+            "image_key": "img_raw",
+            "slice_range": [
+                40,
+                110
+            ],
+            "et_mask": false,
+            "scales": [
+                2800.0,
+                2500.0,
+                2390.0,
+                2370.0
+            ],
+            "crop_size": 128,
+            "random_flips": true,
+            "batch_size": 8,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "i2sb",
+            "root": "../datasets/NYUMets_h5_val",
+            "x0_idx": 2,
+            "x1_idx": 1,
+            "cond_idx": [
+                0,
+                1,
+                3
+            ],
+            "image_key": "img_raw",
+            "slice_range": [
+                40,
+                110
+            ],
+            "et_mask": false,
+            "scales": [
+                2800.0,
+                2500.0,
+                2390.0,
+                2370.0
+            ],
+            "random_flips": false,
+            "batch_size": 8,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "display_window": [
+            0.0,
+            2.0
+        ],
+        "display_orient": "radiological",
+        "num_epochs": 3000,
+        "steps_per_epoch": 100,
+        "val_every_epochs": 50,
+        "save_every_epochs": 5,
+        "clip_grad": 1.0,
+        "use_mask": false,
+        "psnr_only": false,
+        "data_range": 2.0,
+        "val_slices": 1000
+    },
+    "paths": {
+        "save_dir": "trained_nets/nyumets/UNSB_SBCDLNet_NYUMets_CT1_from_all",
+        "ckpt": null
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0001,
+            "betas": [
+                0.5,
+                0.999
+            ]
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "schrodinger-bridge",
+        "id": null
+    }
+}
