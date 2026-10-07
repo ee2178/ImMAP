@@ -393,3 +393,82 @@ def report(model, y, E, sigma, device, clean_ms=None, top=22, iters=3):
              "launch/latency-bound: cut KERNELS")
         print(f"    {op:<22}{fam:<10}{t:>8.2f}{m:>9.0f}{bw:>8.0f}  {v}")
     return rows, by_op, mb
+
+
+# ---------------------------------------------------------------------------
+#  HOST
+# ---------------------------------------------------------------------------
+def host_report(model, y, E, sigma, device, clean_ms=None, top=26, iters=3, warmup=2):
+    """Where the HOST spends the forward, call by call (cProfile).
+
+    `report` above accounts for the GPU: when it says the GPU was busy for only
+    part of the wall time, the rest is the host deciding what to launch next,
+    and no device-time row can show where. A CUDA call returns as soon as its
+    kernel is queued, so under cProfile a torch call's OWN time is its host
+    cost -- dispatch, argument checks, cuDNN / cuFFT plan lookup, the launch --
+    and a Python function's own time is interpreter work. A call that BLOCKS
+    on the GPU (`.item()`, `bool(tensor)`, a `.cpu()`) shows up here as one
+    very expensive row, which is worth knowing too.
+
+    INFIX ARITHMETIC (`a - b`, `t * r`) is not a call cProfile can see: it is
+    charged to the Python function it is written in. So a row like
+    `lpds.py:91 forward` is that function's interpreter time PLUS the host
+    cost of every `+ - *` in its body.
+
+    cProfile adds about a microsecond per call, so the total is inflated;
+    read the split and the ranking, not the absolute figures. Counting kernel
+    launches does NOT predict this: removing 860 tiny `cat`s (the planar
+    weight cache) saved 2 ms on a forward whose "per-launch" average said 8.
+    """
+    import cProfile
+    import os
+    import pstats
+
+    cuda = device.type == "cuda"
+    with torch.no_grad():
+        for _ in range(warmup):
+            model(y, E=E, sigma=sigma)
+        if cuda:
+            torch.cuda.synchronize()
+        pr = cProfile.Profile()
+        pr.enable()
+        for _ in range(iters):
+            model(y, E=E, sigma=sigma)
+        pr.disable()
+        if cuda:
+            torch.cuda.synchronize()
+
+    rows = []
+    for (fn, line, name), (_cc, nc, tt, _ct, _callers) in pstats.Stats(pr).stats.items():
+        if name in ("disable", "enable") or "cProfile" in name:
+            continue
+        builtin = fn == "~"
+        if builtin:
+            # "<built-in method torch.conv2d>", "<method 'abs' of 'torch._C.TensorBase' objects>"
+            label = name.strip("<>").replace("built-in method ", "")
+            if label.startswith("method "):
+                label = "Tensor." + label[len("method "):].split(" of ")[0]
+            label = label.replace("'", "")
+        else:
+            label = f"{os.path.basename(fn)}:{line} {name}"
+        rows.append((1e3 * tt / iters, nc / iters, label, builtin))
+    rows.sort(reverse=True)
+
+    total = sum(r[0] for r in rows)
+    t_builtin = sum(r[0] for r in rows if r[3])
+    n_builtin = sum(r[1] for r in rows if r[3])
+    print(f"--- host time per forward (cProfile own time, mean of {iters}; inflated "
+          f"by ~1 us per call) ---")
+    print(f"    profiled {total:.1f} ms" + (f" vs clean wall {clean_ms:.1f} ms" if clean_ms else "")
+          + f":  torch / C calls {t_builtin:.1f} ms in {n_builtin:.0f} calls"
+          f" ({1e3 * t_builtin / max(n_builtin, 1):.1f} us each),"
+          f"  Python functions {total - t_builtin:.1f} ms")
+    print("    (infix + - * are charged to the Python function they are written in)")
+    print(f"    {'call':<58}{'ms':>8}{'%':>6}{'calls':>8}{'us/call':>9}")
+    for ms, calls, label, _b in rows[:top]:
+        print(f"    {label[:57]:<58}{ms:>8.2f}{100 * ms / total:>6.1f}{calls:>8.0f}"
+              f"{1e3 * ms / max(calls, 1):>9.1f}")
+    rest = sum(r[0] for r in rows[top:])
+    if rest > 0:
+        print(f"    {'(' + str(len(rows) - top) + ' more)':<58}{rest:>8.2f}{100 * rest / total:>6.1f}")
+    return rows

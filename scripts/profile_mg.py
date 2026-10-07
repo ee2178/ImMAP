@@ -571,6 +571,10 @@ def main():
                          "what says whether an op is DRAM-bound (bytes worth "
                          "removing), L2-resident (not worth it) or launch-bound "
                          "(cut kernel count instead)")
+    ap.add_argument("--host", action="store_true",
+                    help="where the HOST spends the forward: cProfile own time "
+                         "per torch call and per Python function. For when "
+                         "--ops shows the GPU idle for much of the wall time")
     ap.add_argument("--counts", action="store_true",
                     help="exact op counts and the grid each ran at")
     ap.add_argument("--breakdown", action="store_true",
@@ -763,6 +767,12 @@ def main():
                     print(f"--- ops: {name} [{mode}] ---")
                     op_profile.report(model, y, E, sigma, device,
                                       clean_ms=stats["median"])
+                    print()
+
+                if args.host:
+                    print(f"--- host: {name} [{mode}] ---")
+                    op_profile.host_report(model, y, E, sigma, device,
+                                           clean_ms=stats["median"])
                     print()
 
                 if args.breakdown and mode in ("optimised", "rediscretize", "planar+fused",

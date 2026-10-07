@@ -48,6 +48,9 @@
 #   OPS=1                         step 3 also splits "elementwise / overhead" by
 #                                 individual op, with each op's achieved
 #                                 bandwidth (launch-bound vs memory-bound)
+#   HOST=1                        step 3 also profiles the HOST side of the
+#                                 forward (cProfile): which torch calls and
+#                                 Python functions the time between kernels goes to
 #   NO_WEIGHT_CACHE=1             step 3 with the planar conv weight rebuilt on
 #                                 every call, as before 2026-10-07 (the baseline
 #                                 for what that cache saves at inference)
@@ -120,7 +123,7 @@ if [ -z "${SKIP_BREAKDOWN:-}" ]; then
         PLANAR="$(python -c "import json, sys; print('--planar' if (json.load(open(sys.argv[1])).get('training') or {}).get('complex_conv') == 'planar' else '')" "${f}")"
         python scripts/profile_mg.py --configs "${f}" --size ${IMG} --coils "${COILS}" \
             --R "${R}" --reps "${REPS}" --cudnn-benchmark ${PLANAR} --by-level --counts \
-            ${OPS:+--ops} ${NO_WEIGHT_CACHE:+--no-weight-cache} \
+            ${OPS:+--ops} ${HOST:+--host} ${NO_WEIGHT_CACHE:+--no-weight-cache} \
             | tee -a "${OUT}/breakdown.txt"
     done
 fi
