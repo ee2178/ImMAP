@@ -45,7 +45,7 @@ from models.circulant_attention import Circulant, circ_adjacency, _abs2
 from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
                                    get_block_mask)
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency
-from models.clip_triton import clip_modulus
+from models.clip_triton import clip_modulus, clip_modulus_planar
 
 TRITON_SIMS = ("pidistance", "pidot")
 
@@ -188,7 +188,47 @@ class SoftThreshold(nn.Module):
     def threshold(self, z, sigma):
         return self.tau(sigma, ref=z)
 
+    # -- planar state -------------------------------------------------------
+    def _is_planar_state(self, z):
+        """`z` is a complex code in planar form: real, with `[re; im]` stacked
+        on the channel axis (twice this prox's channel count)."""
+        return (not torch.is_complex(z) and z.dim() == 4
+                and z.shape[1] == 2 * self.channels)
+
+    def _planar_scale(self, z, sigma, dual):
+        """`(pairs, scale)`: `z` viewed as (B, 2, M, H, W) and the real factor
+        both halves of each pair are multiplied by.
+
+        The modulus couples channel m with channel m + M, exactly as `abs()`
+        couples the two halves of a complex number; everything else is the
+        complex formula unchanged:
+
+            dual   (clip)        min(1, t / |z|)
+            primal (shrink)      relu(1 - t / |z|)
+        """
+        B, C2, H, W = z.shape
+        pairs = z.reshape(B, 2, C2 // 2, H, W)
+        t = self.threshold(z, sigma)                          # (., M, ., .)
+        re, im = pairs[:, 0], pairs[:, 1]
+        if torch.is_grad_enabled():
+            # max(|z|, eps) as sqrt(max(re^2 + im^2, eps^2)): the clamp sits
+            # BEFORE the square root, so the gradient at z = 0 is 0 rather than
+            # the 0/0 `hypot` (and `sqrt`) give there -- and a zero-padded
+            # border puts exact zeros in every embedded batch.
+            eps2 = self.fenchel_eps * self.fenchel_eps
+            a = torch.addcmul(im * im, re, re).clamp_min(eps2).sqrt()
+        else:
+            # what `abs()` does to a complex tensor: one kernel, two reads and
+            # a write. (`linalg.vector_norm` over the pair axis is the same
+            # number and ~20x slower on a CPU.)
+            a = torch.hypot(re, im).clamp_min(self.fenchel_eps)
+        scale = (t / a).clamp_max(1.0) if dual else F.relu(1.0 - t / a)
+        return pairs, scale.unsqueeze(1)                      # (B, 1, M, H, W)
+
     def forward(self, z, sigma=None, cache=None):
+        if self._is_planar_state(z):
+            pairs, scale = self._planar_scale(z, sigma, dual=False)
+            return (pairs * scale).reshape(z.shape), cache
         return soft_threshold(z, self.threshold(z, sigma)), cache
 
     def fenchel(self, z, sigma=None, cache=None):
@@ -214,6 +254,13 @@ class SoftThreshold(nn.Module):
         that is expressible -- forward only, since the kernel has no backward.
         Under autograd, and on CPU, the chain below runs unchanged.
         """
+        if self._is_planar_state(z):
+            if self.FUSED and not torch.is_grad_enabled():
+                out = clip_modulus_planar(z, self.threshold(z, sigma), self.fenchel_eps)
+                if out is not None:
+                    return out, cache
+            pairs, scale = self._planar_scale(z, sigma, dual=True)
+            return (pairs * scale).reshape(z.shape), cache
         t = self.threshold(z, sigma)
         if self.FUSED and not torch.is_grad_enabled():
             out = clip_modulus(z, t, self.fenchel_eps)

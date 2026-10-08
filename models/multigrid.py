@@ -434,7 +434,13 @@ class _ChannelScale(nn.Module):
         self.weight = nn.Parameter(torch.full((1, channels, 1, 1), float(gain)))
 
     def forward(self, x):
-        return x * self.weight
+        w = self.weight
+        if (not x.is_complex() and w.shape[1] > 1
+                and x.shape[1] == 2 * w.shape[1]):
+            # a planar-state tensor: [re; im] stacked on the channel axis, both
+            # halves of a channel take that channel's scale
+            w = torch.cat((w, w), dim=1)
+        return x * w
 
 
 # ===========================================================================

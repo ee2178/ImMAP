@@ -106,8 +106,90 @@ def _clip_kernel(Z, T, OUT, n_elem, HW, M, EPS, BLOCK: tl.constexpr):
     tl.store(OUT + 2 * i + 1, im * s, mask=m)
 
 
+@_jit
+def _clip_kernel_planar(Z, T, OUT, n_elem, HW, M, MHW, EPS, BLOCK: tl.constexpr):
+    """The same clip for a PLANAR code: real (B, 2M, H, W), `[re; im]` stacked
+    on the channel axis.
+
+    Complex element `i` of batch `b = i // MHW` has its real part at float
+    offset `i + b * MHW` (each batch holds 2 * MHW floats) and its imaginary
+    part `MHW` further on. `T` is addressed as in `_clip_kernel`; `MHW` is
+    always the true M * H * W, also when the threshold is a scalar (`M = 1,
+    HW = 1` there only makes the channel index 0).
+    """
+    pid = tl.program_id(0)
+    i = pid * BLOCK + tl.arange(0, BLOCK)
+    m = i < n_elem
+    off = i + (i // MHW) * MHW
+
+    re = tl.load(Z + off, mask=m, other=0.0)
+    im = tl.load(Z + off + MHW, mask=m, other=0.0)
+    t = tl.load(T + (i // HW) % M, mask=m, other=0.0)
+
+    a = tl.sqrt(re * re + im * im)
+    s = tl.minimum(t / tl.maximum(a, EPS), 1.0)
+
+    tl.store(OUT + off, re * s, mask=m)
+    tl.store(OUT + off + MHW, im * s, mask=m)
+
+
 # Pointer arithmetic is int32: `2 * i` must stay representable.
 _MAX_ELEMS = (2 ** 31 - 1) // 2
+
+# The planar kernel cannot be exercised on the CPU dev box, so its FIRST use in
+# a process is checked against the eager formula on the very tensor it was
+# given; a mismatch disables it for the rest of the run instead of returning
+# wrong codes. None = not yet checked.
+_PLANAR_KERNEL_OK = None
+
+
+def _planar_reference(z, t, eps):
+    B, C2, H, W = z.shape
+    pairs = z.reshape(B, 2, C2 // 2, H, W)
+    a = torch.hypot(pairs[:, 0], pairs[:, 1]).clamp_min(eps)
+    return (pairs * (t / a).clamp_max(1.0).unsqueeze(1)).reshape(z.shape)
+
+
+def clip_modulus_planar(z, t, eps, block=1024):
+    """`clip_modulus` for a planar code, or None if this path cannot be taken.
+
+    `z`  float32, contiguous, (B, 2M, H, W) -- `[re; im]` on the channel axis
+    `t`  real, one element per complex CHANNEL (`(1, M, 1, 1)`) or exactly one
+    """
+    global _PLANAR_KERNEL_OK
+    if _PLANAR_KERNEL_OK is False:
+        return None
+    if not (HAVE_TRITON and z.is_cuda and z.dtype == torch.float32):
+        return None
+    if z.dim() != 4 or not z.is_contiguous() or z.shape[1] % 2:
+        return None
+    M, HW = z.shape[1] // 2, z.shape[2] * z.shape[3]
+    n = z.numel() // 2
+    if n == 0 or n > _MAX_ELEMS:
+        return None
+    nt = t.numel()
+    if nt == M:
+        tf, Mt, hw = t.reshape(-1), M, HW
+    elif nt == 1:
+        tf, Mt, hw = t.reshape(-1), 1, 1
+    else:
+        return None
+    tf = tf.to(device=z.device, dtype=torch.float32).contiguous()
+
+    out = torch.empty_like(z)
+    _clip_kernel_planar[(triton.cdiv(n, block),)](
+        z, tf, out, n, hw, Mt, M * HW, float(eps), BLOCK=block)
+
+    if _PLANAR_KERNEL_OK is None:
+        ref = _planar_reference(z, tf.view(1, -1, 1, 1), eps)
+        err = float((out - ref).abs().max() / ref.abs().max().clamp_min(1e-30))
+        _PLANAR_KERNEL_OK = err < 1e-5
+        if not _PLANAR_KERNEL_OK:
+            import warnings
+            warnings.warn(f"planar clip kernel disagrees with the eager formula "
+                          f"(max rel err {err:.2e}); using the eager path instead")
+            return None
+    return out
 
 
 def clip_modulus(z, t, eps, block=1024):

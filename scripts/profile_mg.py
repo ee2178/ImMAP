@@ -550,6 +550,10 @@ def main():
                          "chain. SoftThreshold.FUSED defaults to True, so this "
                          "is what establishes a pre-change baseline -- without "
                          "it a 'gauss' run is already half optimised")
+    ap.add_argument("--planar-state", action="store_true",
+                    help="run EVERY mode with MGLPDSNet.PLANAR_STATE on (iterates "
+                         "carried as real [re; im] tensors), for the breakdown / "
+                         "--ops / --host of that representation")
     ap.add_argument("--no-weight-cache", action="store_true",
                     help="rebuild the planar block weight on every conv call "
                          "(_GaussConvNd.PLANAR_WEIGHT_CACHE=False), as before "
@@ -626,6 +630,8 @@ def main():
             args.ab_planar = False
             print("[profile] --planar is on for every mode; dropping the "
                   "redundant --ab-planar arm.")
+    if args.planar_state:
+        mg_mod.MGLPDSNet.PLANAR_STATE = True
     if args.no_weight_cache:
         components_mod._GaussConvNd.PLANAR_WEIGHT_CACHE = False
     if args.no_fused_prox:
@@ -662,7 +668,8 @@ def main():
     print(f"complex conv    : {components_mod._GaussConvNd.COMPLEX_MODE}"
           f"   fused prox: {prox_mod.SoftThreshold.FUSED}"
           f"   (triton: {clip_mod.HAVE_TRITON})"
-          f"   weight cache: {components_mod._GaussConvNd.PLANAR_WEIGHT_CACHE}\n")
+          f"   weight cache: {components_mod._GaussConvNd.PLANAR_WEIGHT_CACHE}"
+          f"   planar state: {mg_mod.MGLPDSNet.PLANAR_STATE}\n")
 
     rows, first_median, outputs, records = [], {}, {}, []
     for cfg_path in args.configs:

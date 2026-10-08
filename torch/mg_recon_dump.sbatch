@@ -43,6 +43,10 @@ ANATOMIES=(brain knee)
 # Substring filters on the run path, passed to --only. The trailing underscore
 # keeps `lpdsnet_` from also selecting a future cell whose name contains it.
 ONLY="${ONLY:-lpdsnet_ mglpds_ varnetmaps_}"
+# EXACT=1: the ONLY entries are run directory NAMES, matched exactly, so a cell
+# is dumped without its tagged probes (<cell>_500ep, <cell>_prof, ...):
+#   EXACT=1 ONLY="varnetmaps_R12 lpdsnet_R12 mg81v6_R12" sbatch --array=0 ...
+EXACT="${EXACT:-}"
 
 # Slice range and volume count PER ANATOMY, index-matched to ANATOMIES above.
 # These are the ranges each cell actually trained on -- brain 0-7 (train
@@ -117,7 +121,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 python scripts/dump_eval.py \
     --runs "${RUNS_ROOT}" \
-    --only ${ONLY} \
+    --only ${ONLY} ${EXACT:+--exact} \
     --slices "${SLICE_RANGE}" \
     --n-volumes "${N_VOLUMES}" \
     --metrics ${METRICS} \

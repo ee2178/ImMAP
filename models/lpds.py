@@ -46,17 +46,32 @@ import torch
 import torch.nn as nn
 
 from models.base import project_conv, set_weight
-from models.components import Conv2d, ConvTranspose2d
+from models.components import Conv2d, ConvTranspose2d, to_complex, to_planar
 from models.prox import Polynomial, build_prox
 from operators.identity import Identity
 from solvers.eigen import power_method
 
 
-def gram(E, x):
-    """`E^H E x`, with the identity short-circuited."""
+def gram(E, x, planar=False):
+    """`E^H E x`, with the identity short-circuited.
+
+    `planar`: `x` is a complex image in planar form (`[re; im]` on the channel
+    axis). The physics is complex, so this is the one place a planar-state
+    network interleaves -- on the C-channel IMAGE, not the M-channel code.
+    """
     if E is None or isinstance(E, Identity):
         return x
+    if planar:
+        return to_planar(E.gram(to_complex(x)))
     return E.gram(x)
+
+
+def _per_channel(t, x):
+    """A per-channel factor `t` (., C, ., .) against a planar `x` (., 2C, ., .):
+    both halves of a channel take that channel's value. C == 1 broadcasts."""
+    if t.shape[1] > 1 and x.shape[1] == 2 * t.shape[1]:
+        return torch.cat((t, t), dim=1)
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -111,10 +126,16 @@ class LPDSLayer(nn.Module):
         x, z = state
         pi_x, pi_z = (None, None) if pi is None else pi
 
+        # planar STATE (MGLPDSNet.PLANAR_STATE): x and z arrive real, [re; im]
+        # stacked. Nothing below changes -- the sweep is linear apart from the
+        # prox, which pairs the halves itself -- except the Gram.
+        planar = self.is_complex and not x.is_complex()
         tau = self.tau(sigma, ref=x)
         theta = self.theta(sigma, ref=x)
+        if planar:
+            tau, theta = _per_channel(tau, x), _per_channel(theta, x)
 
-        Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x)
+        Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x, planar)
         residual = Ex - y_tilde + self.synthesis(z)
         if pi_x is not None:
             residual = residual - pi_x

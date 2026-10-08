@@ -30,6 +30,11 @@ one upright column per network, the forward pass with the backward pass
 stacked on top of it. --from-json redraws it from a saved --json-out without
 timing anything.
 
+--planar-state times every MGLPDSNet a second time with its iterates carried
+as real [re; im] tensors (`MGLPDSNet.PLANAR_STATE`; same parameters, same map),
+straight after the normal timing, and prints the pair. It is how to find out
+whether that representation is worth adopting.
+
 --compile times every net a second time under `torch.compile`, straight after
 its eager timing on the same node, and prints the pair: the one switch that can
 be applied identically to LPDSNet, the multigrid nets and E2E-VarNet. It also
@@ -122,7 +127,7 @@ def _first_line(e, width=160):
 
 
 def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
-                compile_mode=None):
+                compile_mode=None, planar_state=False):
     with open(cfg_path) as f:
         cfg = json.load(f)
     mode = set_complex_mode(cfg.get("training", {}).get("complex_conv") or "gauss")
@@ -212,15 +217,62 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
                type=cfg["model"]["type"], K=K, M=p.get("M"), params=n_par,
                coarse_op=p.get("coarse_op"), complex_conv=mode,
                embedded=not T.is_identity, peak_mb=peak, first_s=first_s, **cols)
+    if planar_state:
+        row["planar_state"] = time_planar_state(net, measure)
     if compile_mode:
+        # With --planar-state as well, the compiled arm runs ON the planar
+        # state where the net has one: real tensors are what the compiler can
+        # generate code for, so that is the combination worth knowing about.
+        on_planar = bool(planar_state and "skipped" not in row.get("planar_state", {}))
         row["compiled"] = time_compiled(net, measure, compile_mode, row,
-                                        lambda: build_problem(hw, coils, mri, R, device, seed=1))
+                                        lambda: build_problem(hw, coils, mri, R, device, seed=1),
+                                        planar=on_planar)
         print(f"  {row['name']}: " + (row["compiled"].get("error") or "compiled and timed"),
               flush=True)
     return row
 
 
-def time_compiled(net, measure, compile_mode, eager, new_problem):
+def time_planar_state(net, measure):
+    """The same measurement with the planar state on, or why it was not run."""
+    import models.clip_triton as clip_mod
+    from models.mg_lpds import MGLPDSNet
+
+    if not isinstance(net, MGLPDSNet):
+        return dict(skipped="not an MGLPDSNet")
+    keep = MGLPDSNet.PLANAR_STATE
+    MGLPDSNet.PLANAR_STATE = True
+    try:
+        if not net.planar_state_active():
+            return dict(skipped="not implemented for this net (group prox, widen > 1 "
+                                "or learned transfers)")
+        cols, peak, first_s, _ = measure(net)
+        kernel = {None: "not used", True: "active", False: "DISABLED (mismatch)"}[
+            clip_mod._PLANAR_KERNEL_OK]
+        return dict(peak_mb=peak, first_s=first_s, fused_clip=kernel, **cols)
+    finally:
+        MGLPDSNet.PLANAR_STATE = keep
+
+
+def print_planar_state(rows):
+    print("\nplanar state against the complex state, each pair timed back to back "
+          "(ms, median; x = complex / planar, above 1 is a speedup):")
+    keys = [k for k in ("infer", "forward", "backward", "opt", "project")
+            if all(k in r for r in rows)]
+    print(f"  {'config':<16}" + "".join(f"{k:^26}" for k in keys) + "  fused clip")
+    for r in rows:
+        p = r.get("planar_state") or {}
+        if "skipped" in p or not p:
+            print(f"  {r['name']:<16}{p.get('skipped', 'not run')}")
+            continue
+        cells = "".join(f"{r[k]['median']:>8.1f} > {p[k]['median']:<8.1f}"
+                        f"{r[k]['median'] / p[k]['median']:>5.2f}x " for k in keys)
+        print(f"  {r['name']:<16}{cells} {p['fused_clip']}")
+    print("\n  Same parameters and the same map (to fp roundoff). `fused clip` is the "
+          "planar Triton\n  kernel used at inference: it checks itself against the eager "
+          "formula on first use.")
+
+
+def time_compiled(net, measure, compile_mode, eager, new_problem, planar=False):
     """The same measurement under `torch.compile`, or `{"error": ...}`.
 
     Two hand-written host-side shortcuts are switched OFF for this arm, because
@@ -233,13 +285,18 @@ def time_compiled(net, measure, compile_mode, eager, new_problem):
     from models.prox import SoftThreshold
     from training.common import embed_for_net as _embed
 
+    from models.mg_lpds import MGLPDSNet
+
     saved = (SoftThreshold.FUSED, _GaussConvNd.PLANAR_WEIGHT_CACHE)
+    saved_state = MGLPDSNet.PLANAR_STATE
     SoftThreshold.FUSED = _GaussConvNd.PLANAR_WEIGHT_CACHE = False
+    MGLPDSNet.PLANAR_STATE = bool(planar)
     try:
         first_error = None
         for settings in COMPILE_ATTEMPTS:
             out = _compile_once(net, measure, compile_mode, eager, new_problem, _embed,
                                 settings)
+            out["planar_state"] = bool(planar)
             if "error" not in out:
                 if first_error:
                     out["note"] = (f"compiled only with {settings}; as shipped: "
@@ -251,6 +308,7 @@ def time_compiled(net, measure, compile_mode, eager, new_problem):
         return out                                          # every attempt failed
     finally:
         SoftThreshold.FUSED, _GaussConvNd.PLANAR_WEIGHT_CACHE = saved
+        MGLPDSNet.PLANAR_STATE = saved_state
 
 
 # Tried in order until one compiles. Inductor's layout pass moves 4-D conv
@@ -344,6 +402,7 @@ def print_compiled(rows, mode):
                else f"{c['new_operator_ms']:.0f} ms: reused")
         print(f"  {r['name']:<16}{cells}{c['first_s']:>10.0f} s"
               f"{str(c.get('graphs', '?')):>8}{str(c.get('graph_breaks', '?')):>8}  {new}"
+              + ("  [planar state]" if c.get("planar_state") else "")
               + ("  [*]" if c.get("note") else ""))
         if c.get("note"):
             notes.append(f"  [*] {r['name']}: {c['note']}")
@@ -383,6 +442,9 @@ def main():
     ap.add_argument("--ckpt", default=None,
                     help="load these weights (single config only); timing does "
                          "not depend on them unless a prox saturates differently")
+    ap.add_argument("--planar-state", action="store_true",
+                    help="also time each MGLPDSNet with its iterates carried as "
+                         "real [re; im] tensors, right after its normal timing")
     ap.add_argument("--compile", nargs="?", const="default", default=None,
                     choices=("default", "reduce-overhead", "max-autotune"),
                     help="also time each net under torch.compile, right after its "
@@ -419,7 +481,8 @@ def main():
     if args.compile and not hasattr(torch, "compile"):
         raise SystemExit(f"--compile needs torch >= 2.0 (this is {torch.__version__})")
     rows = [time_config(c, hw, args.coils, args.R, args.reps, args.warmup, device,
-                        args.step, args.ckpt, compile_mode=args.compile)
+                        args.step, args.ckpt, compile_mode=args.compile,
+                        planar_state=args.planar_state)
             for c in args.configs]
 
     cols = ["infer", "forward", "backward"] + (["opt", "project"] if args.step else [])
@@ -447,6 +510,8 @@ def main():
             print(f"  {r['name']:<{nw}} infer {r['infer']['median'] / base['infer']['median']:.2f}x"
                   f"   fwd+bwd "
                   f"{(r['forward']['median'] + r['backward']['median']) / (base['forward']['median'] + base['backward']['median']):.2f}x")
+    if args.planar_state:
+        print_planar_state(rows)
     if args.compile:
         print_compiled(rows, args.compile)
     meta = dict(size=list(hw), coils=args.coils, device=str(device),

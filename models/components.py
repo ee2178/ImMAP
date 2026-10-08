@@ -239,10 +239,23 @@ class _GaussConvNd(nn.Module):
         return torch.cat((br if br is not None else z,
                           bi if bi is not None else z))
 
+    def _planar_expressible(self):
+        return (self.groups == 1 and self.conv_real.bias is None
+                and self.conv_imag.bias is None)
+
     def _planar_ok(self):
         """Can this conv take the planar path?  See the class docstring."""
-        return (self.COMPLEX_MODE == "planar" and self.groups == 1
-                and self.conv_real.bias is None and self.conv_imag.bias is None)
+        return self.COMPLEX_MODE == "planar" and self._planar_expressible()
+
+    def _is_planar_state(self, x):
+        """Is `x` a complex signal ALREADY in planar form, `[re; im]` stacked
+        on the channel axis (the planar STATE of `MGLPDSNet.PLANAR_STATE`)?
+
+        Told apart from a genuinely real input by its channel count: a real
+        input to this conv has `in_channels`, a planar one twice that.
+        """
+        return (not x.is_complex()
+                and x.shape[1] == 2 * self.conv_real.in_channels)
 
     def _forward_planar(self, x):
         out = self._op(to_planar(x), self._planar_weight(), None)
@@ -254,6 +267,15 @@ class _GaussConvNd(nn.Module):
 
         if x.is_complex() and self._planar_ok():
             return self._forward_planar(x)
+
+        if self._is_planar_state(x):
+            # planar in, planar out: the same block-weight conv as
+            # `_forward_planar`, without interleaving on either side
+            if not self._planar_expressible():
+                raise ValueError(
+                    "a planar-state input needs a groups=1, bias-free conv "
+                    "(the block weight cannot express anything else)")
+            return self._op(x, self._planar_weight(), None)
 
         wr, br = self.conv_real.weight, self.conv_real.bias
         wi, bi = self.conv_imag.weight, self.conv_imag.bias

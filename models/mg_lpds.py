@@ -59,6 +59,7 @@ import torch
 import torch.nn as nn
 
 from models.base import batched_projection, project_conv, set_weight
+from models.components import to_complex, to_planar
 from models.level_trace import LevelTraceMixin
 from models.lpds import LPDSLayer, LPDSStack, make_lpds_layer
 from models.multigrid import (_ChannelScale, identity_widen_weight,
@@ -136,6 +137,7 @@ class PDObjectiveDownsample(nn.Module):
         self.widen = int(widen)
         self.julia_compat = bool(julia_compat)
         self.coarse_op = coarse_op
+        self.is_complex = bool(getattr(fine_layer, "is_complex", True))
         self.transfer_filter = _check_filter(transfer_filter)
         # LATENT-grid transfer, shared with the enclosing V-cycle. Only the
         # DUAL variable z lives there; the primal x is on the image grid and
@@ -160,10 +162,12 @@ class PDObjectiveDownsample(nn.Module):
 
     def forward(self, x, z, y, E, sigma, cache, static=None):
         R = dict(julia_compat=self.julia_compat, filter=self.transfer_filter)
+        # planar STATE: real tensors, [re; im] stacked (see LPDSLayer.forward)
+        planar = getattr(self, "is_complex", True) and not x.is_complex()
 
         # ---- fine-level primal-dual residual --------------------------------
         # primal:  grad f(x) + A^T z
-        rx_fine = gram_or_x(E, x) - y + self.synthesis_fine(z)
+        rx_fine = gram_or_x(E, x, planar) - y + self.synthesis_fine(z)
         # dual: the FIXED-POINT residual z - prox_{g*}(z + A x), not a gradient
         zhat, cache["_dF_fine"] = self.prox_fine(
             z + self.analysis_fine(x), sigma, cache.setdefault("_dF_fine", {}))
@@ -189,7 +193,7 @@ class PDObjectiveDownsample(nn.Module):
 
         # ---- coarse-level primal-dual residual ------------------------------
         # Handed on to the coarse level, whose first sweep needs the same Gram.
-        gram_x_c = gram_or_x(E_c, x_c)
+        gram_x_c = gram_or_x(E_c, x_c, planar)
         rx_coarse = gram_x_c - y_c + self.synthesis_coarse(z_c)
         zhat_c, cache["_dF_coarse"] = self.prox_coarse(
             z_c + self.analysis_coarse(x_c), sigma_c,
@@ -211,8 +215,12 @@ class PDObjectiveDownsample(nn.Module):
                 m.project_()
 
 
-def gram_or_x(E, x):
-    return x if (E is None or isinstance(E, Identity)) else E.gram(x)
+def gram_or_x(E, x, planar=False):
+    if E is None or isinstance(E, Identity):
+        return x
+    if planar:                                  # see models/lpds.py::gram
+        return to_planar(E.gram(to_complex(x)))
+    return E.gram(x)
 
 
 def _restrict_measurement(y, E, sigma, R, static, coarse_op="galerkin"):
@@ -434,7 +442,20 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
     and `models/ladmm.py` threads exactly this back in as `state` when
     `reuse_latent=True`, so handing back `z` only would make the warm start half
     a warm start (`x` would cold-restart from `y~` every ADMM layer).
+
+    PLANAR_STATE (an option, off by default). The iterates `(x, z)` are carried
+    between layers as REAL tensors with `[re; im]` stacked on the channel axis,
+    instead of complex ones. Every conv then runs planar-in / planar-out with
+    no interleaving around it -- the complex path converts the M-channel code
+    twice per conv -- and the only complex tensors left are inside the SENSE
+    Gram, on the C-channel image. Same parameters, same map (to fp roundoff;
+    tests/test_planar_state.py), complex in and complex out at the boundary of
+    `forward`, so nothing outside this class can tell. Supported for the local
+    prox with `widen == 1` and fixed transfers; any other net ignores the flag.
     """
+
+    # Class-level, like `_GaussConvNd.COMPLEX_MODE`: what a timing run toggles.
+    PLANAR_STATE = False
 
     def __init__(self, K=(1, (8, 8, 8)), M=169, C=1, P=7, s=2, widen=1,
                  lam0=1e-2, tau0=1e-1, theta0=1e-1, degrees=0, alpha0=1e-1,
@@ -458,6 +479,7 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
         self.K, self.iters = K_outer, iters
         self.M, self.C, self.P, self.s = int(M), int(C), int(P), int(s)
         self.preproc, self.resize_noise = preproc, bool(resize_noise)
+        self.is_complex, self.window, self.widen = bool(is_complex), int(window), int(widen)
         self.transfer_filter = _check_filter(transfer_filter)
         self.learn_transfer = bool(learn_transfer)
         self.levels = 1 if iters is None else len(iters)
@@ -510,9 +532,24 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 y_tilde, params = pre_process(x_adj, self.pad_stride)
                 post = lambda x, p: post_process(x, list(p))    # noqa: E731
 
+        planar = self.planar_state_active() and torch.is_complex(y_tilde)
+        if planar:
+            y_tilde = to_planar(y_tilde)
+            if state is not None:
+                state = tuple(to_planar(s) for s in state)
+
         (x, z), _ = self.net(state, y_tilde, E=E, sigma=sigma, cache={})
+        if planar:
+            x, z = to_complex(x), to_complex(z)
         x_hat = x if params is None else post(x, params)
         return x_hat, (x, z)
+
+    def planar_state_active(self):
+        """Is the planar state both requested and expressible for this net?"""
+        return bool(self.PLANAR_STATE and getattr(self, "is_complex", False)
+                    and getattr(self, "window", 1) <= 1
+                    and getattr(self, "widen", 1) == 1
+                    and not self.learn_transfer)
 
     def _check_grid(self, hw):
         H, W = int(hw[0]), int(hw[1])

@@ -44,6 +44,10 @@
 #   R=12 KS="2 4" N_SLICES=6      the ESPIRiT check
 #   IMG="640 320" COILS=20 REPS=30
 #   MODELS="lpdsnet varnetmaps mglpds mg121v6"
+#   PLANAR_STATE=1                step 2 also times each unrolled net with its
+#                                 iterates carried as real [re; im] tensors
+#                                 (MGLPDSNet.PLANAR_STATE), paired with the normal
+#                                 timing; step 3 then profiles THAT representation
 #   COMPILE=1                     step 2 also times every net under torch.compile,
 #                                 paired with its eager timing (COMPILE=reduce-overhead
 #                                 picks a mode). Compiling can take minutes per net:
@@ -111,7 +115,8 @@ if [ -z "${SKIP_NETS:-}" ]; then
         *) COMPILE_FLAG="--compile ${COMPILE}" ;;
     esac
     python scripts/time_net.py --configs "${CFGS[@]}" --size ${IMG} --coils "${COILS}" \
-        --reps "${REPS}" --step ${COMPILE_FLAG} --json-out "${OUT}/time_net.json" \
+        --reps "${REPS}" --step ${COMPILE_FLAG} ${PLANAR_STATE:+--planar-state} \
+        --json-out "${OUT}/time_net.json" \
         --fig-out "${OUT}/time_net.png"
 fi
 
@@ -134,6 +139,7 @@ if [ -z "${SKIP_BREAKDOWN:-}" ]; then
         python scripts/profile_mg.py --configs "${f}" --size ${IMG} --coils "${COILS}" \
             --R "${R}" --reps "${REPS}" --cudnn-benchmark ${PLANAR} --by-level --counts \
             ${OPS:+--ops} ${HOST:+--host} ${NO_WEIGHT_CACHE:+--no-weight-cache} \
+            ${PLANAR_STATE:+--planar-state} \
             | tee -a "${OUT}/breakdown.txt"
     done
 fi
