@@ -820,6 +820,17 @@ def _apply_protocol(args):
 ONLINE_ESPIRIT_KWS = {"thresh_eig": 0.0, "kernel_size": 4, "maxit": 10}
 
 
+def supports_planar_state(spec):
+    """Can this cell run with `training.planar_state`? Mirrors
+    `MGLPDSNet.planar_state_active`: an MGLPDSNet with the local prox, no
+    channel widening and fixed transfers. Every other net ignores the key, so
+    it is not written for them -- their configs stay byte-identical."""
+    p = spec["params"]
+    return (spec["type"] == "MGLPDSNet" and p.get("is_complex", True)
+            and int(p.get("window") or 1) <= 1 and int(p.get("widen", 1)) == 1
+            and not p.get("learn_transfer"))
+
+
 def _opt_mri(args):
     """The optional `mri` keys, present ONLY when switched on.
 
@@ -1173,6 +1184,12 @@ def make_config(anatomy, r, model, args):
             # other config is byte-identical (the launch guard reads an absent
             # key as None). exp8: complex_conv="planar".
             **dict(spec.get("training") or {}),
+            # --planar-state, and only on the cells that can use it. Written
+            # only when ON, like the optional `mri` keys: an absent key reads
+            # as off, and every config generated without the flag is unchanged.
+            **({"planar_state": True}
+               if getattr(args, "planar_state", False) and supports_planar_state(spec)
+               else {}),
         },
         "mri": {
             "R": r,
@@ -1326,6 +1343,14 @@ def main():
                         "coil RSS (physics/object_mask.py).")
     p.add_argument("--accels", nargs="*", type=int, default=None,
                    help="restrict to these accelerations (with --list-cells)")
+    p.add_argument("--planar-state", action="store_true",
+                   help="write training.planar_state=true into every cell that "
+                        "supports it (MGLPDSNet with the local prox: lpdsnet, "
+                        "mglpds, mg<M>v<V>). The iterates are carried as real "
+                        "[re; im] tensors and the thresholding runs as one fused "
+                        "kernel, forward and backward. A SPEED setting: same "
+                        "parameters, same map to fp roundoff, checkpoints "
+                        "interchangeable with the complex state.")
     args = p.parse_args()
     _apply_protocol(args)
 

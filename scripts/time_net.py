@@ -30,6 +30,16 @@ one upright column per network, the forward pass with the backward pass
 stacked on top of it. --from-json redraws it from a saved --json-out without
 timing anything.
 
+--sizes / --sizes-from time every net on SEVERAL measurement sizes as well --
+fastMRI volumes come at a handful of matrix sizes and coil counts, and training
+meets them in random order. Each size is timed twice: on its own (the same
+size back to back, which is what the main table does for --size) and MIXED
+(round-robin, so every call follows a call at a different size). The gap
+between the two is what changing size costs -- cuDNN plans, the allocator's
+block reuse, kernel caches. `--sizes 640x320x20 768x396x16` names them as
+HxW[xCOILS]; `--sizes-from cache/fastmri_sizes_brain.json` reads the dataset's
+own census (scripts/fastmri_sizes.py), whose volume counts weight the mean.
+
 --planar-state times every MGLPDSNet a second time with its iterates carried
 as real [re; im] tensors (`MGLPDSNet.PLANAR_STATE`; same parameters, same map),
 straight after the normal timing, and prints the pair. It is how to find out
@@ -45,8 +55,9 @@ reports what the compiler could not do (graph breaks and why), how long the
 first calls took, and whether a NEW operator of the same shape forces a
 recompile -- in training every step brings one.
 
-Settings come from each config: `training.complex_conv` (planar / gauss) and
-`model.params` (K, M, coarse_op, ...). `cudnn.benchmark` is on, as in train.py.
+Settings come from each config: `training.complex_conv` (planar / gauss),
+`training.planar_state` (the `state` column; --planar-state overrides it for
+the pair) and `model.params` (K, M, coarse_op, ...). `cudnn.benchmark` is on, as in train.py.
 Synthetic SENSE data by default -- timing depends on shapes, not values. A size
 that is not a multiple of the model's stride is embedded exactly as training
 does (`E @ Truncate`); the rediscretized coarse Gram then runs on the measured
@@ -130,12 +141,20 @@ def _first_line(e, width=160):
 
 
 def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
-                compile_mode=None, planar_state=False):
+                compile_mode=None, planar_state=False, sizes=None):
     with open(cfg_path) as f:
         cfg = json.load(f)
     mode = set_complex_mode(cfg.get("training", {}).get("complex_conv") or "gauss")
+    # The base arm runs the config's own state (`training.planar_state`) --
+    # except under --planar-state, whose point is the complex / planar pair:
+    # there the base arm is the complex state for every net.
+    from models.mg_lpds import MGLPDSNet
+    MGLPDSNet.PLANAR_STATE = (bool(cfg.get("training", {}).get("planar_state", False))
+                              and not planar_state)
     torch.manual_seed(0)
     net = build_model(cfg).to(device)
+    rep = ("planar" if isinstance(net, MGLPDSNet) and net.planar_state_active()
+           else "complex" if getattr(net, "is_complex", False) else "-")
     if ckpt:
         state = torch.load(ckpt, map_location=device, weights_only=False)
         net.load_state_dict(state.get("model_state_dict", state))
@@ -145,8 +164,14 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
     mri = cfg.get("mri", {})
     R = R if R is not None else mri.get("R", 8)
 
-    y, E0, image = build_problem(hw, coils, mri, R, device)
-    E, T = embed_for_net(net, E0, image, None)
+    def problem(hw, coils, seed=0):
+        """One measurement, embedded for this net exactly as training does."""
+        y, E0, image = build_problem(hw, coils, mri, R, device, seed=seed)
+        E, T = embed_for_net(net, E0, image, None)
+        return dict(y=y, E=E, T=T, image=image)
+
+    main = problem(hw, coils)
+    y, E, T = main["y"], main["E"], main["T"]
     sigma = torch.full((1, 1, 1, 1), 0.01, device=device)
     loss_fn = LOSS_REGISTRY[cfg.get("training", {}).get("loss_type", "magnitude-nl1-nl2")]
     clock = Clock(device)
@@ -158,57 +183,104 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
             net.parameters(), lr=1e-4)
     clip = cfg.get("training", {}).get("clip_grad", 1.0)
 
+    def infer(fwd, y=y, E=E):
+        net.eval()
+        with torch.no_grad():
+            t0 = clock.now()
+            fwd(y, E=E, sigma=sigma)
+            return {"infer": clock.now() - t0}
+
+    def train_step(fwd, p=main):
+        net.train()
+        net.zero_grad(set_to_none=True)
+        t0 = clock.now()
+        recon, _ = fwd(p["y"], E=p["E"], sigma=sigma)
+        recon = p["T"].forward(recon)
+        t1 = clock.now()
+        loss = loss_fn(p["image"], recon, sigma)
+        loss.backward()
+        t2 = clock.now()
+        out = {"forward": t1 - t0, "backward": t2 - t1}
+        if opt is not None:
+            if clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
+            opt.step()
+            t3 = clock.now()
+            if hasattr(net, "project"):
+                net.project()
+            out.update(opt=t3 - t2, project=clock.now() - t3)
+        return out
+
+    def peak_mb():
+        return (torch.cuda.max_memory_allocated() / 2 ** 20 if device.type == "cuda"
+                else float("nan"))
+
     def measure(fwd):
         """Time `fwd` -- the module itself, or its compiled wrapper. Mode
         switches, gradients and the optimizer always go to `net`.
         -> `(stats per column, peak MB, seconds spent in the first calls)`."""
-        def infer(y=y, E=E):
-            net.eval()
-            with torch.no_grad():
-                t0 = clock.now()
-                fwd(y, E=E, sigma=sigma)
-                return {"infer": clock.now() - t0}
-
-        def train_step():
-            net.train()
-            net.zero_grad(set_to_none=True)
-            t0 = clock.now()
-            recon, _ = fwd(y, E=E, sigma=sigma)
-            recon = T.forward(recon)
-            t1 = clock.now()
-            loss = loss_fn(image, recon, sigma)
-            loss.backward()
-            t2 = clock.now()
-            out = {"forward": t1 - t0, "backward": t2 - t1}
-            if opt is not None:
-                if clip is not None:
-                    torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
-                opt.step()
-                t3 = clock.now()
-                if hasattr(net, "project"):
-                    net.project()
-                out.update(opt=t3 - t2, project=clock.now() - t3)
-            return out
-
         # warm-up: every code path once (cuDNN autotune, lazy kernel compiles,
         # and under torch.compile the compilation itself -- hence `first_s`)
         t0 = clock.now()
-        infer()
-        train_step()
+        infer(fwd)
+        train_step(fwd)
         first_s = clock.now() - t0
         for _ in range(max(warmup, 1) - 1):
-            infer()
-            train_step()
+            infer(fwd)
+            train_step(fwd)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
 
         samples = {}
         for _ in range(reps):
-            for k, v in {**infer(), **train_step()}.items():
+            for k, v in {**infer(fwd), **train_step(fwd)}.items():
                 samples.setdefault(k, []).append(1e3 * v)
-        peak = (torch.cuda.max_memory_allocated() / 2 ** 20 if device.type == "cuda"
-                else float("nan"))
-        return {k: stats(v) for k, v in samples.items()}, peak, first_s, infer
+        return ({k: stats(v) for k, v in samples.items()}, peak_mb(), first_s,
+                lambda y=y, E=E: infer(fwd, y, E))
+
+    def measure_sizes(fwd, sizes):
+        """Every size in `sizes`, on its own and mixed with the others."""
+        probs = [problem((s["H"], s["W"]), s["coils"], seed=10 + i)
+                 for i, s in enumerate(sizes)]
+
+        def one(p):
+            return {**infer(fwd, p["y"], p["E"]), **train_step(fwd, p)}
+
+        def collect(acc, p):
+            for k, v in one(p).items():
+                acc.setdefault(k, []).append(1e3 * v)
+
+        # every shape's first calls, untimed: cuDNN autotunes per shape
+        t0 = clock.now()
+        for p in probs:
+            for _ in range(max(warmup, 1)):
+                one(p)
+        first_s = clock.now() - t0
+
+        own, peaks = [], []
+        for p in probs:
+            one(p)                    # the call straight after a size change is "mixed", not "own"
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            acc = {}
+            for _ in range(reps):
+                collect(acc, p)
+            own.append(acc)
+            peaks.append(peak_mb())
+
+        mixed = [dict() for _ in probs]
+        if len(probs) > 1:            # round-robin: every call follows another size
+            for _ in range(reps):
+                for acc, p in zip(mixed, probs):
+                    collect(acc, p)
+
+        out = []
+        for s, p, a, m, pk in zip(sizes, probs, own, mixed, peaks):
+            out.append(dict(H=s["H"], W=s["W"], coils=s["coils"], weight=s.get("weight"),
+                            grid=list(p["T"].big), embedded=not p["T"].is_identity,
+                            peak_mb=pk, own={k: stats(v) for k, v in a.items()},
+                            mixed={k: stats(v) for k, v in m.items()} or None))
+        return dict(first_s=first_s, sizes=out)
 
     cols, peak, first_s, _ = measure(net)
 
@@ -218,8 +290,10 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
         K = f"{p['num_cascades']}casc"
     row = dict(name=os.path.splitext(os.path.basename(cfg_path))[0],
                type=cfg["model"]["type"], K=K, M=p.get("M"), params=n_par,
-               coarse_op=p.get("coarse_op"), complex_conv=mode,
+               coarse_op=p.get("coarse_op"), complex_conv=mode, state=rep,
                embedded=not T.is_identity, peak_mb=peak, first_s=first_s, **cols)
+    if sizes:
+        row["sizes"] = measure_sizes(net, sizes)
     if planar_state:
         row["planar_state"] = time_planar_state(net, measure)
     if compile_mode:
@@ -233,6 +307,78 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
         print(f"  {row['name']}: " + (row["compiled"].get("error") or "compiled and timed"),
               flush=True)
     return row
+
+
+def parse_sizes(specs, default_coils):
+    """`["640x320x20", "768x396"]` -> `[{H, W, coils, weight}]`."""
+    out = []
+    for spec in specs:
+        parts = spec.lower().replace(",", "x").split("x")
+        if len(parts) not in (2, 3) or not all(p.isdigit() and int(p) > 0 for p in parts):
+            raise SystemExit(f"--sizes takes HxW or HxWxCOILS (e.g. 640x320x20), got {spec!r}")
+        H, W = int(parts[0]), int(parts[1])
+        out.append(dict(H=H, W=W, coils=int(parts[2]) if len(parts) == 3 else default_coils,
+                        weight=None))
+    return out
+
+
+def load_sizes(path, top=None):
+    """The census written by scripts/fastmri_sizes.py, most common first; the
+    volume count is the weight (training draws one slice per volume)."""
+    with open(path) as f:
+        doc = json.load(f)
+    sizes = [dict(H=int(s["H"]), W=int(s["W"]), coils=int(s["coils"]),
+                  weight=float(s["volumes"])) for s in doc["sizes"]]
+    sizes.sort(key=lambda s: -s["weight"])
+    return sizes[:top] if top else sizes
+
+
+def print_sizes(rows, with_step):
+    rows = [r for r in rows if r.get("sizes")]
+    if not rows:
+        return
+    keys = ["infer", "forward", "backward"]
+    weighted = all(s["weight"] is not None for r in rows for s in r["sizes"]["sizes"])
+    n_sizes = len(rows[0]["sizes"]["sizes"])
+    print("\nby measurement size (ms, median). `own` = that size back to back"
+          + (f"; `mixed` = round-robin over all\n{n_sizes} sizes, so every call follows a "
+             "different size -- what a training epoch looks like. A gap\nbetween the two is "
+             "the cost of changing size." if n_sizes > 1 else "."))
+    nw = max(len(r["name"]) for r in rows) + 2
+    print(f"  {'config':<{nw}}{'size':<10}{'coils':>5}  {'net grid':<10}{'share':>6}  "
+          + "".join(f"{k + ' own > mixed':^20}" for k in keys)
+          + f"{'fwd+bwd own > mixed':^22}{'peak MB':>8}")
+
+    def cell(a, m, width=20):
+        txt = f"{a:.1f} > {m:.1f}" if m is not None else f"{a:.1f}"
+        return f"{txt:^{width}}"
+
+    for r in rows:
+        ss = r["sizes"]["sizes"]
+        total = sum(s["weight"] for s in ss) if weighted else None
+        for i, s in enumerate(ss):
+            own, mixed = s["own"], s["mixed"]
+            share = f"{100 * s['weight'] / total:.0f}%" if weighted else "-"
+            fb = lambda d: d["forward"]["median"] + d["backward"]["median"]     # noqa: E731
+            print(f"  {(r['name'] if i == 0 else ''):<{nw}}{str(s['H']) + 'x' + str(s['W']):<10}"
+                  f"{s['coils']:>5}  {str(s['grid'][0]) + 'x' + str(s['grid'][1]):<10}{share:>6}  "
+                  + "".join(cell(own[k]["median"], mixed[k]["median"] if mixed else None)
+                            for k in keys)
+                  + cell(fb(own), fb(mixed) if mixed else None, 22)
+                  + f"{s['peak_mb']:>8.0f}")
+        if len(ss) > 1:
+            w = [s["weight"] / total if weighted else 1.0 / len(ss) for s in ss]
+            mean = lambda sel: sum(wi * sel(s) for wi, s in zip(w, ss))             # noqa: E731
+            cells = "".join(cell(mean(lambda s, k=k: s["own"][k]["median"]),
+                                 mean(lambda s, k=k: s["mixed"][k]["median"])) for k in keys)
+            label = "mean, weighted by volumes" if weighted else "mean, unweighted"
+            fb_own = mean(lambda s: s["own"]["forward"]["median"] + s["own"]["backward"]["median"])
+            fb_mix = mean(lambda s: s["mixed"]["forward"]["median"]
+                          + s["mixed"]["backward"]["median"])
+            print(f"  {'':<{nw}}{label:<33}  {cells}{cell(fb_own, fb_mix, 22)}")
+    if with_step:
+        print("  (each timed step also ran the optimizer and the projection, as in the "
+              "main table; those columns are not repeated here)")
 
 
 def time_planar_state(net, measure):
@@ -468,6 +614,14 @@ def main():
     ap.add_argument("--fig-theme", default="light", choices=("light", "dark"))
     ap.add_argument("--size", type=int, nargs="+", default=[640, 320], help="H [W]")
     ap.add_argument("--coils", type=int, default=20)
+    ap.add_argument("--sizes", nargs="+", default=None, metavar="HxW[xCOILS]",
+                    help="also time each net on these measurement sizes, each on its "
+                         "own and mixed (round-robin); coils default to --coils")
+    ap.add_argument("--sizes-from", default=None, metavar="JSON",
+                    help="like --sizes, from the dataset census written by "
+                         "scripts/fastmri_sizes.py (volume counts weight the mean)")
+    ap.add_argument("--sizes-top", type=int, default=None,
+                    help="with --sizes-from: only the N most common sizes")
     ap.add_argument("--R", type=int, default=None, help="default: each config's mri.R")
     ap.add_argument("--reps", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=5)
@@ -512,23 +666,32 @@ def main():
           f" | cudnn.benchmark {torch.backends.cudnn.benchmark}"
           f" | {args.reps} reps after {args.warmup} warm-up\n")
 
+    if args.sizes and args.sizes_from:
+        raise SystemExit("pass --sizes or --sizes-from, not both")
+    sizes = (parse_sizes(args.sizes, args.coils) if args.sizes
+             else load_sizes(args.sizes_from, args.sizes_top) if args.sizes_from else None)
+    if sizes:
+        print("sizes: " + ", ".join(f"{s['H']}x{s['W']} ({s['coils']} coils)" for s in sizes)
+              + "\n")
     if args.compile and not hasattr(torch, "compile"):
         raise SystemExit(f"--compile needs torch >= 2.0 (this is {torch.__version__})")
     rows = [time_config(c, hw, args.coils, args.R, args.reps, args.warmup, device,
                         args.step, args.ckpt, compile_mode=args.compile,
-                        planar_state=args.planar_state)
+                        planar_state=args.planar_state, sizes=sizes)
             for c in args.configs]
 
     cols = ["infer", "forward", "backward"] + (["opt", "project"] if args.step else [])
     nw = max(len(r["name"]) for r in rows) + 2
-    head = (f"{'config':<{nw}}{'K':<18}{'M':>4}{'params':>11} {'conv':<7}{'coarse':<13}"
+    head = (f"{'config':<{nw}}{'K':<18}{'M':>4}{'params':>11} {'conv':<7}{'state':<8}"
+            f"{'coarse':<13}"
             + "".join(f"{c:>10}" for c in cols) + f"{'fwd+bwd':>10}{'peak MB':>9}")
     print(head + "    (ms, median)")
     print("-" * len(head))
     for r in rows:
         fb = r["forward"]["median"] + r["backward"]["median"]
         print(f"{r['name']:<{nw}}{str(r['K']):<18}{str(r['M'] or ''):>4}{r['params']:>11,} "
-              f"{r['complex_conv']:<7}{str(r['coarse_op'] or '-'):<13}"
+              f"{r['complex_conv']:<7}{r.get('state', '-'):<8}"
+              f"{str(r['coarse_op'] or '-'):<13}"
               + "".join(f"{r[c]['median']:>10.1f}" for c in cols)
               + f"{fb:>10.1f}{r['peak_mb']:>9.0f}"
               + ("   [embedded]" if r["embedded"] else ""))
@@ -544,6 +707,7 @@ def main():
             print(f"  {r['name']:<{nw}} infer {r['infer']['median'] / base['infer']['median']:.2f}x"
                   f"   fwd+bwd "
                   f"{(r['forward']['median'] + r['backward']['median']) / (base['forward']['median'] + base['backward']['median']):.2f}x")
+    print_sizes(rows, args.step)
     if args.planar_state:
         print_planar_state(rows)
     if args.compile:

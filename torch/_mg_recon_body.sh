@@ -49,6 +49,17 @@
 #                   Set it in the launcher rather than relying on the default,
 #                   so the run directory records which REGION it was scored
 #                   over. (This said "backend" -- copy-paste from ATTN.)
+#   PLANAR_STATE    "" = off; 1 writes training.planar_state=true into every
+#                   cell that supports it (lpdsnet, mglpds, mg<M>v<V>): iterates
+#                   carried as real [re; im] tensors, thresholding as one fused
+#                   kernel forward and backward. A SPEED setting -- same
+#                   parameters, same map to fp roundoff -- so unlike every other
+#                   key it is NOT part of the launch-once comparison: a cell
+#                   launched without it is resumed, not refused, and the resume
+#                   runs planar (IMMAP_PLANAR_STATE=1; train.py records it in the
+#                   run's config.json, so later resumes keep it). A run that
+#                   already has it keeps it whatever this is set to; to switch
+#                   one back, resume it with IMMAP_PLANAR_STATE=0 exported.
 #
 # ONLY / ACCELS narrow AND RENUMBER the cell list, so an experiment that runs a
 # subset gets its own dense 0..N-1 array range. The bound is checked at runtime
@@ -112,6 +123,7 @@ ORGAN_MASK="${ORGAN_MASK:-}"
 #                every config of the anatomy, so set it the same in every
 #                launcher of that anatomy.
 PHASE_CORRECT="${PHASE_CORRECT:-}"
+PLANAR_STATE="${PLANAR_STATE:-}"
 
 source ~/.bashrc
 conda activate gcdl
@@ -164,7 +176,7 @@ if [ "${REGENERATE}" = "1" ]; then
     # generator's default (measured). See the generator's module docstring.
     python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
         --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} \
-        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"}         ${PHASE_CORRECT:+--online-phase-correct} >/dev/null
+        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"}         ${PHASE_CORRECT:+--online-phase-correct} ${PLANAR_STATE:+--planar-state} >/dev/null
 fi
 
 if [ ! -f "${BASE_CONFIG}" ]; then
@@ -326,8 +338,13 @@ if os.path.exists(out) and not force:
                 acc.update(_flat(v, f"{p}.{k}" if p else k))
         return acc
 
+    # Execution-only keys: they change how fast the net runs, not what it
+    # computes (same parameters, same map to fp roundoff, checkpoints
+    # interchangeable), so a difference in one is not a different experiment.
+    _EXEC_KEYS = ("training.planar_state",)
     a, b = _flat(old), _flat(cfg)
-    diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+    diff = sorted(k for k in set(a) | set(b)
+                  if a.get(k) != b.get(k) and k not in _EXEC_KEYS)
     if not diff:
         print(f"[grid] {save_dir}: already launched with this exact config "
               f"(possibly by another launcher) -- checking whether to skip or "
@@ -402,6 +419,15 @@ PY
             echo "[grid] could not determine the state of ${RUN_DIR}" >&2
             exit 1 ;;
     esac
+    # A cell launched before the planar state existed (or without it) carries
+    # no such key in the config it continues from. If the generator now writes
+    # it for this cell, switch it on through the environment: train.py lets
+    # that override the config and records it in config.json.
+    if [ "$(python -c "import json, sys; print(int(bool((json.load(open(sys.argv[1])).get('training') or {}).get('planar_state'))))" "${BASE_CONFIG}")" = "1" ] \
+            && [ -z "${IMMAP_PLANAR_STATE:-}" ]; then
+        export IMMAP_PLANAR_STATE=1
+        echo "[grid] planar state ON for this run (IMMAP_PLANAR_STATE=1)."
+    fi
 elif [ "${_rc}" -ne 0 ]; then
     exit "${_rc}"
 fi

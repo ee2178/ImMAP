@@ -110,6 +110,9 @@ def load_run(run_dir, device):
         cfg = json.load(f)
     from models.components import set_complex_mode
     set_complex_mode(cfg.get("training", {}).get("complex_conv"))
+    # per run: a dump spans runs trained with and without the key
+    from models.mg_lpds import set_planar_state
+    set_planar_state(bool(cfg.get("training", {}).get("planar_state", False)))
 
     model = build_model(cfg).to(device)
     ckpt = torch.load(os.path.join(run_dir, "net.ckpt"), map_location=device,

@@ -219,6 +219,8 @@ def count_config(cfg, name, hw, coils, R, device, shapes_only=False):
     if not hasattr(tn, "Mask"):
         _import_repo()
     mode = set_complex_mode(cfg.get("training", {}).get("complex_conv") or "gauss")
+    from models.mg_lpds import set_planar_state
+    set_planar_state(bool(cfg.get("training", {}).get("planar_state", False)))
     torch.manual_seed(0)
     net = build_model(cfg).to(device).eval()
     mri = cfg.get("mri", {})

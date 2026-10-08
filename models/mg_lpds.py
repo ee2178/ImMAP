@@ -54,6 +54,7 @@ Not ported (deliberately, see docs/multigrid_port.md)
 from __future__ import annotations
 
 import copy
+import os
 
 import torch
 import torch.nn as nn
@@ -454,7 +455,9 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
     prox with `widen == 1` and fixed transfers; any other net ignores the flag.
     """
 
-    # Class-level, like `_GaussConvNd.COMPLEX_MODE`: what a timing run toggles.
+    # Class-level, like `_GaussConvNd.COMPLEX_MODE`. Set for the process from
+    # a config's `training.planar_state` by `set_planar_state` (train.py, the
+    # eval scripts, the timing tools).
     PLANAR_STATE = False
 
     def __init__(self, K=(1, (8, 8, 8)), M=169, C=1, P=7, s=2, widen=1,
@@ -609,6 +612,58 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
     def extra_repr(self):
         return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "
                 f"coarse_op={self.coarse_op}")
+
+
+PLANAR_STATE_ENV = "IMMAP_PLANAR_STATE"
+
+
+def planar_state_override():
+    """The `IMMAP_PLANAR_STATE` environment override: True / False, or None
+    when it is unset. Only "1" and "0" are accepted -- a typo must not read as
+    one of them."""
+    v = os.environ.get(PLANAR_STATE_ENV, "").strip()
+    if not v:
+        return None
+    if v not in ("0", "1"):
+        raise ValueError(f"{PLANAR_STATE_ENV} must be 1 or 0, got {v!r}")
+    return v == "1"
+
+
+def set_planar_state(flag=None):
+    """Set `MGLPDSNet.PLANAR_STATE` for the process -> the value now in force.
+
+    `flag` is a config's `training.planar_state`; None (the key is absent)
+    leaves the class default, so existing configs are unchanged. The
+    environment variable `IMMAP_PLANAR_STATE=1|0` overrides the config: it is
+    how a run whose config predates the key -- a resumed training run, a
+    trained net being evaluated or dumped -- gets the planar state without its
+    saved config being edited.
+
+    Like `set_complex_mode`, this changes no parameter and (to fp roundoff) no
+    output or gradient, so a checkpoint trained under either state loads and
+    continues under the other. Nets the planar state is not implemented for
+    ignore it (`MGLPDSNet.planar_state_active`).
+    """
+    env = planar_state_override()
+    if env is not None:
+        flag = env
+    if flag is not None:
+        if not isinstance(flag, bool):
+            raise ValueError(f"training.planar_state must be true or false, got {flag!r}")
+        MGLPDSNet.PLANAR_STATE = flag
+    return MGLPDSNet.PLANAR_STATE
+
+
+def planar_state_report(model):
+    """One line for a log: is the planar state on, and does `model` use it?"""
+    nets = [m for m in model.modules() if isinstance(m, MGLPDSNet)]
+    if not MGLPDSNet.PLANAR_STATE:
+        return "planar state: off"
+    if nets and all(m.planar_state_active() for m in nets):
+        return "planar state: ON (iterates carried as real [re; im] tensors)"
+    why = ("this model has no MGLPDSNet" if not nets else
+           "not implemented for a group prox, widen > 1 or learned transfers")
+    return f"planar state: requested but NOT in use -- {why}"
 
 
 class _OuterStack(nn.Module):

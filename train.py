@@ -142,8 +142,21 @@ def main(config_path):
     # leaves the default, so existing configs are unchanged.
     from models.components import set_complex_mode
     set_complex_mode(cfg.get("training", {}).get("complex_conv"))
+    # Planar STATE (models/mg_lpds.py): the unrolled nets' iterates carried as
+    # real [re; im] tensors, which is also what lets the thresholding run as
+    # one fused kernel with a hand-written backward. Same parameters, same
+    # map; absent leaves it off. IMMAP_PLANAR_STATE=1|0 overrides the config
+    # (a resumed run's saved config may predate the key) and the value that
+    # actually ran is written back, so config.json records it.
+    from models.mg_lpds import (planar_state_override, planar_state_report,
+                                set_planar_state)
+    _planar = set_planar_state(cfg.get("training", {}).get("planar_state"))
+    if planar_state_override() is not None:
+        cfg.setdefault("training", {})["planar_state"] = _planar
     # Init model from scratch if no ckpt provided
     model = build_model(cfg).to(device)
+    if _planar:
+        print(planar_state_report(model))
     optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, cfg)
     # torch.autograd.set_detect_anomaly(True)   # debug only — remove after
@@ -261,10 +274,10 @@ def main(config_path):
     # --------------------------------------------------
     # Keys train.py consumes itself, above. They stay in `cfg` -- and so in the
     # saved config.json, which eval_mg_recon.py / dump_eval.py re-read to restore
-    # `complex_conv` -- but must not reach the train_* functions, none of which
+    # `complex_conv` and `planar_state` -- but must not reach the train_* functions, none of which
     # take **kwargs. Filtered here rather than popped: a pop before save_config
     # would drop them from the file.
-    _TRAIN_PY_KEYS = ("complex_conv", "cudnn_benchmark")
+    _TRAIN_PY_KEYS = ("complex_conv", "cudnn_benchmark", "planar_state")
     train_kws = {k: v for k, v in cfg["training"].items()
                  if k not in _TRAIN_PY_KEYS}
 

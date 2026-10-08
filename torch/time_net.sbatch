@@ -43,7 +43,25 @@
 # Options:
 #   R=12 KS="2 4" N_SLICES=6      the ESPIRiT check
 #   IMG="640 320" COILS=20 REPS=30
+#   SIZES=census                  step 2 also times every net on each matrix size
+#                                 and coil count the dataset really contains, each
+#                                 on its own and MIXED (round-robin, as a training
+#                                 epoch meets them). The sizes come from
+#                                 cache/fastmri_sizes_<anatomy>.json, which is
+#                                 written first if it is not there
+#                                 (scripts/fastmri_sizes.py: headers only, seconds;
+#                                 RESCAN=1 rewrites it). SIZES_TOP=3 keeps the 3
+#                                 most common
+#   SIZES="640x320x20 768x396x16" the same, on sizes named here (HxW[xCOILS])
+#   ANATOMY=knee                  configs, census and data from knee (default brain);
+#                                 set IMG / COILS to match, e.g. IMG="640 372" COILS=15
 #   MODELS="lpdsnet varnetmaps mglpds mg121v6"
+#   PLANAR_STATE=config           time the nets AS A PLANAR-STATE TRAINING RUN would
+#                                 run them: the configs are generated with
+#                                 --planar-state (training.planar_state=true on
+#                                 every cell that supports it), so the main table
+#                                 and the figure are the planar numbers, next to
+#                                 VarNet's, from one node in one job
 #   PLANAR_STATE=1                step 2 also times each unrolled net with its
 #                                 iterates carried as real [re; im] tensors
 #                                 (MGLPDSNet.PLANAR_STATE), paired with the normal
@@ -71,6 +89,7 @@ R="${R:-12}"
 KS="${KS:-2 4}"
 N_SLICES="${N_SLICES:-6}"
 IMG="${IMG:-640 320}"
+ANATOMY="${ANATOMY:-brain}"
 COILS="${COILS:-20}"
 REPS="${REPS:-30}"
 # V=6 only: exp8 showed V=2/4 lose too much to be worth timing, and mgunet
@@ -94,8 +113,29 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # The generator's current brain configs, written to this job's own directory so
 # nothing under config/ (which the training launchers regenerate) is touched.
 # --organ-mask matches the brain launchers; it only affects the data block.
-python scripts/make_mg_recon_configs.py --out "${OUT}/gen" --anatomy brain --organ-mask > /dev/null
-CFG="${OUT}/gen/brain/mg"
+GEN_PLANAR=""; PAIR_PLANAR=""; PROFILE_PLANAR=""
+case "${PLANAR_STATE:-}" in
+    "") ;;
+    config) GEN_PLANAR="--planar-state"; PROFILE_PLANAR="--planar-state" ;;
+    *) PAIR_PLANAR="--planar-state"; PROFILE_PLANAR="--planar-state" ;;
+esac
+python scripts/make_mg_recon_configs.py --out "${OUT}/gen" --anatomy "${ANATOMY}" --organ-mask \
+    ${GEN_PLANAR} > /dev/null
+CFG="${OUT}/gen/${ANATOMY}/mg"
+
+# Sizes for step 2's per-size table: the dataset's own census, or a list.
+SIZES_ARGS=()
+case "${SIZES:-}" in
+    "") ;;
+    census)
+        CENSUS="cache/fastmri_sizes_${ANATOMY}.json"
+        if [ ! -f "${CENSUS}" ] || [ -n "${RESCAN:-}" ]; then
+            echo; echo "================ fastMRI size census (${ANATOMY}) ================"
+            python scripts/fastmri_sizes.py --config "${CFG}/lpdsnet_R${R}.json" --out "${CENSUS}"
+        fi
+        SIZES_ARGS=(--sizes-from "${CENSUS}" ${SIZES_TOP:+--sizes-top "${SIZES_TOP}"}) ;;
+    *) SIZES_ARGS=(--sizes ${SIZES}) ;;
+esac
 
 if [ -z "${SKIP_ESPIRIT:-}" ]; then
     echo; echo "================ 1. online ESPIRiT kernel size ================"
@@ -118,7 +158,7 @@ if [ -z "${SKIP_NETS:-}" ]; then
         *) COMPILE_FLAG="--compile ${COMPILE}" ;;
     esac
     python scripts/time_net.py --configs "${CFGS[@]}" --size ${IMG} --coils "${COILS}" \
-        --reps "${REPS}" --step ${COMPILE_FLAG} ${PLANAR_STATE:+--planar-state} \
+        --reps "${REPS}" --step ${COMPILE_FLAG} ${PAIR_PLANAR} "${SIZES_ARGS[@]}" \
         --json-out "${OUT}/time_net.json" \
         --fig-out "${OUT}/time_net.png"
 fi
@@ -142,7 +182,7 @@ if [ -z "${SKIP_BREAKDOWN:-}" ]; then
         python scripts/profile_mg.py --configs "${f}" --size ${IMG} --coils "${COILS}" \
             --R "${R}" --reps "${REPS}" --cudnn-benchmark ${PLANAR} --by-level --counts \
             ${OPS:+--ops} ${HOST:+--host} ${NO_WEIGHT_CACHE:+--no-weight-cache} \
-            ${PLANAR_STATE:+--planar-state} \
+            ${PROFILE_PLANAR} \
             | tee -a "${OUT}/breakdown.txt"
     done
 fi
