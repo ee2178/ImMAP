@@ -72,8 +72,6 @@ def test_default_is_the_old_net():
     xt, cond, sigma = batch()
     out, z = net(torch.cat([xt, cond], 1), sigma=sigma)
     assert out.shape == xt.shape and net.last_S is None
-    with pytest.raises(ValueError, match="s_mode"):
-        cdl(None, bridge_fidelity=False)
     with pytest.raises(ValueError, match="s_mode must be"):
         cdl("additive")
 
@@ -328,3 +326,31 @@ def test_panel():
     rgb, cap = enhancement_panel(0.5 * torch.rand_like(t1), t1 + torch.rand_like(t1), t1)
     assert rgb.shape == (3, 3, H, H) and float(rgb.min()) >= 0 and float(rgb.max()) <= 1
     assert "S_hat" in cap and "rms" in cap
+
+
+def test_static_mode_without_S_is_plain_coupled_dictionary_synthesis():
+    """bridge_fidelity=False, s_mode=None: the no-S control on the synthesis task."""
+    net = cdl(None, bridge_fidelity=False).eval()
+    assert net.coupling is None and net.A_P[0].conv_real.weight.shape[1] == 3
+    assert float(torch.sigmoid(net.a_nu[0, 0])) == pytest.approx(0.9, abs=1e-6)
+    xt, cond, sigma = batch()
+    with torch.no_grad():
+        a, _ = net(torch.cat([xt, cond], 1), sigma=sigma)
+        b, _ = net(torch.cat([3 * torch.randn_like(xt), cond], 1), sigma=2 * sigma)
+        c, z = net(cond)                                       # task: synthesis
+    assert torch.equal(a, b) and torch.allclose(a, c, atol=1e-6)
+    assert net.last_S is None and a.shape == xt.shape
+    # it is the textbook iteration: one ISTA step on the conditioning fidelity per layer
+    from models.components import ST
+    cc = cond - cond.mean(dim=(2, 3), keepdim=True)
+    zz = torch.zeros_like(net.A_P[0](cc))
+    with torch.no_grad():
+        for k in range(net.K):
+            nu = torch.sigmoid(net.a_nu[k, 0])
+            zz = ST(zz - nu * net.A_P[k](net.B_P[k](zz) - cc), net.t[k, 0].view(1, -1, 1, 1))
+        want = net.B_D[0](zz) + cond[:, 1:2].mean(dim=(1, 2, 3), keepdim=True)
+    assert torch.allclose(c, want, atol=1e-5)
+    out, _ = net.train()(cond)
+    out.pow(2).mean().backward()
+    assert float(net.B_D[0].conv_real.weight.grad.abs().sum()) > 0
+    assert float(net.A_P[1].conv_real.weight.grad.abs().sum()) > 0

@@ -235,6 +235,37 @@ def time_compiled(net, measure, compile_mode, eager, new_problem):
 
     saved = (SoftThreshold.FUSED, _GaussConvNd.PLANAR_WEIGHT_CACHE)
     SoftThreshold.FUSED = _GaussConvNd.PLANAR_WEIGHT_CACHE = False
+    try:
+        first_error = None
+        for settings in COMPILE_ATTEMPTS:
+            out = _compile_once(net, measure, compile_mode, eager, new_problem, _embed,
+                                settings)
+            if "error" not in out:
+                if first_error:
+                    out["note"] = (f"compiled only with {settings}; as shipped: "
+                                   f"{first_error}")
+                return out
+            if first_error and out["error"] != first_error:
+                out["error"] = f"{first_error}  |  with {settings}: {out['error']}"
+            first_error = first_error or out["error"]
+        return out                                          # every attempt failed
+    finally:
+        SoftThreshold.FUSED, _GaussConvNd.PLANAR_WEIGHT_CACHE = saved
+
+
+# Tried in order until one compiles. Inductor's layout pass moves 4-D conv
+# graphs to channels_last, and a COMPLEX tensor in that layout cannot be viewed
+# as its real pairs ("self.stride(-1) must be 1 to view ComplexFloat as Float,
+# but got <channels>") -- which is how every complex net here failed on torch
+# 2.11. So the second attempt switches that pass off. A real-valued net (VarNet)
+# compiles on the first attempt and keeps the pass.
+COMPILE_ATTEMPTS = ({}, {"layout_optimization": False})
+
+
+def _compile_once(net, measure, compile_mode, eager, new_problem, _embed, settings):
+    import contextlib
+    import traceback
+
     counters = None
     try:
         import torch._dynamo as dynamo
@@ -244,9 +275,16 @@ def time_compiled(net, measure, compile_mode, eager, new_problem):
             counters.clear()
         except Exception:                                   # private API: best effort
             counters = None
-        cnet = torch.compile(net, mode=None if compile_mode == "default" else compile_mode)
-        cols, peak, first_s, infer = measure(cnet)
-        out = dict(mode=compile_mode, peak_mb=peak, first_s=first_s, **cols)
+        ctx = contextlib.nullcontext()
+        if settings:
+            import torch._inductor.config as inductor_config
+            ctx = inductor_config.patch(**settings)
+        with ctx:
+            cnet = torch.compile(net,
+                                 mode=None if compile_mode == "default" else compile_mode)
+            cols, peak, first_s, infer = measure(cnet)
+        out = dict(mode=compile_mode, peak_mb=peak, first_s=first_s,
+                   inductor_settings=dict(settings), **cols)
 
         # A fresh operator of the SAME shape, as every training step and every
         # new slice brings: does the compiled code accept it, or recompile?
@@ -267,9 +305,15 @@ def time_compiled(net, measure, compile_mode, eager, new_problem):
                 pass
         return out
     except Exception as e:                                  # report it, time the rest
-        return dict(mode=compile_mode, error=f"torch.compile failed -- {_first_line(e)}")
+        # the one-line message loses WHERE it failed: the full trace goes to
+        # stderr (the job's .err log)
+        print(f"\n[time_net] torch.compile failed for {eager['name']} with inductor "
+              f"settings {dict(settings) or 'as shipped'}:", file=sys.stderr)
+        traceback.print_exc()
+        sys.stderr.flush()
+        return dict(mode=compile_mode, inductor_settings=dict(settings),
+                    error=f"torch.compile failed -- {_first_line(e)}")
     finally:
-        SoftThreshold.FUSED, _GaussConvNd.PLANAR_WEIGHT_CACHE = saved
         try:
             import torch._dynamo as dynamo
             dynamo.reset()
@@ -286,6 +330,7 @@ def print_compiled(rows, mode):
     head = (f"  {'config':<16}{'infer':^26}{'forward':^26}{'backward':^26}"
             f"{'first calls':>12}{'graphs':>8}{'breaks':>8}  new operator")
     print(head)
+    notes = []
     for r in rows:
         c = r.get("compiled") or {}
         if "error" in c or not c:
@@ -298,7 +343,12 @@ def print_compiled(rows, mode):
         new = (f"{c['new_operator_ms']:.0f} ms: RECOMPILES" if c["new_operator_recompiles"]
                else f"{c['new_operator_ms']:.0f} ms: reused")
         print(f"  {r['name']:<16}{cells}{c['first_s']:>10.0f} s"
-              f"{str(c.get('graphs', '?')):>8}{str(c.get('graph_breaks', '?')):>8}  {new}")
+              f"{str(c.get('graphs', '?')):>8}{str(c.get('graph_breaks', '?')):>8}  {new}"
+              + ("  [*]" if c.get("note") else ""))
+        if c.get("note"):
+            notes.append(f"  [*] {r['name']}: {c['note']}")
+    for line in notes:
+        print(line)
     reasons = {}
     for r in rows:
         for why, n in (r.get("compiled") or {}).get("graph_break_reasons", []):
@@ -373,13 +423,14 @@ def main():
             for c in args.configs]
 
     cols = ["infer", "forward", "backward"] + (["opt", "project"] if args.step else [])
-    head = (f"{'config':<14}{'K':<18}{'M':>4}{'params':>11} {'conv':<7}{'coarse':<13}"
+    nw = max(len(r["name"]) for r in rows) + 2
+    head = (f"{'config':<{nw}}{'K':<18}{'M':>4}{'params':>11} {'conv':<7}{'coarse':<13}"
             + "".join(f"{c:>10}" for c in cols) + f"{'fwd+bwd':>10}{'peak MB':>9}")
     print(head + "    (ms, median)")
     print("-" * len(head))
     for r in rows:
         fb = r["forward"]["median"] + r["backward"]["median"]
-        print(f"{r['name']:<14}{str(r['K']):<18}{str(r['M'] or ''):>4}{r['params']:>11,} "
+        print(f"{r['name']:<{nw}}{str(r['K']):<18}{str(r['M'] or ''):>4}{r['params']:>11,} "
               f"{r['complex_conv']:<7}{str(r['coarse_op'] or '-'):<13}"
               + "".join(f"{r[c]['median']:>10.1f}" for c in cols)
               + f"{fb:>10.1f}{r['peak_mb']:>9.0f}"
@@ -387,13 +438,13 @@ def main():
     print("\nspread (min / p95 / max, ms) -- a wide one means the timing, not the "
           "net, is unstable:")
     for r in rows:
-        print(f"  {r['name']:<14}" + "   ".join(
+        print(f"  {r['name']:<{nw}}" + "   ".join(
             f"{c} {r[c]['lo']:.1f}/{r[c]['p95']:.1f}/{r[c]['hi']:.1f}" for c in cols))
     if len(rows) > 1:
         base = rows[0]
         print(f"\nrelative to {base['name']}:")
         for r in rows[1:]:
-            print(f"  {r['name']:<14} infer {r['infer']['median'] / base['infer']['median']:.2f}x"
+            print(f"  {r['name']:<{nw}} infer {r['infer']['median'] / base['infer']['median']:.2f}x"
                   f"   fwd+bwd "
                   f"{(r['forward']['median'] + r['backward']['median']) / (base['forward']['median'] + base['backward']['median']):.2f}x")
     if args.compile:
