@@ -9,21 +9,21 @@
 #    0   i2sb_unet_all_bs256.json                    SBUnet            FLAIR, T1, T2; batch 256 + EMA + sigma weighting
 #    1   i2sb_unet_otherstudy_pair_w2_bs256.json     SBUnet            as 0 + prior-study T1/CT1 at z-2..z+2
 #    2   i2sb_sbcdlnet_sfree.json                    SBCDLNet          FLAIR, T1, T2; S = D_S z
-#    3   i2sb_sbcdlnet_sgate.json                    SBCDLNet          FLAIR, T1, T2; S = D (m . z)
-#    4   i2sb_sbguidedcdl_otherstudy_sfree.json      SBGuidedGroupCDL  as 2; guide = prior-study CT1
-#    5   i2sb_sbguidedcdl_otherstudy_sgate.json      SBGuidedGroupCDL  as 3; guide = prior-study CT1
-#    6   i2sb_sbguidedcdl_otherstudy_sfree_xS.json   SBGuidedGroupCDL  as 4 + enhancement cross-attention
-#    7   i2sb_sbguidedcdl_otherstudy_sgate_xS.json   SBGuidedGroupCDL  as 5 + enhancement cross-attention
-#    8   i2sb_lggcdl_session.json                    LGGCDL            guides = same-session T1, T2, FLAIR
-#    9   i2sb_lggs_session.json                      LGGS              guides = same-session T1, T2, FLAIR
+#    3   i2sb_sbguidedcdl_otherstudy_sfree.json      SBGuidedGroupCDL  as 2; guide = prior-study CT1
+#    4   i2sb_sbguidedcdl_otherstudy_sfree_xS.json   SBGuidedGroupCDL  as 3 + enhancement cross-attention
+#    5   i2sb_lggcdl_session.json                    LGGCDL            guides = same-session T1, T2, FLAIR
+#    6   i2sb_lggs_session.json                      LGGS              guides = same-session T1, T2, FLAIR
 #
-# WHAT THIS ARRAY NO LONGER HOLDS (2026-10-08; every config file still exists):
+# WHAT THIS ARRAY NO LONGER HOLDS (every config file still exists; append its path to rerun):
 #   * the batch-8 SBUnets. The large-batch recipe (0-1) is the UNet standard now.
-#   * SBCDLNet / SBGuidedGroupCDL WITHOUT an enhancement map. Only the +S models (2-7) are
-#     under consideration for those two families.
+#   * SBCDLNet / SBGuidedGroupCDL WITHOUT an enhancement map: only +S models are considered.
+#   * the GATED enhancement map (i2sb_*_sgate*.json). In preliminary runs it was slightly behind
+#     the free dictionary on plain synthesis and further behind on the longitudinal task, so
+#     only the free version is trained for now.
 #   * the cycle nets, and the end-to-end UNets they were controls for. The synthesis-task
 #     comparison lives in bigpurple/synth_sbcdlnet_array.sbatch.
-# INDICES CHANGED with this: the old 16-17 are now 0-1, 20-25 are now 2-7, 6-7 are now 8-9.
+# INDICES HAVE CHANGED TWICE. Against the original 26-entry list: 16-17 are now 0-1, 20 is 2,
+# 22 is 3, 24 is 4, 6-7 are 5-6.
 #
 # UNET (0-1): effective batch 256 = data.batch_size 32 x training.accum_steps 8, EMA 0.99, lr
 # 2e-4, and the 1/sigma^2 loss weight (loss_weight "snr", loss_weight_max 1000). 300,000 optimizer
@@ -33,39 +33,38 @@
 # the average. 0 vs 1 isolates the prior study. The w=0 and w=1 large-batch configs
 # (i2sb_unet_otherstudy_pair_bs256.json, ..._w1_bs256.json) exist but are not listed.
 #
-# ENHANCEMENT MAP (2-7): the T1 fidelity is a LEARNED DATA-CONSISTENCY term through an
-# enhancement map S decoded from the same sparse code as CT1 (models/enhancement.py):
-#     free   S = D_S z         T1 = (D - D_S) z        S has its own synthesis dictionary
-#     gate   S = D (m . z)     T1 = D ((1 - m) . z)    m in [0,1] per atom: which textures enhance
+# ENHANCEMENT MAP (2-4): the T1 fidelity is a LEARNED DATA-CONSISTENCY term through an
+# enhancement map with its own synthesis dictionary, decoded from the same sparse code as CT1
+# (models/enhancement.py):     S = D_S z,     T1 = (D - D_S) z.
 # Trained with  loss(x0_hat, CT1) + s_weight * MSE(S_hat, (CT1 - T1)_+)  on top of the bridge
 # target term. The x0 term uses the same sigma weighting as 0-1; the S term is not sigma-weighted.
 # Batch 8 (SBCDLNet) / 4 (guided), no EMA, no accumulation -- so 0-1 have a far larger training
-# budget than 2-7; read that comparison with it in mind.
+# budget than 2-4; read that comparison with it in mind.
 # Each validation logs the val/S image and the collapse/* scalars:
-#     S = 0                     S_rms_ratio -> 0;  gate_closed -> 1  or  DS_over_D_* -> 0
-#     T1 constrains nothing     T1_resid -> 1;     gate_open -> 1    or  Dy_over_D_min -> 0
+#     S = 0                     S_rms_ratio -> 0   or  DS_over_D_* -> 0
+#     T1 constrains nothing     T1_resid -> 1      or  Dy_over_D_min -> 0
 #     a fidelity switched off   step_xi_min / step_eta_min / step_nu_min -> 0
 #     the code died / is dense  code_density -> 0 / -> 1
 #     S is not one-sided        S_neg_frac large
-#   2 vs 3, 4 vs 5      free dictionary against per-atom gate
-#   2 vs 4, 3 vs 5      the guided prox with the prior-study CT1
+#   2 vs 3   the guided prox with the prior-study CT1
+#   3 vs 4   the enhancement cross-attention
 #
-# ENHANCEMENT CROSS-ATTENTION (6-7, model param s_cross): one more branch of the guided prox
+# ENHANCEMENT CROSS-ATTENTION (4, model param s_cross): one more branch of the guided prox
 # attends between ENHANCEMENT MAPS -- the current estimate S_k against the prior study's
 # S_prior = (CT1_prior - T1_prior)_+, which is known exactly -- beside the CT1-to-CT1 guide branch
-# of 4-5. The loader therefore returns the prior T1 as well (guide_idx [1, 2]); it is used only
-# to form S_prior. 6 weights the extra energy onto every atom, 7 onto the gated atoms. 4 vs 6 and
-# 5 vs 7 isolate the branch. It is one more attention per refreshing layer: if batch 4 no longer
-# fits, lower data.train.batch_size. collapse/cross_gain_min -> 0 means the branch is switched off.
+# of 3. The loader therefore returns the prior T1 as well (guide_idx [1, 2]); it is used only to
+# form S_prior. It is one more attention per refreshing layer: if batch 4 no longer fits, lower
+# data.train.batch_size. collapse/cross_gain_min -> 0 means the branch is switched off.
 #
-# The learned-DC-ONLY versions (no bridge term, task: synthesis) of the S models are not here:
-# SBCDLNet's are in bigpurple/synth_sbcdlnet_array.sbatch, the guided ones
-# (synth_sbguidedcdl_otherstudy_s{free,gate}.json) are unlisted.
+# HOW THE PRIOR STUDY ENTERS 3-4: only through the guided prox's adjacency, never as a
+# conditioning channel. That matters for these nets -- every conditioning channel other than the
+# T1 is FITTED by the code through the side dictionary, so a prior scan given as a channel would
+# have to be reconstructed by today's code. Do not use guide_as_cond with the +S nets.
 #
 # Submit all (at most 4 GPUs at once):
 #   sbatch bigpurple/i2sb_nyumets_array.sbatch
 # A subset (the --array on the command line overrides the #SBATCH line):
-#   sbatch --array=2-7 bigpurple/i2sb_nyumets_array.sbatch
+#   sbatch --array=2-4 bigpurple/i2sb_nyumets_array.sbatch
 # After the h5 build:
 #   sbatch --dependency=afterok:<h5 jobid> --kill-on-invalid-dep=yes \
 #          bigpurple/i2sb_nyumets_array.sbatch
@@ -77,7 +76,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-9%4
+#SBATCH --array=0-6%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -90,7 +89,7 @@
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.err
 
-# --time is 7 days (radiology allows 28): the unrolled nets (2-9) are far slower per step
+# --time is 7 days (radiology allows 28): the unrolled nets (2-6) are far slower per step
 # than SBUnet, and the guided ones pay for 15x15 guide-window attention on top.
 # Mail is for the array as a whole (BEGIN when the first task starts, END/FAIL when all are
 # done). Add ARRAY_TASKS to --mail-type for one mail per task (24 mails for 8 tasks).
@@ -100,11 +99,8 @@ CONFIGS=(
     config/NYUMets/i2sb_unet_all_bs256.json
     config/NYUMets/i2sb_unet_otherstudy_pair_w2_bs256.json
     config/NYUMets/i2sb_sbcdlnet_sfree.json
-    config/NYUMets/i2sb_sbcdlnet_sgate.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_sfree.json
-    config/NYUMets/i2sb_sbguidedcdl_otherstudy_sgate.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_sfree_xS.json
-    config/NYUMets/i2sb_sbguidedcdl_otherstudy_sgate_xS.json
     config/NYUMets/i2sb_lggcdl_session.json
     config/NYUMets/i2sb_lggs_session.json
 )

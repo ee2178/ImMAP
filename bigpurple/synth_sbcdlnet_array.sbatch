@@ -8,31 +8,31 @@
 #
 #   idx  config                         model      what it is
 #    0   synth_unet_all_bs32.json       Unet2D     the standard UNet, at THIS array's recipe
-#    1   synth_sbcdlnet_sfree.json      SBCDLNet   S = D_S z        learned DC through its own dictionary
-#    2   synth_sbcdlnet_sgate.json      SBCDLNet   S = D (m . z)    learned DC through a per-atom gate
+#    1   synth_sbcdlnet_sfree.json      SBCDLNet   S = D_S z: learned DC through S's own dictionary
 #
-# What each pair isolates:
-#   0 vs 1, 2   a UNet against an unrolled sparse-coding net with a physics-informed T1 term
-#   1 vs 2      S with its own dictionary against S gated out of the target's atoms
+# 0 vs 1: a UNet against an unrolled sparse-coding net with a physics-informed T1 term.
+#
+# The GATED enhancement map (synth_sbcdlnet_sgate.json) is no longer listed: in preliminary runs
+# it was slightly behind the free dictionary on this task. The config still exists.
 #
 # There is deliberately no SBCDLNet WITHOUT S here: with no enhancement map the net has no
 # physics-informed structure, and that variant has been tried before and performs poorly.
 #
-# ONE RECIPE for all three, so the table is not a comparison of training budgets: an EFFECTIVE
+# ONE RECIPE for both, so the table is not a comparison of training budgets: an EFFECTIVE
 # batch of 32, no EMA, 300,000 optimizer steps, Adam 1e-4 with cosine decay, complex-mse on the
 # whole frame, and validation every 5,000 steps on the SAME 1,000 val slices (val_seed 0). The
 # only training keys that differ are each model's own gradient clip (UNet 1.0, SBCDLNet 0.05) and
-# s_weight (1, 2).
+# s_weight (1).
 #
 # HOW THE 32 IS REACHED. The UNet uses a true batch of 32. SBCDLNet uses batch 8 x accum_steps 4:
 # on the A100 its throughput PEAKS at a micro-batch of 8 and falls by about 40% beyond it
-# (measured for 2, ms per micro-batch: 8 -> 134, 16 -> 435, 32 -> 938), so
+# (measured for the gated version, ms per micro-batch: 8 -> 134, 16 -> 435, 32 -> 938), so
 #
 #     effective 32 as   8 x 4     0.55 s / optimizer step    ~1.9 days for 300k steps
 #                       32 x 1    0.94 s                     ~3.3 days
 #
 # The gradient is identical either way (no batch statistics in the net). To change the effective
-# batch, change accum_steps in 1-2 and batch_size in 0 TOGETHER: 8 x 2 = 16 is ~1.0 day.
+# batch, change accum_steps in 1 and batch_size in 0 TOGETHER: 8 x 2 = 16 is ~1.0 day.
 #
 # The existing synth_unet_all run (config/NYUMets/synth_unet_all.json, no longer in any array)
 # is the same UNet at batch 64 + EMA.
@@ -41,14 +41,14 @@
 #
 # In SBCDLNet the code is driven by the conditioning stack alone: there is no bridge state, so
 # `bridge_fidelity: false`. FLAIR and T2 are fitted through their own dictionary; the T1 channel
-# goes through the CT1 dictionary and the enhancement map, T1 = CT1 - S. Both runs log the val/S
+# goes through the CT1 dictionary and the enhancement map, T1 = CT1 - S. Run 1 logs the val/S
 # image and the collapse/* scalars.
 #
 # No --partition override: radiology is where these run.
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=synth-sbcdl
-#SBATCH --array=0-2
+#SBATCH --array=0-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -66,7 +66,6 @@
 CONFIGS=(
     config/NYUMets/synth_unet_all_bs32.json
     config/NYUMets/synth_sbcdlnet_sfree.json
-    config/NYUMets/synth_sbcdlnet_sgate.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
