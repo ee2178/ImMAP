@@ -22,7 +22,13 @@ piece and then end to end:
 5. the flag is ignored where the planar state is not implemented (group prox,
    widened V-cycle), so those nets are untouched;
 6. it does what it is for: the M-channel code is no longer converted around
-   every conv.
+   every conv;
+7. the fused prox WITH ITS BACKWARD (`SoftThreshold.FUSED_GRAD`): the
+   hand-written derivative against autograd through the eager chain, clip and
+   shrink, every threshold layout; the two kernels' arithmetic and addressing
+   emulated program by program; and the network trained through the autograd
+   Function (`clip_triton.EMULATE`) against the eager planar chain. NEGATIVE
+   CONTROL: a derivative without its radial term must fail.
 
 CPU only, small problems, no LAPACK needed (the group case is skipped without).
 """
@@ -33,6 +39,7 @@ import math
 
 import torch
 
+import models.clip_triton as clip_mod
 from models.clip_triton import clip_modulus_planar
 from models.components import Conv2d, ConvTranspose2d, _GaussConvNd, to_complex, to_planar
 from models.mg_lpds import MGLPDSNet
@@ -193,6 +200,246 @@ def test_prox():
           B > 1 and sorted(torch.cat((bad, bad + MHW)).tolist()) != list(range(zp.numel())))
 
 
+class emulate:
+    """Run the planar prox through `clip_triton`'s autograd Function on its
+    torch formulas -- the kernels' arithmetic, without the kernels."""
+
+    def __enter__(self):
+        self.keep = clip_mod.EMULATE
+        clip_mod.EMULATE = True
+
+    def __exit__(self, *exc):
+        clip_mod.EMULATE = self.keep
+
+
+def prox_grads(st, zp, sig, g, dual):
+    """`(out, dL/dz, dL/dtau.weight)` for L = <g, prox(z)>."""
+    z = zp.clone().requires_grad_(True)
+    st.zero_grad(set_to_none=True)
+    out = (st.fenchel if dual else st)(z, sig)[0]
+    (out * g).sum().backward()
+    return out, z.grad.clone(), st.tau.weight.grad.clone()
+
+
+def kernel_forward(zp, tf, TN, eps, dual, BLOCK=24):
+    """`_prox_kernel_planar`, program by program. -> (out, floats written)."""
+    B, M, HW = zp.shape[0], zp.shape[1] // 2, zp.shape[2] * zp.shape[3]
+    n, MHW = B * M * HW, M * HW
+    flat, out, hits = zp.reshape(-1), torch.zeros(zp.numel()), torch.zeros(zp.numel())
+    for pid in range(-(-n // BLOCK)):
+        i = pid * BLOCK + torch.arange(BLOCK)
+        i = i[i < n]
+        off = i + fdiv(i, MHW) * MHW
+        re, im = flat[off], flat[off + MHW]
+        q = tf[fdiv(i, HW) % TN] / torch.clamp((re * re + im * im).sqrt(), min=eps)
+        s = torch.clamp(q, max=1.0) if dual else torch.clamp(1.0 - q, min=0.0)
+        out[off], out[off + MHW] = re * s, im * s
+        hits[off] += 1
+        hits[off + MHW] += 1
+    return out.reshape(zp.shape), hits
+
+
+def kernel_backward(zp, tf, TN, g, eps, dual, BLOCK=24):
+    """`_prox_backward_planar`, program by program.
+    -> (dz, dt per (batch, channel), floats written, slots written)."""
+    B, M, HW = zp.shape[0], zp.shape[1] // 2, zp.shape[2] * zp.shape[3]
+    MHW, NB = M * HW, -(-HW // BLOCK)
+    Z, G = zp.reshape(-1), g.reshape(-1)
+    GZ, hits = torch.zeros(zp.numel()), torch.zeros(zp.numel())
+    PART, slots = torch.zeros(B * M * NB), torch.zeros(B * M * NB)
+    for r in range(B * M):
+        for pb in range(NB):
+            j = pb * BLOCK + torch.arange(BLOCK)
+            j = j[j < HW]
+            off = (r + (r // M) * M) * HW + j
+            re, im, gr, gi = Z[off], Z[off + MHW], G[off], G[off + MHW]
+            t = tf[r % TN]
+            a = (re * re + im * im).sqrt()
+            ac = torch.clamp(a, min=eps)
+            q = t / ac
+            d = (gr * re + gi * im) / ac
+            zero = torch.zeros(())
+            if dual:
+                act = q <= 1.0
+                s, w = torch.where(act, q, torch.ones(())), torch.where(act, d, zero)
+            else:
+                act = q < 1.0
+                s, w = torch.where(act, 1.0 - q, zero), torch.where(act, -d, zero)
+            k = torch.where(a >= eps, w * q / ac, zero)
+            GZ[off], GZ[off + MHW] = gr * s - k * re, gi * s - k * im
+            hits[off] += 1
+            hits[off + MHW] += 1
+            PART[r * NB + pb] = w.sum()
+            slots[r * NB + pb] += 1
+    return (GZ.reshape(zp.shape), PART.view(B, M, NB).sum(2).view(B, M, 1, 1), hits, slots)
+
+
+def test_fused_grad():
+    """The planar prox as one kernel forward and one backward: the hand-written
+    derivative, the kernels' index arithmetic, and the Function wiring."""
+    torch.manual_seed(0)
+    B, M = 2, 6
+    zp = to_planar(torch.randn(B, M, 8, 8, dtype=torch.complex64))
+    zp.view(-1)[::7] = 0                                  # zero halves, and ...
+    zp[:, :, :2] = 0                                      # ... exactly-zero pairs (a padded border)
+    g = torch.randn_like(zp)
+    eps = SoftThreshold.fenchel_eps
+
+    def make(degrees, m=M):
+        st = SoftThreshold(m, tau0=0.4, degrees=degrees)
+        with torch.no_grad():
+            st.tau.weight[0] = torch.linspace(0.1, 1.2, m)
+            if degrees:
+                st.tau.weight[1] = 3.0
+        return st
+
+    cases = (("per channel (1, M)", make(0), None, M),
+             ("noise-adaptive, one sigma (1, M)", make(1), 0.03, M),
+             ("noise-adaptive, per batch (B, M)", make(1),
+              torch.tensor([0.02, 0.05]).view(B, 1, 1, 1), B * M))
+    for dual in (True, False):
+        kind = "clip" if dual else "shrink"
+        for tag, st, sig, TN in cases:
+            ref_out, ref_dz, ref_dt = prox_grads(st, zp, sig, g, dual)   # eager chain + autograd
+            used = "PlanarProx" in type(ref_out.grad_fn).__name__
+            with emulate():
+                out, dz, dt = prox_grads(st, zp, sig, g, dual)
+                fn = type(out.grad_fn).__name__
+                with torch.no_grad():
+                    out_ng = (st.fenchel if dual else st)(zp, sig)[0]
+            check(f"{kind}, {tag}: the Function is taken, value == the eager chain",
+                  "PlanarProx" in fn and not used and rel(out, ref_out) < 1e-6
+                  and rel(out_ng, ref_out) < 1e-6, f"grad_fn {fn}")
+            check(f"{kind}, {tag}: hand-written dL/dz and dL/dtau == autograd",
+                  rel(dz, ref_dz) < 1e-5 and rel(dt, ref_dt) < 1e-5
+                  and bool(torch.isfinite(dz).all()),
+                  f"dz rel {rel(dz, ref_dz):.1e}, dtau rel {rel(dt, ref_dt):.1e}")
+
+            # the kernels' own arithmetic and addressing, program by program
+            t4 = st.threshold(zp, sig).detach()
+            tf = (t4.expand(B, M, 1, 1) if t4.shape[0] > 1 else t4).reshape(-1)
+            k_out, hits = kernel_forward(zp, tf, tf.numel(), eps, dual)
+            k_dz, k_dt, bhits, slots = kernel_backward(zp, tf, tf.numel(), g, eps, dual)
+            e_dz, e_dt = clip_mod._eager_backward(zp, t4, g, eps, dual)
+            check(f"{kind}, {tag}: kernel arithmetic (emulated), forward and backward",
+                  tf.numel() == TN and rel(k_out, ref_out) < 1e-6 and rel(k_dz, ref_dz) < 1e-5
+                  and rel(k_dt, e_dt) < 1e-5
+                  and bool((hits == 1).all()) and bool((bhits == 1).all())
+                  and bool((slots == 1).all()), "every float and every slot written once")
+
+    # NEGATIVE CONTROLS: the comparison must see a wrong derivative ...
+    st, sig = cases[1][1], cases[1][2]
+    _, ref_dz, _ = prox_grads(st, zp, sig, g, True)
+    t4 = st.threshold(zp, sig).detach()
+    out = clip_mod._eager_forward(zp, t4, eps, True)
+    pairs = zp.reshape(B, 2, M, 8, 8)
+    s = (t4 / torch.hypot(pairs[:, 0], pairs[:, 1]).clamp_min(eps)).clamp_max(1.0)
+    no_radial = (g.reshape(B, 2, M, 8, 8) * s.unsqueeze(1)).reshape(zp.shape)
+    check("  control: dropping the radial term (dz = s g) is caught",
+          rel(no_radial, ref_dz) > 1e-2, f"rel {rel(no_radial, ref_dz):.2f}")
+    # ... and a wrong row offset in the backward kernel
+    tf = t4.reshape(-1)
+    k_dz = kernel_backward(zp, tf, M, g, eps, True)[0]
+    check("  control: the (emulated) kernel differs for another incoming gradient",
+          rel(kernel_backward(zp, tf, M, g.flip(0), eps, True)[0], k_dz) > 1e-2
+          and rel(out, prox_grads(st, zp, sig, g, True)[0]) < 1e-6)
+
+    # a scalar threshold (TN = 1), and the gradient at exact zeros
+    st1 = SoftThreshold(1, tau0=0.7)
+    z1 = to_planar(torch.randn(2, 1, 6, 6, dtype=torch.complex64))
+    g1 = torch.randn_like(z1)
+    ref = prox_grads(st1, z1, None, g1, True)
+    with emulate():
+        got = prox_grads(st1, z1, None, g1, True)
+    check("a single threshold (TN = 1): value and both gradients",
+          all(rel(a, b) < 1e-5 for a, b in zip(got, ref)))
+    with emulate():
+        zz = torch.zeros(1, 2 * M, 4, 4, requires_grad=True)
+        stz = make(0)
+        (stz.fenchel(zz, None)[0] + stz(zz, None)[0]).sum().backward()
+    check("the gradient at z = 0 is finite and passes g through (clip + shrink = id)",
+          bool(torch.isfinite(zz.grad).all()) and rel(zz.grad, torch.ones_like(zz)) < 1e-6
+          and bool(torch.isfinite(stz.tau.weight.grad).all()))
+
+    # where it must NOT be taken
+    st = make(1)
+    z = zp.clone().requires_grad_(True)
+    check("without CUDA (and without EMULATE) the eager chain runs",
+          clip_mod.prox_planar_grad(z, st.threshold(z, 0.03), eps) is None
+          and clip_mod.prox_planar(zp, st.threshold(zp, 0.03), eps, dual=False) is None)
+    with emulate():
+        check("a full-resolution threshold map is declined",
+              clip_mod.prox_planar_grad(z, torch.rand(B, M, 8, 8), eps) is None)
+        check("a non-contiguous code is declined",
+              clip_mod.prox_planar_grad(z.transpose(-1, -2), st.threshold(z, 0.03), eps) is None)
+        keep = SoftThreshold.FUSED_GRAD
+        SoftThreshold.FUSED_GRAD = False
+        try:
+            off = st.fenchel(z, 0.03)[0]
+        finally:
+            SoftThreshold.FUSED_GRAD = keep
+        check("FUSED_GRAD = False keeps the eager chain under autograd",
+              "PlanarProx" not in type(off.grad_fn).__name__)
+        keep = SoftThreshold.FUSED
+        SoftThreshold.FUSED = False
+        try:
+            off = st.fenchel(z, 0.03)[0]
+        finally:
+            SoftThreshold.FUSED = keep
+        check("FUSED = False switches it off too (the one kill switch)",
+              "PlanarProx" not in type(off.grad_fn).__name__)
+    check("nothing was marked as a kernel on the CPU",
+          clip_mod.planar_kernel_report() == "fwd not used, bwd not used",
+          clip_mod.planar_kernel_report())
+
+
+def test_network_fused_grad():
+    """End to end: the network trained through the Function gives the same
+    gradients as through the eager planar chain (and the complex state)."""
+    import models.prox as prox_mod
+
+    y, E = problem()
+    y_e, E0 = problem(64, 44)
+    E_e, T = embed_operator(E0, (64, 44), 8)
+    for tag, kws, yy, EE in (("flat K=4", dict(K=4), y, E),
+                             ("V-cycle, rediscretize, embedded 64x44",
+                              dict(K=[1, [2, 2, 2]], coarse_op="rediscretize"), y_e, E_e)):
+        torch.manual_seed(0)
+        net = MGLPDSNet(**dict(NET, **kws))
+        _, _, g_cplx = run(net, yy, EE, False, grad=True)
+        a, za, g_eager = run(net, yy, EE, True, grad=True)
+
+        calls = dict(clip=0, shrink=0)
+        real = prox_mod.prox_planar_grad
+
+        def counted(z, t, eps, dual=True):
+            out = real(z, t, eps, dual)
+            if out is not None:
+                calls["clip" if dual else "shrink"] += 1
+            return out
+
+        prox_mod.prox_planar_grad = counted
+        try:
+            with emulate():
+                b, zb, g_fused = run(net, yy, EE, True, grad=True)
+        finally:
+            prox_mod.prox_planar_grad = real
+        worst = max(rel(g_fused[k], g_eager[k]) for k in g_eager
+                    if float(g_eager[k].abs().max()) > 0)
+        worst_c = max(rel(g_fused[k], g_cplx[k]) for k in g_cplx
+                      if float(g_cplx[k].abs().max()) > 0)
+        n_layers = sum(1 for m in net.modules() if isinstance(m, FenchelProx))
+        check(f"{tag}: trained through the Function == the eager planar chain",
+              g_fused.keys() == g_eager.keys() and rel(b, a) < TOL and rel(zb, za) < TOL
+              and worst < 1e-4 and worst_c < 1e-3 and calls["clip"] >= n_layers > 0,
+              f"{calls['clip']} clips through it; worst gradient rel {worst:.1e} "
+              f"(vs complex {worst_c:.1e})")
+        # The primal-dual V-cycle's FAS correction has no prox subgradient
+        # (models/mg_lpds.py), so an LPDS net only ever CLIPS; the shrink is
+        # covered by test_fused_grad.
+        check(f"{tag}: an LPDS net never calls the shrink", calls["shrink"] == 0)
+
+
 def run(net, y, E, planar, grad=False):
     sig = torch.full((1, 1, 1, 1), 0.02)
     with planar_state(planar):
@@ -320,8 +567,8 @@ def test_conversions():
 
 
 def main():
-    for fn in (test_convs, test_prox, test_network, test_ignored_where_unsupported,
-               test_conversions):
+    for fn in (test_convs, test_prox, test_fused_grad, test_network,
+               test_network_fused_grad, test_ignored_where_unsupported, test_conversions):
         print(f"\n--- {fn.__name__}")
         fn()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")

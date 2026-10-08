@@ -33,7 +33,10 @@ timing anything.
 --planar-state times every MGLPDSNet a second time with its iterates carried
 as real [re; im] tensors (`MGLPDSNet.PLANAR_STATE`; same parameters, same map),
 straight after the normal timing, and prints the pair. It is how to find out
-whether that representation is worth adopting.
+whether that representation is worth adopting. Where the fused thresholding
+kernel served the training pass, a third arm times the planar state with that
+switched off (`SoftThreshold.FUSED_GRAD`), so the hand-written backward is
+measured on its own as well.
 
 --compile times every net a second time under `torch.compile`, straight after
 its eager timing on the same node, and prints the pair: the one switch that can
@@ -236,6 +239,7 @@ def time_planar_state(net, measure):
     """The same measurement with the planar state on, or why it was not run."""
     import models.clip_triton as clip_mod
     from models.mg_lpds import MGLPDSNet
+    from models.prox import SoftThreshold
 
     if not isinstance(net, MGLPDSNet):
         return dict(skipped="not an MGLPDSNet")
@@ -246,9 +250,21 @@ def time_planar_state(net, measure):
             return dict(skipped="not implemented for this net (group prox, widen > 1 "
                                 "or learned transfers)")
         cols, peak, first_s, _ = measure(net)
-        kernel = {None: "not used", True: "active", False: "DISABLED (mismatch)"}[
-            clip_mod._PLANAR_KERNEL_OK]
-        return dict(peak_mb=peak, first_s=first_s, fused_clip=kernel, **cols)
+        out = dict(peak_mb=peak, first_s=first_s,
+                   fused_clip=clip_mod.planar_kernel_report(), **cols)
+        # A third arm, when the fused prox really served the training pass:
+        # the same planar state with the prox under autograd on the eager
+        # chain (`SoftThreshold.FUSED_GRAD` off), i.e. what the fused backward
+        # is worth on its own.
+        if (SoftThreshold.FUSED and SoftThreshold.FUSED_GRAD
+                and "bwd active" in out["fused_clip"]):
+            SoftThreshold.FUSED_GRAD = False
+            try:
+                e_cols, e_peak, _, _ = measure(net)
+            finally:
+                SoftThreshold.FUSED_GRAD = True
+            out["eager_grad"] = dict(peak_mb=e_peak, **e_cols)
+        return out
     finally:
         MGLPDSNet.PLANAR_STATE = keep
 
@@ -258,7 +274,7 @@ def print_planar_state(rows):
           "(ms, median; x = complex / planar, above 1 is a speedup):")
     keys = [k for k in ("infer", "forward", "backward", "opt", "project")
             if all(k in r for r in rows)]
-    print(f"  {'config':<16}" + "".join(f"{k:^26}" for k in keys) + "  fused clip")
+    print(f"  {'config':<16}" + "".join(f"{k:^26}" for k in keys) + "  fused prox")
     for r in rows:
         p = r.get("planar_state") or {}
         if "skipped" in p or not p:
@@ -267,9 +283,27 @@ def print_planar_state(rows):
         cells = "".join(f"{r[k]['median']:>8.1f} > {p[k]['median']:<8.1f}"
                         f"{r[k]['median'] / p[k]['median']:>5.2f}x " for k in keys)
         print(f"  {r['name']:<16}{cells} {p['fused_clip']}")
-    print("\n  Same parameters and the same map (to fp roundoff). `fused clip` is the "
-          "planar Triton\n  kernel used at inference: it checks itself against the eager "
-          "formula on first use.")
+    print("\n  Same parameters and the same map (to fp roundoff). `fused prox` is the "
+          "planar Triton\n  thresholding, forward kernel and backward kernel: each checks "
+          "itself against the\n  eager formula on first use and is DISABLED on a mismatch.")
+
+    with_grad = [r for r in rows if "eager_grad" in (r.get("planar_state") or {})]
+    if not with_grad:
+        return
+    print("\nplanar state, the prox in TRAINING: eager chain + autograd against the fused "
+          "kernel with its\nhand-written backward (SoftThreshold.FUSED_GRAD), timed back to "
+          "back (ms, median; above 1 is a speedup):")
+    tkeys = [k for k in ("forward", "backward") if k in keys]
+    print(f"  {'config':<16}" + "".join(f"{k:^26}" for k in tkeys)
+          + f"{'fwd+bwd':^26}{'peak MB':^18}")
+    for r in with_grad:
+        p = r["planar_state"]
+        e = p["eager_grad"]
+        cells = "".join(f"{e[k]['median']:>8.1f} > {p[k]['median']:<8.1f}"
+                        f"{e[k]['median'] / p[k]['median']:>5.2f}x " for k in tkeys)
+        es, ps = (sum(d[k]["median"] for k in tkeys) for d in (e, p))
+        print(f"  {r['name']:<16}{cells}{es:>8.1f} > {ps:<8.1f}{es / ps:>5.2f}x "
+              f"{e['peak_mb']:>8.0f} > {p['peak_mb']:<8.0f}")
 
 
 def time_compiled(net, measure, compile_mode, eager, new_problem, planar=False):

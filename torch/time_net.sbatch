@@ -47,7 +47,10 @@
 #   PLANAR_STATE=1                step 2 also times each unrolled net with its
 #                                 iterates carried as real [re; im] tensors
 #                                 (MGLPDSNet.PLANAR_STATE), paired with the normal
-#                                 timing; step 3 then profiles THAT representation
+#                                 timing; step 3 then profiles THAT representation.
+#                                 A second table times the planar training pass
+#                                 with and without the fused thresholding kernel's
+#                                 hand-written backward (SoftThreshold.FUSED_GRAD)
 #   COMPILE=1                     step 2 also times every net under torch.compile,
 #                                 paired with its eager timing (COMPILE=reduce-overhead
 #                                 picks a mode). Compiling can take minutes per net:

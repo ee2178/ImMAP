@@ -45,7 +45,7 @@ from models.circulant_attention import Circulant, circ_adjacency, _abs2
 from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
                                    get_block_mask)
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency
-from models.clip_triton import clip_modulus, clip_modulus_planar
+from models.clip_triton import clip_modulus, prox_planar, prox_planar_grad
 
 TRITON_SIMS = ("pidistance", "pidot")
 
@@ -180,6 +180,13 @@ class SoftThreshold(nn.Module):
     # toggles to measure what it is worth.
     FUSED = True
 
+    # A PLANAR code is real, so its prox has a hand-written backward and the
+    # fused kernel serves TRAINING as well (`prox_planar_grad`: one kernel
+    # forward, one backward, in place of the eager chain and its autograd
+    # graph). Only consulted when `FUSED` is on; off, a planar code under
+    # autograd runs the eager chain as before 2026-10-08.
+    FUSED_GRAD = True
+
     def __init__(self, channels, tau0=1e-2, degrees=0):
         super().__init__()
         self.tau = Polynomial(channels, degrees=degrees, tau0=tau0)
@@ -195,9 +202,29 @@ class SoftThreshold(nn.Module):
         return (not torch.is_complex(z) and z.dim() == 4
                 and z.shape[1] == 2 * self.channels)
 
-    def _planar_scale(self, z, sigma, dual):
+    def _planar_prox(self, z, sigma, dual):
+        """The clip (`dual`) or the shrink of a planar code.
+
+        One fused kernel wherever that is expressible (models/clip_triton.py)
+        -- with a hand-written backward under autograd -- and the eager chain
+        of `_planar_scale` everywhere else.
+        """
+        t = self.threshold(z, sigma)                          # (., M, ., .)
+        if self.FUSED:
+            if not torch.is_grad_enabled():
+                out = prox_planar(z, t, self.fenchel_eps, dual)
+            elif self.FUSED_GRAD:
+                out = prox_planar_grad(z, t, self.fenchel_eps, dual)
+            else:
+                out = None
+            if out is not None:
+                return out
+        pairs, scale = self._planar_scale(z, t, dual)
+        return (pairs * scale).reshape(z.shape)
+
+    def _planar_scale(self, z, t, dual):
         """`(pairs, scale)`: `z` viewed as (B, 2, M, H, W) and the real factor
-        both halves of each pair are multiplied by.
+        both halves of each pair are multiplied by, for the threshold `t`.
 
         The modulus couples channel m with channel m + M, exactly as `abs()`
         couples the two halves of a complex number; everything else is the
@@ -208,7 +235,6 @@ class SoftThreshold(nn.Module):
         """
         B, C2, H, W = z.shape
         pairs = z.reshape(B, 2, C2 // 2, H, W)
-        t = self.threshold(z, sigma)                          # (., M, ., .)
         re, im = pairs[:, 0], pairs[:, 1]
         if torch.is_grad_enabled():
             # max(|z|, eps) as sqrt(max(re^2 + im^2, eps^2)): the clamp sits
@@ -227,8 +253,7 @@ class SoftThreshold(nn.Module):
 
     def forward(self, z, sigma=None, cache=None):
         if self._is_planar_state(z):
-            pairs, scale = self._planar_scale(z, sigma, dual=False)
-            return (pairs * scale).reshape(z.shape), cache
+            return self._planar_prox(z, sigma, dual=False), cache
         return soft_threshold(z, self.threshold(z, sigma)), cache
 
     def fenchel(self, z, sigma=None, cache=None):
@@ -251,16 +276,12 @@ class SoftThreshold(nn.Module):
         Even in that form it is four kernels and ~12 passes over the latent for
         a map whose irreducible traffic is one read and one write.  `FUSED`
         routes it to a single Triton kernel (`models/clip_triton.py`) wherever
-        that is expressible -- forward only, since the kernel has no backward.
-        Under autograd, and on CPU, the chain below runs unchanged.
+        that is expressible. For a COMPLEX code that is forward only: under
+        autograd, and on CPU, the chain below runs unchanged. A PLANAR code
+        has a kernel for the backward too (`FUSED_GRAD`, `_planar_prox`).
         """
         if self._is_planar_state(z):
-            if self.FUSED and not torch.is_grad_enabled():
-                out = clip_modulus_planar(z, self.threshold(z, sigma), self.fenchel_eps)
-                if out is not None:
-                    return out, cache
-            pairs, scale = self._planar_scale(z, sigma, dual=True)
-            return (pairs * scale).reshape(z.shape), cache
+            return self._planar_prox(z, sigma, dual=True), cache
         t = self.threshold(z, sigma)
         if self.FUSED and not torch.is_grad_enabled():
             out = clip_modulus(z, t, self.fenchel_eps)
