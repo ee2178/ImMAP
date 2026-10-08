@@ -80,6 +80,28 @@ every choice from the sample index instead, so val/test see the same guide every
 
 Scaling matches I2SBDataset exactly: each stored contrast is DIVIDED by `scales[c]`; each guide
 plane is divided by the scale of the contrast it was drawn from.
+
+THE MASK. `mask_source` picks what comes back as `mask`:
+
+    h5      (default) the stored `mask` dataset -- the build's thresholded brain proxy. It was
+            seen to cut into real signal, which is why the other option exists.
+    t1ct1   the SUPPORT shared by this session's T1 and CT1 at this slice: every pixel where
+            both are nonzero (|value| > mask_eps; contrasts `mask_idx`, default [x1_idx, x0_idx]).
+            Only those two define it -- NOT the intersection of every contrast's support, so a
+            FLAIR or T2 with a smaller field of view does not shrink it.
+
+`mask_apply=True` also MULTIPLIES the images by that mask (either source): x0, x1, cond and y by
+this session's mask, and the guide planes according to `mask_guides`:
+
+    target  (default) this session's mask on the guides too, so every image the net is
+            conditioned on shares one support. Only as good as the registration between studies:
+            a misaligned prior scan gets cut through.
+    own     each guide plane by ITS OWN study's mask at ITS slice (same source rule)
+    none    guides are left untouched
+
+A bridge start taken from another study (x1_source="other_study") follows `mask_guides` as well.
+Masking happens before the crop/flip, so the mask and the images always move together. With
+mask_apply=False nothing is multiplied and only the returned `mask` changes.
 """
 
 import os
@@ -95,6 +117,8 @@ from datasets.slice_filter import filter_by_slice_range
 
 GUIDE_MODES = ("none", "same_session", "other_study", "far_slice", "central_slice", "same_slice")
 GUIDE_SLICES = ("matched", "index", "central", "random")
+MASK_SOURCES = ("h5", "t1ct1")
+MASK_GUIDES = ("target", "own", "none")
 X1_SOURCES = ("contrast", "other_study")
 
 
@@ -184,6 +208,20 @@ class NYUMetsGuidedDataset(Dataset):
         yi = getattr(cfg, "y_idx", None)
         self.y_idx = self.x1_idx if yi is None else int(yi)
         self._zidx = {}                                   # per-file original slice indices
+
+        # ---- the mask: where it comes from, and whether the images are multiplied by it ----
+        self.mask_source = str(getattr(cfg, "mask_source", "h5") or "h5")
+        if self.mask_source not in MASK_SOURCES:
+            raise ValueError(f"mask_source must be one of {MASK_SOURCES}, got {self.mask_source!r}")
+        self.mask_apply = bool(getattr(cfg, "mask_apply", False))
+        self.mask_guides = str(getattr(cfg, "mask_guides", "target") or "target")
+        if self.mask_guides not in MASK_GUIDES:
+            raise ValueError(f"mask_guides must be one of {MASK_GUIDES}, got {self.mask_guides!r}")
+        self.mask_eps = float(getattr(cfg, "mask_eps", 0.0) or 0.0)
+        mi = getattr(cfg, "mask_idx", None)
+        self.mask_idx = [self.x1_idx, self.x0_idx] if mi is None else [int(c) for c in mi]
+        if not self.mask_idx:
+            raise ValueError("mask_idx must name at least one stored contrast")
 
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
@@ -352,11 +390,22 @@ class NYUMetsGuidedDataset(Dataset):
             img = img / self.scales[None, None, :]
         return img, h
 
+    def _mask_of(self, img, h, li):
+        """(H, W, 1) float32 mask of one stored slice, by `mask_source`."""
+        if self.mask_source == "h5":
+            return np.asarray(h["mask"][li]).astype(np.float32)
+        # the support shared by the mask contrasts; `img` may be scaled, which cannot move a zero
+        m = np.all(np.abs(img[..., self.mask_idx]) > self.mask_eps, axis=-1, keepdims=True)
+        return m.astype(np.float32)
+
     def __getitem__(self, idx):
         fi = int(self.file_id[idx])
         li = int(self.local[idx])
         img, h = self._read(fi, li)
-        mask = np.asarray(h["mask"][li])                  # (H, W, 1)
+        mask = self._mask_of(img, h, li)                  # (H, W, 1)
+        mask_np = mask                                    # numpy copy: `mask` becomes a tensor below
+        if self.mask_apply:
+            img = img * mask                              # every contrast of THIS session's slice
 
         def chw(a):
             return torch.from_numpy(
@@ -366,7 +415,11 @@ class NYUMetsGuidedDataset(Dataset):
         y = None
         if self.x1_source == "other_study":
             gf, gz = self._other_study_slice(fi, li, idx, 777)
-            x1 = chw(self._read(gf, gz)[0][..., [self.x1_other_idx]])
+            oimg, oh = self._read(gf, gz)
+            if self.mask_apply and self.mask_guides != "none":   # another study: same rule as a guide
+                oimg = oimg * (mask_np if self.mask_guides == "target"
+                               else self._mask_of(oimg, oh, gz))
+            x1 = chw(oimg[..., [self.x1_other_idx]])
             y = chw(img[..., [self.y_idx]])
         else:
             x1 = chw(img[..., [self.x1_idx]])
@@ -375,10 +428,16 @@ class NYUMetsGuidedDataset(Dataset):
 
         guide = None
         if self.modes:
-            planes, slices = [], {(fi, li): img}    # each (study, slice) read once, all contrasts
+            # each (study, slice) is read once, all contrasts, and masked once. (fi, li) is this
+            # session's own slice: already masked above, and its "own" mask IS the target mask.
+            planes, slices = [], {(fi, li): img}
             for gf, gz, gc in self._guide_planes(fi, li, idx):
                 if (gf, gz) not in slices:
-                    slices[(gf, gz)] = self._read(gf, gz)[0]
+                    gimg, gh = self._read(gf, gz)
+                    if self.mask_apply and self.mask_guides != "none":
+                        gimg = gimg * (mask_np if self.mask_guides == "target"
+                                       else self._mask_of(gimg, gh, gz))
+                    slices[(gf, gz)] = gimg
                 planes.append(slices[(gf, gz)][..., gc])
             guide = chw(np.stack(planes, axis=-1))        # (G, H, W)
 

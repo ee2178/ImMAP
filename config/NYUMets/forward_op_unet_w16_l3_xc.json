@@ -25,7 +25,7 @@
                 0
             ],
             "image_key": "img_raw",
-            "slice_range": [40, 110],
+            "slice_range": [50, 90],
             "guide_mode": "none",
             "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "crop_size": 128,
@@ -43,7 +43,7 @@
                 0
             ],
             "image_key": "img_raw",
-            "slice_range": [40, 110],
+            "slice_range": [50, 90],
             "guide_mode": "none",
             "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "random_flips": false,

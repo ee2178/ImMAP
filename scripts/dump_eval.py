@@ -81,18 +81,22 @@ DUMP_VERSION = 1
 # ---------------------------------------------------------------------------
 # run discovery
 # ---------------------------------------------------------------------------
-def find_runs(root, only=None):
+def find_runs(root, only=None, exact=False):
     """Every directory under `root` holding both a config.json and a net.ckpt.
 
     `only` filters by the run's path relative to `root` -- a substring match, so
-    `--only R8` takes every R=8 cell and `--only mglpds_R8` takes one.
+    `--only R8` takes every R=8 cell and `--only mglpds_R8` takes one. With
+    `exact`, an entry must BE the run directory's name: `mg81v6_R12` then leaves
+    out `mg81v6_R12_500ep` and any other tagged probe of the same cell.
     """
     out = []
     for dirpath, _, filenames in os.walk(root):
         if "config.json" in filenames and "net.ckpt" in filenames:
             out.append(dirpath)
     out = sorted(out)
-    if only:
+    if only and exact:
+        out = [d for d in out if os.path.basename(os.path.normpath(d)) in set(only)]
+    elif only:
         out = [d for d in out
                if any(o in os.path.relpath(d, root).replace(os.sep, "/")
                       for o in only)]
@@ -308,6 +312,9 @@ def main():
                    help="root of the trained-run tree (or one run directory)")
     p.add_argument("--only", nargs="*",
                    help="substring filter on the run path, e.g. --only R8")
+    p.add_argument("--exact", action="store_true",
+                   help="--only entries are run directory NAMES, matched exactly "
+                        "(skips tagged probes such as <cell>_500ep)")
     p.add_argument("--out", help="mirror the run tree here instead of writing "
                                  "into each <run>/eval_dump/")
     p.add_argument("--slices", default="0:16",
@@ -335,7 +342,12 @@ def main():
     metrics = build_metrics(args.metrics)
     warm_up(args.metrics, device)             # LPIPS downloads now, not mid-sweep
 
-    runs = find_runs(args.runs, args.only)
+    runs = find_runs(args.runs, args.only, exact=args.exact)
+    if args.exact and args.only:
+        missing = sorted(set(args.only) - {os.path.basename(os.path.normpath(r))
+                                           for r in runs})
+        if missing:
+            print(f"[dump] no trained run named: {' '.join(missing)}  (skipped)")
     if not runs:
         raise SystemExit(
             f"no runs with both config.json and net.ckpt under {args.runs}"

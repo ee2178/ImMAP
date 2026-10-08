@@ -60,10 +60,7 @@
                 3
             ],
             "image_key": "img_raw",
-            "slice_range": [
-                40,
-                110
-            ],
+            "slice_range": [50, 90],
             "scales": [
                 2800.0,
                 2500.0,
@@ -94,10 +91,7 @@
                 3
             ],
             "image_key": "img_raw",
-            "slice_range": [
-                40,
-                110
-            ],
+            "slice_range": [50, 90],
             "scales": [
                 2800.0,
                 2500.0,

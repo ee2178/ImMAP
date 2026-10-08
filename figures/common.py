@@ -88,7 +88,9 @@ CONFIGURABLE = (
 
 def apply_config(path):
     """Execute a config file and copy its settings over the defaults."""
-    ns = {}
+    # `__file__` so a config can place DUMP_ROOT relative to itself (every
+    # config under figures/configs does); exec() alone does not define it.
+    ns = {"__file__": os.path.abspath(path), "__name__": "__viewer_config__"}
     with open(path) as f:
         exec(compile(f.read(), path, "exec"), ns)
     unknown = sorted(k for k in ns

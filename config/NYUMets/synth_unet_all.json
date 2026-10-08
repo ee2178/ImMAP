@@ -38,10 +38,7 @@
                 1,
                 3
             ],
-            "slice_range": [
-                40,
-                110
-            ],
+            "slice_range": [50, 90],
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 64,
@@ -64,10 +61,7 @@
                 1,
                 3
             ],
-            "slice_range": [
-                40,
-                110
-            ],
+            "slice_range": [50, 90],
             "random_flips": false,
             "batch_size": 64,
             "num_workers": 8

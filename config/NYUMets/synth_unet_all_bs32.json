@@ -1,33 +1,24 @@
 {
     "task": "synthesis",
     "experiment": {
-        "name": "Synth_SBCDLNet_NYUMets_CT1_from_all_sfree_dconly"
+        "name": "Synth_Unet_NYUMets_CT1_from_all_bs32"
     },
     "model": {
-        "type": "SBCDLNet",
+        "type": "Unet2D",
         "params": {
-            "K": 30,
-            "M": 169,
-            "P": 7,
-            "s": 2,
-            "C": 4,
-            "prior_idx": 1,
-            "t0": 0.0,
-            "deg_eta": 0,
-            "deg_tau": 0,
-            "kind": "brownian",
-            "tau": 0.1,
-            "n_points": 1000,
-            "beta_max": 0.3,
-            "init": true,
-            "complex": false,
-            "s_mode": "free",
-            "bridge_fidelity": false
+            "in_chans": 3,
+            "out_chans": 1,
+            "chans": 32,
+            "num_pool_layers": 4,
+            "max_chans": 256,
+            "convs_per_block": 2,
+            "norm": "group",
+            "act": "relu",
+            "group_size": 4,
+            "up_mode": "nearest",
+            "up_conv": true,
+            "head": "conv"
         }
-    },
-    "paths": {
-        "save_dir": "trained_nets/nyumets/Synth_SBCDLNet_NYUMets_CT1_from_all_sfree_dconly",
-        "ckpt": null
     },
     "data": {
         "train": {
@@ -50,7 +41,7 @@
             "slice_range": [50, 90],
             "crop_size": 128,
             "random_flips": true,
-            "batch_size": 8,
+            "batch_size": 32,
             "num_workers": 8
         },
         "val": {
@@ -77,11 +68,13 @@
         }
     },
     "training": {
-        "display_orient": "radiological",
+        "ema_warmup": true,
+        "ema_decay": null,
+        "accum_steps": 1,
         "num_epochs": 3000,
         "steps_per_epoch": 100,
         "val_every_epochs": 50,
-        "clip_grad": 0.05,
+        "clip_grad": 1.0,
         "backtrack_thresh": 1000,
         "backtrack_factor": 0.9,
         "loss_type": "complex-mse",
@@ -92,10 +85,13 @@
         "et_weight": 1.0,
         "pretrained": null,
         "data_range": 2.0,
-        "s_weight": 1.0,
+        "display_orient": "radiological",
         "val_slices": 1000,
-        "val_seed": 0,
-        "accum_steps": 4
+        "val_seed": 0
+    },
+    "paths": {
+        "save_dir": "trained_nets/nyumets/Synth_Unet_NYUMets_CT1_from_all_bs32",
+        "ckpt": null
     },
     "optimizer": {
         "type": "Adam",
@@ -113,6 +109,6 @@
     "wandb": {
         "project": "schrodinger-bridge",
         "id": null,
-        "name": "Synth_SBCDLNet_NYUMets_CT1_from_all_sfree_dconly"
+        "name": "Synth_Unet_NYUMets_CT1_from_all_bs32"
     }
 }

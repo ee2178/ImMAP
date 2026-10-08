@@ -47,10 +47,7 @@
                 1,
                 3
             ],
-            "slice_range": [
-                40,
-                110
-            ],
+            "slice_range": [50, 90],
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 8,
@@ -73,10 +70,7 @@
                 1,
                 3
             ],
-            "slice_range": [
-                40,
-                110
-            ],
+            "slice_range": [50, 90],
             "random_flips": false,
             "batch_size": 8,
             "num_workers": 8
@@ -100,7 +94,8 @@
         "data_range": 2.0,
         "s_weight": 1.0,
         "val_slices": 1000,
-        "val_seed": 0
+        "val_seed": 0,
+        "accum_steps": 4
     },
     "optimizer": {
         "type": "Adam",

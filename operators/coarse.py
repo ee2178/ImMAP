@@ -28,6 +28,8 @@ tests/test_coarse_operator.py measures. Used by
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from operators.fourier import FFT2D
@@ -86,6 +88,14 @@ def coarse_data(y, factor=DEFAULT_FACTOR):
 
 
 COARSE_OPS = ("galerkin", "rediscretize")
+
+# Rediscretize an EMBEDDED operator (`E @ Truncate`) too? True since 2026-10-07.
+# Before that such slices fell back to Galerkin, so a "rediscretize" net trained
+# earlier saw two coarse operators: rediscretized on sizes that divide by the
+# stride (brain 640x320), Galerkin on the rest (brain 768x396, knee 372-wide).
+# `IMMAP_REDISCRETIZE_EMBEDDED=0` restores that, to EVALUATE such a net with the
+# operator it trained with on every slice. No parameter depends on it.
+REDISCRETIZE_EMBEDDED = os.environ.get("IMMAP_REDISCRETIZE_EMBEDDED", "1") != "0"
 
 
 def coarse_truncate(T, factor=DEFAULT_FACTOR):
@@ -156,6 +166,8 @@ def rediscretize(E, factor=DEFAULT_FACTOR, filter=None):
 
     T_c = None
     if len(ops) == 4:
+        if not REDISCRETIZE_EMBEDDED:
+            return None
         T = ops[3]
         if type(T) is not Truncate or T.small != (H, W):
             return None

@@ -47,6 +47,12 @@ def build_nyumets_guided_loader(root=None,
                                 x1_source="contrast",     # "contrast" (x1_idx) | "other_study"
                                 x1_other_idx=None,        # other_study: contrast of the start; default x0
                                 y_idx=None,               # measurement returned as "y"; default x1_idx
+                                # --- mask (see the dataset docstring) ---
+                                mask_source="h5",         # "h5" | "t1ct1" (support of T1 & CT1)
+                                mask_apply=False,         # multiply the images by the mask
+                                mask_guides="target",     # guides: "target" | "own" | "none"
+                                mask_eps=0.0,             # nonzero means |value| > mask_eps
+                                mask_idx=None,            # contrasts defining it; default [x1_idx, x0_idx]
                                 # --- geometry ---
                                 center_crop=None,
                                 crop_size=None,
@@ -71,6 +77,8 @@ def build_nyumets_guided_loader(root=None,
         deterministic=deterministic, guide_as_cond=guide_as_cond,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
         slice_range=slice_range,
+        mask_source=mask_source, mask_apply=mask_apply, mask_guides=mask_guides,
+        mask_eps=mask_eps, mask_idx=mask_idx,
         x1_source=x1_source, x1_other_idx=x1_other_idx, y_idx=y_idx,
     )
     dataset = NYUMetsGuidedDataset(ds_cfg)

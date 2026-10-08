@@ -12,6 +12,8 @@ registered to each other, so one original index is one anatomical level in EVERY
 range therefore keeps the same anatomy everywhere, and the slice of another study that matches a
 target slice is simply the one with the same original index (NYUMetsGuidedDataset guide_slice
 "index"). [40, 110) was chosen from the brain-coverage-vs-index plot over the NYUMets train split.
+Since 2026-10-08 every NYUMets config uses the narrower [50, 90) -- the middle 40 slices, where
+the anatomy is most informative; there is plenty of data, so the outer slices were dropped.
 
 Cost: one small `slice_index` read per volume when the dataset is constructed.
 """

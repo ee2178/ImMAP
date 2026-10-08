@@ -59,7 +59,7 @@ def main():
                     help="fidelity region M for the prox")
     ap.add_argument("--nfe", type=int, default=None, help="default: the run's val_nfe")
     ap.add_argument("--n-slices", type=int, default=200)
-    ap.add_argument("--slice-range", type=int, nargs=2, default=[40, 110], metavar=("LO", "HI"),
+    ap.add_argument("--slice-range", type=int, nargs=2, default=[50, 90], metavar=("LO", "HI"),
                     help="original slice indices [LO, HI) to evaluate on; overrides the run's "
                          "config (older runs have none). Pass -1 -1 to keep the run's own setting")
     ap.add_argument("--batch", type=int, default=8)

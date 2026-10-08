@@ -56,7 +56,7 @@
                 1
             ],
             "image_key": "img_raw",
-            "slice_range": [40, 110],
+            "slice_range": [50, 90],
             "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "guide_mode": [
                 "same_session",
@@ -85,7 +85,7 @@
                 1
             ],
             "image_key": "img_raw",
-            "slice_range": [40, 110],
+            "slice_range": [50, 90],
             "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "guide_mode": [
                 "same_session",
