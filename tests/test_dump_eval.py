@@ -311,7 +311,35 @@ def test_figures(dump_root, tmp):
           fc.active_rows() == rows and fc.load_zooms() == {"volA_s3": (5, 7)})
 
 
+def test_shipped_configs():
+    """Every config under figures/configs must LOAD. They all place DUMP_ROOT
+    relative to `__file__`, which `apply_config` did not define -- so until
+    2026-10-08 none of them could be opened by the viewer at all."""
+    import glob
+    keep = {k: getattr(fc, k) for k in fc.CONFIGURABLE}
+    keep_variant = fc.VARIANT
+    cfg_dir = os.path.join(os.path.dirname(os.path.abspath(fc.__file__)), "configs")
+    paths = sorted(glob.glob(os.path.join(cfg_dir, "*.py")))
+    check("there are shipped viewer configs to load", len(paths) > 0, cfg_dir)
+    try:
+        for p in paths:
+            try:
+                fc.apply_config(p)
+                ok = (os.path.isabs(fc.DUMP_ROOT) and len(fc.COLUMNS) >= 2
+                      and fc.COLUMNS[-1][1] is None)
+                detail = f"{len(fc.COLUMNS)} columns"
+            except BaseException as e:                              # noqa: BLE001
+                ok, detail = False, f"{type(e).__name__}: {e}"
+            check(f"config loads: {os.path.basename(p)}", ok, detail)
+    finally:
+        for k, v in keep.items():
+            setattr(fc, k, v)
+        fc.VARIANT = keep_variant
+
+
 if __name__ == "__main__":
+    print("\n--- shipped configs ---")
+    test_shipped_configs()
     tmp = tempfile.mkdtemp(prefix="immap_dump_test_")
     try:
         ks, sm = build_trees(tmp)

@@ -72,6 +72,10 @@ class EnhancementCoupling(nn.Module):
         keep = 1.0 - self.gate()
         return keep * A(B(keep * z) - y)
 
+    def decode_layer(self, k, B, z):
+        """S from a code through layer k's pair -- the in-loop estimate (decode is the readout)."""
+        return self.B_S[k](z) if self.mode == "free" else B(self.gate() * z)
+
     def decode(self, B0, z):
         """S_hat from the final code, through the readout synthesis B0 of the target pair."""
         return self.B_S[0](z) if self.mode == "free" else B0(self.gate() * z)
@@ -200,6 +204,9 @@ def collapse_param_logs(net):
     for name, a in steps:
         v = torch.sigmoid(a[:, 0])
         out[f"step_{name}_mean"], out[f"step_{name}_min"] = float(v.mean()), float(v.min())
+    g = getattr(net, "cross_gain", None)
+    if g is not None:                        # -> 0: the enhancement cross-attention is switched off
+        out["cross_gain_mean"], out["cross_gain_min"] = float(g.mean()), float(g.min())
     return out
 
 

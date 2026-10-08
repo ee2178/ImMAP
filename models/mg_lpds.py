@@ -58,7 +58,7 @@ import copy
 import torch
 import torch.nn as nn
 
-from models.base import set_weight
+from models.base import batched_projection, project_conv, set_weight
 from models.level_trace import LevelTraceMixin
 from models.lpds import LPDSLayer, LPDSStack, make_lpds_layer
 from models.multigrid import (_ChannelScale, identity_widen_weight,
@@ -66,7 +66,6 @@ from models.multigrid import (_ChannelScale, identity_widen_weight,
 from models.prox import GroupThreshold, PixelConv
 from operators.coarse import COARSE_OPS, coarsen
 from operators.identity import Identity
-from operators.projections import uball_project
 from operators.resample import (GridTransfer, _check_filter, prolong,
                                 restrict, restrict_noise)
 from preprocessing.image import post_process, pre_process
@@ -204,7 +203,7 @@ class PDObjectiveDownsample(nn.Module):
     def project_(self):
         for m in (self.analysis_fine, self.synthesis_fine,
                   self.analysis_coarse, self.synthesis_coarse):
-            set_weight(m, uball_project(m.weight))
+            project_conv(m)
         # The thresholds too: `MGLPDSNet.project` stops at a module that
         # defines `project_`, so this one has to cover its whole subtree.
         for m in (self.prox_fine, self.prox_coarse):
@@ -565,7 +564,10 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 else:
                     walk(child)
 
-        walk(self)
+        # The convs' unit-ball projections are collected and applied together
+        # (models/base.py): one stacked norm instead of ~10 kernels per conv.
+        with batched_projection():
+            walk(self)
 
     def extra_repr(self):
         return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "

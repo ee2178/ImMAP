@@ -45,11 +45,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from models.base import set_weight
+from models.base import project_conv, set_weight
 from models.components import Conv2d, ConvTranspose2d
 from models.prox import Polynomial, build_prox
 from operators.identity import Identity
-from operators.projections import uball_project
 from solvers.eigen import power_method
 
 
@@ -133,8 +132,8 @@ class LPDSLayer(nn.Module):
     # -- constraints --------------------------------------------------------
     @torch.no_grad()
     def project_(self):
-        set_weight(self.analysis, uball_project(self.analysis.weight))
-        set_weight(self.synthesis, uball_project(self.synthesis.weight))
+        project_conv(self.analysis)
+        project_conv(self.synthesis)
         self.tau.project_(lo=0.0)
         self.theta.project_(lo=0.0, hi=1.0)      # over-relaxation stays in [0,1]
         if hasattr(self.prox, "project_"):

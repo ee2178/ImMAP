@@ -110,6 +110,29 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
                stores `last_S`; bridge_fidelity=False drops the target term. Under
                `task: synthesis` the call is net(X) with X = [cond..., guides...] -- the guides
                are split off and routed to the prox, never into a fidelity.
+    s_cross    True adds CROSS-ATTENTION BETWEEN ENHANCEMENT MAPS (needs s_mode). The prior
+               study's enhancement map is known exactly, S_prior = (CT1_prior - T1_prior)_+, and
+               the current estimate S_k is decoded from the code at layer k. One extra branch of
+               the guided prox compares THEIR latents under this layer's dictionary,
+
+                   Xi = softmax( sim( W_theta A_k S_k , W_phi A_k S_prior ) ),
+
+               and adds the pooled energy of A_k S_prior to xi^2, weighted per atom. Anatomy
+               cancels out of both sides, so the weights go to "where did this patient enhance
+               before, and does the current estimate look like that" -- which the CT1-to-CT1
+               guide branch, dominated by anatomy, cannot isolate. It runs BESIDE that branch.
+               Like any guide it enters through the adjacency only: it changes which coefficients
+               survive the threshold, never writes the prior enhancement into the estimate.
+    s_cross_planes
+               (i_T1, i_CT1): which GUIDE planes are the prior study's T1 and CT1. With the
+               loader's guide_idx [1, 2] and guide_window 0 that is (0, 1), the default. The prior
+               T1 plane is used ONLY to form S_prior; it is not also an ordinary guide (that would
+               be a third attention branch for no new information). Every other plane stays one.
+    s_cross_atoms
+               "gate"  the extra energy is weighted by the gate m, so it acts on the enhancement
+                       atoms only (default for s_mode="gate")
+               "all"   every atom (the only choice for s_mode="free", which has no per-atom gate)
+               A learned gain per layer (`cross_gain`, >= 0, starts at 1) scales it either way.
     """
 
     def __init__(self, K=30, M=169, C=2, P=7, s=2, Mh=64,
@@ -120,8 +143,22 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
                  prior_idx=0, t0=1e-3, deg_eta=0, deg_tau=1,
                  kind="brownian", tau=0.19, n_points=1000, beta_max=0.3,
                  spectral_init=True, init=None,
-                 s_mode=None, bridge_fidelity=True, gate_init=0.0):
+                 s_mode=None, bridge_fidelity=True, gate_init=0.0,
+                 s_cross=False, s_cross_planes=(0, 1), s_cross_atoms=None):
         super().__init__()
+        if s_cross and s_mode is None:
+            raise ValueError("s_cross attends between enhancement maps, so it needs an S model: "
+                             "set s_mode='free' or 'gate'.")
+        if s_cross_atoms is None:
+            s_cross_atoms = "gate" if s_mode == "gate" else "all"
+        if s_cross_atoms not in ("gate", "all") or (s_cross_atoms == "gate" and s_mode != "gate"):
+            raise ValueError(f"s_cross_atoms={s_cross_atoms!r}: use 'all', or 'gate' with "
+                             f"s_mode='gate' (s_mode={s_mode!r} has no per-atom gate).")
+        self.s_cross, self.s_cross_atoms = bool(s_cross), s_cross_atoms
+        self.s_cross_planes = tuple(int(i) for i in s_cross_planes)
+        if len(self.s_cross_planes) != 2 or len(set(self.s_cross_planes)) != 2:
+            raise ValueError(f"s_cross_planes must be two different guide-plane indices "
+                             f"(T1, CT1), got {s_cross_planes}")
         if not bridge_fidelity and s_mode is None:
             raise ValueError("bridge_fidelity=False leaves only the learned data consistency, "
                              "which needs s_mode='free' or 'gate'.")
@@ -189,6 +226,9 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
             self.coupling = EnhancementCoupling(s_mode, self.K, M, self.layers[0].analysis,
                                                 self.layers[0].synthesis, gate_init=gate_init)
         self.last_S = self.last_density = None
+        if self.s_cross:
+            # one gain per layer on the cross branch's energy; clamped >= 0 by project()
+            self.cross_gain = nn.Parameter(torch.ones(self.K))
 
         # ---- bridge steps, identical parameterization to SBGroupCDL ----
         # sigmoid(0) = 0.5 on each of the two fidelities: the combined-step analogue of a single
@@ -216,6 +256,35 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
             set_weight(self.B_P[k], self.B_P[k].weight / scale)
 
     # -----------------------------------------------------------------
+    @staticmethod
+    def _guide_planes(guide):
+        """Any accepted guide argument -> a list of raw planes, each (B, 1, H, W)."""
+        if guide is None:
+            return []
+        if torch.is_tensor(guide) and guide.dim() == 4:
+            return [guide[:, g:g + 1] for g in range(guide.shape[1])]
+        return as_guide_list(guide)
+
+    def _prior_enhancement(self, planes, pad, ref):
+        """(S_prior padded, the remaining ordinary guide planes).
+
+        S_prior = (CT1_prior - T1_prior)_+ on the RAW planes: `_prep_guides` subtracts each
+        guide's own mean, and a difference of separately centred images is off by the difference
+        of their means. S_prior itself is not centred -- it is zero almost everywhere, and that
+        zero is what makes non-enhancing keys cheap to tell apart."""
+        i_t1, i_ct1 = self.s_cross_planes
+        if max(i_t1, i_ct1) >= len(planes):
+            raise ValueError(
+                f"s_cross needs the prior study's T1 and CT1 as guide planes {self.s_cross_planes}, "
+                f"but only {len(planes)} guide plane(s) were given. Set the loader's guide_idx to "
+                f"[1, 2] (T1, CT1) with guide_mode 'other_study'.")
+        s_prior = (planes[i_ct1] - planes[i_t1]).clamp_min(0.0).to(ref.dtype)
+        s_prior = F.pad(s_prior, pad, mode="reflect")
+        if s_prior.shape[-2:] != ref.shape[-2:]:
+            raise ValueError(f"guide grid {tuple(s_prior.shape[-2:])} != bridge grid "
+                             f"{tuple(ref.shape[-2:])}")
+        return s_prior, [w for i, w in enumerate(planes) if i != i_t1]
+
     def _prep_guides(self, guide, pad, ref):
         """Guides -> list of (B, 1, H', W'), each mean-subtracted and padded like `r`.
 
@@ -223,14 +292,8 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
         `as_guide_list` as-is: a 4-D tensor would be read as ONE guide with G channels, which the
         C=1 analysis conv would then reject -- or, worse, silently mis-read if G happened to be 1.
         """
-        if guide is None:
-            return []
-        if torch.is_tensor(guide) and guide.dim() == 4:
-            planes = [guide[:, g:g + 1] for g in range(guide.shape[1])]
-        else:
-            planes = as_guide_list(guide)
         out = []
-        for w in planes:
+        for w in self._guide_planes(guide):
             if w.dim() != 4 or w.shape[1] != 1:
                 raise ValueError(f"each guide must be (B, 1, H, W); got {tuple(w.shape)}")
             w = w.to(ref.dtype)
@@ -292,6 +355,9 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
             r = mu0 = None
         y_meas = c[:, self.prior_idx:self.prior_idx + 1]
         c_side = c[:, self.side_idx] if self.n_p else None
+        s_prior = None
+        if self.s_cross:
+            s_prior, guide = self._prior_enhancement(self._guide_planes(guide), pad, y_meas)
         guides = self._prep_guides(guide, pad, y_meas)
 
         z = torch.zeros_like(self.layers[0].analysis(y_meas))
@@ -307,7 +373,15 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
                 nu = torch.sigmoid(_horner(self.a_nu[k], s_log))
                 u = u - nu * self.A_P[k](self.B_P[k](z) - c_side)
             v = layer.analyse_guides(guides) if guides else None
-            z, cache = layer.prox(u, v, s_hat, cache)
+            cross = None
+            if self.s_cross:
+                # enhancement map vs enhancement map, both through THIS layer's dictionary. The
+                # query (one synthesis + one analysis) is built only when the adjacency refreshes.
+                w = self.cross_gain[k] * (self.coupling.gate() if self.s_cross_atoms == "gate"
+                                          else 1.0)
+                cross = {"query": lambda u=u, A=A, B=B, k=k: A(self.coupling.decode_layer(k, B, u)),
+                         "guide": A(s_prior), "weight": w}
+            z, cache = layer.prox(u, v, s_hat, cache, cross=cross)
 
         B0 = self.layers[0].synthesis
         x0_hat = unpad(B0(z), pad) + dc
@@ -320,6 +394,8 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
     def project(self):
         if self.coupling is not None:
             self.coupling.project()
+        if self.s_cross:
+            self.cross_gain.clamp_(0.0)
         for layer in self.layers:
             layer.project_()               # unit-ball filters + the prox's tau/gamma/rho/Wbeta
             # re-floor the threshold's CONSTANT term: the prox clamps it at 0, and 0 kills the

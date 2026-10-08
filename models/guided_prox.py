@@ -239,6 +239,23 @@ class GuidedGroupThreshold(GroupThreshold):
         cache["gdupdate"] = (cache.get("gdupdate", 0) + 1) % self.dK
         return cache["Phi"], cache["Omega"], cache
 
+    # -- cross branch --------------------------------------------------------
+    def _cross_adjacency(self, q_lat, k_lat, sigma):
+        """One attention whose QUERY is not `z`: sim(W_theta q_lat, W_phi k_lat) over the guide
+        window, with its OWN row-softmax. Same projections and rho as every other branch, so it
+        adds no parameters; it stays out of the joint simplex because its query differs and the
+        scores are not comparable with the self / guide ones."""
+        rho = self.rho(sigma, ref=q_lat)
+        sq = torch.sqrt(rho + self.eps)
+        q = self._rho_scale(self.Wtheta(q_lat) if self.grouped else q_lat, sq)
+        k = self._rho_scale(self.Wphi(k_lat) if self.grouped else k_lat, sq)
+        if self.attn_backend != "gather":
+            return self._fused_branch(q, k, self.guide_window)
+        s, col, crow = circulant_similarity_window(
+            self.sim_fun, self._to_heads(q), self._to_heads(k), self.guide_window)
+        return Circulant(F.softmax(s, dim=-1), col, crow, tuple(q_lat.shape[-2:]),
+                         self.guide_window)
+
     # -- blend weight --------------------------------------------------------
     def _omega_map(self, z, sigma):
         """`omega` broadcast from per-head to the Mh channels of the energy."""
@@ -249,12 +266,28 @@ class GuidedGroupThreshold(GroupThreshold):
         return w
 
     # -- prox ----------------------------------------------------------------
-    def forward(self, z, guide=None, sigma=None, cache=None):
+    def forward(self, z, guide=None, sigma=None, cache=None, cross=None):
+        """`cross` (optional) adds one branch that attends between two OTHER latents:
+
+            cross = {"query": fn() -> (B, M, H, W),   evaluated only when the adjacency refreshes
+                     "guide": (B, M, H, W),           the keys, and the values whose energy is pooled
+                     "weight": broadcastable to (B, M, 1, 1), >= 0}
+
+            Xi   = row-softmax( sim( W_theta query , W_phi guide ; guide_window ) )
+            xi^2 <- xi^2 + weight * ( W_beta sqrt( Xi (W_alpha guide)^2 ) )^2
+
+        i.e. its group energy is ADDED per atom, scaled by `weight`, so it can only raise xi and
+        therefore only relax the shrinkage of the atoms it is weighted onto. Like every guide it
+        enters through the adjacency alone. Refreshed on the same dK schedule as Phi (rebuilt,
+        not blended). cross=None is the prox exactly as before.
+        """
         guides = as_guide_list(guide)
-        if not guides:
+        if not guides and cross is None:
             # Self-only view sharing every weight -- `GroupThreshold(ggt)`.
             return super().forward(z, sigma, cache)
 
+        refresh = (not cache) or cache.get("Phi") is None \
+            or cache.get("gdupdate", 0) % self.dK == 0
         Phi, Omegas, cache = self.adjacencies_of(z, guides, sigma, cache)
 
         za = self.Walpha(z) if self.grouped else z
@@ -265,13 +298,22 @@ class GuidedGroupThreshold(GroupThreshold):
             term = self.apply_gamma(Om, _abs2(ga))
             e_guide = term if e_guide is None else e_guide + term
 
-        if not self.joint_softmax:
+        if e_guide is None:                       # a cross branch with no ordinary guide
+            e_guide = torch.zeros_like(e_self)
+        elif not self.joint_softmax:
             w = self._omega_map(z, sigma)
             e_self = w * e_self
             e_guide = (1.0 - w).abs() * e_guide
 
         xi_a = torch.sqrt(e_self + e_guide + self.eps)
         xi = self.beta_apply(xi_a) if self.grouped else xi_a
+        if cross is not None:
+            if refresh or "Xi" not in cache:
+                cache["Xi"] = self._cross_adjacency(cross["query"](), cross["guide"], sigma)
+            ga = self.Walpha(cross["guide"]) if self.grouped else cross["guide"]
+            xa = torch.sqrt(self.apply_gamma(cache["Xi"], _abs2(ga)) + self.eps)
+            xi_x = self.beta_apply(xa) if self.grouped else xa
+            xi = torch.sqrt(xi ** 2 + cross["weight"] * xi_x ** 2)
         tau = self.tau(sigma, ref=z)
         return z * F.relu(1.0 - tau / (xi + self.eps)), cache
 

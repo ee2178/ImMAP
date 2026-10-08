@@ -120,9 +120,15 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
 
                    with g_y the measurement gradient. `last_S` holds S_hat after every forward.
     bridge_fidelity
-                   False drops g_D: JUST the learned data consistency (plus the side channels).
-                   The net then never reads the bridge state, so it also runs under
-                   `task: synthesis` as net(cond) -- no sigma, no x_t. Needs s_mode.
+                   False drops g_D, so the net never reads the bridge state and also runs under
+                   `task: synthesis` as net(cond) -- no sigma, no x_t.
+                     with s_mode      JUST the learned data consistency (plus the side channels)
+                     s_mode=None      plain coupled-dictionary synthesis: the code is fitted to
+                                      the conditioning stack through (A_P, B_P) alone,
+                                          z <- ST( z - nu A_P[k]( B_P[k] z - c ) ; tau ),
+                                      and read out through the target dictionary, x0_hat = B_D[0] z.
+                                      This is the no-S control for the two above. Only B_D[0] of
+                                      the target pair is used; the rest of A_D / B_D is idle.
     gate_init      starting value of every gate (s_mode="gate"); 0 = "nothing is enhancement".
     """
 
@@ -132,9 +138,6 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
                  init=True, complex=False,
                  s_mode=None, bridge_fidelity=True, gate_init=0.0):
         super().__init__()
-        if not bridge_fidelity and s_mode is None:
-            raise ValueError("bridge_fidelity=False leaves only the learned data consistency, "
-                             "which needs s_mode='free' or 'gate'.")
         self.s_mode, self.bridge_fidelity = s_mode, bool(bridge_fidelity)
 
         if C < 2:
@@ -186,6 +189,9 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
             with torch.no_grad():
                 for a in (self.a_eta, self.a_nu, self.a_xi):
                     a[:, 0] = start
+        elif not self.bridge_fidelity:
+            with torch.no_grad():                  # one fidelity only: start it near a full step
+                self.a_nu[:, 0] = step_logit(1)
         # Per-atom threshold, shaped like CDLNet's t = (K, deg+1, M, 1, 1).
         t = torch.zeros(K, deg_tau + 1, M, 1, 1)
         t[:, 0] = float(t0)
@@ -288,6 +294,8 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
         for signature parity with the repo's denoisers and ignored. Returns (x0_hat, z)."""
         if self.s_mode is not None:
             return self._forward_s(y, sigma, step)
+        if not self.bridge_fidelity:
+            return self._forward_static(y, sigma, step)
         # split, debias, DC-correct and pad -- all shared with SBGroupCDL
         r, c, dc, pad, mu0, s_log, s_hat = self.bridge_inputs(y, sigma=sigma, step=step)
 
@@ -348,3 +356,16 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
         self.last_S = unpad(self.coupling.decode(self.B_D[0], z), pad)
         self.last_density = (z.detach() != 0).float().mean()     # a tensor: no sync until read
         return x0_hat, z
+
+    # -----------------------------------------------------------------
+    # forward with neither a bridge term nor an S model: coupled-dictionary synthesis
+    # -----------------------------------------------------------------
+    def _forward_static(self, y, sigma, step):
+        """z <- ST( z - nu g_P ; tau ),  x0_hat = B_D[0] z + dc.  Input layouts as in _forward_s."""
+        cond = y if (sigma is None and step is None) else y[:, 1:]
+        c, dc, pad, s_log, s_hat = self.static_inputs(cond)
+        z = torch.zeros_like(self.A_P[0](c))
+        for k in range(self.K):
+            nu = torch.sigmoid(_horner(self.a_nu[k], s_log))
+            z = ST(z - nu * self.A_P[k](self.B_P[k](z) - c), _horner(self.t[k], s_hat))
+        return unpad(self.B_D[0](z), pad) + dc, z

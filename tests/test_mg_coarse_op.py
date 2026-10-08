@@ -154,6 +154,18 @@ def test_embedded_grids():
           names == ["Mask", "FFT2D", "Sense", "Truncate"]
           and tuple(E_c.ops[2].smaps.shape[-2:]) == (h // 2, w // 2), f"{names} {E_c.ops[-1]!r}")
     sig = torch.full((1, 1, 1, 1), 0.01)
+
+    # the switch that restores the pre-2026-10-07 behaviour for evaluation
+    import operators.coarse as coarse_mod
+    coarse_mod.REDISCRETIZE_EMBEDDED = False
+    try:
+        check("REDISCRETIZE_EMBEDDED=False: an embedded operator falls back to Galerkin",
+              rediscretize(E_t) is None
+              and isinstance(coarsen(E_t, "rediscretize").ops[-1], Resample)
+              and rediscretize(E) is not None)
+    finally:
+        coarse_mod.REDISCRETIZE_EMBEDDED = True
+
     grids, out = {}, {}
     for mode in ("galerkin", "rediscretize"):
         net = build(mode).eval()
