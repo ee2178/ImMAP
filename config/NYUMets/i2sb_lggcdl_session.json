@@ -52,6 +52,9 @@
             "cond_idx": [],
             "image_key": "img_raw",
             "slice_range": [50, 90],
+            "mask_source": "t1ct1",
+            "mask_apply": true,
+            "mask_guides": "target",
             "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "guide_mode": "same_session",
             "guide_contrasts": [
@@ -73,6 +76,9 @@
             "cond_idx": [],
             "image_key": "img_raw",
             "slice_range": [50, 90],
+            "mask_source": "t1ct1",
+            "mask_apply": true,
+            "mask_guides": "target",
             "scales": [2800.0, 2500.0, 2390.0, 2370.0],
             "guide_mode": "same_session",
             "guide_contrasts": [
