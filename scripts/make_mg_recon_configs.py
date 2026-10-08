@@ -602,6 +602,41 @@ MODELS.update({
 })
 EXP9_CELLS = tuple(f"mg{m}v6" for m in EXP9_M)
 
+# ---------------------------------------------------------------------------
+#  EXP12: the GROUP twins of the main comparison's two multigrid cells
+#  (2026-10-08).
+#
+#  mggroup169v6 / mggroup81v6 are mg169v6 (MGLPDS-Big) / mg81v6 (MGLPDS-Small)
+#  with the nonlocal GroupThreshold in the prox slot -- and nothing else
+#  changed: same K=[6,[4,4,6]], same REDISCRETIZED coarse Gram, same PLANAR
+#  complex conv. The group settings are exactly what `mggrouplpds` adds to
+#  `mglpds` (window 15, Mh 64, dK 5, one head, "distance" on flex), so each
+#  twin differs from its local cell ONLY in the prox.
+#
+#  NOT `mggrouplpds`: that cell is the group twin of the older `mglpds`
+#  (Galerkin Gram, gauss convs), so it is not comparable to mg169v6 / mg81v6.
+#
+#  `training.planar_state` does not apply (the planar STATE is implemented for
+#  the local prox only; --planar-state leaves these configs untouched). The
+#  planar CONV does.
+# ---------------------------------------------------------------------------
+EXP12_M = (169, 81)
+_GROUP_EXTRA = {k: v for k, v in MODELS["mggrouplpds"]["params"].items()
+                if k not in MODELS["mglpds"]["params"]}
+MODELS.update({
+    f"mggroup{m}v6": dict(
+        type="MGGroupLPDS",
+        params=dict(MODELS[f"mg{m}v6"]["params"], **_GROUP_EXTRA),
+        training=dict(_EXP8_TRAINING),
+        note=(f"mg{m}v6 with the nonlocal prox at every grid level "
+              f"(GroupThreshold; window=15, the V-cycle supplying long range). "
+              f"Rediscretized coarse Gram and planar convs, as mg{m}v6. "
+              f"sim_fun='distance' because flex cannot carry a phase-invariant "
+              f"similarity on complex features."))
+    for m in EXP12_M
+})
+EXP12_CELLS = tuple(f"mggroup{m}v6" for m in EXP12_M)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -613,7 +648,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
-          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS
+          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP12_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -960,17 +995,18 @@ def _display_name(spec_type, params):
         if params.get("band_norm", "none") != "none":
             tag += "_bn" + params["band_norm"]
         return "%s%s_%s" % (spec_type, tag, variant)
-    if spec_type == "MGLPDSNet" and variant == "mg" and (
+    if spec_type in ("MGLPDSNet", "MGGroupLPDS") and variant == "mg" and (
             params.get("M", 169) != 169 or params.get("K") != LPDS_VCYCLE_K
             or params.get("coarse_op", "galerkin") != "galerkin"):
         # exp8's cells are all MGLPDSNet V-cycles; plain `mglpds` keeps its
-        # name, anything else carries what differs.
+        # name, anything else carries what differs. The same for the group
+        # twins (exp12) against plain `mggrouplpds`.
         k_out, iters = params["K"]
         tag = "M%dK%dx%s" % (params.get("M", 169), k_out,
                              "-".join(str(i) for i in iters))
         if params.get("coarse_op", "galerkin") != "galerkin":
             tag += "_rd"
-        return "MGLPDSNet_%s" % tag
+        return "%s_%s" % (spec_type, tag)
     if spec_type == "E2EVarNet" and params.get("use_smaps"):
         # `varnet` and `varnetmaps` are the same class with the same variant,
         # so the table below cannot separate them -- and two cells under one

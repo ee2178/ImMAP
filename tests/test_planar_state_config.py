@@ -135,7 +135,7 @@ def test_generator(tmp):
     have = sorted(n for n, c in on.items() if c["training"].get("planar_state") is True)
     tags = sorted({n.rsplit("_R", 1)[0] for n in have})
     expect = {"lpdsnet", "mglpds", "mg169v6", "mg121v6", "mg100v6", "mg81v6", "mgunet"}
-    never = {"varnetmaps", "varnet", "mggrouplpds"}
+    never = {"varnetmaps", "varnet", "mggrouplpds", "mggroup169v6", "mggroup81v6"}
     check("--planar-state writes it on the LPDS and multigrid-LPDS cells, every R",
           expect <= set(tags) and not (never & set(tags))
           and all(f"{t}_R{r}" in have for t in ("lpdsnet", "mg81v6") for r in (4, 8, 12, 16)),
