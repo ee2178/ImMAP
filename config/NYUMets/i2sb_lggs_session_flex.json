@@ -1,13 +1,14 @@
 {
     "task": "i2sb",
     "experiment": {
-        "name": "I2SB_SBGuidedCDL_NYUMets_CT1_from_all_guide_otherCT1_sfree"
+        "name": "I2SB_LGGS_NYUMets_CT1_from_T1_guided_session_flex"
     },
     "model": {
-        "type": "SBGuidedGroupCDL",
+        "type": "LGGS",
         "params": {
             "K": 30,
             "M": 169,
+            "C": 1,
             "P": 7,
             "s": 2,
             "Mh": 32,
@@ -15,24 +16,15 @@
             "guide_window": 15,
             "joint_softmax": true,
             "attn_backend": "flex",
-            "sim_fun": "distance",
             "dK": 5,
-            "share_attention": true,
             "nheads": 1,
             "rho0": 1.0,
             "gamma0": 0.8,
             "init_strategy": "semi_orthogonal",
-            "C": 4,
-            "prior_idx": 1,
-            "t0": 0.001,
-            "deg_eta": 0,
-            "deg_tau": 1,
-            "kind": "brownian",
-            "tau": 0.1,
-            "n_points": 1000,
-            "beta_max": 0.3,
-            "s_mode": "free",
-            "bridge_fidelity": true
+            "sim_fun": "pidistance",
+            "degrees": 1,
+            "is_complex": false,
+            "preproc": "image"
         }
     },
     "i2sb": {
@@ -54,11 +46,7 @@
             "root": "../datasets/NYUMets_h5_train",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [
-                0,
-                1,
-                3
-            ],
+            "cond_idx": [],
             "image_key": "img_raw",
             "slice_range": [
                 50,
@@ -73,29 +61,24 @@
                 2390.0,
                 2370.0
             ],
-            "guide_mode": "other_study",
-            "guide_idx": [
-                2
+            "guide_mode": "same_session",
+            "guide_contrasts": [
+                1,
+                3,
+                0
             ],
-            "n_guides": 1,
-            "guide_slice": "index",
             "random_flips": true,
             "deterministic": false,
-            "batch_size": 8,
+            "batch_size": 4,
             "num_workers": 8,
-            "crop_size": 128,
-            "guide_window": 0
+            "crop_size": 128
         },
         "val": {
             "name": "nyumets_guided",
             "root": "../datasets/NYUMets_h5_val",
             "x0_idx": 2,
             "x1_idx": 1,
-            "cond_idx": [
-                0,
-                1,
-                3
-            ],
+            "cond_idx": [],
             "image_key": "img_raw",
             "slice_range": [
                 50,
@@ -110,17 +93,16 @@
                 2390.0,
                 2370.0
             ],
-            "guide_mode": "other_study",
-            "guide_idx": [
-                2
+            "guide_mode": "same_session",
+            "guide_contrasts": [
+                1,
+                3,
+                0
             ],
-            "n_guides": 1,
-            "guide_slice": "index",
             "random_flips": false,
             "deterministic": true,
-            "batch_size": 4,
-            "num_workers": 8,
-            "guide_window": 0
+            "batch_size": 1,
+            "num_workers": 8
         }
     },
     "training": {
@@ -137,16 +119,14 @@
         "backtrack_factor": 0.9,
         "use_mask": false,
         "loss_type": "complex-mse",
-        "loss_weight": "snr",
-        "loss_weight_max": 1000.0,
+        "loss_weight": "uniform",
         "et_weight": 1.0,
         "psnr_only": false,
         "data_range": 2.0,
-        "val_slices": 1000,
-        "s_weight": 1.0
+        "val_slices": 1000
     },
     "paths": {
-        "save_dir": "trained_nets/nyumets/I2SB_SBGuidedCDL_NYUMets_CT1_from_all_guide_otherCT1_sfree",
+        "save_dir": "trained_nets/nyumets/I2SB_LGGS_NYUMets_CT1_from_T1_guided_session_flex",
         "ckpt": null
     },
     "optimizer": {

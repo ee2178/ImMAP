@@ -4,75 +4,74 @@
 # task, one A100 per task. Every run is task: i2sb, mapping this session's T1 -> CT1. The runner
 # is task-agnostic -- it picks a config by index and calls train.py.
 #
-#   idx  config                                      model             what it is
-#   ---  ------------------------------------------  ----------------  ---------------------------------------
-#    0   i2sb_unet_all_bs256.json                    SBUnet            FLAIR, T1, T2; batch 256 + EMA + sigma weighting
-#    1   i2sb_unet_otherstudy_pair_w2_bs256.json     SBUnet            as 0 + prior-study T1/CT1 at z-2..z+2
-#    2   i2sb_sbcdlnet_sfree.json                    SBCDLNet          FLAIR, T1, T2; S = D_S z
-#    3   i2sb_sbguidedcdl_otherstudy_sfree.json      SBGuidedGroupCDL  as 2; guide = prior-study CT1
-#    4   i2sb_sbguidedcdl_otherstudy_sfree_xS.json   SBGuidedGroupCDL  as 3 + enhancement cross-attention
-#    5   i2sb_lggcdl_session.json                    LGGCDL            guides = same-session T1, T2, FLAIR
-#    6   i2sb_lggs_session.json                      LGGS              guides = same-session T1, T2, FLAIR
-#    7   i2sb_sbguidedcdl_otherstudy_w0_sfree_flex.json    SBGuidedGroupCDL  1 guide:  prior CT1 at z      (flex)
-#    8   i2sb_sbguidedcdl_otherstudy_w1_sfree_flex.json    SBGuidedGroupCDL  3 guides: prior CT1 at z-1..z+1
-#    9   i2sb_sbguidedcdl_otherstudy_w2_sfree_flex.json    SBGuidedGroupCDL  5 guides: prior CT1 at z-2..z+2
+#   idx  config                                           model             what it is
+#   ---  -----------------------------------------------  ----------------  --------------------------------
+#    0   i2sb_unet_all_bs256.json                         SBUnet            FLAIR, T1, T2; batch 256 + EMA + sigma weighting
+#    1   i2sb_unet_otherstudy_pair_w2_bs256.json          SBUnet            as 0 + prior-study T1/CT1 at z-2..z+2
+#    2   i2sb_sbcdlnet_sfree.json                         SBCDLNet          FLAIR, T1, T2; S = D_S z
+#    3   i2sb_sbguidedcdl_otherstudy_w0_sfree_flex.json   SBGuidedGroupCDL  as 2; 1 guide:  prior CT1 at z
+#    4   i2sb_sbguidedcdl_otherstudy_w1_sfree_flex.json   SBGuidedGroupCDL  as 2; 3 guides: prior CT1 at z-1..z+1
+#    5   i2sb_sbguidedcdl_otherstudy_w2_sfree_flex.json   SBGuidedGroupCDL  as 2; 5 guides: prior CT1 at z-2..z+2
+#    6   i2sb_sbguidedcdl_otherstudy_sfree_xS_flex.json   SBGuidedGroupCDL  as 3 + enhancement cross-attention
+#
+# EVERY GUIDED RUN (3-6) IS ON attn_backend "flex" (2026-10-09). Measured on an A100 for the
+# guided net of 3-5 (cuDNN autotuning on, 128 crop, training step):
+#
+#     guides   flex, batch 8        gather
+#       1      0.22 s,  6.7 GB      0.60 s, 41 GB at batch 8; OOM at 16
+#       3      0.36 s,  9.0 GB      0.79 s, 54 GB at batch 4; OOM at 8
+#       5      0.50 s, 11.4 GB      OOM at batch 4
+#
+# so 300,000 steps is about 0.8 / 1.3 / 1.7 days of network time for 3 / 4 / 5 (add ~15% for data
+# loading and logging). flex runs the SAME joint softmax as gather (models/guided_prox.py,
+# "Backends"; it checks itself against gather on first use), with one model difference: no
+# adjacency blend between refreshes (dK = 5). A gather checkpoint is therefore not the same
+# model; the gather configs (same names without _flex) still exist but are no longer listed.
+# 3 and 6 keep the save_dir of the gather run each replaces, so they overwrite it in place.
+# flex, not triton: the data is real-valued, so the phase-invariant kernel buys nothing.
+# train.py compiles the kernel at start-up.
 #
 # WHAT THIS ARRAY NO LONGER HOLDS (every config file still exists; append its path to rerun):
 #   * the batch-8 SBUnets. The large-batch recipe (0-1) is the UNet standard now.
 #   * SBCDLNet / SBGuidedGroupCDL WITHOUT an enhancement map: only +S models are considered.
-#   * the GATED enhancement map (i2sb_*_sgate*.json). In preliminary runs it was slightly behind
-#     the free dictionary on plain synthesis and further behind on the longitudinal task, so
-#     only the free version is trained for now.
-#   * the cycle nets, and the end-to-end UNets they were controls for. The synthesis-task
-#     comparison lives in bigpurple/synth_sbcdlnet_array.sbatch.
-# INDICES HAVE CHANGED TWICE. Against the original 26-entry list: 16-17 are now 0-1, 20 is 2,
-# 22 is 3, 24 is 4, 6-7 are 5-6.
+#   * the GATED enhancement map (i2sb_*_sgate*.json): behind the free dictionary in preliminary
+#     runs, more so on the longitudinal task.
+#   * the gather-backend guided runs, replaced by their flex versions.
+#   * the cycle nets and the end-to-end UNets. The synthesis-task comparison lives in
+#     bigpurple/synth_sbcdlnet_array.sbatch.
+#   * LGGCDL and LGGS (i2sb_lggcdl_session*.json, i2sb_lggs_session*.json): tested, and they
+#     underperform the other nets here.
+# INDICES HAVE CHANGED SEVERAL TIMES; trust this table, not a number from an old log.
 #
 # UNET (0-1): effective batch 256 = data.batch_size 32 x training.accum_steps 8, EMA 0.99, lr
 # 2e-4, and the 1/sigma^2 loss weight (loss_weight "snr", loss_weight_max 1000). 300,000 optimizer
-# steps is about six days on one A100; resume with the same command -- the checkpoint carries the
-# optimizer, scheduler, best_loss and the EMA state. Each writes net.ckpt (live weights, for
+# steps is about six days on one A100. Each writes net.ckpt (live weights, for
 # resume) and net_ema.ckpt (the average -- SAMPLE FROM THIS ONE); validation is reported under
-# the average. 0 vs 1 isolates the prior study. The w=0 and w=1 large-batch configs
-# (i2sb_unet_otherstudy_pair_bs256.json, ..._w1_bs256.json) exist but are not listed.
+# the average. 0 vs 1 isolates the prior study.
 #
-# ENHANCEMENT MAP (2-4): the T1 fidelity is a LEARNED DATA-CONSISTENCY term through an
+# ENHANCEMENT MAP (2-6): the T1 fidelity is a LEARNED DATA-CONSISTENCY term through an
 # enhancement map with its own synthesis dictionary, decoded from the same sparse code as CT1
 # (models/enhancement.py):     S = D_S z,     T1 = (D - D_S) z.
 # Trained with  loss(x0_hat, CT1) + s_weight * MSE(S_hat, (CT1 - T1)_+)  on top of the bridge
 # target term. The x0 term uses the same sigma weighting as 0-1; the S term is not sigma-weighted.
-# Batch 8 (SBCDLNet) / 4 (guided), no EMA, no accumulation -- so 0-1 have a far larger training
-# budget than 2-4; read that comparison with it in mind.
+# Batch 8, no EMA, no accumulation -- so 0-1 have a far larger training budget than 2-6.
 # Each validation logs the val/S image and the collapse/* scalars:
 #     S = 0                     S_rms_ratio -> 0   or  DS_over_D_* -> 0
 #     T1 constrains nothing     T1_resid -> 1      or  Dy_over_D_min -> 0
 #     a fidelity switched off   step_xi_min / step_eta_min / step_nu_min -> 0
 #     the code died / is dense  code_density -> 0 / -> 1
 #     S is not one-sided        S_neg_frac large
-#   2 vs 3   the guided prox with the prior-study CT1
-#   3 vs 4   the enhancement cross-attention
+#   2 vs 3        the guided prox with the prior-study CT1
+#   3 vs 4 vs 5   the number of guide slices (same batch, backend and similarity)
+#   3 vs 6        the enhancement cross-attention
 #
-# ENHANCEMENT CROSS-ATTENTION (4, model param s_cross): one more branch of the guided prox
+# ENHANCEMENT CROSS-ATTENTION (6, model param s_cross): one more branch of the guided prox
 # attends between ENHANCEMENT MAPS -- the current estimate S_k against the prior study's
 # S_prior = (CT1_prior - T1_prior)_+, which is known exactly -- beside the CT1-to-CT1 guide branch
 # of 3. The loader therefore returns the prior T1 as well (guide_idx [1, 2]); it is used only to
-# form S_prior. It is one more attention per refreshing layer: if batch 4 no longer fits, lower
-# data.train.batch_size. collapse/cross_gain_min -> 0 means the branch is switched off.
+# form S_prior. collapse/cross_gain_min -> 0 means the branch is switched off.
 #
-# GUIDE COUNT ON THE FUSED BACKEND (7-9): the free-S guided net with the prior study's CT1 at
-# 1, 3 and 5 slices around the matched one (guide_window 0 / 1 / 2), each slice its own guide
-# branch. attn_backend "flex": the joint softmax runs fused, nothing of size (B, Q, K) is
-# allocated, and memory no longer limits the batch (LGGS sweep on an A100, 2026-10-09: 5 guides
-# at batch 16 took 18 GB, against an OOM at batch 8 on gather). So these train at batch 8 like 2.
-# flex, not triton: the data is real-valued, so the phase-invariant kernel buys nothing, and
-# flex keeps the similarity of 3 ("distance"). train.py compiles the kernel at start-up.
-# Two things differ from 3 besides the guide count, which is why 7 exists as the 1-guide twin:
-#   * no adjacency blend between refreshes (dK = 5; see models/guided_prox.py, "Backends");
-#   * batch 8, not 4.
-# Read 7 vs 8 vs 9 for the number of guides, and 3 vs 7 for the backend change.
-#   sbatch --array=7-9 bigpurple/i2sb_nyumets_array.sbatch
-#
-# HOW THE PRIOR STUDY ENTERS 3-4 AND 7-9: only through the guided prox's adjacency, never as a
+# HOW THE PRIOR STUDY ENTERS 3-6: only through the guided prox's adjacency, never as a
 # conditioning channel. That matters for these nets -- every conditioning channel other than the
 # T1 is FITTED by the code through the side dictionary, so a prior scan given as a channel would
 # have to be reconstructed by today's code. Do not use guide_as_cond with the +S nets.
@@ -80,19 +79,27 @@
 # Submit all (at most 4 GPUs at once):
 #   sbatch bigpurple/i2sb_nyumets_array.sbatch
 # A subset (the --array on the command line overrides the #SBATCH line):
-#   sbatch --array=2-4 bigpurple/i2sb_nyumets_array.sbatch
+#   sbatch --array=3-6 bigpurple/i2sb_nyumets_array.sbatch
 # After the h5 build:
 #   sbatch --dependency=afterok:<h5 jobid> --kill-on-invalid-dep=yes \
 #          bigpurple/i2sb_nyumets_array.sbatch
 #
 # Every config has its own paths.save_dir, so tasks never share a checkpoint directory.
+#
+# SUBMITTING AN INDEX ALWAYS STARTS THAT RUN FROM SCRATCH and writes into its save_dir, over
+# whatever run is there: the configs here have paths.ckpt = null, and nothing in this script
+# looks for an existing checkpoint. That is how a rerun replaces an old run in place (3 and 6
+# write into the folders of the gather runs they replace). It also means this script CANNOT
+# resume an interrupted run. To resume, give train.py the config the run saved, which has its
+# checkpoint path and wandb id stamped in (and carries the optimizer, scheduler and EMA state):
+#     python train.py trained_nets/nyumets/<run name>/config.json
 # The rest (partition, preflight, split, root checks) is bigpurple/i2sb_unet_nyumets.sbatch;
 # the only behavioural difference is that the split is serialised with flock, because array
 # tasks start together and would otherwise all split the same directory at once.
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-9%4
+#SBATCH --array=0-6%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -105,7 +112,7 @@
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.err
 
-# --time is 7 days (radiology allows 28): the unrolled nets (2-9) are far slower per step
+# --time is 7 days (radiology allows 28): the unrolled nets (2-6) are far slower per step
 # than SBUnet, and the guided ones pay for 15x15 guide-window attention on top.
 # Mail is for the array as a whole (BEGIN when the first task starts, END/FAIL when all are
 # done). Add ARRAY_TASKS to --mail-type for one mail per task (24 mails for 8 tasks).
@@ -115,13 +122,10 @@ CONFIGS=(
     config/NYUMets/i2sb_unet_all_bs256.json
     config/NYUMets/i2sb_unet_otherstudy_pair_w2_bs256.json
     config/NYUMets/i2sb_sbcdlnet_sfree.json
-    config/NYUMets/i2sb_sbguidedcdl_otherstudy_sfree.json
-    config/NYUMets/i2sb_sbguidedcdl_otherstudy_sfree_xS.json
-    config/NYUMets/i2sb_lggcdl_session.json
-    config/NYUMets/i2sb_lggs_session.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_w0_sfree_flex.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_w1_sfree_flex.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_w2_sfree_flex.json
+    config/NYUMets/i2sb_sbguidedcdl_otherstudy_sfree_xS_flex.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then

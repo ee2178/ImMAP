@@ -10,29 +10,44 @@
 #    0   synth_unet_all_bs32.json       Unet2D     the standard UNet, at THIS array's recipe
 #    1   synth_sbcdlnet_sfree.json      SBCDLNet   S = D_S z: learned DC through S's own dictionary
 #
+#    2   synth_sbguidedcdl_otherstudy_w0_sfree_flex.json   SBGuidedGroupCDL   as 1 + 1 guide:  prior CT1 at z
+#    3   synth_sbguidedcdl_otherstudy_w1_sfree_flex.json   SBGuidedGroupCDL   as 1 + 3 guides: prior CT1 at z-1..z+1
+#    4   synth_sbguidedcdl_otherstudy_w2_sfree_flex.json   SBGuidedGroupCDL   as 1 + 5 guides: prior CT1 at z-2..z+2
+#
 # 0 vs 1: a UNet against an unrolled sparse-coding net with a physics-informed T1 term.
+# 1 vs 2: the guided prox with the prior-study CT1.  2 vs 3 vs 4: the number of guide slices.
 #
-# The GATED enhancement map (synth_sbcdlnet_sgate.json) is no longer listed: in preliminary runs
-# it was slightly behind the free dictionary on this task. The config still exists.
+# THE GUIDED RUNS (2-4) ARE LONGITUDINAL, unlike 0-1: the prior study enters through the guided
+# prox's adjacency (attn_backend "flex"), never as an input channel. Two consequences:
+#   * guide_mode "other_study" drops patients with a single study in the split, so 2-4 train
+#     and validate on the multi-study population, not on every patient as 0-1 do. Their 1,000
+#     validation slices are therefore NOT the same slices as 0-1's: compare 2-4 with each other
+#     on the logged numbers, and with 0-1 only in a notebook on one shared set.
+#   * they train at BATCH 8, not this array's 32 (set 2026-10-09 to keep them affordable).
+#     Measured for the bridge version of this net on an A100 at batch 8: 0.22 / 0.36 / 0.50 s
+#     per step for 1 / 3 / 5 guides, i.e. about 0.8 / 1.3 / 1.7 days for 300k steps; without the
+#     bridge term these should come in somewhat under that. So 2-4 see a quarter of the samples
+#     per step that 0-1 do: 1 vs 2 is NOT budget-matched.
 #
-# There is deliberately no SBCDLNet WITHOUT S here: with no enhancement map the net has no
-# physics-informed structure, and that variant has been tried before and performs poorly.
-#
-# ONE RECIPE for both, so the table is not a comparison of training budgets: an EFFECTIVE
+# ONE RECIPE for 0-1 (2-4 differ in batch size, above), so the table is not a comparison of training budgets: an EFFECTIVE
 # batch of 32, no EMA, 300,000 optimizer steps, Adam 1e-4 with cosine decay, complex-mse on the
 # whole frame, and validation every 5,000 steps on the SAME 1,000 val slices (val_seed 0). The
 # only training keys that differ are each model's own gradient clip (UNet 1.0, SBCDLNet 0.05) and
-# s_weight (1).
+# s_weight (1-4).
 #
-# HOW THE 32 IS REACHED. The UNet uses a true batch of 32. SBCDLNet uses batch 8 x accum_steps 4:
-# on the A100 its throughput PEAKS at a micro-batch of 8 and falls by about 40% beyond it
-# (measured for the gated version, ms per micro-batch: 8 -> 134, 16 -> 435, 32 -> 938), so
+# HOW THE 32 IS REACHED. 0 and 1 use a true batch of 32 (accum_steps 1). Measured for 1 on an
+# A100 with cuDNN autotuning ON, as train.py runs it (2026-10-09), ms per micro-batch:
 #
-#     effective 32 as   8 x 4     0.55 s / optimizer step    ~1.9 days for 300k steps
-#                       32 x 1    0.94 s                     ~3.3 days
+#     batch 8 -> 84     16 -> 159     32 -> 300          (95 / 101 / 107 samples per second)
 #
-# The gradient is identical either way (no batch statistics in the net). To change the effective
-# batch, change accum_steps in 1 and batch_size in 0 TOGETHER: 8 x 2 = 16 is ~1.0 day.
+# so one step of 32 is 0.31 s (~1.1 days for 300k steps, 15 GB), against 0.34 s as 8 x 4.
+# An EARLIER version of this header said SBCDLNet's throughput peaks at a micro-batch of 8 and
+# that 8 x 4 was faster. That was measured with autotuning OFF (8 -> 171, 16 -> 510, 32 -> 1142)
+# and is not how training runs.
+#
+# SUBMITTING AN INDEX ALWAYS STARTS THAT RUN FROM SCRATCH, over whatever is in its save_dir (the
+# configs have paths.ckpt = null). To RESUME an interrupted run instead, give train.py the config
+# that run saved:   python train.py trained_nets/nyumets/<run name>/config.json
 #
 # The existing synth_unet_all run (config/NYUMets/synth_unet_all.json, no longer in any array)
 # is the same UNet at batch 64 + EMA.
@@ -48,13 +63,13 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=synth-sbcdl
-#SBATCH --array=0-1
+#SBATCH --array=0-4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=4-00:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=EE2178@nyulangone.org
 #SBATCH --chdir=/gpfs/scratch/ee2178/ImMAP
@@ -66,6 +81,9 @@
 CONFIGS=(
     config/NYUMets/synth_unet_all_bs32.json
     config/NYUMets/synth_sbcdlnet_sfree.json
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w0_sfree_flex.json
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w1_sfree_flex.json
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w2_sfree_flex.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then

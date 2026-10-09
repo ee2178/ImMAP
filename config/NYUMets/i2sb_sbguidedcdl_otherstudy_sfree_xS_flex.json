@@ -1,7 +1,7 @@
 {
     "task": "i2sb",
     "experiment": {
-        "name": "I2SB_SBGuidedCDL_NYUMets_CT1_from_all_guide_otherCT1_sfree"
+        "name": "I2SB_SBGuidedCDL_NYUMets_CT1_from_all_guide_otherCT1_sfree_xS"
     },
     "model": {
         "type": "SBGuidedGroupCDL",
@@ -32,7 +32,12 @@
             "n_points": 1000,
             "beta_max": 0.3,
             "s_mode": "free",
-            "bridge_fidelity": true
+            "bridge_fidelity": true,
+            "s_cross": true,
+            "s_cross_planes": [
+                0,
+                1
+            ]
         }
     },
     "i2sb": {
@@ -75,6 +80,7 @@
             ],
             "guide_mode": "other_study",
             "guide_idx": [
+                1,
                 2
             ],
             "n_guides": 1,
@@ -112,6 +118,7 @@
             ],
             "guide_mode": "other_study",
             "guide_idx": [
+                1,
                 2
             ],
             "n_guides": 1,
@@ -146,7 +153,7 @@
         "s_weight": 1.0
     },
     "paths": {
-        "save_dir": "trained_nets/nyumets/I2SB_SBGuidedCDL_NYUMets_CT1_from_all_guide_otherCT1_sfree",
+        "save_dir": "trained_nets/nyumets/I2SB_SBGuidedCDL_NYUMets_CT1_from_all_guide_otherCT1_sfree_xS",
         "ckpt": null
     },
     "optimizer": {
