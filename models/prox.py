@@ -46,7 +46,9 @@ from models.circulant_attention import Circulant, circ_adjacency, _abs2
 from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
                                    get_block_mask)
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency
-from models.clip_triton import clip_modulus, prox_planar, prox_planar_grad
+from models.clip_triton import (clip_modulus, prox_planar, prox_planar_grad,
+                                scale_planar, scale_planar_grad)
+from models.components import to_complex, to_planar
 
 TRITON_SIMS = ("pidistance", "pidot")
 
@@ -146,9 +148,23 @@ class PixelConv(nn.Module):
     def weight(self):
         return self.conv.weight            # (cout, cin // groups, 1, 1)
 
+    @staticmethod
+    def _planar(x, c):
+        """`x` is a complex map of `c` channels in PLANAR form: real, with
+        `[re; im]` stacked on the channel axis (the planar state of
+        `MGLPDSNet.PLANAR_STATE`). A real input never has 2c channels -- the
+        conv would reject it -- so the channel count identifies it."""
+        return not torch.is_complex(x) and x.dim() == 4 and x.shape[1] == 2 * c
+
     def forward(self, x):
         if torch.is_complex(x):
             return torch.complex(self.conv(x.real), self.conv(x.imag))
+        if self._planar(x, self.cin):
+            # W applies to each half: (B, 2 cin, H, W) IS (2B, cin, H, W), so
+            # both halves go through ONE conv with no copy on either side.
+            B, _, H, W = x.shape
+            return self.conv(x.reshape(2 * B, self.cin, H, W)).reshape(
+                B, 2 * self.cout, H, W)
         return self.conv(x)
 
     def transpose_apply(self, x):
@@ -156,6 +172,10 @@ class PixelConv(nn.Module):
         if torch.is_complex(x):
             return torch.complex(F.conv_transpose2d(x.real, w, groups=self.groups),
                                  F.conv_transpose2d(x.imag, w, groups=self.groups))
+        if self._planar(x, self.cout):
+            B, _, H, W = x.shape
+            return F.conv_transpose2d(x.reshape(2 * B, self.cout, H, W), w,
+                                      groups=self.groups).reshape(B, 2 * self.cin, H, W)
         return F.conv_transpose2d(x, w, groups=self.groups)
 
 
@@ -471,6 +491,73 @@ class GroupThreshold(nn.Module):
         xr = x.reshape(B, self.nheads, C // self.nheads, H, W)
         return torch.cat([xr.real, xr.imag], dim=2).reshape(B, 2 * C, H, W)
 
+    # -- planar state -------------------------------------------------------
+    def _is_planar_state(self, z):
+        """`z` is a complex code in planar form: real, `[re; im]` stacked on
+        the channel axis (twice this prox's channel count)."""
+        return (not torch.is_complex(z) and z.dim() == 4
+                and z.shape[1] == 2 * self.M)
+
+    def _heads_ri(self, x):
+        """A PLANAR map `[re; im]` in `_stack_ri`'s layout, `[re_h; im_h]` per
+        head -- what `_stack_ri` returns for the same map held complex. With
+        one head the two layouts are the same tensor."""
+        if self.nheads == 1:
+            return x
+        B, C2, H, W = x.shape
+        return x.reshape(B, 2, self.nheads, C2 // (2 * self.nheads), H, W) \
+                .transpose(1, 2).reshape(B, C2, H, W)
+
+    @staticmethod
+    def _abs2_planar(x):
+        """`|x|^2` of a planar map: channel m pairs with channel m + C."""
+        B, C2, H, W = x.shape
+        p = x.reshape(B, 2, C2 // 2, H, W)
+        return torch.addcmul(p[:, 1] * p[:, 1], p[:, 0], p[:, 0])
+
+    def _planar_prox(self, z, sigma, cache, dual):
+        """The group shrink, or the group clip (`dual`), of a PLANAR code.
+
+        The same map as the complex path, step for step: the transforms are
+        real and act on each half; the envelope `xi` depends on the code only
+        through `|W_alpha z|^2`, which pairs the halves; and the result is
+        both halves scaled by one real factor,
+
+            shrink   z * relu(1 - tau / (xi + eps))
+            clip     z * min(1, tau / (xi + eps))         (= z - shrink)
+
+        That last step is one fused kernel wherever it is expressible, with a
+        hand-written backward under autograd (models/clip_triton.py; the
+        switches are `SoftThreshold.FUSED` / `FUSED_GRAD`).
+        """
+        tau = self.tau(sigma, ref=z)
+        Gamma, cache = self.gamma_of(z, sigma, cache)
+        za = self.Walpha(z) if self.grouped else z
+        xi_a = torch.sqrt(self.apply_gamma(Gamma, self._abs2_planar(za)) + self.eps)
+        xi = self.beta_apply(xi_a) if self.grouped else xi_a
+        if SoftThreshold.FUSED:
+            if not torch.is_grad_enabled():
+                out = scale_planar(z, xi, tau, self.eps, dual)
+            elif SoftThreshold.FUSED_GRAD:
+                out = scale_planar_grad(z, xi, tau, self.eps, dual)
+            else:
+                out = None
+            if out is not None:
+                return out, cache
+        q = tau / (xi + self.eps)
+        s = q.clamp_max(1.0) if dual else F.relu(1.0 - q)
+        B, C2, H, W = z.shape
+        return (z.reshape(B, 2, C2 // 2, H, W) * s.unsqueeze(1)).reshape(z.shape), cache
+
+    def fenchel(self, z, sigma=None, cache=None):
+        """`prox_{g*}(z) = z - prox_g(z)`. Formed directly for a planar code
+        (the group clip above); for a complex or real one it is the literal
+        subtraction `FenchelProx` always did, through `forward`, unchanged."""
+        if self._is_planar_state(z):
+            return self._planar_prox(z, sigma, cache, dual=True)
+        zt, cache = self.forward(z, sigma=sigma, cache=cache)
+        return z - zt, cache
+
     def _flex_block_mask(self, ref, win=None):
         """The BlockMask for this grid and window (`win=None`: the self window).
 
@@ -499,12 +586,20 @@ class GroupThreshold(nn.Module):
         k = self.Wphi(z) if self.grouped else z
         rho = self.rho(sigma, ref=z)
         sq = torch.sqrt(rho + self.eps)
+        if sq.shape[1] > 1 and q.shape[1] == 2 * sq.shape[1]:
+            sq = torch.cat((sq, sq), dim=1)        # planar q, k: one rho per PAIR
         if self.rho_inv:
             return q / sq, k / sq
         return q * sq, k * sq
 
     def _build_gamma(self, z, sigma):
         q, k = self._scaled_qk(z, sigma)
+        # PLANAR state: q and k arrive as [re; im]. flex wants exactly that
+        # (per head); the other two backends take the complex features, and at
+        # Mh channels re-interleaving them is cheap.
+        planar = self._is_planar_state(z)
+        if planar and self.attn_backend != "flex":
+            q, k = to_complex(q), to_complex(k)
         if self.attn_backend == "triton":
             # Complex q/k are the point of this backend: it accumulates BOTH
             # Re<q,k> and Im<q,k> so |<q,k>| is available, which no score_mod
@@ -524,7 +619,7 @@ class GroupThreshold(nn.Module):
             # Re<q,k>; recovering the modulus needs Im<q,k> as well, a second
             # bilinear form that a score_mod cannot see. Fail here rather than
             # silently attending on the wrong similarity.
-            if self.sim_fun in SIM_ABS and q.is_complex():
+            if self.sim_fun in SIM_ABS and (q.is_complex() or planar):
                 raise ValueError(
                     f"sim_fun={self.sim_fun!r} needs |<q,k>|, which "
                     f"FlexAttention cannot form for COMPLEX features: its "
@@ -533,7 +628,10 @@ class GroupThreshold(nn.Module):
                     f"materialises the window), or sim_fun='distance' with "
                     f"flex (fused, drops phase invariance). Real-valued "
                     f"models can use {self.sim_fun!r} with flex directly.")
-            q, k = self._stack_ri(q), self._stack_ri(k)
+            if planar:
+                q, k = self._heads_ri(q), self._heads_ri(k)
+            else:
+                q, k = self._stack_ri(q), self._stack_ri(k)
             return FlexAdjacency(q, k, self.window, sim=self.sim_fun,
                                  heads=self.nheads,
                                  block_mask=self._flex_block_mask(q),
@@ -572,6 +670,8 @@ class GroupThreshold(nn.Module):
 
     # -- prox ---------------------------------------------------------------
     def forward(self, z, sigma=None, cache=None):
+        if self._is_planar_state(z):
+            return self._planar_prox(z, sigma, cache, dual=False)
         tau = self.tau(sigma, ref=z)
         Gamma, cache = self.gamma_of(z, sigma, cache)
         za = self.Walpha(z) if self.grouped else z
@@ -585,6 +685,12 @@ class GroupThreshold(nn.Module):
         if not self.grouped or mode == "moreau":
             zt, cache = self.forward(z, sigma, cache)
             return z - zt, cache
+        if self._is_planar_state(z):
+            # The closed forms below are written for a complex code. No LPDS
+            # net reaches them (its V-cycle has no prox subgradient), so a
+            # planar code just takes the complex path rather than a second copy.
+            g, cache = self.subgradient(to_complex(z), sigma, cache, mode)
+            return to_planar(g), cache
         if mode == "simple":
             return self._subgrad_simple(z, sigma, cache)
         if mode == "rigorous":

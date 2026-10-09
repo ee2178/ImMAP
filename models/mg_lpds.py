@@ -65,7 +65,7 @@ from models.level_trace import LevelTraceMixin
 from models.lpds import LPDSLayer, LPDSStack, make_lpds_layer
 from models.multigrid import (_ChannelScale, identity_widen_weight,
                               widen_filter, widen_prox_)
-from models.prox import GroupThreshold, PixelConv
+from models.prox import FenchelProx, GroupThreshold, PixelConv, SoftThreshold
 from operators.coarse import COARSE_OPS, coarsen
 from operators.identity import Identity
 from operators.resample import (GridTransfer, _check_filter, prolong,
@@ -452,7 +452,9 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
     Gram, on the C-channel image. Same parameters, same map (to fp roundoff;
     tests/test_planar_state.py), complex in and complex out at the boundary of
     `forward`, so nothing outside this class can tell. Supported for the local
-    prox with `widen == 1` and fixed transfers; any other net ignores the flag.
+    prox AND the group prox (`window > 1`: its transforms are real and act on
+    each half, and its envelope pairs the halves -- models/prox.py), with
+    `widen == 1` and fixed transfers; any other net ignores the flag.
     """
 
     # Class-level, like `_GaussConvNd.COMPLEX_MODE`. Set for the process from
@@ -550,9 +552,21 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
     def planar_state_active(self):
         """Is the planar state both requested and expressible for this net?"""
         return bool(self.PLANAR_STATE and getattr(self, "is_complex", False)
-                    and getattr(self, "window", 1) <= 1
                     and getattr(self, "widen", 1) == 1
-                    and not self.learn_transfer)
+                    and not self.learn_transfer
+                    and self._planar_proxes())
+
+    def _planar_proxes(self):
+        """Does every prox slot hold a prox that takes a planar code? Exactly
+        `SoftThreshold` or `GroupThreshold` -- not a subclass, whose own
+        `forward` (a guided prox, say) knows nothing about the planar form."""
+        ok = getattr(self, "_planar_proxes_ok", None)
+        if ok is None:
+            slots = [m for m in self.modules() if isinstance(m, FenchelProx)]
+            ok = bool(slots) and all(type(m.prox) in (SoftThreshold, GroupThreshold)
+                                     for m in slots)
+            self._planar_proxes_ok = ok
+        return ok
 
     def _check_grid(self, hw):
         H, W = int(hw[0]), int(hw[1])
@@ -662,7 +676,7 @@ def planar_state_report(model):
     if nets and all(m.planar_state_active() for m in nets):
         return "planar state: ON (iterates carried as real [re; im] tensors)"
     why = ("this model has no MGLPDSNet" if not nets else
-           "not implemented for a group prox, widen > 1 or learned transfers")
+           "not implemented for widen > 1, learned transfers or a guided prox")
     return f"planar state: requested but NOT in use -- {why}"
 
 

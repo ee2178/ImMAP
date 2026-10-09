@@ -136,6 +136,26 @@ def anchor_channel(X, idx):
     return X[:, idx:idx + 1]
 
 
+def display_scale(grid, n_ref=2, window=None):
+    """Panels -> [0, 1] for display, ALWAYS clamped.
+
+    window = [lo, hi]   a FIXED window, the same for every panel and every validation, as
+                        train_i2sb draws its panels (`display_window`; [0, 2] for scaled raw
+                        NYUMets). Brightness is then comparable across runs and over training.
+    window = None       the min / max of the first `n_ref` panels (input and target), as before.
+
+    The clamp is what the old code lacked. It normalised by the input and target only, so a
+    prediction that overshot them left values above 1 in the grid -- and `to_uint8_image` treats
+    a float image whose maximum exceeds 1 as already being on a 0..255 scale. One overshooting
+    pixel therefore logged the whole panel as 0s and 1s out of 255: black.
+    """
+    if window is not None:
+        lo, hi = float(window[0]), float(window[1])
+    else:
+        lo, hi = float(grid[:n_ref].min()), float(grid[:n_ref].max())
+    return ((grid - lo) / max(hi - lo, 1e-8)).clamp(0.0, 1.0)
+
+
 def diverging_rgb(x, vmax=None, eps=1e-8):
     """Signed (B, 1, H, W) map -> (B, 3, H, W) RGB on a diverging blue-white-red scale
     (matplotlib 'bwr'): white at 0, red positive, blue negative, clamped to [-vmax, vmax].
@@ -240,6 +260,9 @@ def train_synthesis(
                                      # models/enhancement.py). TRAIN term only.
     s_src_idx=None,                  # channel of X holding T1 for that term; None = the net's
                                      # own prior_idx (X is [cond..., guides...])
+    display_window=None,             # [vmin, vmax] for the val/example panel, as in train_i2sb.
+                                     # [0, 2] for scaled raw NYUMets. None = the input + target
+                                     # range of the logged sample. Clamped either way.
     val_slices=None,                 # validate on a FIXED random subset of this many val slices
                                      # (val_seed picks them), as train_i2sb does. None = the
                                      # whole split -- hours for a guided unrolled net at batch 1.
@@ -589,9 +612,10 @@ def train_synthesis(
                     else:
                         gt_img = target_vm[:1]; pred_img = pv_m[:1]
 
-                    # Input | GT | Pred, shared scale from input+GT (unchanged)
-                    grid = torch.cat([in_img, gt_img, pred_img], dim=0)
-                    grid = grid - grid[0:2].min(); grid = grid / grid[0:2].max().clamp(min=1e-8)
+                    # Input | GT | Pred on ONE window: `display_window` if given, else the
+                    # input + GT range; clamped to [0, 1] either way (display_scale)
+                    grid = display_scale(torch.cat([in_img, gt_img, pred_img], dim=0),
+                                         n_ref=2, window=display_window)
 
                     # Mask our grid after normalization
                     grid = mask*grid

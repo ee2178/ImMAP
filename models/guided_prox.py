@@ -119,6 +119,22 @@ def merge_joint(outs, lses, nheads):
 _FUSED_JOINT_CHECKED = set()
 
 
+def fused_check_tolerance():
+    """How closely a fused backend must match gather in the one-off self-check.
+
+    models/groupcdl.py sets `torch.set_float32_matmul_precision("high")` at import, and
+    FlexAttention's kernel then forms q.k with TF32 dot products: ~10 mantissa bits, so its
+    scores -- and the attention built from them -- carry ~1e-3 of relative error against
+    gather's IEEE arithmetic. That is precision, not a disagreement: measured 2026-10-09 on an
+    A100, flex / distance came out at 1.0e-3, right ON the old fixed tolerance, so the check
+    passed or failed with the random weights. A real fault (a wrong window, a lost constant, a
+    mis-merged branch) is off by tens of percent, so 2e-2 still separates the two.
+    """
+    get = getattr(torch, "get_float32_matmul_precision", None)
+    ieee = get is None or get() == "highest"
+    return 1e-3 if ieee else 2e-2
+
+
 def as_guide_list(v):
     """Normalise the guide argument to a list of (B, C, H, W) tensors.
 
@@ -372,7 +388,7 @@ class GuidedGroupThreshold(GroupThreshold):
 
     # -- fused joint softmax: one self-check per process ----------------------
     @torch.no_grad()
-    def _check_fused_joint(self, ref, size=None, tol=1e-3):
+    def _check_fused_joint(self, ref, size=None, tol=None):
         """Compare the fused joint energy with the gather one on a small random problem.
 
         Runs the first time a (backend, similarity, heads, windows) combination is used in a
@@ -383,6 +399,7 @@ class GuidedGroupThreshold(GroupThreshold):
         if key in _FUSED_JOINT_CHECKED or os.environ.get("IMMAP_SKIP_FUSED_CHECK") == "1":
             return None
         _FUSED_JOINT_CHECKED.add(key)
+        tol = fused_check_tolerance() if tol is None else tol
         n = size or (max(self.window, self.guide_window) + 5)
         gen = torch.Generator(device="cpu").manual_seed(0)
 
@@ -408,8 +425,11 @@ class GuidedGroupThreshold(GroupThreshold):
             raise RuntimeError(
                 f"fused joint softmax ({self.attn_backend}, sim={self.sim_fun}, "
                 f"heads={self.nheads}, windows {self.window}/{self.guide_window}) disagrees "
-                f"with the gather backend: relative error {err:.2e} on a {n}x{n} check. "
+                f"with the gather backend: relative error {err:.2e} on a {n}x{n} check "
+                f"(tolerance {tol:.0e}). "
                 f"Use attn_backend='gather', or set IMMAP_SKIP_FUSED_CHECK=1 to run anyway.")
+        print(f"[guided_prox] fused joint softmax self-check passed: {self.attn_backend} / "
+              f"{self.sim_fun} vs gather, relative error {err:.1e} (tolerance {tol:.0e})")
         return err
 
     # -- subgradient ---------------------------------------------------------

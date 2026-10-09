@@ -616,9 +616,8 @@ EXP9_CELLS = tuple(f"mg{m}v6" for m in EXP9_M)
 #  NOT `mggrouplpds`: that cell is the group twin of the older `mglpds`
 #  (Galerkin Gram, gauss convs), so it is not comparable to mg169v6 / mg81v6.
 #
-#  `training.planar_state` does not apply (the planar STATE is implemented for
-#  the local prox only; --planar-state leaves these configs untouched). The
-#  planar CONV does.
+#  `training.planar_state` applies to them as to the local cells (the group
+#  prox takes a planar code since 2026-10-09), and so does the planar CONV.
 # ---------------------------------------------------------------------------
 EXP12_M = (169, 81)
 _GROUP_EXTRA = {k: v for k, v in MODELS["mggrouplpds"]["params"].items()
@@ -857,12 +856,14 @@ ONLINE_ESPIRIT_KWS = {"thresh_eig": 0.0, "kernel_size": 4, "maxit": 10}
 
 def supports_planar_state(spec):
     """Can this cell run with `training.planar_state`? Mirrors
-    `MGLPDSNet.planar_state_active`: an MGLPDSNet with the local prox, no
-    channel widening and fixed transfers. Every other net ignores the key, so
-    it is not written for them -- their configs stay byte-identical."""
+    `MGLPDSNet.planar_state_active`: the real primal-dual net (`MGLPDSNet`, or
+    `MGGroupLPDS` -- the same class with the group prox, supported since
+    2026-10-09), complex, no channel widening and fixed transfers. Every other
+    net ignores the key, so it is not written for them -- their configs stay
+    byte-identical."""
     p = spec["params"]
-    return (spec["type"] == "MGLPDSNet" and p.get("is_complex", True)
-            and int(p.get("window") or 1) <= 1 and int(p.get("widen", 1)) == 1
+    return (spec["type"] in ("MGLPDSNet", "MGLPDS", "MGGroupLPDS")
+            and p.get("is_complex", True) and int(p.get("widen", 1)) == 1
             and not p.get("learn_transfer"))
 
 
@@ -1381,8 +1382,8 @@ def main():
                    help="restrict to these accelerations (with --list-cells)")
     p.add_argument("--planar-state", action="store_true",
                    help="write training.planar_state=true into every cell that "
-                        "supports it (MGLPDSNet with the local prox: lpdsnet, "
-                        "mglpds, mg<M>v<V>). The iterates are carried as real "
+                        "supports it (lpdsnet, mglpds, mg<M>v<V>, and the group "
+                        "cells mggrouplpds / mggroup<M>v6). The iterates are carried as real "
                         "[re; im] tensors and the thresholding runs as one fused "
                         "kernel, forward and backward. A SPEED setting: same "
                         "parameters, same map to fp roundoff, checkpoints "

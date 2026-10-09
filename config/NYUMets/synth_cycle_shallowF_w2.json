@@ -107,6 +107,7 @@
         }
     },
     "training": {
+        "display_window": [0.0, 2.0],
         "backward_weight": 1.0,
         "ema_warmup": true,
         "ema_decay": 0.99,

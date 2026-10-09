@@ -46,10 +46,15 @@
 # ESPIRiT (thresh_eig 0, 4x4 kernel), stored SENSE combination as ground
 # truth, organ mask on. 6000 epochs x 50 steps.
 #
-# NO PLANAR STATE HERE. `training.planar_state` (and with it the fused
-# thresholding kernel) is implemented for the local prox only, so these cells
-# train on the complex state; PLANAR_STATE is ignored for them. The planar
-# CONV is on, as in mg169v6.
+# PLANAR STATE ON (PLANAR_STATE=1, the default here), as in the knee main
+# comparison: the iterates are carried as real [re; im] tensors, and the group
+# thresholding's last step -- both halves of the code scaled by
+# min(1, tau / (xi + eps)) -- runs as one fused kernel, forward and backward
+# (models/prox.py::GroupThreshold._planar_prox, models/clip_triton.py). The
+# windowed attention itself is unchanged. A speed setting only: same
+# parameters, same map to fp roundoff. NOT YET TIMED OR RUN ON A GPU for the
+# group prox -- the probe below is its first real use; PLANAR_STATE= (empty)
+# turns it off. The planar CONV is on either way, as in mg169v6.
 #
 # H200, AND WHY ONE FILE CAN HOLD ALL FOUR: the group prox runs windowed
 # attention at three grid levels and did not fit an L40S (48 GB) as
@@ -83,6 +88,7 @@
 ANATOMIES="${ANATOMIES:-brain knee}"
 ONLY="${ONLY:-mggroup169v6}"
 ACCELS="${ACCELS:-8 12}"
+PLANAR_STATE="${PLANAR_STATE-1}"     # `-`, not `:-`: an explicitly EMPTY value turns it off
 ATTN="flex"                          # stated, not inherited: the run dir should
                                      # record which backend produced it
 ORGAN_MASK=1                         # matches every other launcher of either

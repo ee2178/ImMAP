@@ -134,9 +134,11 @@ def test_generator(tmp):
           f"{len(off)} configs")
     have = sorted(n for n, c in on.items() if c["training"].get("planar_state") is True)
     tags = sorted({n.rsplit("_R", 1)[0] for n in have})
-    expect = {"lpdsnet", "mglpds", "mg169v6", "mg121v6", "mg100v6", "mg81v6", "mgunet"}
-    never = {"varnetmaps", "varnet", "mggrouplpds", "mggroup169v6", "mggroup81v6"}
-    check("--planar-state writes it on the LPDS and multigrid-LPDS cells, every R",
+    expect = {"lpdsnet", "mglpds", "mg169v6", "mg121v6", "mg100v6", "mg81v6", "mgunet",
+              # the group prox takes a planar code too (tests/test_planar_group.py)
+              "mggrouplpds", "mggroup169v6", "mggroup81v6"}
+    never = {"varnetmaps", "varnet", "altsplit", "mgaltsplit", "mllpdsw2"}
+    check("--planar-state writes it on the LPDS, multigrid-LPDS and group cells, every R",
           expect <= set(tags) and not (never & set(tags))
           and all(f"{t}_R{r}" in have for t in ("lpdsnet", "mg81v6") for r in (4, 8, 12, 16)),
           f"{len(have)} configs: {' '.join(tags)}")
@@ -150,7 +152,8 @@ def test_generator(tmp):
     keep = MGLPDSNet.PLANAR_STATE
     MGLPDSNet.PLANAR_STATE = True
     try:
-        for tag in ("lpdsnet", "mglpds", "mg81v6", "mggrouplpds", "varnetmaps"):
+        for tag in ("lpdsnet", "mglpds", "mg81v6", "mggrouplpds", "mggroup81v6",
+                    "varnetmaps"):
             cfg = on[f"{tag}_R12"]
             try:
                 net = build_model(copy.deepcopy(cfg))

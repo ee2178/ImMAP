@@ -74,6 +74,7 @@
         }
     },
     "training": {
+        "display_window": [0.0, 2.0],
         "ema_warmup": true,
         "ema_decay": null,
         "accum_steps": 1,

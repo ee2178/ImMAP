@@ -83,6 +83,7 @@
         }
     },
     "training": {
+        "display_window": [0.0, 2.0],
         "display_orient": "radiological",
         "num_epochs": 3000,
         "steps_per_epoch": 100,

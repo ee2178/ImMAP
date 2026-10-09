@@ -429,6 +429,10 @@ def train_joint_denoising_recon(
                     grid = torch.cat([gt_img, noisy_img, recon_img], dim=0)
                     grid = grid - grid[0:2].min()
                     grid = grid / grid[0:2].max().clamp(min=1e-8)
+                    # clamp: a third panel that overshoots the first two would otherwise push
+                    # the grid's max above 1 and log the whole image black (see
+                    # training.synthesis.display_scale)
+                    grid = grid.clamp(0.0, 1.0)
 
                     # Residual on its own symmetric scale: 0.5 = zero error, 0/1 = -/+ max|error|
                     res = (gt_img - recon_img).abs()

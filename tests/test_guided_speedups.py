@@ -350,6 +350,26 @@ def test_self_check_catches_a_wrong_log_sum_exp():
         bad._check_fused_joint(torch.zeros(1, dtype=torch.float64))
 
 
+def test_self_check_tolerance_follows_the_matmul_precision(monkeypatch):
+    """models/groupcdl.py switches float32 matmuls to TF32, and flex's dot products with them:
+    ~1e-3 of relative error against gather. The tolerance has to sit above that, and still far
+    below a real fault."""
+    monkeypatch.setattr(torch, "get_float32_matmul_precision", lambda: "highest", raising=False)
+    assert gp.fused_check_tolerance() == 1e-3
+    monkeypatch.setattr(torch, "get_float32_matmul_precision", lambda: "high", raising=False)
+    tol = gp.fused_check_tolerance()
+    assert 1.04e-3 < tol <= 5e-2, "must clear the measured TF32 error (1.04e-3 on an A100)"
+
+    # a branch whose scores carry TF32-sized noise passes; a wrong log-sum-exp still fails
+    gp._FUSED_JOINT_CHECKED.clear()
+    noisy, _ = fused_prox(lse_shift=[0.0, 2e-3])
+    assert noisy._check_fused_joint(torch.zeros(1, dtype=torch.float64)) < tol
+    gp._FUSED_JOINT_CHECKED.clear()
+    bad, _ = fused_prox(lse_shift=[0.0, 2.0])
+    with pytest.raises(RuntimeError, match="disagrees with the gather backend"):
+        bad._check_fused_joint(torch.zeros(1, dtype=torch.float64))
+
+
 def test_fused_joint_without_guides_and_with_a_cross_branch():
     gp._FUSED_JOINT_CHECKED.clear()
     fused, gather = fused_prox()

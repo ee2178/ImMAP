@@ -19,8 +19,9 @@ piece and then end to end:
 4. the network: outputs, latent and PARAMETER GRADIENTS agree for a flat stack
    and a V-cycle, Galerkin and rediscretized, on a size that needs the
    image-domain embedding too;
-5. the flag is ignored where the planar state is not implemented (group prox,
-   widened V-cycle), so those nets are untouched;
+5. the flag is ignored where the planar state is not implemented (a widened
+   V-cycle), so that net is untouched. The GROUP prox is supported and has its
+   own file, tests/test_planar_group.py;
 6. it does what it is for: the M-channel code is no longer converted around
    every conv;
 7. the fused prox WITH ITS BACKWARD (`SoftThreshold.FUSED_GRAD`): the
@@ -495,8 +496,7 @@ def test_network():
 
 def test_ignored_where_unsupported():
     y, E = problem()
-    for tag, kws in (("widened V-cycle", dict(K=[1, [2, 2, 2]], widen=2)),
-                     ("group prox", dict(K=[1, [2, 2]], window=5, Mh=4, attn_backend="gather"))):
+    for tag, kws in (("widened V-cycle", dict(K=[1, [2, 2, 2]], widen=2)),):
         try:
             torch.manual_seed(0)
             net = MGLPDSNet(**dict(NET, **kws))

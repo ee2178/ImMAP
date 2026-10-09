@@ -40,8 +40,9 @@ block reuse, kernel caches. `--sizes 640x320x20 768x396x16` names them as
 HxW[xCOILS]; `--sizes-from cache/fastmri_sizes_brain.json` reads the dataset's
 own census (scripts/fastmri_sizes.py), whose volume counts weight the mean.
 
---planar-state times every MGLPDSNet a second time with its iterates carried
-as real [re; im] tensors (`MGLPDSNet.PLANAR_STATE`; same parameters, same map),
+--planar-state times every MGLPDSNet (local or group prox) a second time with
+its iterates carried as real [re; im] tensors (`MGLPDSNet.PLANAR_STATE`; same
+parameters, same map),
 straight after the normal timing, and prints the pair. It is how to find out
 whether that representation is worth adopting. Where the fused thresholding
 kernel served the training pass, a third arm times the planar state with that
@@ -393,8 +394,8 @@ def time_planar_state(net, measure):
     MGLPDSNet.PLANAR_STATE = True
     try:
         if not net.planar_state_active():
-            return dict(skipped="not implemented for this net (group prox, widen > 1 "
-                                "or learned transfers)")
+            return dict(skipped="not implemented for this net (widen > 1, learned "
+                                "transfers or a guided prox)")
         cols, peak, first_s, _ = measure(net)
         out = dict(peak_mb=peak, first_s=first_s,
                    fused_clip=clip_mod.planar_kernel_report(), **cols)

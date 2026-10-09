@@ -81,6 +81,12 @@ The CPU dev box cannot run a Triton kernel, so:
   tests/test_planar_state.py checks them against autograd through the eager
   chain, emulates the kernels' index arithmetic, and (with `EMULATE`) runs the
   whole network through the autograd Function on these formulas.
+* the GROUP prox (models/prox.py::GroupThreshold) ends in the same kind of
+  map with the modulus replaced by an envelope `xi` that the windowed
+  attention supplies: `out = z * s(t / (xi + eps))`. `scale_planar` /
+  `scale_planar_grad` are that step as one kernel each way, returning the
+  gradient to `xi` as well so it can continue into the attention. Same
+  switches, same first-use check.
 * each kernel's FIRST use in a process is compared against those formulas on
   the very tensors it was given; a mismatch, or a kernel that fails to build,
   disables it with a warning and the formulas (then the eager chain) take over.
@@ -222,6 +228,83 @@ def _prox_backward_planar(Z, T, G, GZ, PART, HW, M, TN, MHW, NB, EPS,
     tl.store(PART + r * NB + pb, tl.sum(tl.where(m, w, 0.0), 0))
 
 
+@_jit
+def _scale_kernel_planar(Z, XI, T, OUT, n_elem, HW, TN, MHW, EPS,
+                         DUAL: tl.constexpr, BLOCK: tl.constexpr):
+    """The GROUP prox's last step on a planar code: `out = z * s(t / (xi + eps))`.
+
+    As `_prox_kernel_planar`, with the code's own modulus replaced by an
+    envelope `XI` computed elsewhere (the windowed attention): real,
+    (B, M, H, W), so complex element `i` reads `XI[i]`. `s` is `min(q, 1)` for
+    the group clip (`DUAL`) and `relu(1 - q)` for the group shrink.
+    """
+    pid = tl.program_id(0)
+    i = pid * BLOCK + tl.arange(0, BLOCK)
+    m = i < n_elem
+    off = i + (i // MHW) * MHW
+
+    re = tl.load(Z + off, mask=m, other=0.0)
+    im = tl.load(Z + off + MHW, mask=m, other=0.0)
+    x = tl.load(XI + i, mask=m, other=1.0)
+    t = tl.load(T + (i // HW) % TN, mask=m, other=0.0)
+
+    q = t / (x + EPS)
+    if DUAL:
+        s = tl.minimum(q, 1.0)
+    else:
+        s = tl.maximum(1.0 - q, 0.0)
+
+    tl.store(OUT + off, re * s, mask=m)
+    tl.store(OUT + off + MHW, im * s, mask=m)
+
+
+@_jit
+def _scale_backward_planar(Z, XI, T, G, GZ, GXI, PART, HW, M, TN, MHW, NB, EPS,
+                           DUAL: tl.constexpr, BLOCK: tl.constexpr):
+    """The backward of `_scale_kernel_planar`, on `_prox_backward_planar`'s grid.
+
+    With den = xi + eps, q = t / den and ds/dq = +1 (clip, where q <= 1) or -1
+    (shrink, where q < 1):
+
+        dL/dz  = s g
+        dL/dt  = ds/dq (g . z) / den                (summed per channel: PART)
+        dL/dxi = -ds/dq (g . z) q / den             (per pixel: GXI, shaped like XI)
+
+    There is no radial term: `s` does not depend on this pixel's own `z` here,
+    only through `xi`, whose gradient goes back out to the attention.
+    """
+    r = tl.program_id(0)
+    pb = tl.program_id(1)
+    j = pb * BLOCK + tl.arange(0, BLOCK)
+    m = j < HW
+    off = (r + (r // M) * M) * HW + j
+    xo = r * HW + j
+
+    re = tl.load(Z + off, mask=m, other=0.0)
+    im = tl.load(Z + off + MHW, mask=m, other=0.0)
+    gr = tl.load(G + off, mask=m, other=0.0)
+    gi = tl.load(G + off + MHW, mask=m, other=0.0)
+    x = tl.load(XI + xo, mask=m, other=1.0)
+    t = tl.load(T + r % TN)
+
+    den = x + EPS
+    q = t / den
+    d = (gr * re + gi * im) / den
+    if DUAL:
+        act = q <= 1.0
+        s = tl.where(act, q, 1.0)
+        w = tl.where(act, d, 0.0)
+    else:
+        act = q < 1.0
+        s = tl.where(act, 1.0 - q, 0.0)
+        w = tl.where(act, -d, 0.0)
+
+    tl.store(GZ + off, gr * s, mask=m)
+    tl.store(GZ + off + MHW, gi * s, mask=m)
+    tl.store(GXI + xo, -w * q, mask=m)
+    tl.store(PART + r * NB + pb, tl.sum(tl.where(m, w, 0.0), 0))
+
+
 # Pointer arithmetic is int32: `2 * i` must stay representable.
 _MAX_ELEMS = (2 ** 31 - 1) // 2
 
@@ -238,7 +321,8 @@ _STATE = {}
 def planar_kernel_report():
     """One line on the planar kernels, for the timing tools."""
     def one(kind):
-        vals = [_STATE[k] for k in _STATE if k[0] == kind]
+        # the local prox's kernels and the group prox's ("group forward", ...)
+        vals = [_STATE[k] for k in _STATE if k[0].endswith(kind)]
         if not vals:
             return "not used"
         return "active" if all(vals) else "DISABLED"
@@ -439,6 +523,153 @@ def prox_planar_grad(z, t, eps, dual=True):
 def clip_modulus_planar(z, t, eps):
     """`clip_modulus` for a planar code (no autograd): `prox_planar(dual=True)`."""
     return prox_planar(z, t, eps, dual=True)
+
+
+# ---------------------------------------------------------------------------
+#  the GROUP prox's scale step:  out = z * s(t / (xi + eps))
+# ---------------------------------------------------------------------------
+def _eager_scale_forward(z, xi, t4, eps, dual):
+    """`_scale_kernel_planar` in torch."""
+    pairs, _, _ = _halves(z)
+    q = t4 / (xi + eps)
+    s = q.clamp_max(1.0) if dual else (1.0 - q).clamp_min(0.0)
+    return (pairs * s.unsqueeze(1)).reshape(z.shape)
+
+
+def _eager_scale_backward(z, xi, t4, g, eps, dual):
+    """`_scale_backward_planar` in torch
+    -> `(dL/dz, dL/dxi, dL/dt per (batch, channel) as (B, M, 1, 1))`."""
+    _, re, im = _halves(z)
+    _, gr, gi = _halves(g)
+    den = xi + eps
+    q = t4 / den
+    d = (gr * re + gi * im) / den
+    zero = torch.zeros((), dtype=z.dtype, device=z.device)
+    if dual:
+        act = q <= 1.0
+        s = torch.where(act, q, torch.ones_like(q))
+        w = torch.where(act, d, zero)
+    else:
+        act = q < 1.0
+        s = torch.where(act, 1.0 - q, zero)
+        w = torch.where(act, -d, zero)
+    gz = torch.stack((gr * s, gi * s), dim=1).reshape(z.shape)
+    return gz, -w * q, w.sum(dim=(2, 3), keepdim=True)
+
+
+def _scale_args(z, xi, t):
+    """`_planar_args`, plus the envelope: real float32, one value per complex
+    element of `z`."""
+    args = _planar_args(z, t)
+    if args is None:
+        return None
+    B, C2, H, W = z.shape
+    if not (torch.is_tensor(xi) and xi.dtype == torch.float32
+            and tuple(xi.shape) == (B, C2 // 2, H, W) and xi.device == z.device):
+        return None
+    return args
+
+
+def _scale_forward_impl(z, xi, t4, tf, TN, eps, dual, block=1024):
+    key = ("group forward", bool(dual))
+    if EMULATE or _STATE.get(key) is False:
+        return _eager_scale_forward(z, xi, t4.detach(), eps, dual)
+    M, HW = z.shape[1] // 2, z.shape[2] * z.shape[3]
+    n = z.numel() // 2
+    out = torch.empty_like(z)
+    try:
+        _scale_kernel_planar[(triton.cdiv(n, block),)](
+            z, xi, tf, out, n, HW, TN, M * HW, float(eps), DUAL=bool(dual), BLOCK=block)
+    except Exception as e:                                    # noqa: BLE001
+        _disable(key, f"{type(e).__name__}: {e}")
+        return _eager_scale_forward(z, xi, t4.detach(), eps, dual)
+    if key not in _STATE:
+        ref = _eager_scale_forward(z, xi, t4.detach(), eps, dual)
+        err = _rel_err(out, ref, z.abs().max())
+        if not err < 1e-5:
+            _disable(key, f"max rel err {err:.2e} against the eager formula")
+            return ref
+        _STATE[key] = True
+    return out
+
+
+def _scale_backward_impl(z, xi, t4, tf, TN, g, eps, dual, block=1024):
+    key = ("group backward", bool(dual))
+    if EMULATE or _STATE.get(key) is False:
+        return _eager_scale_backward(z, xi, t4, g, eps, dual)
+    B, M, HW = z.shape[0], z.shape[1] // 2, z.shape[2] * z.shape[3]
+    nb = triton.cdiv(HW, block)
+    gz, gxi = torch.empty_like(z), torch.empty_like(xi)
+    part = torch.empty(B * M * nb, device=z.device, dtype=torch.float32)
+    try:
+        _scale_backward_planar[(B * M, nb)](
+            z, xi, tf, g, gz, gxi, part, HW, M, TN, M * HW, nb, float(eps),
+            DUAL=bool(dual), BLOCK=block)
+    except Exception as e:                                    # noqa: BLE001
+        _disable(key, f"{type(e).__name__}: {e}")
+        return _eager_scale_backward(z, xi, t4, g, eps, dual)
+    gt = part.view(B, M, nb).sum(dim=2).view(B, M, 1, 1)
+    if key not in _STATE:
+        rz, rx, rt = _eager_scale_backward(z, xi, t4, g, eps, dual)
+        _, re, im = _halves(z)
+        _, gr, gi = _halves(g)
+        mass = ((gr * re + gi * im).abs() / (xi + eps).abs()).sum(dim=(2, 3)).max()
+        ez = _rel_err(gz, rz, g.abs().max())
+        ex = _rel_err(gxi, rx, rx.abs().max())
+        et = _rel_err(gt, rt, mass)
+        if not (ez < 1e-4 and ex < 1e-4 and et < 1e-4):
+            _disable(key, f"max rel err dz {ez:.2e}, dxi {ex:.2e}, dt {et:.2e} "
+                          f"against the eager formula")
+            return rz, rx, rt
+        _STATE[key] = True
+    return gz, gxi, gt
+
+
+class _PlanarScale(torch.autograd.Function):
+    """`_scale_forward_impl` with `_scale_backward_impl` as its derivative:
+    gradients to the code, to the envelope and to the threshold."""
+
+    @staticmethod
+    def forward(ctx, z, xi, t4, eps, dual):
+        tf = t4.reshape(-1).contiguous()
+        ctx.save_for_backward(z, xi, t4)
+        ctx.eps, ctx.dual = eps, dual
+        return _scale_forward_impl(z, xi, t4, tf, tf.numel(), eps, dual)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        z, xi, t4 = ctx.saved_tensors
+        tf = t4.reshape(-1).contiguous()
+        gz, gxi, gt = _scale_backward_impl(z, xi, t4, tf, tf.numel(), g.contiguous(),
+                                           ctx.eps, ctx.dual)
+        need = ctx.needs_input_grad
+        return (gz if need[0] else None, gxi if need[1] else None,
+                gt.sum_to_size(t4.shape) if need[2] else None, None, None)
+
+
+def scale_planar(z, xi, t, eps, dual=True):
+    """`z * s(t / (xi + eps))` on a planar code in one pass, NO autograd, or
+    None if this path cannot be taken. `xi` real, (B, M, H, W); `z`, `t` as in
+    `prox_planar`."""
+    if _STATE.get(("group forward", bool(dual))) is False:
+        return None
+    args = _scale_args(z, xi, t)
+    if args is None:
+        return None
+    return _scale_forward_impl(z, xi.contiguous(), *args, eps, dual)
+
+
+def scale_planar_grad(z, xi, t, eps, dual=True):
+    """`scale_planar` as a differentiable op (gradients to `z`, `xi` and `t`),
+    or None if it cannot be taken or either of its kernels has been disabled."""
+    if (_STATE.get(("group forward", bool(dual))) is False
+            or _STATE.get(("group backward", bool(dual))) is False):
+        return None
+    args = _scale_args(z, xi, t)
+    if args is None:
+        return None
+    return _PlanarScale.apply(z, xi.contiguous(), args[0], float(eps), bool(dual))
 
 
 def clip_modulus(z, t, eps, block=1024):
