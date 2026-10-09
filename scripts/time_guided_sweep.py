@@ -141,10 +141,17 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--model-override", type=yaml.safe_load, default=None,
                     help="YAML/JSON merged into model.params, e.g. '{K: 10, guide_window: 7}'")
+    ap.add_argument("--no-cudnn-benchmark", action="store_true",
+                    help="time with cuDNN autotuning off (train.py turns it on by default)")
     ap.add_argument("--csv", default=None)
     args = ap.parse_args()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # As train.py: cuDNN autotuning ON unless --no-cudnn-benchmark. Until 2026-10-09 these
+    # timings ran with it OFF while training ran with it ON, and came out ~1.8x pessimistic for
+    # SBCDLNet (225 ms timed against 125 ms in training at batch 8).
+    torch.backends.cudnn.benchmark = not args.no_cudnn_benchmark
+    print(f"cudnn.benchmark = {torch.backends.cudnn.benchmark}")
     with open(args.config) as f:
         base = yaml.safe_load(f)
     base["model"]["params"].update(args.model_override or {})
