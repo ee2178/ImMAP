@@ -161,11 +161,12 @@ def main():
     # the pair). The only valid fused configuration is joint_softmax=False: one softmax per branch
     # plus the learned blend omega. That is a slightly different prox, so it is switched over
     # loudly rather than silently -- the timings are then for THAT prox, not the gather one.
+    # (Until 2026-10-09 a fused backend forced joint_softmax=False here. The joint softmax now
+    # runs fused, so the config's own setting is timed.)
     js_note = ""
     if params.get("attn_backend", "gather") != "gather" and params.get("joint_softmax", True):
-        params["joint_softmax"] = False
-        js_note = (f"  [joint_softmax -> False: backend {params['attn_backend']!r} cannot run the "
-                   f"joint self+guide softmax; this times the per-branch prox with the omega blend]")
+        js_note = (f"  [joint softmax on the fused {params['attn_backend']!r} backend: same simplex "
+                   f"as gather, no adjacency blend between refreshes]")
     net = build_model({"model": {"type": "LGGS", "params": params}}).to(device)
     if getattr(net, "attn_backend", None) == "flex":
         net.compile_flex()

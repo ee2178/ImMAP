@@ -56,6 +56,28 @@ def set_weight(module, W):
 # immediately, exactly as before -- so a `project_()` called on its own (the
 # older models do) is unaffected.
 _BATCH = None
+_ONCE = None        # ids already handled inside the current batched_projection()
+
+
+def project_once(obj):
+    """True the FIRST time `obj` is seen inside a `batched_projection()`; always True outside.
+
+    For constraints on something several owners share. `tie_attention` points every layer's
+    prox at layer 0's W_theta / W_phi / W_alpha / W_beta / gamma, so K layers each asking to
+    clamp the same tensor is K - 1 wasted kernels per step:
+
+        if project_once(self.gamma):
+            self.gamma.project_(lo=0.05, hi=0.95)
+
+    Clamps are idempotent, so skipping the repeats cannot change the result
+    (tests/test_guided_speedups.py compares against projecting every time).
+    """
+    if _ONCE is None:
+        return True
+    if id(obj) in _ONCE:
+        return False
+    _ONCE.add(id(obj))
+    return True
 
 
 def _foreach_list_ok():
@@ -88,17 +110,17 @@ def project_conv(module, dim=(2, 3)):
 @contextlib.contextmanager
 def batched_projection():
     """Collect `project_conv` requests and apply them together on exit."""
-    global _BATCH
+    global _BATCH, _ONCE
     if _BATCH is not None:                 # nested: the outermost one flushes
         yield
         return
-    _BATCH = []
+    _BATCH, _ONCE = [], set()
     try:
         yield
         pending, _BATCH = _BATCH, None     # flush with batching OFF
         _flush_projection(pending)
     finally:
-        _BATCH = None
+        _BATCH = _ONCE = None
 
 
 @torch.no_grad()

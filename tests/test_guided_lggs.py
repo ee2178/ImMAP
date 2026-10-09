@@ -174,12 +174,16 @@ def test_complex_and_projection():
 
 
 def test_joint_softmax_rejects_fused_backends():
-    print("\n[a joint simplex cannot be a fused kernel]")
+    # The name is historical: the pair used to be refused. The joint simplex now runs on the
+    # fused backends through the branches' log-sum-exps (guided_prox.merge_joint;
+    # tests/test_guided_speedups.py checks that identity against the gather softmax).
+    print("\n[the joint softmax is accepted on a fused backend]")
     try:
-        prox(attn_backend="flex")
-        check("joint_softmax + flex raises", False)
+        p = prox(attn_backend="flex")
+        check("joint_softmax + flex builds, and is marked fused", p.joint_fused)
     except ValueError as e:
-        check("joint_softmax + flex raises", "gather" in str(e))
+        check("joint_softmax + flex builds", False, str(e))
+    check("gather keeps the concatenated softmax", not prox().joint_fused)
 
 
 # ---------------------------------------------------------------------------

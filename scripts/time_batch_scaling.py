@@ -106,6 +106,8 @@ def time_config(path, args, dev):
         cfg["model"]["params"][k] = v
     name = path.replace("\\", "/").split("/")[-1].replace(".json", "")
     net = build_model(cfg).to(dev).train()
+    if getattr(net, "attn_backend", None) == "flex" and dev.type == "cuda":
+        net.compile_flex()                                  # as train.py does
     opt = torch.optim.Adam(net.parameters(), lr=1e-6)      # real update, negligible movement
     clip = cfg["training"].get("clip_grad")
     step = make_step(cfg, net, dev, args.size)

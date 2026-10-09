@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from models.base import set_weight
+from models.base import project_conv, set_weight
 from models.components import Conv2d, ConvTranspose2d
 from models.prox import Polynomial, build_prox
 from operators.identity import Identity
@@ -91,9 +91,11 @@ class LISTALayer(nn.Module):
     # -- constraints --------------------------------------------------------
     @torch.no_grad()
     def project_(self):
+        # project_conv: immediate on its own (as before), batched with every other conv of the
+        # same shape when the net's project() opens a batched_projection()
         d = self.proj_dims
-        set_weight(self.analysis, uball_project(self.analysis.weight, dim=d))
-        set_weight(self.synthesis, uball_project(self.synthesis.weight, dim=d))
+        project_conv(self.analysis, dim=d)
+        project_conv(self.synthesis, dim=d)
         if self.eta is not None:
             self.eta.project_(lo=0.0)
 

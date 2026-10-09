@@ -72,7 +72,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.base import BaseUnrolledModel, set_weight
+from models.base import BaseUnrolledModel, batched_projection, project_conv, set_weight
 from models.components import ST, Conv2d, ConvTranspose2d
 from models.enhancement import EnhancementCoupling, step_logit
 from models.sb_schedule import BridgeScheduleMixin, horner as _horner
@@ -253,10 +253,13 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
 
     @torch.no_grad()
     def project_filters(self):
-        for A, B in ((self.A_D, self.B_D), (self.A_P, self.B_P)):
-            for a, b in zip(A, B):                 # the P pair is empty with no side channels
-                set_weight(a, uball_project(a.weight))
-                set_weight(b, uball_project(b.weight))
+        # 4K convs in two weight shapes: one stacked norm per shape instead of ~10 small
+        # kernels per conv (models/base.py::batched_projection). Same values.
+        with batched_projection():
+            for A, B in ((self.A_D, self.B_D), (self.A_P, self.B_P)):
+                for a, b in zip(A, B):             # the P pair is empty with no side channels
+                    project_conv(a)
+                    project_conv(b)
 
     @torch.no_grad()
     def project(self):

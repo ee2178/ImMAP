@@ -69,6 +69,7 @@ import torch.nn.functional as F
 
 from models.guided_prox import (GuidedGroupThreshold, as_guide_list,
                                 build_guided_prox)
+from models.base import batched_projection
 from models.lpds import LPDSLayer, gram
 from operators.identity import Identity
 from operators.padding import calc_pad_2d, unpad
@@ -351,9 +352,25 @@ class LGGSNet(nn.Module):
 
     @torch.no_grad()
     def project(self):
-        for m in self.modules():
-            if m is not self and hasattr(m, "project_"):
-                m.project_()
+        """Constraint projection, each constrained module ONCE (as MGLPDSNet.project).
+
+        Top-down: a module that defines `project_` is called and NOT descended into -- a layer
+        projects its filters, its steps and its prox. Walking `self.modules()` instead called
+        every layer, then the Fenchel wrapper, then the prox inside it, then each Polynomial
+        again with default bounds: four passes over the same parameters every step. Clamps
+        are idempotent, so the result is identical (tests/test_guided_speedups.py). Inside
+        `batched_projection` the filters are projected together and shared attention
+        transforms once.
+        """
+        def walk(mod):
+            for child in mod.children():
+                if hasattr(child, "project_"):
+                    child.project_()
+                else:
+                    walk(child)
+
+        with batched_projection():
+            walk(self)
 
     def extra_repr(self):
         return (f"K={self.K}, M={self.M}, C={self.C}, s={self.s}, "

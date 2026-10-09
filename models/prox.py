@@ -40,6 +40,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.base import project_once
 
 from models.circulant_attention import Circulant, circ_adjacency, _abs2
 from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
@@ -470,8 +471,8 @@ class GroupThreshold(nn.Module):
         xr = x.reshape(B, self.nheads, C // self.nheads, H, W)
         return torch.cat([xr.real, xr.imag], dim=2).reshape(B, 2 * C, H, W)
 
-    def _flex_block_mask(self, ref):
-        """The BlockMask for this grid.
+    def _flex_block_mask(self, ref, win=None):
+        """The BlockMask for this grid and window (`win=None`: the self window).
 
         Memoised process-wide by `get_block_mask`, NOT per module: an unrolled
         network has one prox per layer per level, every one of them wants the
@@ -479,7 +480,8 @@ class GroupThreshold(nn.Module):
         MG-GroupCDL ends up with one mask per level instead of one per prox.
         """
         H, W = ref.shape[-2], ref.shape[-1]
-        return get_block_mask(H, W, self.window, ref.device, circular=True,
+        return get_block_mask(H, W, self.window if win is None else int(win),
+                              ref.device, circular=True,
                               BLOCK_SIZE=self.flex_block_size,
                               compile=self.flex_compile_mask)
 
@@ -636,9 +638,12 @@ class GroupThreshold(nn.Module):
     @torch.no_grad()
     def project_(self):
         self.tau.project_(lo=0.0)
-        self.gamma.project_(lo=0.05, hi=0.95)
+        # gamma and W_beta are SHARED across layers under tie_attention: once per step is
+        # enough (models/base.py::project_once; a no-op guard outside batched_projection)
+        if project_once(self.gamma):
+            self.gamma.project_(lo=0.05, hi=0.95)
         self.rho.project_(lo=0.1)
-        if self.grouped:
+        if self.grouped and project_once(self.Wbeta):
             self.Wbeta.weight.clamp_(min=0.0)
 
     def extra_repr(self):

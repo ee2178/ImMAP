@@ -25,6 +25,12 @@
 #
 #   CONFIGS="config/NYUMets/i2sb_sbcdlnet_sgate.json" BATCHES="32 64 128" sbatch bigpurple/time_batch_scaling.sbatch
 #
+# A/B switches for the guided-threshold speedups (2026-10-09):
+#   IMMAP_SIM_LOOP=1 sbatch ...     the gather backend's ORIGINAL one-offset-at-a-time similarity
+#   OVERRIDE='{"attn_backend": "flex"}' sbatch ...   the joint softmax on the fused flex kernel
+#                                   (sim_fun "distance"; "triton" for "pidistance")
+# sbatch passes the submitting shell's environment through, so the first form needs no edit here.
+#
 # radiology is the only GPU partition these jobs run on. Typed GRES (gpu:a100:1) so the numbers
 # are comparable with the A100 training runs.
 

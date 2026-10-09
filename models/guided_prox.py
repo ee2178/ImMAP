@@ -52,15 +52,37 @@ here (unlike `build_prox`, where `window=1` selects soft-thresholding).
 
 Backends
 --------
-`gather` materialises the (B, Q, K) window values as a `Circulant` and is the
-only backend that can do a joint softmax (a fused kernel normalises one
-attention at a time; a joint simplex spans two differently-windowed ones) or
-carry complex features.  `flex` / `triton` are available for
-`joint_softmax=False`, where each branch is an ordinary independent attention;
-they skip the Alg.-4 adjacency blend for the same reason `GroupThreshold` does.
+`gather` materialises the (B, Q, K) window values as a `Circulant`. It is the
+only backend that carries the Alg.-4 adjacency BLEND (a convex combination of
+materialised values) and complex features on every similarity.
+
+`flex` / `triton` are fused: nothing of size (B, Q, K) is allocated and there is
+no per-offset loop. Each branch is one windowed attention. They cover BOTH
+normalisations:
+
+  joint_softmax=False   independent branches, learned blend omega.
+  joint_softmax=True    the SAME joint simplex as gather, without concatenating
+      anything. A fused kernel normalises one attention at a time, but it also
+      returns that attention's log-sum-exp, and a softmax over a union of
+      windows factorises exactly:
+
+          L_b   = log sum_{k in window b} exp(s_bk)                 (returned)
+          pi_b  = softmax_b(L_b)                                    per query
+          joint weight of (b, k) = pi_b * softmax_k(s_b)_k
+
+      so the pooled energy is `sum_b pi_b * (Gamma_b v_b)` -- `merge_joint`.
+      Every branch shares the query, so whatever per-query constant a backend
+      leaves out of its scores cancels in pi.
+
+Neither fused backend blends adjacencies across layers: on a refresh the new one
+simply replaces the old (as in `GroupThreshold`). With dK = 1 that is the gather
+model exactly; with dK > 1 it is the gather model minus the gamma blend, so a
+checkpoint trained on gather does not transfer bit-for-bit.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 import torch.nn as nn
@@ -71,6 +93,30 @@ from models.circulant_similarity import circulant_similarity_window
 from models.circulant_flex import FlexAdjacency
 from models.circulant_triton import TritonAdjacency
 from models.prox import GroupThreshold, Polynomial
+
+
+def merge_joint(outs, lses, nheads):
+    """The joint-softmax energy from per-branch attention outputs and their log-sum-exps.
+
+    outs : list of (B, C, H, W)  -- `Gamma_b v_b`, each branch softmaxed on its own
+    lses : list, each (B, heads, S) or (B * heads, S) with S = H * W, row-major
+    Returns `sum_b softmax_b(lse)_b * outs_b`, the head's weight spread over its channels.
+    """
+    B, C, H, W = outs[0].shape
+    L = torch.stack([l.reshape(B, nheads, H, W) for l in lses], dim=0)     # (nb, B, h, H, W)
+    pi = torch.softmax(L, dim=0)
+    if C != nheads:
+        pi = pi.repeat_interleave(C // nheads, dim=2)                      # heads are contiguous
+    e = pi[0] * outs[0]
+    for b in range(1, len(outs)):
+        e = e + pi[b] * outs[b]
+    return e
+
+
+# One comparison against the gather backend per (backend, similarity, heads) per process:
+# the fused joint softmax cannot be run on the CPU dev box, so its first use on a GPU checks
+# itself. IMMAP_SKIP_FUSED_CHECK=1 skips it.
+_FUSED_JOINT_CHECKED = set()
 
 
 def as_guide_list(v):
@@ -114,15 +160,9 @@ class GuidedGroupThreshold(GroupThreshold):
         assert self.guide_window % 2 == 1, "guide window side must be odd"
         self.joint_softmax = bool(joint_softmax)
 
-        if self.joint_softmax and self.attn_backend != "gather":
-            raise ValueError(
-                f"joint_softmax=True needs attn_backend='gather': the joint "
-                f"simplex spans the self window ({self.window}) AND the guide "
-                f"window ({self.guide_window}) together, and a fused attention "
-                f"kernel normalises exactly one of them. Use "
-                f"attn_backend='gather', or joint_softmax=False if you want the "
-                f"fused backends (each branch then gets its own softmax and the "
-                f"learned blend omega).")
+        # joint softmax on flex / triton: exact, through the branches' log-sum-exps
+        # (module docstring, `merge_joint`)
+        self.joint_fused = self.joint_softmax and self.attn_backend != "gather"
 
         # Only the non-joint path has a blend to learn; the joint softmax makes
         # the branches compete directly, so `omega` would be redundant there
@@ -159,8 +199,11 @@ class GuidedGroupThreshold(GroupThreshold):
                                    heads=self.nheads,
                                    block_m=self.triton_block_m)
         q, k = self._stack_ri(q), self._stack_ri(k)
+        # The mask must be THIS branch's window. It used to be the self window for every
+        # branch, so with window != guide_window (LGGS: 1 vs 15) a flex guide branch attended
+        # over the self window only.
         return FlexAdjacency(q, k, win, sim=self.sim_fun, heads=self.nheads,
-                             block_mask=self._flex_block_mask(q),
+                             block_mask=self._flex_block_mask(q, win),
                              compiled=self._flex_fn)
 
     def _build_adjacencies(self, z, guides, sigma):
@@ -168,15 +211,16 @@ class GuidedGroupThreshold(GroupThreshold):
         q, k_self, k_guides = self._project_qk(z, guides, sigma)
 
         if self.attn_backend != "gather":
-            # Reached only when joint_softmax is False (the constructor rejects
-            # the other combination), so every branch is an ordinary
-            # independent attention.
+            # One independent windowed attention per branch. Under joint_softmax
+            # they are merged afterwards through their log-sum-exps (forward).
             return (self._fused_branch(q, k_self, self.window),
                     [self._fused_branch(q, kg, self.guide_window)
                      for kg in k_guides])
 
+        return self._gather_adjacencies(q, k_self, k_guides, tuple(z.shape[-2:]))
+
+    def _gather_adjacencies(self, q, k_self, k_guides, spatial):
         qh = self._to_heads(q)
-        spatial = tuple(z.shape[-2:])
         s_phi, col_phi, crow_phi = circulant_similarity_window(
             self.sim_fun, qh, self._to_heads(k_self), self.window)
         branches = [circulant_similarity_window(
@@ -292,20 +336,29 @@ class GuidedGroupThreshold(GroupThreshold):
 
         za = self.Walpha(z) if self.grouped else z
         e_self = self.apply_gamma(Phi, _abs2(za))
-        e_guide = None
+        terms = []
         for Om, g in zip(Omegas, guides):
             ga = self.Walpha(g) if self.grouped else g
-            term = self.apply_gamma(Om, _abs2(ga))
-            e_guide = term if e_guide is None else e_guide + term
+            terms.append(self.apply_gamma(Om, _abs2(ga)))
 
-        if e_guide is None:                       # a cross branch with no ordinary guide
-            e_guide = torch.zeros_like(e_self)
-        elif not self.joint_softmax:
-            w = self._omega_map(z, sigma)
-            e_self = w * e_self
-            e_guide = (1.0 - w).abs() * e_guide
+        if self.joint_fused and terms:
+            # the joint simplex, from each branch's own softmax and its log-sum-exp
+            self._check_fused_joint(z)
+            energy = merge_joint([e_self] + terms,
+                                 [Phi._lse] + [Om._lse for Om in Omegas], self.nheads)
+        else:
+            e_guide = None
+            for term in terms:
+                e_guide = term if e_guide is None else e_guide + term
+            if e_guide is None:                   # a cross branch with no ordinary guide
+                e_guide = torch.zeros_like(e_self)
+            elif not self.joint_softmax:
+                w = self._omega_map(z, sigma)
+                e_self = w * e_self
+                e_guide = (1.0 - w).abs() * e_guide
+            energy = e_self + e_guide
 
-        xi_a = torch.sqrt(e_self + e_guide + self.eps)
+        xi_a = torch.sqrt(energy + self.eps)
         xi = self.beta_apply(xi_a) if self.grouped else xi_a
         if cross is not None:
             if refresh or "Xi" not in cache:
@@ -316,6 +369,48 @@ class GuidedGroupThreshold(GroupThreshold):
             xi = torch.sqrt(xi ** 2 + cross["weight"] * xi_x ** 2)
         tau = self.tau(sigma, ref=z)
         return z * F.relu(1.0 - tau / (xi + self.eps)), cache
+
+    # -- fused joint softmax: one self-check per process ----------------------
+    @torch.no_grad()
+    def _check_fused_joint(self, ref, size=None, tol=1e-3):
+        """Compare the fused joint energy with the gather one on a small random problem.
+
+        Runs the first time a (backend, similarity, heads, windows) combination is used in a
+        process and raises if they disagree: a silently different attention would train
+        without complaint. Returns the relative error (None when skipped)."""
+        key = (self.attn_backend, self.sim_fun, self.nheads, self.window, self.guide_window,
+               ref.is_complex())
+        if key in _FUSED_JOINT_CHECKED or os.environ.get("IMMAP_SKIP_FUSED_CHECK") == "1":
+            return None
+        _FUSED_JOINT_CHECKED.add(key)
+        n = size or (max(self.window, self.guide_window) + 5)
+        gen = torch.Generator(device="cpu").manual_seed(0)
+
+        def rnd():
+            t = torch.randn(1, self.M, n, n, generator=gen)
+            if ref.is_complex():
+                t = torch.complex(t, torch.randn(1, self.M, n, n, generator=gen))
+            return t.to(device=ref.device, dtype=ref.dtype)
+
+        z, g = rnd(), rnd()
+        q, k_self, k_guides = self._project_qk(z, [g], None)
+        vals = [_abs2(self.Walpha(t) if self.grouped else t) for t in (z, g)]
+
+        branches = [self._fused_branch(q, k_self, self.window),
+                    self._fused_branch(q, k_guides[0], self.guide_window)]
+        outs = [self.apply_gamma(A, v) for A, v in zip(branches, vals)]
+        fused = merge_joint(outs, [A._lse for A in branches], self.nheads)
+
+        Phi, Omegas = self._gather_adjacencies(q, k_self, k_guides, (n, n))
+        want = self.apply_gamma(Phi, vals[0]) + self.apply_gamma(Omegas[0], vals[1])
+        err = float((fused - want).abs().max() / want.abs().max().clamp_min(1e-30))
+        if not err < tol:
+            raise RuntimeError(
+                f"fused joint softmax ({self.attn_backend}, sim={self.sim_fun}, "
+                f"heads={self.nheads}, windows {self.window}/{self.guide_window}) disagrees "
+                f"with the gather backend: relative error {err:.2e} on a {n}x{n} check. "
+                f"Use attn_backend='gather', or set IMMAP_SKIP_FUSED_CHECK=1 to run anyway.")
+        return err
 
     # -- subgradient ---------------------------------------------------------
     def subgradient(self, z, guide=None, sigma=None, cache=None, mode=None):

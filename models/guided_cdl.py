@@ -59,7 +59,7 @@ import copy
 import torch
 import torch.nn as nn
 
-from models.base import set_weight
+from models.base import batched_projection, project_conv, set_weight
 from models.components import ConvTranspose2d
 from models.guided_prox import (GuidedGroupThreshold, as_guide_list,
                                 build_guided_prox)
@@ -301,11 +301,15 @@ class GuidedGroupCDL(nn.Module):
 
     @torch.no_grad()
     def project(self):
-        for layer in self.layers:
-            layer.project_()
-            if self.tau_floor is not None:
-                layer.prox.tau.weight.data[0].clamp_(min=self.tau_floor)
-        set_weight(self.D, uball_project(self.D.weight))
+        # batched_projection: the 2K + 1 filter projections become one stacked norm per weight
+        # shape, and the attention transforms tie_attention shares are clamped once instead
+        # of K times (models/base.py). Same result as projecting each on its own.
+        with batched_projection():
+            for layer in self.layers:
+                layer.project_()
+                if self.tau_floor is not None:
+                    layer.prox.tau.weight.data[0].clamp_(min=self.tau_floor)
+            project_conv(self.D)
 
     def extra_repr(self):
         return (f"K={self.K}, M={self.M}, C={self.C}, s={self.s}, "

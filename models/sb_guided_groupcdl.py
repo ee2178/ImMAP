@@ -65,7 +65,9 @@ PARAMETERS THAT NEVER RECEIVE GRADIENT -- both inherited, both harmless, both fl
 MEMORY. attn_backend="gather" materializes every window position: one intermediate is
 B x Mh x (H/s)(W/s) x guide_window^2 floats -- 450 MB at B=4, Mh=32, 128px, window 15 -- and one
 exists per guide branch per refreshing layer, all held for backward. Batch size and Mh are the
-knobs if this does not fit; joint_softmax=True rules out the fused flex/triton backends.
+knobs if this does not fit -- or a fused backend: attn_backend="flex" (sim_fun "distance") /
+"triton" ("pidistance") allocate nothing of that size and run the SAME joint softmax, without
+the adjacency blend between refreshes (models/guided_prox.py, "Backends").
 """
 
 import copy
@@ -75,7 +77,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.base import set_weight
+from models.base import batched_projection, project_conv, set_weight
 from models.components import Conv2d, ConvTranspose2d
 from models.enhancement import EnhancementCoupling, step_logit
 from models.guided_cdl import make_guided_lista_layer, tie_attention
@@ -95,7 +97,7 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
         Unroll depth, atoms, filter size, stride, attention width -- as in LGGCDL.
     window, guide_window, joint_softmax, sim_fun, nheads, dK, rho0, gamma0, rho_inv,
     init_strategy, attn_backend, flex_block_size, share_attention
-        The guided prox, as in GuidedGroupCDL. `joint_softmax=True` requires attn_backend="gather".
+        The guided prox, as in GuidedGroupCDL. `joint_softmax=True` runs on every backend.
     C          input width = 1 + len(cond_idx); >= 2 because the bridge prior x_1 lives in cond.
     prior_idx  which CONDITIONING channel is x_1 (0-based within cond).
     t0         constant term of the threshold; MUST be > 0 (see the module docstring).
@@ -183,6 +185,7 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
         self.n_cond = n_cond
         self.prior_idx = int(prior_idx)
         self.t_floor = float(t0)
+        self.attn_backend = attn_backend       # train.py reads this to call compile_flex()
         self.cdtype = torch.float32
 
         # ---- target-domain layers: dictionary pair (A_k, B_k) + the guided prox ----
@@ -390,20 +393,32 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
         return x0_hat, z
 
     # -----------------------------------------------------------------
+    def compile_flex(self):
+        """torch.compile every guided prox's fused kernel (GPU; call once). train.py does this
+        for any model whose `attn_backend` is "flex"."""
+        for layer in self.layers:
+            if layer.prox.attn_backend == "flex":
+                layer.prox.compile_flex()
+        return self
+
+    # -----------------------------------------------------------------
     @torch.no_grad()
     def project(self):
         if self.coupling is not None:
             self.coupling.project()
         if self.s_cross:
             self.cross_gain.clamp_(0.0)
-        for layer in self.layers:
-            layer.project_()               # unit-ball filters + the prox's tau/gamma/rho/Wbeta
-            # re-floor the threshold's CONSTANT term: the prox clamps it at 0, and 0 kills the
-            # attention gradient permanently (module docstring).
-            layer.prox.tau.weight.data[0].clamp_(min=self.t_floor)
-        for a, b in zip(self.A_P, self.B_P):       # empty with no side channels
-            set_weight(a, uball_project(a.weight))
-            set_weight(b, uball_project(b.weight))
+        # batched_projection: every filter of one shape in one stacked norm, and the attention
+        # transforms shared by tie_attention clamped once, not K times (models/base.py)
+        with batched_projection():
+            for layer in self.layers:
+                layer.project_()           # unit-ball filters + the prox's tau/gamma/rho/Wbeta
+                # re-floor the threshold's CONSTANT term: the prox clamps it at 0, and 0 kills
+                # the attention gradient permanently (module docstring).
+                layer.prox.tau.weight.data[0].clamp_(min=self.t_floor)
+            for a, b in zip(self.A_P, self.B_P):   # empty with no side channels
+                project_conv(a)
+                project_conv(b)
 
     @torch.no_grad()
     def param_logs(self, probes=(0.0, 0.5, 1.0)):

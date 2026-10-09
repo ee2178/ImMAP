@@ -28,6 +28,7 @@ Conventions
 
 from __future__ import annotations
 import itertools
+import os
 import torch
 import torch.nn.functional as F
 
@@ -120,6 +121,102 @@ def circulant_indices(spatial, win: int, device=None, dtype=torch.int64):
 # ----------------------------------------------------------------------------
 # Window-space similarity (dense): (B, N, K)
 # ----------------------------------------------------------------------------
+# The sparsity pattern depends on (grid, window, device) and on nothing else --
+# not the weights, not the data -- so it is built once and shared, exactly as
+# `circulant_flex.get_block_mask` shares the BlockMask. It used to be rebuilt on
+# every call: K index-grid rolls and a stack, a third of this function's kernel
+# launches at K = 225. The tensors are handed out shared; treat them read-only
+# (`Circulant._like` already shares them between adjacencies).
+_INDEX_CACHE = {}
+
+
+def window_indices(spatial, win: int, device=None):
+    """`(col, crow)` in OFFSET order (unsorted), memoised.
+
+    col  : (N, K) long, col[r, k] = flat index of r + offset_k (circular)
+    crow : (N + 1,) long CSR row pointer
+    """
+    spatial = tuple(int(v) for v in spatial)
+    key = (spatial, int(win), str(device))
+    hit = _INDEX_CACHE.get(key)
+    if hit is None:
+        ndim = len(spatial)
+        N = 1
+        for v in spatial:
+            N *= v
+        K = win ** ndim
+        grid = torch.arange(N, device=device, dtype=torch.int64).reshape(spatial)
+        col = torch.stack(
+            [torch.roll(grid, shifts=tuple(-d for d in o),
+                        dims=tuple(range(ndim))).reshape(N) for o in _offsets(win, ndim)],
+            dim=1)                                                 # (N, K)
+        crow = torch.arange(0, N * K + 1, K, device=device, dtype=torch.int64)
+        hit = _INDEX_CACHE[key] = (col, crow)
+    return hit
+
+
+# Set False (or IMMAP_SIM_LOOP=1 in the environment) to get the original
+# one-offset-at-a-time loop back: the kill switch, and what an A/B run toggles.
+VECTORIZED = os.environ.get("IMMAP_SIM_LOOP", "0") != "1"
+# Peak size of the (B, C, H, W, rows-of-offsets, win) temporary. The loop held the
+# same bytes spread over K per-offset tensors; this only bounds how many are alive
+# at once. Smaller = more kernels, never a different result.
+CHUNK_BYTES = int(os.environ.get("IMMAP_SIM_CHUNK_MB", "1024")) * 2 ** 20
+
+
+def _sq(d):
+    """|d|^2 elementwise. For real `d` that is d*d -- the same values `abs().pow(2)`
+    produces, in one kernel instead of two."""
+    return d.abs().pow(2) if d.is_complex() else d * d
+
+
+# The same five similarities as above, for a block of offsets at once:
+# `xq` is (B, C, H, W, 1, 1) and `yv` (B, C, H, W, a, win); reduce over C (dim 1).
+def _v_dot(xq, yv):
+    return (xq * yv.conj()).sum(dim=1)
+
+def _v_realdot(xq, yv):
+    return (xq * yv.conj()).real.sum(dim=1)
+
+def _v_distance(xq, yv):
+    return -0.5 * _sq(xq - yv).sum(dim=1)
+
+def _v_pidot(xq, yv):
+    return (xq * yv.conj()).sum(dim=1).abs()
+
+def _v_pidistance(xq, yv):
+    s_xx = _sq(xq).sum(dim=1)
+    s_xy = (xq * yv.conj()).sum(dim=1).abs()
+    s_yy = _sq(yv).sum(dim=1)
+    return -0.5 * s_xx + s_xy - 0.5 * s_yy
+
+_VECTORIZED = {_dot: _v_dot, _realdot: _v_realdot, _distance: _v_distance,
+               _pidot: _v_pidot, _pidistance: _v_pidistance}
+
+
+def _window_values_2d(vfun, x, y, win):
+    """All K = win^2 offsets of a 2-D grid in a handful of kernels.
+
+    `yr[r] = y[r + o]` for every offset o is one VIEW of a circularly padded y:
+    `unfold` twice gives (B, C, H, W, win, win) with [.., i, j, a, b] =
+    y[i + a - p, j + b - p], and (a, b) runs in `_offsets` order (first axis
+    outermost). So the K rolls and K reductions of the loop become one
+    broadcast expression per block of offset rows -- the arithmetic per element
+    is the loop's, only issued together.
+    """
+    B, C, H, W = x.shape
+    p = (win - 1) // 2
+    yp = torch.cat((y[..., H - p:, :], y, y[..., :p, :]), dim=-2) if p else y
+    yp = torch.cat((yp[..., W - p:], yp, yp[..., :p]), dim=-1) if p else yp
+    yv = yp.unfold(2, win, 1).unfold(3, win, 1)             # (B, C, H, W, win, win), a view
+    xq = x[..., None, None]
+    per_row = B * C * H * W * win * x.element_size() * (2 if x.is_complex() else 1)
+    rows = max(1, min(win, CHUNK_BYTES // max(per_row, 1)))
+    out = [vfun(xq, yv[..., a:a + rows, :]) for a in range(0, win, rows)]   # (B, H, W, rows, win)
+    vals = out[0] if len(out) == 1 else torch.cat(out, dim=3)
+    return vals.reshape(B, H * W, win * win)
+
+
 def circulant_similarity_window(simfun, x, y, win: int):
     """
     Dense window-space similarity, the analogue of Julia's `windowview(S)`.
@@ -131,6 +228,10 @@ def circulant_similarity_window(simfun, x, y, win: int):
         crow : (N + 1,)   CSR row pointer
     The K axis is aligned with `circulant_indices(...)`'s offset order, i.e.
     unsorted; `to_sparse_csr` below re-sorts to canonical form.
+
+    2-D grids take the vectorised path (`_window_values_2d`); anything else, a
+    window wider than the grid (the loop's `roll` wraps more than once there), or
+    a custom similarity keeps the per-offset loop.
     """
     if isinstance(simfun, str):
         simfun = SIMILARITIES[simfun]
@@ -140,24 +241,19 @@ def circulant_similarity_window(simfun, x, y, win: int):
     N = 1
     for s in spatial:
         N *= s
-    offs = _offsets(win, ndim)
+    col, crow = window_indices(spatial, win, x.device)
+
+    vfun = _VECTORIZED.get(simfun)
+    p = (win - 1) // 2
+    if VECTORIZED and vfun is not None and ndim == 2 and p < min(spatial):
+        return _window_values_2d(vfun, x, y, win), col, crow
 
     out = []
-    for o in offs:
+    for o in _offsets(win, ndim):
         yr = torch.roll(y, shifts=tuple(-d for d in o),
                        dims=tuple(2 + i for i in range(ndim)))  # yr[..,r]=y[..,r+o]
         out.append(simfun(x, yr).reshape(B, N))               # (B, N)
     vals = torch.stack(out, dim=2)                            # (B, N, K)
-
-    # matching (unsorted) column indices
-    grid = torch.arange(N, device=x.device, dtype=torch.int64).reshape(spatial)
-    col = torch.stack(
-        [torch.roll(grid, shifts=tuple(-d for d in o),
-                    dims=tuple(range(ndim))).reshape(N) for o in offs],
-        dim=1,
-    )                                                          # (N, K)
-    crow = torch.arange(0, N * (win ** ndim) + 1, win ** ndim,
-                        device=x.device, dtype=torch.int64)
     return vals, col, crow
 
 
