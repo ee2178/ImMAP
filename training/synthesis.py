@@ -78,6 +78,7 @@ from training.metrics import compute_metrics
 from visualization.params import get_param_logs
 from training.losses import LOSS_REGISTRY, weighted_loss
 from models.enhancement import enhancement_loss, enhancement_panel, CollapseMeter
+from training.step_profile import StepProfiler
 
 # For reducing LR on plateau
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -359,6 +360,11 @@ def train_synthesis(
         print(f"resuming at backtrack_count={backtrack_count}: LR -> "
               f"{resync_schedule(opt, sched, backtrack_count, backtrack_factor)}")
 
+    # PROFILE_STEPS=N in the environment times the first N optimizer steps per phase
+    # (training/step_profile.py), as in train_i2sb. With accum_steps > 1 each phase is the SUM
+    # over the step's micro-batches. Off by default.
+    prof = StepProfiler(device)
+
     for epoch in range(start_epoch, num_epochs):
         net.train()
         running_loss, running_cyc, running_bwd, n_batches = 0.0, 0.0, 0.0, 0
@@ -366,6 +372,7 @@ def train_synthesis(
         for _ in range(steps_per_epoch):
             opt.zero_grad()
             step_loss, step_cyc, step_bwd = 0.0, 0.0, 0.0
+            prof.start()
             # `accum_steps` micro-batches make up ONE optimizer step. Each micro-batch's loss is
             # divided by accum_steps before backward, so the accumulated gradient is the MEAN over
             # the effective batch -- summing instead would scale the effective LR by accum_steps.
@@ -379,6 +386,7 @@ def train_synthesis(
                 y = y.to(device, non_blocking=True)
                 organ_mask = organ_mask.to(device, non_blocking=True)
                 et = et.to(device, non_blocking=True)
+                prof.mark("data")
 
                 # residual mode: the net predicts y - src, not y. Everything downstream
                 # (mask, loss, backtracking) is unchanged; `src` carries the anchor forward
@@ -417,9 +425,11 @@ def train_synthesis(
                     # in residual mode
                     t1 = anchor_channel(X, s_src)
                     loss = loss + s_weight * enhancement_loss(net, y, t1, organ_mask, use_mask)
+                prof.mark("forward")
 
                 (loss / accum_steps).backward()
                 step_loss = step_loss + loss.detach() / accum_steps
+                prof.mark("backward")
 
             if clip_grad is not None:
                 # once per OPTIMIZER step, on the accumulated gradient
@@ -427,11 +437,15 @@ def train_synthesis(
             opt.step()
             if ema is not None:
                 ema.update()                    # after the step, once per optimizer step
+            prof.mark("opt")
             if hasattr(net, "project"):         # CDLNet-family constraint projection
                 net.project()
+            prof.mark("project")
 
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
+            prof.mark("opt")
+            prof.end(X.shape[-2:])
 
             running_loss += step_loss              # on-device; no sync
             running_cyc += step_cyc

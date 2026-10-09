@@ -47,6 +47,7 @@ from training.losses import (LOSS_REGISTRY, POINTWISE_REGISTRY, LOSS_PARAM_KEYS,
 from training.metrics import compute_metrics
 from sb.base import build_schedule, n_steps, forward_sample, forward_std, predict_x0
 from models.enhancement import enhancement_loss, enhancement_panel, CollapseMeter
+from training.step_profile import StepProfiler
 from sb.i2sb import i2sb_sample
 from visualization.filters import get_filter_grids
 from visualization.params import get_param_logs
@@ -412,6 +413,13 @@ def train_i2sb(
         print(f"resuming at backtrack_count={backtrack_count}: LR -> "
               f"{resync_schedule(opt, sched, backtrack_count, backtrack_factor)}")
 
+    # PROFILE_STEPS=N in the environment times the first N optimizer steps per phase
+    # (training/step_profile.py): data = waiting on the loader + host->GPU copies, forward =
+    # bridge sample + net + loss, backward, opt = clip + step + EMA + scheduler, project. With
+    # accum_steps > 1 each phase is the SUM over the step's micro-batches. Off by default, and
+    # then every `prof.*` call returns at once.
+    prof = StepProfiler(device)
+
     for epoch in range(start_epoch, num_epochs):
         net.train()
         running_loss, n_batches = 0.0, 0
@@ -419,6 +427,7 @@ def train_i2sb(
         for _ in range(steps_per_epoch):
             opt.zero_grad()
             step_loss = 0.0
+            prof.start()
             # `accum_steps` micro-batches make up ONE optimizer step. Each micro-batch's loss is
             # divided by accum_steps before backward, so the accumulated gradient is the mean over
             # the whole effective batch -- not its sum, which would scale the LR by accum_steps.
@@ -429,6 +438,7 @@ def train_i2sb(
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
                 x0, x1, cond, mask, et, guide = _split_batch(batch, device)
+                prof.mark("data")
 
                 # ----- sample a bridge point and regress the clean endpoint x0 -----
                 b = x0.shape[0]
@@ -448,9 +458,11 @@ def train_i2sb(
                 if s_weight:
                     # the S map of THIS forward, against the one-sided difference
                     loss = loss + s_weight * enhancement_loss(net, x0, x1, mask, use_mask)
+                prof.mark("forward")
 
                 (loss / accum_steps).backward()
                 step_loss = step_loss + loss.detach() / accum_steps
+                prof.mark("backward")
 
             if clip_grad is not None:
                 # once per OPTIMIZER step, on the accumulated gradient -- clipping each
@@ -460,10 +472,14 @@ def train_i2sb(
             opt.step()
             if ema is not None:
                 ema.update()                       # after the step, once per optimizer step
+            prof.mark("opt")
             # Important for our unrolled models
             if hasattr(net, "project"): net.project()
+            prof.mark("project")
             if sched is not None and not isinstance(sched, ReduceLROnPlateau):
                 sched.step()
+            prof.mark("opt")
+            prof.end(x0.shape[-2:])
 
             running_loss += step_loss              # on-device; no sync
             n_batches += 1

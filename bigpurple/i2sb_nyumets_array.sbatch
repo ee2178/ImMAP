@@ -13,6 +13,9 @@
 #    4   i2sb_sbguidedcdl_otherstudy_sfree_xS.json   SBGuidedGroupCDL  as 3 + enhancement cross-attention
 #    5   i2sb_lggcdl_session.json                    LGGCDL            guides = same-session T1, T2, FLAIR
 #    6   i2sb_lggs_session.json                      LGGS              guides = same-session T1, T2, FLAIR
+#    7   i2sb_sbguidedcdl_otherstudy_w0_sfree_flex.json    SBGuidedGroupCDL  1 guide:  prior CT1 at z      (flex)
+#    8   i2sb_sbguidedcdl_otherstudy_w1_sfree_flex.json    SBGuidedGroupCDL  3 guides: prior CT1 at z-1..z+1
+#    9   i2sb_sbguidedcdl_otherstudy_w2_sfree_flex.json    SBGuidedGroupCDL  5 guides: prior CT1 at z-2..z+2
 #
 # WHAT THIS ARRAY NO LONGER HOLDS (every config file still exists; append its path to rerun):
 #   * the batch-8 SBUnets. The large-batch recipe (0-1) is the UNet standard now.
@@ -56,7 +59,20 @@
 # form S_prior. It is one more attention per refreshing layer: if batch 4 no longer fits, lower
 # data.train.batch_size. collapse/cross_gain_min -> 0 means the branch is switched off.
 #
-# HOW THE PRIOR STUDY ENTERS 3-4: only through the guided prox's adjacency, never as a
+# GUIDE COUNT ON THE FUSED BACKEND (7-9): the free-S guided net with the prior study's CT1 at
+# 1, 3 and 5 slices around the matched one (guide_window 0 / 1 / 2), each slice its own guide
+# branch. attn_backend "flex": the joint softmax runs fused, nothing of size (B, Q, K) is
+# allocated, and memory no longer limits the batch (LGGS sweep on an A100, 2026-10-09: 5 guides
+# at batch 16 took 18 GB, against an OOM at batch 8 on gather). So these train at batch 8 like 2.
+# flex, not triton: the data is real-valued, so the phase-invariant kernel buys nothing, and
+# flex keeps the similarity of 3 ("distance"). train.py compiles the kernel at start-up.
+# Two things differ from 3 besides the guide count, which is why 7 exists as the 1-guide twin:
+#   * no adjacency blend between refreshes (dK = 5; see models/guided_prox.py, "Backends");
+#   * batch 8, not 4.
+# Read 7 vs 8 vs 9 for the number of guides, and 3 vs 7 for the backend change.
+#   sbatch --array=7-9 bigpurple/i2sb_nyumets_array.sbatch
+#
+# HOW THE PRIOR STUDY ENTERS 3-4 AND 7-9: only through the guided prox's adjacency, never as a
 # conditioning channel. That matters for these nets -- every conditioning channel other than the
 # T1 is FITTED by the code through the side dictionary, so a prior scan given as a channel would
 # have to be reconstructed by today's code. Do not use guide_as_cond with the +S nets.
@@ -76,7 +92,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-nyumets
-#SBATCH --array=0-6%4
+#SBATCH --array=0-9%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -89,7 +105,7 @@
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.err
 
-# --time is 7 days (radiology allows 28): the unrolled nets (2-6) are far slower per step
+# --time is 7 days (radiology allows 28): the unrolled nets (2-9) are far slower per step
 # than SBUnet, and the guided ones pay for 15x15 guide-window attention on top.
 # Mail is for the array as a whole (BEGIN when the first task starts, END/FAIL when all are
 # done). Add ARRAY_TASKS to --mail-type for one mail per task (24 mails for 8 tasks).
@@ -103,6 +119,9 @@ CONFIGS=(
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_sfree_xS.json
     config/NYUMets/i2sb_lggcdl_session.json
     config/NYUMets/i2sb_lggs_session.json
+    config/NYUMets/i2sb_sbguidedcdl_otherstudy_w0_sfree_flex.json
+    config/NYUMets/i2sb_sbguidedcdl_otherstudy_w1_sfree_flex.json
+    config/NYUMets/i2sb_sbguidedcdl_otherstudy_w2_sfree_flex.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
