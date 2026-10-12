@@ -622,6 +622,14 @@ EXP9_CELLS = tuple(f"mg{m}v6" for m in EXP9_M)
 EXP12_M = (169, 81)
 _GROUP_EXTRA = {k: v for k, v in MODELS["mggrouplpds"]["params"].items()
                 if k not in MODELS["mglpds"]["params"]}
+# FlexAttention's sparse block. NOT a model setting -- the mask and the map are
+# the same at every value (tests/test_flex_block_size.py); it only sets how much
+# masked score work the kernel does. Measured on an H200, knee 640x368x15, one
+# training step of mggroup169v6 (torch/time_mggroup.sbatch, job 19642407):
+#     B=128  698.8 ms     B=64  594.1     B=32  497.2     B=16  444.1   (1.57x)
+# at the same 15.5-15.7 GB peak. The gain is all in the BACKWARD (518 -> 271 ms);
+# the forward is flat. `mggrouplpds` keeps its 128: it has runs in progress.
+_GROUP_EXTRA["flex_block_size"] = 16
 MODELS.update({
     f"mggroup{m}v6": dict(
         type="MGGroupLPDS",
@@ -1088,7 +1096,8 @@ def make_config(anatomy, r, model, args):
     if "attn_backend" in params:
         params["attn_backend"] = attn
         if attn == "flex":
-            params["flex_block_size"] = 128
+            # the cell's own value if it names one (exp12's 16), else torch's 128
+            params.setdefault("flex_block_size", 128)
             # These models are complex, so flex cannot carry pidistance -- see
             # the GROUP comment. Record the swap in the config rather than
             # letting the model raise on the first forward.

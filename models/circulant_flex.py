@@ -242,6 +242,12 @@ def _kernel_options(block_mask):
     that is ~1070, at 16 ~600 (tests/test_flex_block_size.py counts them). Same
     mask, same map -- only less masked work.
 
+    Smaller tiles also need less per-block SHARED memory, and that is a hard
+    limit: on an L40S (99 KB) the default tiles at this head size do not
+    compile at all -- "out of resource: triton_tem_fused_flex_attention_0
+    Required: 114688 Hardware limit: 101376" -- while B=16 does. That error,
+    not the card's 48 GB, is why the group net "did not fit" an L40S.
+
     At the default 128 this returns None and the call is exactly what it was.
     """
     bs = getattr(block_mask, "BLOCK_SIZE", None)

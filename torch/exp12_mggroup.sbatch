@@ -52,15 +52,38 @@
 # min(1, tau / (xi + eps)) -- runs as one fused kernel, forward and backward
 # (models/prox.py::GroupThreshold._planar_prox, models/clip_triton.py). The
 # windowed attention itself is unchanged. A speed setting only: same
-# parameters, same map to fp roundoff. NOT YET TIMED OR RUN ON A GPU for the
-# group prox -- the probe below is its first real use; PLANAR_STATE= (empty)
-# turns it off. The planar CONV is on either way, as in mg169v6.
+# parameters, same map to fp roundoff. PLANAR_STATE= (empty) turns it off. The
+# planar CONV is on either way, as in mg169v6.
 #
-# H200, AND WHY ONE FILE CAN HOLD ALL FOUR: the group prox runs windowed
-# attention at three grid levels and did not fit an L40S (48 GB) as
-# `mggrouplpds`. Every cell here needs the same node type, so they share one
-# array; `--constraint` cannot vary per task, which is why the local cells are
-# in other files. Say the arm ran on different hardware if timing is reported.
+# MEASURED (torch/time_mggroup.sbatch, job 19642407: H200, knee 640x368x15, one
+# training step, planar state, network only -- no data, no online ESPIRiT):
+#
+#     mg169v6 (local prox)        199 ms    8.8 GB peak
+#     mggroup169v6, flex B=128    699 ms   15.5 GB
+#     mggroup169v6, flex B=16     444 ms   15.7 GB      <- what the configs now carry
+#
+# `flex_block_size` is FlexAttention's sparse tile, not a model setting: same
+# mask, same map (tests/test_flex_block_size.py). The generator writes 16 for
+# these cells; it buys 1.57x, all of it in the backward pass.
+#
+# NODE TYPE. The constraint below is h200 because the group net "did not fit an
+# L40S". That was NOT the card's 48 GB. Timed on an L40S (job 19647191), the
+# flex kernel at the default B=128 fails to COMPILE:
+#     OutOfMemoryError: out of resource: triton_tem_fused_flex_attention_0
+#     Required: 114688 Hardware limit: 101376
+# -- the kernel's per-block SHARED memory, which is 99 KB on an L40S and larger
+# on an H200. At B=16 the tiles are small enough and the same step runs:
+#
+#     L40S, knee 640x368x15     mg169v6 287 ms / 8.7 GB
+#                               mggroup169v6 (B=16) 567 ms / 15.7 GB
+#
+# So this cell runs on an L40S, 1.28x slower per step than the H200:
+#     sbatch --constraint=l40s torch/exp12_mggroup.sbatch
+# but ONLY with flex_block_size=16 in its config -- at 128 every task dies at
+# its first forward with the error above. Online ESPIRiT adds its own per-slice
+# memory on top of these figures; probe before a full-length run.
+# Every cell in one submission lands on one node type; `--constraint` cannot
+# vary per task. Say which hardware an arm ran on if timing is reported.
 #
 # THIS CELL HAS NEVER BEEN TRAINED. Probe one task first and watch memory and
 # it/s (tagged; lands in trained_nets/mg_recon/knee/mggroup169v6_R8_20ep):

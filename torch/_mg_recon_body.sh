@@ -341,7 +341,11 @@ if os.path.exists(out) and not force:
     # Execution-only keys: they change how fast the net runs, not what it
     # computes (same parameters, same map to fp roundoff, checkpoints
     # interchangeable), so a difference in one is not a different experiment.
-    _EXEC_KEYS = ("training.planar_state",)
+    # `flex_block_size` is FlexAttention's sparse tile: same mask, same output
+    # at every value (tests/test_flex_block_size.py). A resumed run keeps the
+    # value in its own config.json; this only stops a changed default from
+    # making an existing run look like a different experiment.
+    _EXEC_KEYS = ("training.planar_state", "model.params.flex_block_size")
     a, b = _flat(old), _flat(cfg)
     diff = sorted(k for k in set(a) | set(b)
                   if a.get(k) != b.get(k) and k not in _EXEC_KEYS)

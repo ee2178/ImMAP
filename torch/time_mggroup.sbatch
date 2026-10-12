@@ -65,8 +65,11 @@
 #                                 epoch meets them
 #   R=8  REPS=10  BLOCKS="128 64 32 16"  SKIP_TRITON=1
 #   An L40S instead:              sbatch --constraint=l40s torch/time_mggroup.sbatch
-#                                 (exp12's header says the cell did not fit one;
-#                                 a smaller block does not change memory much)
+#                                 The B=128 and B=64 arms may FAIL there, and not
+#                                 for GPU memory: the flex kernel's tiles need more
+#                                 per-block shared memory than an L40S has ("out of
+#                                 resource ... Required: 114688 Hardware limit:
+#                                 101376"). B=16 compiles and runs at ~15.7 GB.
 
 ANATOMY="${ANATOMY:-knee}"
 R="${R:-8}"
