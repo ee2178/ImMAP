@@ -63,6 +63,7 @@
 #   SIZES="640x368x15 640x372x15" measurement sizes (HxWxCOILS); knee's two widths
 #                                 by default, and they are timed MIXED too, as an
 #                                 epoch meets them
+#   M=81                          the narrow pair, mg81v6 / mggroup81v6 (default 169)
 #   R=8  REPS=10  BLOCKS="128 64 32 16"  SKIP_TRITON=1
 #   An L40S instead:              sbatch --constraint=l40s torch/time_mggroup.sbatch
 #                                 The B=128 and B=64 arms may FAIL there, and not
@@ -72,6 +73,7 @@
 #                                 101376"). B=16 compiles and runs at ~15.7 GB.
 
 ANATOMY="${ANATOMY:-knee}"
+M="${M:-169}"                        # 169 or 81: times mg<M>v6 and mggroup<M>v6
 R="${R:-8}"
 REPS="${REPS:-10}"
 BLOCKS="${BLOCKS:-128 64 32 16}"
@@ -107,8 +109,12 @@ python -m tests.test_flex_block_size
 python scripts/make_mg_recon_configs.py --out "${OUT}/gen" --anatomy "${ANATOMY}" \
     --attn flex --organ-mask --planar-state > /dev/null
 SRC="${OUT}/gen/${ANATOMY}/mg"
-cp "${SRC}/mg169v6_R${R}.json" "${OUT}/cfg/mg169v6.json"
-python - "${SRC}/mggroup169v6_R${R}.json" "${OUT}/cfg" "${SKIP_TRITON:-}" ${BLOCKS} <<'PY'
+for _f in "mg${M}v6" "mggroup${M}v6"; do
+    [ -f "${SRC}/${_f}_R${R}.json" ] || { echo "[time-mggroup] no ${_f} cell at R=${R}" \
+        "(M=${M}); the generator has mggroup169v6 and mggroup81v6." >&2; exit 1; }
+done
+cp "${SRC}/mg${M}v6_R${R}.json" "${OUT}/cfg/mg${M}v6.json"
+python - "${SRC}/mggroup${M}v6_R${R}.json" "${OUT}/cfg" "${SKIP_TRITON:-}" ${BLOCKS} <<'PY'
 import json, sys
 src, out, skip_triton, blocks = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 base = json.load(open(src))
@@ -125,7 +131,7 @@ if not skip_triton:
     json.dump(c, open(f"{out}/mggroup_triton.json", "w"), indent=1)
 PY
 
-ARMS="mg169v6"
+ARMS="mg${M}v6"
 for b in ${BLOCKS}; do ARMS="${ARMS} mggroup_fb${b}"; done
 [ -n "${SKIP_TRITON:-}" ] || ARMS="${ARMS} mggroup_triton"
 
@@ -140,9 +146,9 @@ done
 set -e
 
 # ---- one table ---------------------------------------------------------------
-python - "${OUT}" ${ARMS} <<'PY'
+python - "${OUT}" "${M}" ${ARMS} <<'PY'
 import json, os, sys
-out, arms = sys.argv[1], sys.argv[2:]
+out, M, arms = sys.argv[1], sys.argv[2], sys.argv[3:]
 rows = {}
 for a in arms:
     f = os.path.join(out, a + ".json")
@@ -151,10 +157,10 @@ for a in arms:
     r = json.load(open(f))["rows"][0]
     fwd, bwd = r["forward"]["median"], r["backward"]["median"]
     rows[a] = (fwd, bwd, fwd + bwd, r.get("peak_mb"), r.get("first_s"), r.get("state"))
-print("\n================ mggroup169v6: one training step ================")
+print(f"\n================ mggroup{M}v6: one training step ================")
 print(f"  {'arm':<16}{'state':>8}{'fwd ms':>9}{'bwd ms':>9}{'fwd+bwd':>10}"
       f"{'vs fb128':>10}{'vs local':>10}{'peak MB':>9}{'first s':>9}")
-ref, loc = rows.get("mggroup_fb128"), rows.get("mg169v6")
+ref, loc = rows.get("mggroup_fb128"), rows.get(f"mg{M}v6")
 for a in arms:
     if a not in rows:
         print(f"  {a:<16}   FAILED / not run")
@@ -165,9 +171,14 @@ for a in arms:
           f"{(f'{ref[2] / tot:.2f}x' if ref else ''):>10}"
           f"{(f'{tot / loc[2]:.2f}x' if loc else ''):>10}"
           f"{(peak or 0):>9.0f}{(first or 0):>9.1f}")
+flex = [(v[2], a) for a, v in rows.items() if a.startswith("mggroup_fb")]
+if flex and not ref:
+    steps, best = 6000 * 50, min(flex)
+    print(f"\n  full length = {steps:,} steps: best flex arm ({best[1]}) "
+          f"{best[0] * steps / 3.6e6:.0f} h of fwd+bwd alone (fb128 did not run)")
 if ref:
     steps = 6000 * 50
-    best = min((v[2], a) for a, v in rows.items() if a.startswith("mggroup_fb"))
+    best = min(flex)
     print(f"\n  full length = {steps:,} steps: fb128 {ref[2] * steps / 3.6e6:.0f} h"
           f" of fwd+bwd alone;  best flex arm ({best[1]}) {best[0] * steps / 3.6e6:.0f} h")
     print("  (optimizer, projection, data and the online ESPIRiT maps come on top)")
