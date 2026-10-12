@@ -226,6 +226,33 @@ def circulant_flex_attention_image(xq, xk, xv, win, sim="distance",
 # ---------------------------------------------------------------------------
 # FlexAdjacency: a Circulant-compatible adjacency that is never materialised
 # ---------------------------------------------------------------------------
+def _kernel_options(block_mask):
+    """Tile sizes for a sparse block smaller than torch's default, else None.
+
+    The compiled kernel computes one dense tile per non-empty (query block, key
+    block) pair, and requires the SPARSE block size to be divisible by its
+    internal tiles (`BLOCK_M`, `BLOCK_N`): "Q and KV block size must be
+    divisible by BLOCK_M and BLOCK_N". torch picks those per GPU -- (128, 32)
+    on A100, (32, 64) on H100 for fp32 at this head size -- so a sparse block
+    of 32 or 16 fails to compile on some cards unless the tiles are given.
+
+    Why a smaller sparse block is worth having: a 2-D window laid out row-major
+    touches `win` separate row-bands of keys, so at BLOCK_SIZE=128 a query on a
+    320x184 latent has ~3000 scores computed for the 225 its window uses. At 32
+    that is ~1070, at 16 ~600 (tests/test_flex_block_size.py counts them). Same
+    mask, same map -- only less masked work.
+
+    At the default 128 this returns None and the call is exactly what it was.
+    """
+    bs = getattr(block_mask, "BLOCK_SIZE", None)
+    if bs is None:
+        return None
+    b = int(min(bs)) if isinstance(bs, (tuple, list)) else int(bs)
+    if b >= 128 or b & (b - 1):          # default, or not a power of two
+        return None
+    return {"BLOCK_M": min(b, 64), "BLOCK_N": min(b, 32)}
+
+
 def _flex_with_lse(q, k, v, score_mod, block_mask, compiled=None):
     """Call flex_attention and also return the row log-sum-exp.
 
@@ -233,14 +260,18 @@ def _flex_with_lse(q, k, v, score_mod, block_mask, compiled=None):
     spelling first and fall back so this works across versions.
     """
     fa = compiled if compiled is not None else flex_attention
+    kw = {}
+    ko = _kernel_options(block_mask)
+    if ko is not None:
+        kw["kernel_options"] = ko
     try:
         from torch.nn.attention.flex_attention import AuxRequest
         out, aux = fa(q, k, v, score_mod=score_mod, block_mask=block_mask,
-                      scale=1.0, return_aux=AuxRequest(lse=True))
+                      scale=1.0, return_aux=AuxRequest(lse=True), **kw)
         return out, aux.lse
     except (ImportError, TypeError):
         return fa(q, k, v, score_mod=score_mod, block_mask=block_mask,
-                  scale=1.0, return_lse=True)
+                  scale=1.0, return_lse=True, **kw)
 
 
 def _per_key_bias(bias):
