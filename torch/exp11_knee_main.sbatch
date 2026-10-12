@@ -75,6 +75,12 @@
 # One rate only (renumbers to 0-3):
 #     ACCELS=12 sbatch --array=0-3 torch/exp11_knee_main.sbatch
 #
+# THE BRAIN HALF, same cells, same switches, same index order (run dirs under
+# trained_nets/mg_recon/brain/):
+#     ANATOMY=brain sbatch torch/exp11_knee_main.sbatch
+# brain lpdsnet / varnetmaps at R8 are the run dirs exp1 uses, and the mg cells
+# at R12 are exp9's: LAUNCH-ONCE resumes or skips them unless FORCE_RESTART=1.
+#
 # SUBMIT FROM THE REPO ROOT.
 #   sbatch torch/exp11_knee_main.sbatch
 #
@@ -82,7 +88,7 @@
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
 #       --accels 8 12 --only lpdsnet varnetmaps mg169v6 mg81v6
 
-ANATOMY=knee
+ANATOMY="${ANATOMY:-knee}"          # ANATOMY=brain runs the same eight cells on brain
 ONLY="${ONLY:-lpdsnet varnetmaps mg169v6 mg81v6}"
 ACCELS="${ACCELS:-8 12}"
 PLANAR_STATE="${PLANAR_STATE-1}"     # `-`, not `:-`: an explicitly EMPTY value turns it off

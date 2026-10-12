@@ -73,6 +73,19 @@
 #                                 state, planar convs, rediscretized Gram, flex
 #                                 block 16), each in its own process, then one
 #                                 table. CELLS="..." picks a different list.
+#   REDRAW=<dir>                  no timing: reprint the comparison table and
+#                                 redraw the figure from the cmp_<net>.json files
+#                                 a COMPARE run left in <dir>. No GPU needed.
+#
+# WHAT A RUN LEAVES ON DISK, under trained_nets/profile/time_mggroup_<jobid>/
+# (<jobid> is SLURM_JOB_ID -- an interactive session keeps ONE id, so every run
+# in it writes to the same directory and replaces files of the same name):
+#   cmp_<net>.json / .log   COMPARE: each net's numbers and its full output
+#   compare.txt / .json / .png        COMPARE: the table, all nets, the figure
+#   <arm>.json / .log                 the block arms
+#   step_profile.txt                  BWD=1
+# The test output at the top is the only part that goes to the terminal alone.
+#
 #   M=81                          the narrow pair, mg81v6 / mggroup81v6 (default 169)
 #   R=8  REPS=10  BLOCKS="128 64 32 16"  SKIP_TRITON=1
 #   BWD=1                         also profile ONE TRAINING STEP per op and per GPU
@@ -115,21 +128,42 @@ cd "${IMMAP_ROOT}"
 set -eo pipefail
 
 OUT="trained_nets/profile/time_mggroup_${SLURM_JOB_ID:-local}"
-mkdir -p "${OUT}/cfg"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-echo "[time-mggroup] ${ANATOMY} R=${R} sizes=\"${SIZES}\" reps=${REPS} -> ${OUT}"
+# REDRAW=<dir>: rebuild the comparison table and figure from the per-net
+# cmp_<net>.json files a COMPARE run left in <dir>. Nothing is timed and no
+# GPU is needed, so it also works from a login node.
+if [ -n "${REDRAW:-}" ]; then
+    OUT="${REDRAW%/}"
+    COMPARE=1
+    ls "${OUT}"/cmp_*.json >/dev/null 2>&1 || {
+        echo "[time-mggroup] REDRAW: no cmp_<net>.json in ${OUT}" >&2; exit 1; }
+    echo "[time-mggroup] redrawing from ${OUT} (nothing is timed)"
+else
+    mkdir -p "${OUT}/cfg"
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+    echo "[time-mggroup] ${ANATOMY} R=${R} sizes=\"${SIZES}\" reps=${REPS} -> ${OUT}"
 
-# the block-size arms are only comparable if the knob is exact
-python -m tests.test_flex_block_size
-python -m tests.test_transfer_pad_grad
-python -m tests.test_group_envelope       # on a GPU this runs the real kernels
+    # What the nets below run under. All of these are ON by default and are speed
+    # settings only (same map); printed so the log says what was timed.
+    python - <<'PY'
+from models.prox import GroupThreshold, SoftThreshold
+from operators.resample import GridTransfer
+print(f"[time-mggroup] pad/fold adjoint backward (every multigrid net): {GridTransfer.ADJOINT_PAD}"
+      f"   fused prox: {SoftThreshold.FUSED} / grad {SoftThreshold.FUSED_GRAD}"
+      f"   fused group envelope: {GroupThreshold.FUSED_CHAIN}")
+PY
 
-# ---- configs: exp12's own, generated as its launcher generates them ----------
-# (--planar-state so each net is timed as the training run would run it; nothing
-# under config/ is touched)
-python scripts/make_mg_recon_configs.py --out "${OUT}/gen" --anatomy "${ANATOMY}" \
-    --attn flex --organ-mask --planar-state > /dev/null
-SRC="${OUT}/gen/${ANATOMY}/mg"
+    # the block-size arms are only comparable if the knob is exact
+    python -m tests.test_flex_block_size
+    python -m tests.test_transfer_pad_grad
+    python -m tests.test_group_envelope       # on a GPU this runs the real kernels
+
+    # ---- configs: exp12's own, generated as its launcher generates them ----------
+    # (--planar-state so each net is timed as the training run would run it; nothing
+    # under config/ is touched)
+    python scripts/make_mg_recon_configs.py --out "${OUT}/gen" --anatomy "${ANATOMY}" \
+        --attn flex --organ-mask --planar-state > /dev/null
+    SRC="${OUT}/gen/${ANATOMY}/mg"
+fi
 
 # ---- COMPARE: every net of the comparison, one training step each ------------
 # One process per net, so one that fails (memory, a kernel this card refuses)
@@ -137,21 +171,23 @@ SRC="${OUT}/gen/${ANATOMY}/mg"
 # The configs are the generator's, untouched: what a training run would load.
 if [ -n "${COMPARE:-}" ]; then
     CELLS="${CELLS:-lpdsnet varnetmaps mg169v6 mg81v6 mggroup169v6 mggroup81v6}"
-    set +e
-    for cell in ${CELLS}; do
-        f="${SRC}/${cell}_R${R}.json"
-        echo; echo "================ ${cell} ================"
-        if [ ! -f "${f}" ]; then
-            echo "[time-mggroup] no config for ${cell} at R=${R} (${f})"; continue
-        fi
-        cp "${f}" "${OUT}/cfg/${cell}.json"
-        python scripts/time_net.py --configs "${OUT}/cfg/${cell}.json" --size ${IMG} \
-            --coils "${COILS}" --reps "${REPS}" --step --sizes ${SIZES} \
-            --json-out "${OUT}/cmp_${cell}.json" 2>&1 | tee "${OUT}/cmp_${cell}.log"
-        [ "${PIPESTATUS[0]}" -eq 0 ] || echo "[time-mggroup] ${cell} FAILED -- see ${OUT}/cmp_${cell}.log"
-    done
-    set -e
-    python - "${OUT}" "${IMG}" "${COILS}" ${CELLS} <<'PY'
+    if [ -z "${REDRAW:-}" ]; then
+        set +e
+        for cell in ${CELLS}; do
+            f="${SRC}/${cell}_R${R}.json"
+            echo; echo "================ ${cell} ================"
+            if [ ! -f "${f}" ]; then
+                echo "[time-mggroup] no config for ${cell} at R=${R} (${f})"; continue
+            fi
+            cp "${f}" "${OUT}/cfg/${cell}.json"
+            python scripts/time_net.py --configs "${OUT}/cfg/${cell}.json" --size ${IMG} \
+                --coils "${COILS}" --reps "${REPS}" --step --sizes ${SIZES} \
+                --json-out "${OUT}/cmp_${cell}.json" 2>&1 | tee "${OUT}/cmp_${cell}.log"
+            [ "${PIPESTATUS[0]}" -eq 0 ] || echo "[time-mggroup] ${cell} FAILED -- see ${OUT}/cmp_${cell}.log"
+        done
+        set -e
+    fi
+    python - "${OUT}" "${IMG}" "${COILS}" ${CELLS} <<'PY' | tee "${OUT}/compare.txt"
 import json, os, sys
 out, img, coils, cells = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 rows = {}
@@ -184,6 +220,34 @@ print('\n  ms, median. infer = eval-mode forward without autograd; fwd / bwd = a
 print('  training step. 300k h = (fwd+bwd+optimizer+projection) x 300,000 steps:')
 print('  the NETWORK only -- data loading and the online coil maps come on top.')
 PY
+    # ---- one figure: a column per net, forward with backward stacked on top ----
+    # The per-net JSONs are merged into time_net.py's own format (the run's
+    # header fields, every net's row) and drawn with its redraw path, which
+    # needs no GPU -- so the figure can be remade later, e.g. dark or as a pdf:
+    #   python scripts/time_net.py --from-json <out>/compare.json \
+    #       --fig-out <out>/compare_dark.png --fig-theme dark
+    python - "${OUT}" ${CELLS} <<'PY'
+import json, os, sys
+out, cells = sys.argv[1], sys.argv[2:]
+merged = None
+for c in cells:
+    f = os.path.join(out, f"cmp_{c}.json")
+    if not os.path.exists(f):
+        continue
+    d = json.load(open(f))
+    if merged is None:
+        merged = {k: v for k, v in d.items() if k != 'rows'}
+        merged['rows'] = []
+    merged['rows'] += d.get('rows', [])
+if merged and merged['rows']:
+    json.dump(merged, open(os.path.join(out, "compare.json"), "w"), indent=1)
+    print(f"[time-mggroup] merged {len(merged['rows'])} nets -> {out}/compare.json")
+PY
+    if [ -f "${OUT}/compare.json" ]; then
+        python scripts/time_net.py --from-json "${OUT}/compare.json" \
+            --fig-out "${OUT}/compare.png" \
+            || echo "[time-mggroup] figure not drawn; the table above and compare.json are complete"
+    fi
     echo "[time-mggroup] per-net logs and JSON under ${OUT} (cmp_<net>.*)"
     exit 0
 fi
