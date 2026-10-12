@@ -672,6 +672,276 @@ def scale_planar_grad(z, xi, t, eps, dual=True):
     return _PlanarScale.apply(z, xi.contiguous(), args[0], float(eps), bool(dual))
 
 
+# ===========================================================================
+#  The group prox's ENVELOPE, around the attention
+# ===========================================================================
+# `GroupThreshold._planar_prox` computes
+#
+#     za   = W_alpha z                    1x1 conv, planar (B, 2C, H, W)
+#     v    = |za|^2                       (B, C, H, W)
+#     o    = Gamma v                      the windowed attention
+#     xi_a = sqrt(o + eps)
+#     xi   = W_beta^T xi_a                1x1 conv
+#     out  = z * s(tau / (xi + eps))      `_PlanarScale`, already one kernel
+#
+# FlexAttention wants `v` as a SEQUENCE, (B, heads, H*W, C) -- channels last --
+# and returns `o` the same way. Eager, the two elementwise steps therefore come
+# wrapped in layout copies, and their backwards in autograd's handling of the
+# views they are built from (`p[:, 0]`, `p[:, 1]` of a reshape: each select
+# costs a zero-fill and a copy of the whole map going back):
+#
+#     forward    mul, addcmul, copy to sequence | copy to image, add, sqrt
+#     backward   ~10 kernels for |.|^2, 2 layout copies, 2 for the sqrt
+#
+# Here each side is ONE kernel that changes the layout as it goes:
+#
+#     `_abs2_seq_kernel`   v[b, s, c]    = za[b, c, s]^2 + za[b, C + c, s]^2
+#     `_sqrt_img_kernel`   xi_a[b, c, s] = sqrt(o[b, s, c] + eps)
+#
+# with hand-written backwards (`_PlanarAbs2Seq`, `_SqrtSeqImage`). Same map;
+# checked against the torch formulas below on first use, per process, and
+# disabled with a warning if they disagree -- as the kernels above are.
+# One head only (what every config uses); anything else takes the eager chain.
+
+
+def _next_pow2(n):
+    return 1 << max(int(n) - 1, 0).bit_length()
+
+
+def _tile(C):
+    """`(BLOCK_C, BLOCK_S)`: all C channels by a run of pixels, ~2048 lanes."""
+    bc = _next_pow2(C)
+    return bc, max(8, 2048 // bc)
+
+
+@_jit
+def _abs2_seq_kernel(ZA, OUT, S, C, CHW, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr):
+    """`out[b, s, c] = za[b, c, s]^2 + za[b, C + c, s]^2`.
+
+    `ZA` is planar (B, 2C, H, W): channel `c` pairs with `C + c`. `OUT` is the
+    attention's value layout (B, 1, S, C). A tile is every channel by BLOCK_S
+    pixels, so the STORE is one contiguous run and the loads are C short ones.
+    """
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    c = tl.arange(0, BLOCK_C)
+    px = sb * BLOCK_S + tl.arange(0, BLOCK_S)
+    m = (c[:, None] < C) & (px[None, :] < S)
+    src = b * 2 * CHW + c[:, None] * S + px[None, :]
+    re = tl.load(ZA + src, mask=m, other=0.0)
+    im = tl.load(ZA + src + CHW, mask=m, other=0.0)
+    tl.store(OUT + b * CHW + px[None, :] * C + c[:, None], re * re + im * im, mask=m)
+
+
+@_jit
+def _abs2_seq_backward(ZA, G, GZA, S, C, CHW, BLOCK_C: tl.constexpr,
+                       BLOCK_S: tl.constexpr):
+    """`gza[b, c, s] = 2 za[b, c, s] g[b, s, c]`, both halves."""
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    c = tl.arange(0, BLOCK_C)
+    px = sb * BLOCK_S + tl.arange(0, BLOCK_S)
+    m = (c[:, None] < C) & (px[None, :] < S)
+    src = b * 2 * CHW + c[:, None] * S + px[None, :]
+    g2 = 2.0 * tl.load(G + b * CHW + px[None, :] * C + c[:, None], mask=m, other=0.0)
+    re = tl.load(ZA + src, mask=m, other=0.0)
+    im = tl.load(ZA + src + CHW, mask=m, other=0.0)
+    tl.store(GZA + src, re * g2, mask=m)
+    tl.store(GZA + src + CHW, im * g2, mask=m)
+
+
+@_jit
+def _sqrt_img_kernel(O, OUT, S, C, CHW, EPS, BLOCK_C: tl.constexpr,
+                     BLOCK_S: tl.constexpr):
+    """`out[b, c, s] = sqrt(o[b, s, c] + eps)`: sequence in, image out."""
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    c = tl.arange(0, BLOCK_C)
+    px = sb * BLOCK_S + tl.arange(0, BLOCK_S)
+    m = (c[:, None] < C) & (px[None, :] < S)
+    o = tl.load(O + b * CHW + px[None, :] * C + c[:, None], mask=m, other=0.0)
+    tl.store(OUT + b * CHW + c[:, None] * S + px[None, :], tl.sqrt(o + EPS), mask=m)
+
+
+@_jit
+def _sqrt_img_backward(XI, G, GO, S, C, CHW, BLOCK_C: tl.constexpr,
+                       BLOCK_S: tl.constexpr):
+    """`go[b, s, c] = g[b, c, s] / (2 xi[b, c, s])`, `xi` being the forward's
+    own output: d sqrt(o + eps) / do = 1 / (2 sqrt(o + eps))."""
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    c = tl.arange(0, BLOCK_C)
+    px = sb * BLOCK_S + tl.arange(0, BLOCK_S)
+    m = (c[:, None] < C) & (px[None, :] < S)
+    img = b * CHW + c[:, None] * S + px[None, :]
+    x = tl.load(XI + img, mask=m, other=1.0)
+    g = tl.load(G + img, mask=m, other=0.0)
+    tl.store(GO + b * CHW + px[None, :] * C + c[:, None], 0.5 * g / x, mask=m)
+
+
+# ---- the same four maps in torch: the reference, the fallback, and EMULATE ----
+def _eager_abs2_seq(za):
+    B, C2, H, W = za.shape
+    p = za.reshape(B, 2, C2 // 2, H * W)
+    v = torch.addcmul(p[:, 1] * p[:, 1], p[:, 0], p[:, 0])        # (B, C, S)
+    return v.transpose(1, 2).reshape(B, 1, H * W, C2 // 2).contiguous()
+
+
+def _eager_abs2_seq_backward(za, g):
+    B, C2, H, W = za.shape
+    gi = g.reshape(B, H * W, C2 // 2).transpose(1, 2)             # (B, C, S)
+    return (2.0 * za.reshape(B, 2, C2 // 2, H * W) * gi.unsqueeze(1)).reshape(za.shape)
+
+
+def _eager_sqrt_img(o, eps, H, W):
+    B, _, S, C = o.shape
+    return torch.sqrt(o.reshape(B, S, C).transpose(1, 2) + eps).reshape(B, C, H, W)
+
+
+def _eager_sqrt_img_backward(xi, g):
+    B, C, H, W = xi.shape
+    go = (0.5 * g / xi).reshape(B, C, H * W).transpose(1, 2)
+    return go.reshape(B, 1, H * W, C).contiguous()
+
+
+def _chain_disable(key, why):
+    import warnings
+    _STATE[key] = False
+    warnings.warn(f"group envelope kernel ({key[0]}) disabled, using the torch "
+                  f"formula instead: {why}")
+
+
+def _chain_run(key, kernel, ref_fn, out_shape, like, scale_of, tol):
+    """Launch `kernel(out)`; on first use check it against `ref_fn()`.
+
+    -> the kernel's output, or the reference where the kernel is unavailable,
+    raised, or failed its check (in which case it is disabled for the process).
+    """
+    if EMULATE or _STATE.get(key) is False:
+        return ref_fn()
+    out = torch.empty(out_shape, device=like.device, dtype=torch.float32)
+    try:
+        kernel(out)
+    except Exception as e:                                    # noqa: BLE001
+        _chain_disable(key, f"{type(e).__name__}: {e}")
+        return ref_fn()
+    if key not in _STATE:
+        ref = ref_fn()
+        err = _rel_err(out, ref, scale_of(ref))
+        if not err < tol:
+            _chain_disable(key, f"max rel err {err:.2e} against the torch formula")
+            return ref
+        _STATE[key] = True
+    return out
+
+
+def _abs2_impl(za):
+    B, C2, H, W = za.shape
+    C, S = C2 // 2, H * W
+    bc, bs = _tile(C)
+    return _chain_run(
+        ("envelope abs2 forward", None),
+        lambda out: _abs2_seq_kernel[(B, triton.cdiv(S, bs))](
+            za, out, S, C, C * S, BLOCK_C=bc, BLOCK_S=bs),
+        lambda: _eager_abs2_seq(za), (B, 1, S, C), za,
+        lambda ref: ref.abs().max(), 1e-5)
+
+
+def _abs2_backward_impl(za, g):
+    B, C2, H, W = za.shape
+    C, S = C2 // 2, H * W
+    bc, bs = _tile(C)
+    return _chain_run(
+        ("envelope abs2 backward", None),
+        lambda out: _abs2_seq_backward[(B, triton.cdiv(S, bs))](
+            za, g, out, S, C, C * S, BLOCK_C=bc, BLOCK_S=bs),
+        lambda: _eager_abs2_seq_backward(za, g), tuple(za.shape), za,
+        lambda ref: ref.abs().max(), 1e-4)
+
+
+def _sqrt_impl(o, eps, H, W):
+    B, _, S, C = o.shape
+    bc, bs = _tile(C)
+    return _chain_run(
+        ("envelope sqrt forward", None),
+        lambda out: _sqrt_img_kernel[(B, triton.cdiv(S, bs))](
+            o, out, S, C, C * S, float(eps), BLOCK_C=bc, BLOCK_S=bs),
+        lambda: _eager_sqrt_img(o, eps, H, W), (B, C, H, W), o,
+        lambda ref: ref.abs().max(), 1e-5)
+
+
+def _sqrt_backward_impl(xi, g):
+    B, C, H, W = xi.shape
+    S = H * W
+    bc, bs = _tile(C)
+    return _chain_run(
+        ("envelope sqrt backward", None),
+        lambda out: _sqrt_img_backward[(B, triton.cdiv(S, bs))](
+            xi, g, out, S, C, C * S, BLOCK_C=bc, BLOCK_S=bs),
+        lambda: _eager_sqrt_img_backward(xi, g), (B, 1, S, C), xi,
+        lambda ref: ref.abs().max(), 1e-4)
+
+
+class _PlanarAbs2Seq(torch.autograd.Function):
+    """`|za|^2` of a planar map, delivered in the attention's value layout."""
+
+    @staticmethod
+    def forward(ctx, za):
+        ctx.save_for_backward(za)
+        return _abs2_impl(za)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        (za,) = ctx.saved_tensors
+        return _abs2_backward_impl(za, g.contiguous())
+
+
+class _SqrtSeqImage(torch.autograd.Function):
+    """`sqrt(o + eps)` of the attention's output, delivered as an image."""
+
+    @staticmethod
+    def forward(ctx, o, eps, H, W):
+        out = _sqrt_impl(o, eps, H, W)
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        (xi,) = ctx.saved_tensors
+        return _sqrt_backward_impl(xi, g.contiguous()), None, None, None
+
+
+def envelope_supported(za):
+    """Can `planar_envelope` take this map? Planar float32, contiguous, on a
+    device the kernels run on (or under EMULATE), and within int32 offsets."""
+    if not (torch.is_tensor(za) and za.dim() == 4 and za.dtype == torch.float32
+            and za.shape[1] % 2 == 0 and za.is_contiguous()):
+        return False
+    if za.numel() == 0 or za.numel() > _MAX_ELEMS:
+        return False
+    return EMULATE or (HAVE_TRITON and za.is_cuda)
+
+
+def planar_envelope(za, apply_seq, eps, grad=True):
+    """`sqrt(Gamma |za|^2 + eps)` as (B, C, H, W), the layout changes fused
+    into the two elementwise kernels either side of the attention.
+
+    `apply_seq` maps the attention's value sequence (B, 1, H*W, C) to its
+    output in the same layout (`FlexAdjacency.apply_seq`). `grad=False` skips
+    the autograd Functions (no graph is being built). Returns None where
+    `envelope_supported` says no -- the caller keeps its eager chain.
+    """
+    if not envelope_supported(za):
+        return None
+    H, W = za.shape[-2], za.shape[-1]
+    if grad and torch.is_grad_enabled():
+        v = _PlanarAbs2Seq.apply(za)
+        return _SqrtSeqImage.apply(apply_seq(v).contiguous(), float(eps), H, W)
+    return _sqrt_impl(apply_seq(_abs2_impl(za)).contiguous(), float(eps), H, W)
+
+
 def clip_modulus(z, t, eps, block=1024):
     """`z * min(1, t/|z|)` in one pass, or None if this path cannot be taken.
 

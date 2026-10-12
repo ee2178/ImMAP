@@ -368,6 +368,16 @@ class FlexAdjacency:
         return -0.5 * self.ksq if self.sim in SIM_KNORM else 0.0
 
     # -- application --------------------------------------------------------
+    def apply_seq(self, v):
+        """`Gamma v` with `v` and the result already in the kernel's own layout,
+        (B, heads, H*W, C // heads) -- `apply` without its two layout copies.
+        For a caller that produces and consumes that layout directly
+        (models/clip_triton.py::planar_envelope)."""
+        out, lse = _flex_with_lse(self.q, self.k, v, self._fwd_mod(),
+                                  self.block_mask, self.compiled)
+        self._lse = lse                                   # reused by the transpose
+        return out
+
     def apply(self, x, transpose=False):
         """`Gamma x` (or `Gamma^T x`) applied channel-wise; x is (B, C, H, W)."""
         v = image_to_seq(x, self.heads)

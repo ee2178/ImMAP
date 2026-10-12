@@ -101,10 +101,12 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd.function import once_differentiable
 
 from operators.base import Operator
 from operators.identity import Identity
@@ -458,6 +460,96 @@ def _fold_circular2d(g, a, b):
     return g
 
 
+def _fold_once(g, a, b):
+    """`_fold_circular2d` in ONE full pass: crop the core, then add the eight
+    halo pieces (four edges, four corners) onto its borders.
+
+    The same sums as folding one axis and then the other -- a corner reaches
+    its pixel directly instead of via an edge strip -- so it agrees to fp
+    roundoff, not bitwise. Used where the result is a GRADIENT (the backward
+    of the pad), never for a forward value.
+    """
+    H, W = g.shape[-2] - a - b, g.shape[-1] - a - b
+    out = g[..., a:a + H, a:a + W].clone()
+    rows = ((H - a, 0, a),) * bool(a) + ((0, a + H, b),) * bool(b)   # (dst, src, n)
+    cols = ((W - a, 0, a),) * bool(a) + ((0, a + W, b),) * bool(b)
+    for rd, rs, rn in rows:
+        out[..., rd:rd + rn, :].add_(g[..., rs:rs + rn, a:a + W])
+    for cd, cs, cn in cols:
+        out[..., :, cd:cd + cn].add_(g[..., a:a + H, cs:cs + cn])
+    for rd, rs, rn in rows:
+        for cd, cs, cn in cols:
+            out[..., rd:rd + rn, cd:cd + cn].add_(g[..., rs:rs + rn, cs:cs + cn])
+    return out
+
+
+class _CircPad(torch.autograd.Function):
+    """`F.pad(x, (a, b, a, b), mode='circular')` whose backward is the fold.
+
+    Autograd differentiates torch's circular pad through the five slice
+    assignments it is built from, and each of those costs several full passes
+    over the padded tensor going back (clone the gradient, zero the slice,
+    accumulate). On the fine planar latent (338 x 326 x 190, 84 MB) that was
+    ~3.7 ms per pad and 53 ms of mg169v6's 197 ms backward on an L40S
+    (scripts/op_profile.py::step_report, job 19651520): the `add_` / `copy_` /
+    `fill_` rows at the padded shape. The adjoint of a circular pad is a crop
+    plus thin halo adds -- one pass.
+    """
+
+    @staticmethod
+    def forward(ctx, x, a, b):
+        ctx.ab = (int(a), int(b))
+        return F.pad(x, (a, b, a, b), mode="circular")
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        a, b = ctx.ab
+        return _fold_once(g, a, b), None, None
+
+
+class _CircFold(torch.autograd.Function):
+    """`_fold_circular2d` whose backward is the circular pad -- the mirror of
+    `_CircPad`, for the prolongation. The forward is the existing fold, run
+    without a graph, so the VALUE is bit-identical to what it was."""
+
+    @staticmethod
+    def forward(ctx, g, a, b):
+        ctx.ab = (int(a), int(b))
+        return _fold_circular2d(g, a, b)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        a, b = ctx.ab
+        return F.pad(g, (a, b, a, b), mode="circular"), None, None
+
+
+def _use_adjoint(t):
+    return (GridTransfer.ADJOINT_PAD and torch.is_grad_enabled()
+            and t.requires_grad)
+
+
+def circ_pad(t, a, b):
+    """Circular pad for the restriction. Same values as `F.pad`; under autograd
+    the backward is the fold (`GridTransfer.ADJOINT_PAD`)."""
+    if not (a or b):
+        return t
+    if _use_adjoint(t):
+        return _CircPad.apply(t, a, b)
+    return F.pad(t, (a, b, a, b), mode="circular")
+
+
+def circ_fold(t, a, b):
+    """Halo fold for the prolongation. Same values as `_fold_circular2d`; under
+    autograd the backward is the circular pad (`GridTransfer.ADJOINT_PAD`)."""
+    if not (a or b):
+        return t
+    if _use_adjoint(t):
+        return _CircFold.apply(t, a, b)
+    return _fold_circular2d(t, a, b)
+
+
 def _weight_for(x, filter, factor, length, groups):
     dtype = x.real.dtype if torch.is_complex(x) else x.dtype
     w = _cached_kernel(filter, factor, length, x.device, dtype)
@@ -519,9 +611,7 @@ def restrict(x, factor=DEFAULT_FACTOR, length=None, julia_compat=False,
     w = _weight_for(x, filter, factor, length, groups)
 
     def fn(t):
-        if a or b:
-            t = F.pad(t, (a, b, a, b), mode="circular")
-        return F.conv2d(t, w, stride=factor, groups=groups)
+        return F.conv2d(circ_pad(t, a, b), w, stride=factor, groups=groups)
 
     return _apply_complex(fn, x)
 
@@ -543,8 +633,7 @@ def prolong(x, scale=DEFAULT_FACTOR, length=None, filter=None):
     w = _weight_for(x, filter, scale, length, groups) * adjoint_scale(filter, scale)
 
     def fn(t):
-        t = F.conv_transpose2d(t, w, stride=scale, groups=groups)
-        return _fold_circular2d(t, a, b) if (a or b) else t
+        return circ_fold(F.conv_transpose2d(t, w, stride=scale, groups=groups), a, b)
 
     return _apply_complex(fn, x)
 
@@ -625,6 +714,16 @@ class GridTransfer(nn.Module):
     between feature stages, fixed windowed sinc inside the physics.
     """
 
+    # Differentiate the circular pad (restriction) and its fold (prolongation)
+    # with hand-written backwards -- each is the other's forward -- instead of
+    # through the slice assignments they are built from (`_CircPad`,
+    # `_CircFold`). Values are unchanged bit for bit; gradients agree to fp
+    # roundoff (tests/test_transfer_pad_grad.py). Covers the module-level
+    # `restrict` / `prolong` too. Class-level so it can be flipped globally,
+    # like `SoftThreshold.FUSED`: a kill switch, and what an A/B toggles.
+    # `IMMAP_ADJOINT_PAD=0` in the environment turns it off for a whole run.
+    ADJOINT_PAD = os.environ.get("IMMAP_ADJOINT_PAD", "1") != "0"
+
     def __init__(self, channels=1, factor=DEFAULT_FACTOR, length=None,
                  learn=False, filter=None):
         super().__init__()
@@ -698,9 +797,7 @@ class GridTransfer(nn.Module):
         w, groups = self._w(x)
 
         def fn(t):
-            if a or b:
-                t = F.pad(t, (a, b, a, b), mode="circular")
-            return F.conv2d(t, w, stride=self.factor, groups=groups)
+            return F.conv2d(circ_pad(t, a, b), w, stride=self.factor, groups=groups)
 
         return _apply_complex(fn, x)
 
@@ -710,8 +807,8 @@ class GridTransfer(nn.Module):
         w = w * self.adjoint_scale
 
         def fn(t):
-            t = F.conv_transpose2d(t, w, stride=self.factor, groups=groups)
-            return _fold_circular2d(t, a, b) if (a or b) else t
+            return circ_fold(
+                F.conv_transpose2d(t, w, stride=self.factor, groups=groups), a, b)
 
         return _apply_complex(fn, z)
 

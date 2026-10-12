@@ -111,6 +111,8 @@ echo "[time-mggroup] ${ANATOMY} R=${R} sizes=\"${SIZES}\" reps=${REPS} -> ${OUT}
 
 # the block-size arms are only comparable if the knob is exact
 python -m tests.test_flex_block_size
+python -m tests.test_transfer_pad_grad
+python -m tests.test_group_envelope       # on a GPU this runs the real kernels
 
 # ---- configs: exp12's own, generated as its launcher generates them ----------
 # (--planar-state so each net is timed as the training run would run it; nothing

@@ -76,6 +76,8 @@ _FAMILY = [
               "masked_fill", "threshold", "silu", "sigmoid", "tanh", "softmax",
               "angle", "polar", "real", "imag")),
     ("matmul", ("mm", "bmm", "matmul", "addmm", "baddbmm", "einsum", "linear")),
+    ("attention", ("triton_tem_fused_flex_attention", "flex_attention",
+                   "scaled_dot_product_attention")),
     ("index", ("index", "select", "slice", "narrow", "gather", "scatter",
                "take", "repeat", "expand", "permute", "transpose", "reshape",
                "view", "unsqueeze", "squeeze", "flip", "unfold")),
@@ -199,6 +201,8 @@ def op_times(model, y, E, sigma, device, iters=3, warmup=3):
                    ms=t / 1e3 / iters,
                    calls=ev.count / iters)
         is_kernel = cuda and getattr(ev, "device_type", None) == DeviceType.CUDA
+        if is_kernel and _is_annotation(ev.key):
+            continue                     # a range around kernels, not a kernel
         (kernel_rows if is_kernel else rows).append(row)
 
     gpu = None
@@ -398,6 +402,19 @@ def report(model, y, E, sigma, device, clean_ms=None, top=22, iters=3):
 # ---------------------------------------------------------------------------
 #  TRAINING STEP: forward (autograd on) and backward, separately
 # ---------------------------------------------------------------------------
+def _is_annotation(key):
+    """A GPU-side ANNOTATION, not a kernel.
+
+    torch.compile wraps each compiled graph's launches in a device-side range
+    named `## Call CompiledFxGraph <hash> ##`, and the profiler reports it as a
+    CUDA event with the duration of the kernels inside it. Counting it next to
+    those kernels doubles them: the group net's backward read "GPU busy 495 ms"
+    against a 422 ms wall, the surplus being exactly the FlexAttention kernel's
+    82 ms (job 19651520).
+    """
+    return str(key).lstrip().startswith("## ")
+
+
 def _kernel_name(key, width=54):
     """A GPU kernel's name, short enough to tabulate.
 
@@ -429,6 +446,8 @@ def _collect(prof, cuda):
         if t <= 0 or ev.count == 0:
             continue
         if cuda and getattr(ev, "device_type", None) == DeviceType.CUDA:
+            if _is_annotation(ev.key):
+                continue
             k = kernels[_kernel_name(ev.key)]
         elif "Backward" in ev.key or "evaluate_function" in ev.key:
             # An autograd NODE, not an aten op. It has device time of its own

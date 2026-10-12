@@ -36,6 +36,7 @@ envelope approximation ("Simple") and the Moreau fallback.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -46,6 +47,7 @@ from models.circulant_attention import Circulant, circ_adjacency, _abs2
 from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
                                    get_block_mask)
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency
+import models.clip_triton as clip_triton
 from models.clip_triton import (clip_modulus, prox_planar, prox_planar_grad,
                                 scale_planar, scale_planar_grad)
 from models.components import to_complex, to_planar
@@ -352,6 +354,13 @@ class GroupThreshold(nn.Module):
     natively.
     """
 
+    # Fuse the planar prox's envelope chain around the attention
+    # (`_fused_envelope`). Same map; each kernel is checked against the torch
+    # formula on first use and disabled with a warning if it disagrees. Class-
+    # level like `SoftThreshold.FUSED`; `IMMAP_GROUP_FUSED=0` turns it off for
+    # a whole run.
+    FUSED_CHAIN = os.environ.get("IMMAP_GROUP_FUSED", "1") != "0"
+
     def __init__(self, M, Mh=None, nheads=1, window=15, tau0=1e-3, degrees=0,
                  gamma0=0.8, gamma_degrees=0, rho0=1.0, rho_degrees=0,
                  rho_inv=True, sim_fun="distance", dK=1,
@@ -515,6 +524,40 @@ class GroupThreshold(nn.Module):
         p = x.reshape(B, 2, C2 // 2, H, W)
         return torch.addcmul(p[:, 1] * p[:, 1], p[:, 0], p[:, 0])
 
+    def _fused_envelope(self, za, Gamma):
+        """`sqrt(Gamma |za|^2 + eps)` through the fused chain, or None.
+
+        The attention takes its values channels-last and returns them so; done
+        eagerly, the squared modulus before it and the square root after it
+        each come with a layout copy, and a backward of ~10 kernels for the
+        modulus alone (autograd fills and copies a whole map for every half it
+        selects). `clip_triton.planar_envelope` does each side as one kernel
+        that changes the layout as it computes, with a hand-written backward.
+        The attention call and both 1x1 transforms are untouched.
+
+        Taken for one head on the flex backend, where the kernels run. None --
+        and the eager line in `_planar_prox` -- for anything else.
+        """
+        if not (GroupThreshold.FUSED_CHAIN and SoftThreshold.FUSED
+                and self.nheads == 1):
+            return None
+        grad = torch.is_grad_enabled()
+        if grad and not SoftThreshold.FUSED_GRAD:
+            return None
+        if isinstance(Gamma, FlexAdjacency):
+            apply_seq = Gamma.apply_seq
+        elif clip_triton.EMULATE:
+            # Tests only: any backend, through its image-layout apply, so the
+            # chain's Functions and this wiring run on the CPU dev box.
+            def apply_seq(v):
+                B, _, S, C = v.shape
+                img = v.reshape(B, S, C).transpose(1, 2).reshape(B, C, *za.shape[-2:])
+                out = self.apply_gamma(Gamma, img)
+                return out.reshape(B, C, S).transpose(1, 2).reshape(B, 1, S, C)
+        else:
+            return None
+        return clip_triton.planar_envelope(za, apply_seq, self.eps, grad=grad)
+
     def _planar_prox(self, z, sigma, cache, dual):
         """The group shrink, or the group clip (`dual`), of a PLANAR code.
 
@@ -533,7 +576,9 @@ class GroupThreshold(nn.Module):
         tau = self.tau(sigma, ref=z)
         Gamma, cache = self.gamma_of(z, sigma, cache)
         za = self.Walpha(z) if self.grouped else z
-        xi_a = torch.sqrt(self.apply_gamma(Gamma, self._abs2_planar(za)) + self.eps)
+        xi_a = self._fused_envelope(za, Gamma)
+        if xi_a is None:
+            xi_a = torch.sqrt(self.apply_gamma(Gamma, self._abs2_planar(za)) + self.eps)
         xi = self.beta_apply(xi_a) if self.grouped else xi_a
         if SoftThreshold.FUSED:
             if not torch.is_grad_enabled():
