@@ -396,6 +396,222 @@ def report(model, y, E, sigma, device, clean_ms=None, top=22, iters=3):
 
 
 # ---------------------------------------------------------------------------
+#  TRAINING STEP: forward (autograd on) and backward, separately
+# ---------------------------------------------------------------------------
+def _kernel_name(key, width=54):
+    """A GPU kernel's name, short enough to tabulate.
+
+    Compiled flex / Triton kernels get a numeric suffix per specialisation
+    (`triton_tem_fused_flex_attention_backward_3`), one per grid level and
+    shape; folding it gives one row per KIND of kernel, which is the question.
+    """
+    import re
+    k = re.sub(r"_\d+$", "", str(key).strip())
+    k = re.sub(r"^void\s+", "", k)
+    return k[:width]
+
+
+def _collect(prof, cuda):
+    """One profiler session -> `(ops, kernels)`.
+
+    `ops`     {(op, family, shapes): [ms, calls]}   aten ops, self device time
+    `kernels` {name: [ms, launches]}                the GPU kernels themselves
+
+    The profiler lists every kernel as its own event AND credits its time to
+    the aten op that launched it, so the two are kept apart (as `op_times`
+    does): summing both double-counts.
+    """
+    from torch.autograd import DeviceType
+
+    ops, kernels = defaultdict(lambda: [0.0, 0.0]), defaultdict(lambda: [0.0, 0.0])
+    for ev in prof.key_averages(group_by_input_shape=True):
+        t = ev.self_device_time_total if cuda else ev.self_cpu_time_total
+        if t <= 0 or ev.count == 0:
+            continue
+        if cuda and getattr(ev, "device_type", None) == DeviceType.CUDA:
+            k = kernels[_kernel_name(ev.key)]
+        elif "Backward" in ev.key or "evaluate_function" in ev.key:
+            # An autograd NODE, not an aten op. It has device time of its own
+            # only when its backward launches kernels directly -- a custom
+            # Function (the fused clip) or a compiled one (FlexAttention) --
+            # which makes this row the place those backwards show up by name.
+            node = ev.key.split(": ")[-1].replace("autograd::engine::", "")
+            k = ops[("[" + node[:22] + "]", "autograd", "")]
+        else:
+            k = ops[(short(ev.key)[:24], family(ev.key), _fmt_shapes(ev.input_shapes))]
+        k[0] += t / 1e3
+        k[1] += ev.count
+    return ops, kernels
+
+
+def step_times(model, y, E, sigma, device, iters=3, warmup=2):
+    """Profile one TRAINING step in two phases. -> dict.
+
+    forward   `model(y, E, sigma)` with autograd on, plus the loss
+    backward  `loss.backward()`
+
+    Each phase gets its own profiler session, so an op is never split between
+    them and nothing depends on which thread the autograd engine runs it on
+    (on CUDA the backward runs on the engine's device thread, where a
+    `record_function` label opened by the caller is not its parent).
+
+    The CLEAN wall times come from a separate, unprofiled loop: the profiler
+    records every op with its shapes, which slows the host, so its own wall is
+    not the step's. Device times are kernel durations and are not affected.
+
+    The loss is a plain squared error on the output -- the real one differs by
+    a mask and a target, which is noise next to the net.
+    """
+    import time
+
+    from torch.profiler import ProfilerActivity, profile
+
+    cuda = device.type == "cuda"
+
+    def sync():
+        if cuda:
+            torch.cuda.synchronize()
+
+    def forward():
+        out = model(y, E=E, sigma=sigma)
+        out = out[0] if isinstance(out, (tuple, list)) else out
+        v = torch.view_as_real(out) if out.is_complex() else out
+        return v.pow(2).mean()
+
+    was_training = model.training
+    model.train()
+    try:
+        for _ in range(warmup):
+            model.zero_grad(set_to_none=True)
+            forward().backward()
+        sync()
+
+        clean = {"forward": [], "backward": []}
+        for _ in range(iters):
+            model.zero_grad(set_to_none=True)
+            sync()
+            t0 = time.perf_counter()
+            loss = forward()
+            sync()
+            t1 = time.perf_counter()
+            loss.backward()
+            sync()
+            clean["forward"].append(1e3 * (t1 - t0))
+            clean["backward"].append(1e3 * (time.perf_counter() - t1))
+            del loss
+
+        acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if cuda else [])
+        acc = {ph: (defaultdict(lambda: [0.0, 0.0]), defaultdict(lambda: [0.0, 0.0]))
+               for ph in ("forward", "backward")}
+
+        def merge(ph, prof):
+            ops, kernels = _collect(prof, cuda)
+            for src, dst in ((ops, acc[ph][0]), (kernels, acc[ph][1])):
+                for k, (ms, n) in src.items():
+                    dst[k][0] += ms / iters
+                    dst[k][1] += n / iters
+
+        for _ in range(iters):
+            model.zero_grad(set_to_none=True)
+            sync()
+            with profile(activities=acts, record_shapes=True) as pf:
+                loss = forward()
+                sync()
+            merge("forward", pf)
+            with profile(activities=acts, record_shapes=True) as pb:
+                loss.backward()
+                sync()
+            merge("backward", pb)
+            del loss, pf, pb
+    finally:
+        model.zero_grad(set_to_none=True)
+        model.train(was_training)
+
+    out = {}
+    for ph in ("forward", "backward"):
+        ops, kernels = acc[ph]
+        w = sorted(clean[ph])
+        attributed = sum(v[0] for v in ops.values())
+        busy = sum(v[0] for v in kernels.values()) if kernels else attributed
+        out[ph] = dict(ops=dict(ops), kernels=dict(kernels), clean_ms=w[len(w) // 2],
+                       attributed_ms=attributed, busy_ms=busy,
+                       launches=sum(v[1] for v in kernels.values()))
+    return out
+
+
+def step_report(model, y, E, sigma, device, top=16, iters=3):
+    """Where one TRAINING step's time goes, forward against backward.
+
+    Three views of the same step:
+
+    1. by FAMILY, forward next to backward. `(outside aten)` is the time of
+       kernels no aten op launched -- the compiled FlexAttention kernels and
+       the fused Triton clip -- i.e. GPU busy minus what the ops account for.
+    2. the top BACKWARD ops by (op, input shapes): the shapes tell a 7x7
+       dictionary convolution from the group prox's 1x1 transforms, and the
+       latent from the image. A `[...Backward]` row (family `autograd`) is an
+       autograd node that launched kernels itself rather than through an aten
+       op: the fused clip's hand-written backward, the compiled attention's.
+    3. the GPU KERNELS by name, per phase: the only place the attention
+       kernels appear under their own names.
+
+    `idle` is the clean wall minus GPU-busy time: the host issuing kernels.
+    """
+    st = step_times(model, y, E, sigma, device, iters=iters)
+    f, b = st["forward"], st["backward"]
+    cuda = device.type == "cuda"
+
+    print(f"--- training step, per phase ({'device' if cuda else 'cpu'} self time, "
+          f"mean of {iters}) ---")
+    print(f"    {'':<22}{'forward':>10}{'backward':>10}")
+    print(f"    {'clean wall ms':<22}{f['clean_ms']:>10.1f}{b['clean_ms']:>10.1f}")
+    if cuda:
+        print(f"    {'GPU busy ms':<22}{f['busy_ms']:>10.1f}{b['busy_ms']:>10.1f}")
+        print(f"    {'idle (host) ms':<22}{f['clean_ms'] - f['busy_ms']:>10.1f}"
+              f"{b['clean_ms'] - b['busy_ms']:>10.1f}")
+        print(f"    {'kernel launches':<22}{f['launches']:>10.0f}{b['launches']:>10.0f}")
+
+    fam = {ph: defaultdict(float) for ph in ("forward", "backward")}
+    for ph in ("forward", "backward"):
+        for (_op, fm, _sh), (ms, _n) in st[ph]["ops"].items():
+            fam[ph][fm] += ms
+        if cuda:
+            outside = st[ph]["busy_ms"] - st[ph]["attributed_ms"]
+            if outside > 0.05:
+                fam[ph]["(outside aten)"] = outside
+    tot = {ph: sum(fam[ph].values()) or 1.0 for ph in fam}
+    names = sorted(set(fam["forward"]) | set(fam["backward"]),
+                   key=lambda k: -(fam["forward"].get(k, 0) + fam["backward"].get(k, 0)))
+    print(f"\n    {'family':<18}{'fwd ms':>9}{'%':>6}{'bwd ms':>10}{'%':>6}{'bwd/fwd':>9}")
+    for k in names:
+        a, c = fam["forward"].get(k, 0.0), fam["backward"].get(k, 0.0)
+        print(f"    {k:<18}{a:>9.2f}{100 * a / tot['forward']:>6.1f}"
+              f"{c:>10.2f}{100 * c / tot['backward']:>6.1f}"
+              f"{(f'{c / a:.1f}x' if a > 0.05 else '-'):>9}")
+    print(f"    {'total':<18}{tot['forward']:>9.2f}{'':>6}{tot['backward']:>10.2f}")
+
+    for ph, d in (("BACKWARD", b), ("FORWARD", f)):
+        rows = sorted(((ms, n, k) for k, (ms, n) in d["ops"].items()), reverse=True)
+        t = sum(r[0] for r in rows) or 1.0
+        print(f"\n    top {ph} ops    {'':<8}{'family':<10}{'shapes':<34}"
+              f"{'ms':>8}{'%':>6}{'calls':>7}{'us/call':>9}")
+        for ms, n, (op, fm, sh) in rows[:top if ph == 'BACKWARD' else max(top // 2, 6)]:
+            print(f"    {op:<26}{fm:<10}{sh:<34}{ms:>8.2f}{100 * ms / t:>6.1f}"
+                  f"{n:>7.0f}{1e3 * ms / max(n, 1):>9.1f}")
+
+    if cuda:
+        for ph, d in (("backward", b), ("forward", f)):
+            rows = sorted(((ms, n, k) for k, (ms, n) in d["kernels"].items()), reverse=True)
+            t = sum(r[0] for r in rows) or 1.0
+            print(f"\n    GPU kernels, {ph:<10}{'':<34}{'ms':>8}{'%':>6}"
+                  f"{'launches':>10}{'us each':>9}")
+            for ms, n, k in rows[:10]:
+                print(f"    {k:<56}{ms:>8.2f}{100 * ms / t:>6.1f}{n:>10.0f}"
+                      f"{1e3 * ms / max(n, 1):>9.1f}")
+    return st
+
+
+# ---------------------------------------------------------------------------
 #  HOST
 # ---------------------------------------------------------------------------
 def host_report(model, y, E, sigma, device, clean_ms=None, top=26, iters=3, warmup=2):

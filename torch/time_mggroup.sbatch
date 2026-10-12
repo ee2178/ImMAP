@@ -65,6 +65,14 @@
 #                                 epoch meets them
 #   M=81                          the narrow pair, mg81v6 / mggroup81v6 (default 169)
 #   R=8  REPS=10  BLOCKS="128 64 32 16"  SKIP_TRITON=1
+#   BWD=1                         also profile ONE TRAINING STEP per op and per GPU
+#                                 kernel, forward and backward separately
+#                                 (scripts/profile_mg.py --ops-step), for mg<M>v6
+#                                 and the group cell at block BWD_BLOCK (default
+#                                 16). The backward is over half the real step and
+#                                 no other tool here splits it. Output is appended
+#                                 to <out>/step_profile.txt
+#   SKIP_TIMING=1                 with BWD=1: skip the timing arms, profile only
 #   An L40S instead:              sbatch --constraint=l40s torch/time_mggroup.sbatch
 #                                 The B=128 and B=64 arms may FAIL there, and not
 #                                 for GPU memory: the flex kernel's tiles need more
@@ -77,6 +85,7 @@ M="${M:-169}"                        # 169 or 81: times mg<M>v6 and mggroup<M>v6
 R="${R:-8}"
 REPS="${REPS:-10}"
 BLOCKS="${BLOCKS:-128 64 32 16}"
+BWD_BLOCK="${BWD_BLOCK:-16}"
 case "${ANATOMY}" in
     knee)  SIZES="${SIZES:-640x368x15 640x372x15}" ;;
     brain) SIZES="${SIZES:-640x320x20}" ;;
@@ -131,12 +140,22 @@ if not skip_triton:
     json.dump(c, open(f"{out}/mggroup_triton.json", "w"), indent=1)
 PY
 
+# the step profile needs its own block size written out, whatever BLOCKS holds
+if [ -n "${BWD:-}" ] && [ ! -f "${OUT}/cfg/mggroup_fb${BWD_BLOCK}.json" ]; then
+    python - "${SRC}/mggroup${M}v6_R${R}.json" "${OUT}/cfg" "${BWD_BLOCK}" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c["model"]["params"]["flex_block_size"] = int(sys.argv[3])
+json.dump(c, open(f"{sys.argv[2]}/mggroup_fb{sys.argv[3]}.json", "w"), indent=1)
+PY
+fi
+
 ARMS="mg${M}v6"
 for b in ${BLOCKS}; do ARMS="${ARMS} mggroup_fb${b}"; done
 [ -n "${SKIP_TRITON:-}" ] || ARMS="${ARMS} mggroup_triton"
 
 set +e
-for arm in ${ARMS}; do
+for arm in $([ -n "${SKIP_TIMING:-}" ] || echo "${ARMS}"); do
     echo; echo "================ ${arm} ================"
     python scripts/time_net.py --configs "${OUT}/cfg/${arm}.json" --size ${IMG} \
         --coils "${COILS}" --reps "${REPS}" --step --sizes ${SIZES} \
@@ -146,6 +165,7 @@ done
 set -e
 
 # ---- one table ---------------------------------------------------------------
+if [ -z "${SKIP_TIMING:-}" ]; then
 python - "${OUT}" "${M}" ${ARMS} <<'PY'
 import json, os, sys
 out, M, arms = sys.argv[1], sys.argv[2], sys.argv[3:]
@@ -183,4 +203,23 @@ if ref:
           f" of fwd+bwd alone;  best flex arm ({best[1]}) {best[0] * steps / 3.6e6:.0f} h")
     print("  (optimizer, projection, data and the online ESPIRiT maps come on top)")
 PY
+fi
+# ---- where one TRAINING step goes: forward and backward, per op and per kernel ----
+# One net per process: profile_mg.py takes the conv mode as a flag for the run.
+# Read the family table first (forward next to backward), then the kernel
+# tables -- the compiled attention kernels appear there under their own names
+# (triton_tem_fused_flex_attention / ..._backward), and in the family table as
+# "(outside aten)" or an autograd-node row.
+if [ -n "${BWD:-}" ]; then
+    : > "${OUT}/step_profile.txt"
+    set +e
+    for arm in "mg${M}v6" "mggroup_fb${BWD_BLOCK}"; do
+        echo; echo "================ training-step profile: ${arm} ================"
+        python scripts/profile_mg.py --configs "${OUT}/cfg/${arm}.json" --size ${IMG} \
+            --coils "${COILS}" --R "${R}" --reps 5 --cudnn-benchmark --planar \
+            --planar-state --ops-step 2>&1 | tee -a "${OUT}/step_profile.txt"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || echo "[time-mggroup] step profile of ${arm} FAILED"
+    done
+    set -e
+fi
 echo "[time-mggroup] per-arm logs and JSON under ${OUT}"

@@ -575,6 +575,13 @@ def main():
                          "what says whether an op is DRAM-bound (bytes worth "
                          "removing), L2-resident (not worth it) or launch-bound "
                          "(cut kernel count instead)")
+    ap.add_argument("--ops-step", action="store_true",
+                    help="profile one TRAINING step -- the forward with autograd "
+                         "on, then the backward -- per aten op and per GPU kernel "
+                         "(scripts/op_profile.py::step_report). The backward is "
+                         "most of a training step and --ops only sees the no-grad "
+                         "forward. The compiled attention kernels show under their "
+                         "own names in the kernel table")
     ap.add_argument("--host", action="store_true",
                     help="where the HOST spends the forward: cProfile own time "
                          "per torch call and per Python function. For when "
@@ -774,6 +781,11 @@ def main():
                     print(f"--- ops: {name} [{mode}] ---")
                     op_profile.report(model, y, E, sigma, device,
                                       clean_ms=stats["median"])
+                    print()
+
+                if args.ops_step:
+                    print(f"--- ops (training step): {name} [{mode}] ---")
+                    op_profile.step_report(model, y, E, sigma, device)
                     print()
 
                 if args.host:
