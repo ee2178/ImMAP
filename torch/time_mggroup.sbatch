@@ -63,6 +63,16 @@
 #   SIZES="640x368x15 640x372x15" measurement sizes (HxWxCOILS); knee's two widths
 #                                 by default, and they are timed MIXED too, as an
 #                                 epoch meets them
+#   COMPARE=1                     THE WHOLE COMPARISON instead of the block arms:
+#                                 inference, forward and backward for
+#                                   lpdsnet        LPDSNet, K=30, M=169
+#                                   varnetmaps     E2E-VarNet on the operator's maps
+#                                   mg169v6  mg81v6            MGLPDS, M=169 / 81
+#                                   mggroup169v6  mggroup81v6  the group twins
+#                                 each exactly as its config trains it (planar
+#                                 state, planar convs, rediscretized Gram, flex
+#                                 block 16), each in its own process, then one
+#                                 table. CELLS="..." picks a different list.
 #   M=81                          the narrow pair, mg81v6 / mggroup81v6 (default 169)
 #   R=8  REPS=10  BLOCKS="128 64 32 16"  SKIP_TRITON=1
 #   BWD=1                         also profile ONE TRAINING STEP per op and per GPU
@@ -120,6 +130,63 @@ python -m tests.test_group_envelope       # on a GPU this runs the real kernels
 python scripts/make_mg_recon_configs.py --out "${OUT}/gen" --anatomy "${ANATOMY}" \
     --attn flex --organ-mask --planar-state > /dev/null
 SRC="${OUT}/gen/${ANATOMY}/mg"
+
+# ---- COMPARE: every net of the comparison, one training step each ------------
+# One process per net, so one that fails (memory, a kernel this card refuses)
+# is reported and the rest still run, and each peak-memory figure is its own.
+# The configs are the generator's, untouched: what a training run would load.
+if [ -n "${COMPARE:-}" ]; then
+    CELLS="${CELLS:-lpdsnet varnetmaps mg169v6 mg81v6 mggroup169v6 mggroup81v6}"
+    set +e
+    for cell in ${CELLS}; do
+        f="${SRC}/${cell}_R${R}.json"
+        echo; echo "================ ${cell} ================"
+        if [ ! -f "${f}" ]; then
+            echo "[time-mggroup] no config for ${cell} at R=${R} (${f})"; continue
+        fi
+        cp "${f}" "${OUT}/cfg/${cell}.json"
+        python scripts/time_net.py --configs "${OUT}/cfg/${cell}.json" --size ${IMG} \
+            --coils "${COILS}" --reps "${REPS}" --step --sizes ${SIZES} \
+            --json-out "${OUT}/cmp_${cell}.json" 2>&1 | tee "${OUT}/cmp_${cell}.log"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || echo "[time-mggroup] ${cell} FAILED -- see ${OUT}/cmp_${cell}.log"
+    done
+    set -e
+    python - "${OUT}" "${IMG}" "${COILS}" ${CELLS} <<'PY'
+import json, os, sys
+out, img, coils, cells = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+rows = {}
+for c in cells:
+    f = os.path.join(out, f"cmp_{c}.json")
+    if not os.path.exists(f):
+        continue
+    r = json.load(open(f))["rows"][0]
+    med = lambda k: (r.get(k) or {}).get('median')          # time_net.py stores ms
+    rows[c] = dict(params=r.get('params'), state=r.get('state'), infer=med('infer'),
+                   fwd=med('forward'), bwd=med('backward'), opt=med('opt') or 0.0,
+                   proj=med('project') or 0.0, peak=r.get('peak_mb'), first=r.get('first_s'))
+print(f"\n================ one training step, {img.replace(chr(32), chr(120))}, {coils} coils ================")
+print(f"  {'net':<15}{'params':>11}{'state':>8}{'infer':>8}{'fwd':>8}{'bwd':>8}"
+      f"{'fwd+bwd':>9}{'x lpdsnet':>10}{'peak MB':>9}{'300k h':>8}")
+ref = rows.get('lpdsnet')
+ref = ref['fwd'] + ref['bwd'] if ref and ref['fwd'] and ref['bwd'] else None
+f1 = lambda v: f'{v:8.1f}' if v is not None else f"{'-':>8}"
+for c in cells:
+    if c not in rows or rows[c]['fwd'] is None or rows[c]['bwd'] is None:
+        print(f'  {c:<15}   FAILED / not run')
+        continue
+    r = rows[c]
+    tot = r['fwd'] + r['bwd']
+    hours = (tot + r['opt'] + r['proj']) * 300_000 / 3.6e6
+    print(f"  {c:<15}{(r['params'] or 0):>11,}{str(r['state']):>8}{f1(r['infer'])}{f1(r['fwd'])}"
+          f"{f1(r['bwd'])}{tot:>9.1f}{(f'{tot / ref:.2f}x' if ref else '-'):>10}"
+          f"{(r['peak'] or 0):>9.0f}{hours:>8.0f}")
+print('\n  ms, median. infer = eval-mode forward without autograd; fwd / bwd = a')
+print('  training step. 300k h = (fwd+bwd+optimizer+projection) x 300,000 steps:')
+print('  the NETWORK only -- data loading and the online coil maps come on top.')
+PY
+    echo "[time-mggroup] per-net logs and JSON under ${OUT} (cmp_<net>.*)"
+    exit 0
+fi
 for _f in "mg${M}v6" "mggroup${M}v6"; do
     [ -f "${SRC}/${_f}_R${R}.json" ] || { echo "[time-mggroup] no ${_f} cell at R=${R}" \
         "(M=${M}); the generator has mggroup169v6 and mggroup81v6." >&2; exit 1; }
