@@ -794,8 +794,15 @@ def _eager_abs2_seq_backward(za, g):
 
 
 def _eager_sqrt_img(o, eps, H, W):
+    # `.contiguous()` is not cosmetic. An elementwise op on a transposed view
+    # keeps that view's memory order, so without it this returns a tensor
+    # SHAPED (B, C, H, W) whose storage is still channels-last. torch ops read
+    # the strides and do not care; a Triton kernel reads the raw buffer and
+    # gets the wrong layout. This is the map `_SqrtSeqImage` saves for its
+    # backward whenever the forward kernel is not in use.
     B, _, S, C = o.shape
-    return torch.sqrt(o.reshape(B, S, C).transpose(1, 2) + eps).reshape(B, C, H, W)
+    out = torch.sqrt(o.reshape(B, S, C).transpose(1, 2) + eps)
+    return out.reshape(B, C, H, W).contiguous()
 
 
 def _eager_sqrt_img_backward(xi, g):
@@ -835,7 +842,11 @@ def _chain_run(key, kernel, ref_fn, out_shape, like, scale_of, tol):
     return out
 
 
+# Every tensor below is made contiguous HERE, where the kernel is launched, and
+# not left to the caller: a kernel reads the buffer, not the strides, so a
+# strided argument is silently the wrong data rather than an error.
 def _abs2_impl(za):
+    za = za.contiguous()
     B, C2, H, W = za.shape
     C, S = C2 // 2, H * W
     bc, bs = _tile(C)
@@ -848,6 +859,7 @@ def _abs2_impl(za):
 
 
 def _abs2_backward_impl(za, g):
+    za, g = za.contiguous(), g.contiguous()
     B, C2, H, W = za.shape
     C, S = C2 // 2, H * W
     bc, bs = _tile(C)
@@ -860,6 +872,7 @@ def _abs2_backward_impl(za, g):
 
 
 def _sqrt_impl(o, eps, H, W):
+    o = o.contiguous()
     B, _, S, C = o.shape
     bc, bs = _tile(C)
     return _chain_run(
@@ -871,6 +884,7 @@ def _sqrt_impl(o, eps, H, W):
 
 
 def _sqrt_backward_impl(xi, g):
+    xi, g = xi.contiguous(), g.contiguous()
     B, C, H, W = xi.shape
     S = H * W
     bc, bs = _tile(C)

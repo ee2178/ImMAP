@@ -118,8 +118,16 @@ def run_kernel(kernel, grid, out_shape, *args, **consts):
     fake, real = _FakeTL(), ct.tl
     out = torch.full(out_shape, float("nan"))
     out_ptr = _Ptr(out.reshape(-1))
+    for a in args:
+        # A real kernel reads the raw buffer. Making the argument contiguous
+        # here would hide exactly the bug this guards against: a tensor with
+        # the right SHAPE and the wrong memory order.
+        if torch.is_tensor(a) and not a.is_contiguous():
+            raise AssertionError(
+                f"non-contiguous tensor (shape {tuple(a.shape)}, strides "
+                f"{a.stride()}) handed to a kernel")
     call = [out_ptr if (isinstance(a, str) and a == "OUT") else
-            (_Ptr(a.contiguous().reshape(-1)) if torch.is_tensor(a) else a) for a in args]
+            (_Ptr(a.reshape(-1)) if torch.is_tensor(a) else a) for a in args]
     ct.tl = fake
     try:
         for p0 in range(grid[0]):
@@ -173,6 +181,40 @@ def test_kernel_source_on_cpu():
               oob == 0 and once and rel(got, ref) < 1e-6, f"rel {rel(got, ref):.1e}")
 
 
+def test_layouts_are_real():
+    """Everything a kernel may be handed must be contiguous IN ITS OWN LAYOUT.
+
+    The torch references double as fallbacks, so their outputs reach kernels
+    (the sqrt's output is what its backward kernel reads). A reference that
+    returns the right shape over the wrong memory order passes every torch
+    comparison and feeds a kernel garbage -- which is what happened on the
+    first GPU run (the sqrt-backward kernel failed its self-check at 0.99).
+    """
+    torch.manual_seed(4)
+    B, C, H, W, eps = 2, 5, 6, 7, 1e-8
+    za = torch.randn(B, 2 * C, H, W)
+    o = torch.rand(B, 1, H * W, C)
+    xi = ct._eager_sqrt_img(o, eps, H, W)
+    outs = {"_eager_abs2_seq": ct._eager_abs2_seq(za),
+            "_eager_sqrt_img": xi,
+            "_eager_sqrt_img_backward": ct._eager_sqrt_img_backward(xi, torch.randn(B, C, H, W))}
+    for name, t in outs.items():
+        check(f"{name} returns a contiguous tensor", t.is_contiguous(),
+              f"strides {t.stride()}")
+    # and the launch wrappers repair a strided argument rather than trust it
+    old = ct.EMULATE
+    ct.EMULATE = True
+    try:
+        strided = xi.permute(0, 1, 3, 2).contiguous().permute(0, 1, 3, 2)   # same values, strided
+        assert not strided.is_contiguous()
+        g = torch.randn(B, C, H, W)
+        a = ct._sqrt_backward_impl(strided, g)
+        b = ct._sqrt_backward_impl(xi, g)
+    finally:
+        ct.EMULATE = old
+    check("a strided argument gives the same answer as a contiguous one", rel(a, b) == 0.0)
+
+
 def test_backward_formulas():
     torch.manual_seed(1)
     B, C, H, W, eps = 2, 5, 6, 7, 1e-8
@@ -189,12 +231,12 @@ def test_backward_formulas():
           rel(ct._eager_sqrt_img_backward(xi.detach(), gi), auto) < 1e-12)
 
 
-def _prox_run(chain, dual, backend="gather", device="cpu", emulate=True):
+def _prox_run(chain, dual, backend="gather", device="cpu", emulate=True,
+              M=12, Mh=6, H=12, W=10):
     old = (GroupThreshold.FUSED_CHAIN, ct.EMULATE)
     GroupThreshold.FUSED_CHAIN, ct.EMULATE = chain, emulate
     try:
         torch.manual_seed(1)
-        M, Mh, H, W = 12, 6, 12, 10
         gt = GroupThreshold(M, Mh=Mh, window=5, tau0=0.05, sim_fun="distance",
                             attn_backend=backend).to(device)
         if backend == "flex" and device != "cpu":
@@ -294,9 +336,13 @@ def test_gpu():
     state = {k[0]: v for k, v in ct._STATE.items() if k[0].startswith("envelope")}
     check("GPU: all four envelope kernels passed their first-use check",
           len(state) == 4 and all(state.values()), str(state))
+    # Compiled FlexAttention needs embedding dimensions >= 16 ("NYI: ... must be
+    # at least 16"): Mh=16 gives 32 for the stacked query / key and 16 for the
+    # values. The real cells use Mh=64.
+    wide = dict(M=32, Mh=16, H=16, W=12)
     for dual in (True, False):
-        o1, g1 = _prox_run(True, dual, backend="flex", device=dev, emulate=False)
-        o0, g0 = _prox_run(False, dual, backend="flex", device=dev, emulate=False)
+        o1, g1 = _prox_run(True, dual, backend="flex", device=dev, emulate=False, **wide)
+        o0, g0 = _prox_run(False, dual, backend="flex", device=dev, emulate=False, **wide)
         worst = max(rel(a, b) for a, b in zip(g1, g0))
         check(f"GPU, flex: group {'clip' if dual else 'shrink'} chain on == off",
               rel(o1, o0) < 1e-5 and worst < 1e-4,
@@ -304,7 +350,8 @@ def test_gpu():
 
 
 def main():
-    for fn in (test_kernel_source_on_cpu, test_backward_formulas, test_wiring,
+    for fn in (test_kernel_source_on_cpu, test_layouts_are_real,
+               test_backward_formulas, test_wiring,
                test_negative_controls, test_gpu):
         print(f"\n--- {fn.__name__}")
         fn()
