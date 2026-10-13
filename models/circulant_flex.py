@@ -36,6 +36,7 @@ is exact for genuinely real features only.
 
 from __future__ import annotations
 import functools
+import os
 import torch
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
@@ -285,6 +286,55 @@ def _per_key_bias(bias):
     def score_mod(score, b, h, q_idx, kv_idx):
         return score + bias[b, h, kv_idx]
     return score_mod
+
+
+class PointwiseAdjacency:
+    """The adjacency of a window of ONE neighbour (each pixel sees only itself), in closed form.
+
+    A softmax over a single score is 1, so Gamma = I: `apply` returns its argument, in either
+    direction. What a joint softmax still needs from this branch is its log-sum-exp, which for
+    one neighbour is the score itself, in FlexAdjacency's convention (`_fwd_mod`):
+
+        distance     q.k - 1/2 ||k||^2          dot / realdot   q.k
+        pidistance  |q.k| - 1/2 ||k||^2         pidot          |q.k|
+
+    at the same pixel -- two reductions over the head dimension. The guided nets run
+    `window: 1` beside a 15 x 15 guide window, and a FlexAdjacency there launches the whole
+    attention kernel (forward and backward, every layer) to compute exactly this.
+    IMMAP_POINTWISE_SELF=0 restores the kernel."""
+
+    __slots__ = ("H", "W", "win", "sim", "heads", "_lse")
+
+    def __init__(self, q_img, k_img, sim="distance", heads=1):
+        if sim not in FLEX_SIMS:
+            raise ValueError(f"unsupported sim {sim!r}; expected one of {FLEX_SIMS}")
+        if q_img.is_complex() or k_img.is_complex():
+            raise ValueError("PointwiseAdjacency needs real query/key tensors; stack complex "
+                             "features as [Re; Im] first (GroupThreshold._stack_ri)")
+        B, C, H, W = q_img.shape
+        self.H, self.W, self.win, self.sim, self.heads = H, W, 1, sim, heads
+        d = C // heads                                    # heads are contiguous channel runs
+        score = (q_img * k_img).reshape(B, heads, d, H * W).sum(dim=2)        # (B, heads, S)
+        if sim in SIM_ABS:
+            score = score.abs()
+        if sim in SIM_KNORM:
+            score = score - 0.5 * (k_img * k_img).reshape(B, heads, d, H * W).sum(dim=2)
+        self._lse = score
+
+    def apply(self, x, transpose=False):
+        return x
+
+    def apply_seq(self, v):
+        return v
+
+    def matvec(self, x):
+        return x
+
+    def rmatvec(self, x):
+        return x
+
+
+POINTWISE_SELF = os.environ.get("IMMAP_POINTWISE_SELF", "1") != "0"
 
 
 class FlexAdjacency:

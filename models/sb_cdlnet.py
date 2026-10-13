@@ -75,6 +75,7 @@ import torch.nn.functional as F
 from models.base import BaseUnrolledModel, batched_projection, project_conv, set_weight
 from models.components import ST, Conv2d, ConvTranspose2d
 from models.enhancement import EnhancementCoupling, step_logit
+from models.fused_fidelity import fusable, s_gradient, shrink
 from models.sb_schedule import BridgeScheduleMixin, horner as _horner
 from operators.padding import unpad
 from operators.projections import uball_project
@@ -341,10 +342,24 @@ class SBCDLNet(BridgeScheduleMixin, BaseUnrolledModel):
         c_side = c[:, self.side_idx] if self.n_p else None
 
         z = torch.zeros_like(self.A_D[0](y_meas))
+        # one synthesis + one analysis per layer instead of eight convs (models/fused_fidelity.py):
+        # the same map and parameters. Real, ungrouped convs only; else the loop body below.
+        fused = (not z.is_complex()) and fusable(
+            self.A_D[0], self.B_D[0], *self.coupling.convs(), *self.A_P[:1], *self.B_P[:1])
         for k in range(self.K):
             tau = _horner(self.t[k], s_hat)                        # (B,M,1,1); see forward()
             A, B = self.A_D[k], self.B_D[k]
             xi = torch.sigmoid(_horner(self.a_xi[k], s_log))
+            if fused:
+                bridge = side = None
+                if self.bridge_fidelity:
+                    bridge = (mu0, r, torch.sigmoid(_horner(self.a_eta[k], s_log)))
+                if self.n_p:
+                    side = (self.A_P[k], self.B_P[k], c_side,
+                            torch.sigmoid(_horner(self.a_nu[k], s_log)))
+                z = shrink(z - s_gradient(z, k, A, B, self.coupling, y_meas, xi, bridge, side),
+                           tau)
+                continue
             u = z - xi * self.coupling.meas_grad(k, A, B, z, y_meas)   # learned data consistency
             if self.bridge_fidelity:
                 eta = torch.sigmoid(_horner(self.a_eta[k], s_log))

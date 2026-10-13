@@ -90,7 +90,8 @@ import torch.nn.functional as F
 
 from models.circulant_attention import Circulant, _abs2
 from models.circulant_similarity import circulant_similarity_window
-from models.circulant_flex import FlexAdjacency
+import models.circulant_flex as circulant_flex
+from models.circulant_flex import FlexAdjacency, PointwiseAdjacency
 from models.circulant_triton import TritonAdjacency
 from models.prox import GroupThreshold, Polynomial
 
@@ -215,6 +216,9 @@ class GuidedGroupThreshold(GroupThreshold):
                                    heads=self.nheads,
                                    block_m=self.triton_block_m)
         q, k = self._stack_ri(q), self._stack_ri(k)
+        if win == 1 and circulant_flex.POINTWISE_SELF:
+            # one neighbour: the identity and a pointwise score, no attention kernel
+            return PointwiseAdjacency(q, k, sim=self.sim_fun, heads=self.nheads)
         # The mask must be THIS branch's window. It used to be the self window for every
         # branch, so with window != guide_window (LGGS: 1 vs 15) a flex guide branch attended
         # over the self window only.

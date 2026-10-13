@@ -80,6 +80,7 @@ import torch.nn.functional as F
 from models.base import batched_projection, project_conv, set_weight
 from models.components import Conv2d, ConvTranspose2d
 from models.enhancement import EnhancementCoupling, step_logit
+from models.fused_fidelity import fusable, s_gradient
 from models.guided_cdl import make_guided_lista_layer, tie_attention
 from models.guided_prox import as_guide_list
 from models.sb_schedule import BridgeScheduleMixin, horner as _horner
@@ -365,16 +366,25 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
 
         z = torch.zeros_like(self.layers[0].analysis(y_meas))
         cache = {}
+        # the fidelity step as one synthesis + one analysis per layer (models/fused_fidelity.py)
+        fused = fusable(self.layers[0].analysis, self.layers[0].synthesis,
+                        *self.coupling.convs(), *self.A_P[:1], *self.B_P[:1])
         for k, layer in enumerate(self.layers):
             A, B = layer.analysis, layer.synthesis
             xi = torch.sigmoid(_horner(self.a_xi[k], s_log))
-            u = z - xi * self.coupling.meas_grad(k, A, B, z, y_meas)
-            if self.bridge_fidelity:
-                eta = torch.sigmoid(_horner(self.a_eta[k], s_log))
-                u = u - eta * (mu0 * A(mu0 * B(z) - r))
-            if self.n_p:
-                nu = torch.sigmoid(_horner(self.a_nu[k], s_log))
-                u = u - nu * self.A_P[k](self.B_P[k](z) - c_side)
+            eta = torch.sigmoid(_horner(self.a_eta[k], s_log)) if self.bridge_fidelity else None
+            nu = torch.sigmoid(_horner(self.a_nu[k], s_log)) if self.n_p else None
+            if fused:
+                u = z - s_gradient(
+                    z, k, A, B, self.coupling, y_meas, xi,
+                    (mu0, r, eta) if self.bridge_fidelity else None,
+                    (self.A_P[k], self.B_P[k], c_side, nu) if self.n_p else None)
+            else:
+                u = z - xi * self.coupling.meas_grad(k, A, B, z, y_meas)
+                if self.bridge_fidelity:
+                    u = u - eta * (mu0 * A(mu0 * B(z) - r))
+                if self.n_p:
+                    u = u - nu * self.A_P[k](self.B_P[k](z) - c_side)
             v = layer.analyse_guides(guides) if guides else None
             cross = None
             if self.s_cross:

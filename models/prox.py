@@ -45,7 +45,7 @@ from models.base import project_once
 
 from models.circulant_attention import Circulant, circ_adjacency, _abs2
 from models.circulant_flex import (FLEX_SIMS, SIM_ABS, FlexAdjacency,
-                                   get_block_mask)
+                                   PointwiseAdjacency, get_block_mask)
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency
 import models.clip_triton as clip_triton
 from models.clip_triton import (clip_modulus, prox_planar, prox_planar_grad,
@@ -472,6 +472,8 @@ class GroupThreshold(nn.Module):
 
     def apply_gamma(self, Gamma, x, transpose=False):
         """`(I (x) Gamma) x` channel-wise, complex-safe, head-aware."""
+        if isinstance(Gamma, PointwiseAdjacency):
+            return x                                       # one neighbour: Gamma = I
         if isinstance(Gamma, (FlexAdjacency, TritonAdjacency)):
             if torch.is_complex(x):
                 raise TypeError(

@@ -72,6 +72,19 @@ class EnhancementCoupling(nn.Module):
         keep = 1.0 - self.gate()
         return keep * A(B(keep * z) - y)
 
+    def meas_weights(self, k, wa, wb):
+        """The pair of D_y as plain conv weights, from layer k's target weights `wa` (analysis,
+        (M, 1, P, P)) and `wb` (synthesis, (M, 1, P, P)): `meas_grad` is then
+        conv(conv_transpose(z, wb_y) - y, wa_y). Used by models/fused_fidelity.py."""
+        if self.mode == "free":
+            return wa - self.A_S[k].conv_real.weight, wb - self.B_S[k].conv_real.weight
+        keep = (1.0 - self.m).view(-1, 1, 1, 1)
+        return keep * wa, keep * wb
+
+    def convs(self):
+        """Every conv module the coupling owns (none for the gate)."""
+        return list(self.A_S) + list(self.B_S) if self.mode == "free" else []
+
     def decode_layer(self, k, B, z):
         """S from a code through layer k's pair -- the in-loop estimate (decode is the readout)."""
         return self.B_S[k](z) if self.mode == "free" else B(self.gate() * z)
