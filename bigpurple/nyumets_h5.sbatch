@@ -25,6 +25,23 @@
 #                        reg_slice_shift and reg_ncc (the quality gate; studies below
 #                        --reg-min-ncc are flagged in the log).
 #
+#   --reg-method fit     NOT the default yet (2026-10-13). An image-based 3-D affine -- rotation,
+#                        per-axis scale and shift -- fitted to the T1s by gradient descent from
+#                        the centroid translation, then ONE resample onto the reference's grid.
+#                        Written because scripts/diagnose_nyumets_registration.py found, on the
+#                        centroid build, 38% of slices needing >= 3 deg of in-plane rotation and
+#                        43% matching a slice other than the one at their own index, with that
+#                        offset varying along z -- which no translation can express. A rejected
+#                        fit falls back to the centroid translation (reg_fit_ok attr).
+#                        ~16 s per non-reference study on 8 CPU threads at 190x224x224, so the
+#                        cohort wants a GPU or cpu_medium. Shake it out on a subset first and
+#                        re-run the diagnostic on the result:
+#
+#   OVERWRITE=1 REG_DEVICE=cuda EXTRA="--reg-method fit --limit 300" \
+#       OUT=~/scratch/datasets/NYUMets_h5_fit_test \
+#       sbatch --partition=radiology --gres=gpu:a100:1 bigpurple/nyumets_h5.sbatch
+#   python -m scripts.diagnose_nyumets_registration --root ~/scratch/datasets/NYUMets_h5_fit_test
+#
 # RUNTIME. centroid registration costs ~1.5 s per non-reference study on 8-10 CPU threads
 # (benchmarked 2026-09-25 at 224x224, depth ~190): ~1.5 h for the cohort on top of the NIfTI
 # loading, which cpu_short's 12 h should hold. --reg-method search is ~8 s per study (~7 h); for

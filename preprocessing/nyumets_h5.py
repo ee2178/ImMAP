@@ -76,6 +76,7 @@ img_median_mad -> raw is exact only away from the clipped tails.
 import os
 import re
 import csv
+import math
 import glob
 import argparse
 
@@ -527,6 +528,283 @@ def _register_affine(vols, cfg, ref, given):
     return offsets, valid
 
 
+# ---------------------------------------------------------------------------------------------
+# --reg-method fit: an image-based 3-D affine, found by gradient descent
+# ---------------------------------------------------------------------------------------------
+FIT_DOF = (6, 7, 9, 12)
+
+
+def _euler(r):
+    """(3,) radians about the (h, w, z) index axes -> a 3x3 rotation. Differentiable."""
+    c, n = torch.cos(r), torch.sin(r)
+    one, zero = torch.ones_like(c[0]), torch.zeros_like(c[0])
+    Rh = torch.stack([one, zero, zero, zero, c[0], -n[0], zero, n[0], c[0]]).view(3, 3)
+    Rw = torch.stack([c[1], zero, n[1], zero, one, zero, -n[1], zero, c[1]]).view(3, 3)
+    Rz = torch.stack([c[2], -n[2], zero, n[2], c[2], zero, zero, zero, one]).view(3, 3)
+    return Rz @ Rw @ Rh
+
+
+def fit_matrix(par, centre, t0, dof):
+    """Parameters -> the 4x4 `M` taking a REFERENCE index (h, w, z, 1) to the SOURCE index it is
+    sampled from -- `affine_matrix`'s convention, so `resample_to_ref` applies it unchanged.
+
+        src = A (x - centre) + centre + t0 + shift
+
+    A = rotation (6), x one scale (7), x one scale per axis (9), + a free 3x3 (12). Rotating
+    and scaling ABOUT THE BRAIN CENTRE is what keeps the parameters from fighting: about the
+    index origin, a 3 deg rotation moves the head ~10 voxels and the shift has to undo it.
+    """
+    A = _euler(par["rot"])
+    if dof == 7:
+        A = A * torch.exp(par["logs"][0])
+    elif dof >= 9:
+        A = A @ torch.diag(torch.exp(par["logs"]))
+    if dof == 12:
+        A = A + par["free"]
+    b = centre - A @ centre + t0 + par["shift"]
+    top = torch.cat([A, b.view(3, 1)], dim=1)
+    return torch.cat([top, top.new_tensor([[0.0, 0.0, 0.0, 1.0]])], dim=0)
+
+
+def _level_grid(M, out_dhw, src_dhw, f):
+    """grid_sample grid for a pyramid level pooled by `f`: where each pooled REFERENCE voxel
+    reads the pooled SOURCE. `M` stays in full-resolution index units throughout -- a pooled
+    voxel i is centred on full-resolution index (i + 1/2) f - 1/2, and back the same way."""
+    D, H, W = out_dhw
+    Ds, Hs, Ws = src_dhw
+    ax = lambda n: (torch.arange(n, dtype=M.dtype, device=M.device) + 0.5) * f - 0.5
+    z, h, w = ax(D).view(D, 1, 1), ax(H).view(1, H, 1), ax(W).view(1, 1, W)
+    sh, sw, sz = (M[r, 0] * h + M[r, 1] * w + M[r, 2] * z + M[r, 3] for r in range(3))
+    unit = lambda a, n: 2.0 * ((a + 0.5) / f - 0.5) / max(n - 1, 1) - 1.0
+    return torch.stack([unit(sw, Ws), unit(sh, Hs), unit(sz, Ds)], dim=-1)[None]
+
+
+def _weighted_ncc(x, y, w):
+    """Correlation of x and y under non-negative weights w (all the same shape)."""
+    n = w.sum().clamp_min(1e-6)
+    xm, ym = x - (x * w).sum() / n, y - (y * w).sum() / n
+    cov = (xm * ym * w).sum()
+    return cov / ((xm * xm * w).sum() * (ym * ym * w).sum()).clamp_min(1e-12).sqrt()
+
+
+def fit_affine(a, ma, b, mb, t0, dof=9, levels=(4, 2), iters=(120, 60), dev="cpu"):
+    """Affine of `b` onto `a` by maximising their masked correlation. -> (M 4x4 numpy, info).
+
+    a, ma   reference volume (D, H, W) and its bool mask;  b, mb  the moving one (own depth)
+    t0      (dz, dh, dw) starting translation, `translate`'s sign: out[i] = b[i + t0]
+
+    WHAT IT IS. The standard intensity-based registration loop (what SimpleITK's and ANTs'
+    rigid / affine stages do), written out:
+
+      transform   `fit_matrix` -- rotation, per-axis scale and shift about the brain centre
+      metric      correlation of the two T1s where BOTH have brain: the reference mask times the
+                  moving mask carried through the same transform. Same contrast, median/MAD
+                  normalised, so correlation is the right metric; mutual information is for
+                  pairs whose intensities are not linearly related.
+      optimiser   Adam on the transform parameters, gradients through trilinear grid_sample
+      pyramid     coarse to fine (`levels` = pooling factors): the coarse level sees a blurred
+                  head, so its optimum is wide enough to be reached from a rough start; the fine
+                  level sharpens it. `iters` per level.
+
+    `info` holds the correlation at the start (`ncc_init`) and at the end (`ncc`), both on the
+    finest level, and `overlap`, the share of the reference mask the moved mask still covers.
+    The caller decides whether to trust the fit from those.
+    """
+    dev = torch.device(dev)
+    a, b = a.to(dev, torch.float32), b.to(dev, torch.float32)
+    ma, mb = ma.to(dev, torch.float32), mb.to(dev, torch.float32)
+    idx = torch.nonzero(ma > 0.5).to(torch.float32)
+    if idx.numel() == 0:
+        raise ValueError("the reference has an empty brain mask")
+    cz, ch, cw = idx.mean(0)
+    centre = torch.stack([ch, cw, cz])                                   # (h, w, z)
+    t0v = torch.tensor([float(t0[1]), float(t0[2]), float(t0[0])], device=dev)
+
+    par = {"rot": torch.zeros(3, device=dev), "logs": torch.zeros(3, device=dev),
+           "shift": torch.zeros(3, device=dev), "free": torch.zeros(3, 3, device=dev)}
+    for v in par.values():
+        v.requires_grad_(True)
+
+    def pooled(x, f):
+        return F.avg_pool3d(x[None, None], f) if f > 1 else x[None, None]
+
+    def score(M, A, MA, B, MB, f):
+        grid = _level_grid(M, tuple(A.shape[2:]), tuple(B.shape[2:]), f)
+        wb = F.grid_sample(B, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        # The moving mask is carried through the transform, then used as a HARD weight with no
+        # gradient: only voxels wholly inside both brains count. A soft, differentiable weight
+        # biases the scale -- voxels half-interpolated across the moving mask's edge (or the
+        # volume's zero padding) correlate badly, and the cheapest way to shed them is to
+        # magnify the moving image until its edge leaves the reference mask. Measured: a
+        # consistent ~2% scale error on the analytic phantom, gone with the hard weight.
+        with torch.no_grad():
+            wm = F.grid_sample(MB, grid.detach(), mode="bilinear", padding_mode="zeros",
+                               align_corners=True)
+            w = MA * (wm > 0.999).to(MA.dtype)
+        return _weighted_ncc(A, wb, w), w.sum() / MA.sum().clamp_min(1e-6)
+
+    info = {}
+    for f, n_it in zip(levels, iters):
+        A, MA, B, MB = pooled(a, f), pooled(ma, f), pooled(b, f), pooled(mb, f)
+        if min(A.shape[2:]) < 4 or min(B.shape[2:]) < 4:
+            continue                                   # too small to pool this far
+        # step sizes in the units each parameter moves the HEAD by: ~1/4 voxel of this level
+        opt = torch.optim.Adam([
+            {"params": [par["rot"]], "lr": 0.004 * f / 2},
+            {"params": [par["logs"]], "lr": 0.002 * f / 2},
+            {"params": [par["shift"]], "lr": 0.25 * f},
+            {"params": [par["free"]], "lr": 0.001 * f / 2}])
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda k: 1.0 - 0.9 * k / max(n_it, 1))
+        for _ in range(n_it):
+            opt.zero_grad()
+            c, _ = score(fit_matrix(par, centre, t0v, dof), A, MA, B, MB, f)
+            (-c).backward()
+            opt.step()
+            sched.step()
+        with torch.no_grad():
+            zero = {k: torch.zeros_like(v) for k, v in par.items()}
+            c0, _ = score(fit_matrix(zero, centre, t0v, dof), A, MA, B, MB, f)
+            c1, ov = score(fit_matrix(par, centre, t0v, dof), A, MA, B, MB, f)
+            info = {"ncc_init": float(c0), "ncc": float(c1), "overlap": float(ov)}
+    if not info:
+        raise ValueError("volumes too small for any pyramid level")
+    with torch.no_grad():
+        M = fit_matrix(par, centre, t0v, dof).cpu().numpy().astype(np.float64)
+    return M, info
+
+
+def _register_fit(vols, cfg, ref=0, given=None):
+    """Image-based 3-D AFFINE onto vols[ref], then one trilinear resample. `--reg-method fit`.
+
+    Written after the 2026-10-13 diagnosis of the centroid build (scripts/
+    diagnose_nyumets_registration.py, 56 study pairs): 38% of slices needed an in-plane rotation
+    of >= 3 deg, 43% matched a slice other than the one at their own index, and that slice
+    offset VARIED along z in most pairs -- a grid mismatch (tilt, slice spacing) that no integer
+    translation, however well chosen, can express. This fits rotation, per-axis scale and shift
+    to the IMAGES (the headers do not relate anatomy across visits) and resamples.
+
+      1. start   the translation the centroid method would apply: `find_dz` + `centroid_shift`
+      2. fit     `fit_affine` on the normalised `reg_contrast`, coarse to fine (--reg-dof)
+      3. accept  only if the fit beat its own starting point, kept the brains overlapping and
+                 stayed within sane bounds; otherwise the study gets the starting translation
+                 and `reg_fit_ok` is False. A fit is never allowed to make things worse.
+      4. apply   `resample_to_ref`: raw / norm / fg / fov onto the reference's grid in one pass
+
+    As under `affine`, studies are not padded to a common depth, every study comes out on the
+    reference's grid (so `slice_index` names one anatomical level across the patient), and a
+    slice is valid where >= --reg-min-cover of the reference's brain was drawn from real data.
+    `v.reg["ncc"]` is the masked correlation with the reference afterwards, at full resolution.
+    """
+    ci = CONTRASTS.index(getattr(cfg, "reg_contrast", "T1"))
+    dev = torch.device(getattr(cfg, "reg_device", None) or "cpu")
+    stride = int(getattr(cfg, "reg_stride", 2))
+    max_dz = int(getattr(cfg, "reg_max_dz", 60))
+    min_cover = float(getattr(cfg, "reg_min_cover", 0.99))
+    dof = int(getattr(cfg, "reg_dof", 9))
+    if dof not in FIT_DOF:
+        raise ValueError(f"--reg-dof must be one of {FIT_DOF}, got {dof}")
+    levels = tuple(int(f) for f in getattr(cfg, "reg_levels", (4, 2)))
+    iters = tuple(int(n) for n in getattr(cfg, "reg_iters", (120, 60)))
+    if len(iters) != len(levels):
+        raise ValueError("--reg-iters needs one count per --reg-levels entry")
+    max_rot = math.radians(float(getattr(cfg, "reg_max_rot", 25.0)))
+    max_scale = float(getattr(cfg, "reg_max_scale", 0.25))
+
+    out_dhw = (vols[ref].raw.shape[0],) + tuple(int(n) for n in vols[ref].raw.shape[2:])
+    depth = max(v.raw.shape[0] for v in vols)
+    real = []
+    for i, v in enumerate(vols):
+        d0 = v.raw.shape[0]
+        if given is None:
+            ok = torch.ones(d0, dtype=torch.bool)
+        else:
+            ok = torch.as_tensor(np.asarray(given[i]), dtype=torch.bool)
+            if ok.shape[0] < d0:
+                ok = torch.cat([ok, torch.zeros(d0 - ok.shape[0], dtype=torch.bool)])
+            ok = ok[:d0]
+        real.append(ok)
+
+    def padded(x):                       # copies for the translation start only
+        if x.shape[0] == depth:
+            return x
+        return torch.cat([x, torch.zeros((depth - x.shape[0],) + x.shape[1:], dtype=x.dtype,
+                                         device=x.device)])
+
+    A = vols[ref].norm[:, ci].to(dev, torch.float32)
+    MA = vols[ref].fg.to(dev).bool()
+    grid = {"grid_affine": np.asarray(vols[ref].affine, dtype=np.float32),
+            "grid_native_hw": tuple(int(n) for n in vols[ref].native_hw)}
+    eye = np.eye(4, dtype=np.float32)
+
+    offsets, valid = [], []
+    for i, v in enumerate(vols):
+        if i == ref:
+            v.reg = dict(grid, method="fit", matrix=eye, oblique=0.0, cover=1.0, ncc=1.0,
+                         ncc_init=1.0, fit_ok=True, scale=(1.0, 1.0, 1.0))
+            offsets.append((0, 0, 0))
+            valid.append(real[i].numpy())
+            continue
+        B = v.norm[:, ci].to(dev, torch.float32)
+        MB = v.fg.to(dev).bool()
+        # 1. the centroid method's translation, measured on padded COPIES (it needs one shape)
+        Ap, MAp, Bp, MBp = padded(A), padded(MA), padded(B), padded(MB)
+        dz = find_dz(Ap, MAp, Bp, MBp, max_dz, stride)
+        dh, dw = centroid_shift(MAp, MBp, dz)
+        t0 = (dz, dh, dw)
+        M0 = np.eye(4)
+        M0[0, 3], M0[1, 3], M0[2, 3] = dh, dw, dz
+        del Ap, MAp, Bp, MBp
+
+        # 2-3. fit, and keep it only if it is an improvement that still looks like a head
+        M, info, why = M0, {"ncc_init": float("nan"), "ncc": float("nan")}, ""
+        try:
+            Mf, info = fit_affine(A, MA, B, MB, t0, dof=dof, levels=levels, iters=iters, dev=dev)
+            sv = np.linalg.svd(Mf[:3, :3], compute_uv=False)
+            rot = Mf[:3, :3] @ np.diag(1.0 / sv) if dof < 12 else Mf[:3, :3]
+            angle = math.acos(min(1.0, max(-1.0, (np.trace(Mf[:3, :3]) / max(sv.mean(), 1e-6)
+                                                   - 1.0) / 2.0)))
+            if not info["ncc"] > info["ncc_init"]:
+                why = "did not beat the starting translation"
+            elif info["overlap"] < 0.5:
+                why = f"brains overlap only {info['overlap']:.0%}"
+            elif sv.max() > 1 + max_scale or sv.min() < 1 - max_scale:
+                why = f"scale {sv.min():.2f}..{sv.max():.2f} outside 1 +- {max_scale}"
+            elif angle > max_rot:
+                why = f"rotation {math.degrees(angle):.0f} deg above --reg-max-rot"
+            else:
+                M = Mf
+            del rot
+        except ValueError as err:
+            why = str(err)
+        fit_ok = M is not M0
+        if not fit_ok:
+            print(f"  ?? fit rejected ({why}); this study gets the centroid translation {t0}")
+
+        # 4. one resample for everything
+        cover = resample_to_ref(v, M, out_dhw, real[i], dev)
+        roi = MA
+        num = (cover & roi).flatten(1).sum(1).to(torch.float32)
+        den = roi.flatten(1).sum(1).to(torch.float32)
+        frac = torch.where(den > 0, num / den.clamp_min(1.0),
+                           cover.flatten(1).to(torch.float32).mean(1))
+        valid.append((frac >= min_cover).cpu().numpy())
+
+        R = np.asarray(M[:3, :3])
+        sv = np.linalg.svd(R, compute_uv=False)
+        c = np.array([(out_dhw[1] - 1) / 2.0, (out_dhw[2] - 1) / 2.0, (out_dhw[0] - 1) / 2.0, 1.0])
+        t = (M @ c)[:3] - c[:3]                     # the closest single translation: reporting
+        v.reg = dict(grid, method="fit", matrix=np.asarray(M, dtype=np.float32),
+                     oblique=float(np.abs(R - np.diag(np.diag(R))).max()),
+                     cover=float(cover.to(torch.float32).mean()),
+                     ncc=masked_ncc(A, v.norm[:, ci].to(dev, torch.float32), MA,
+                                    v.fg.to(dev).bool(), (0, 0, 0), stride),
+                     ncc_init=float(info["ncc_init"]), fit_ok=bool(fit_ok),
+                     scale=tuple(float(x) for x in sorted(sv)))
+        offsets.append((int(round(t[2])), int(round(t[0])), int(round(t[1]))))
+        del cover, B, MB
+    return offsets, valid
+
+
 def register_patient(vols, cfg, ref=0, real=None):
     """-> (offsets, valid) for one patient's studies, all put onto vols[ref]'s grid.
 
@@ -536,6 +814,10 @@ def register_patient(vols, cfg, ref=0, real=None):
                         brain mask on the reference's. See `_register_centroid`.
       search            dz, then in-plane (dh, dw) -- one per volume, then per slice -- found by
                         searching the masked correlation of the images. See `_register_search`.
+      fit               an image-based 3-D affine (rotation, per-axis scale, shift) found by
+                        gradient descent on the masked correlation, then one resample. The
+                        only method that corrects rotation and scale FROM THE IMAGES. See
+                        `_register_fit`.
       affine            read the rigid transform off the headers and resample. Exact for a
                         rigid pair on a common grid, and it corrects ROTATION, which the
                         cohort has ~6.5 deg of between sessions.
@@ -559,6 +841,8 @@ def register_patient(vols, cfg, ref=0, real=None):
         return _register_centroid(vols, cfg, ref, real)
     if method == "search":
         return _register_search(vols, cfg, ref, real)
+    if method == "fit":
+        return _register_fit(vols, cfg, ref, real)
     if method == "affine":
         return _register_affine(vols, cfg, ref, real)
     return _register_xcorr(vols, cfg, ref, real)
@@ -1253,6 +1537,11 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
         # masked correlation of reg_contrast with the reference AFTER registration (search only;
         # NaN otherwise). The quality gate: a low value is a study that did not align.
         f.attrs["reg_ncc"] = float(r.get("ncc", float("nan")))
+        if r.get("method") == "fit":
+            # False: the fit was rejected and this study carries the centroid translation only
+            f.attrs["reg_fit_ok"] = bool(r.get("fit_ok", False))
+            f.attrs["reg_ncc_init"] = float(r.get("ncc_init", float("nan")))
+            f.attrs["reg_scale"] = np.asarray(r.get("scale", (1.0, 1.0, 1.0)), dtype=np.float32)
         if r.get("slice_shift") is not None:
             # (n, 2) in-plane (dh, dw) applied to each STORED slice, after the whole-volume dz.
             # Under reg_slicewise these differ slice to slice; reg_offset holds the global one.
@@ -1260,7 +1549,13 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
                              data=np.asarray(r["slice_shift"])[idx].astype(np.int32))
         f.attrs["reg_rule"] = (
             "none" if not r.get("applied") else
-            ("rigid transform read off the NIfTI affines (inv(A_other) @ A_ref), applied by "
+            (f"image-based 3-D affine ({getattr(cfg, 'reg_dof', 9)} dof: rotation, scale, shift) "
+             f"maximising the masked correlation of the normalised {cfg.reg_contrast} with the "
+             f"reference, started from the centroid translation, applied by one trilinear "
+             f"grid_sample onto the reference's grid (reg_matrix); reg_fit_ok False = the fit "
+             f"was rejected and only the starting translation was applied"
+             if r.get("method") == "fit" else
+             "rigid transform read off the NIfTI affines (inv(A_other) @ A_ref), applied by "
              "trilinear grid_sample onto the reference's grid: rotation AND translation, "
              "border padding for intensities, nearest-threshold for the masks"
              if r.get("method") == "affine" else
@@ -1312,8 +1607,13 @@ def main():
                     help="do NOT align a patient's studies to one another (they are then "
                          "written on their own index axes, as before 2026-09-23)")
     ap.add_argument("--reg-method", default="centroid",
-                    choices=("centroid", "search", "affine", "xcorr"), dest="reg_method",
-                    help="centroid (default): dz by masked correlation, then one in-plane "
+                    choices=("centroid", "search", "fit", "affine", "xcorr"), dest="reg_method",
+                    help="fit: an image-based 3-D affine -- rotation, per-axis scale and shift, "
+                         "found by gradient descent on the masked T1 correlation from the "
+                         "centroid translation, then ONE resample onto the reference's grid. "
+                         "The only method that corrects rotation and scale from the images; "
+                         "see _register_fit (--reg-dof, --reg-levels, --reg-iters). "
+                         "centroid (default): dz by masked correlation, then one in-plane "
                          "(dh, dw) centring the brain mask on the reference's -- see "
                          "_register_centroid. "
                          "search: dz, then in-plane (dh, dw) -- one per volume, then "
@@ -1326,6 +1626,19 @@ def main():
                          "cross-correlation, integer translation only -- it cannot remove the "
                          "~6.5 deg of median inter-session obliqueness the 2026-09-24 survey "
                          "measured, which leaves ~13 voxels of error at the edge of the head")
+    ap.add_argument("--reg-dof", type=int, default=9, choices=FIT_DOF, dest="reg_dof",
+                    help="fit: 6 rigid | 7 + one scale | 9 + one scale per axis (default: the "
+                         "2026-10-13 diagnosis found slice offsets drifting along z, which a "
+                         "z-scale absorbs) | 12 full affine")
+    ap.add_argument("--reg-levels", type=int, nargs="+", default=[4, 2], dest="reg_levels",
+                    help="fit: pooling factor of each pyramid level, coarse to fine. Add 1 for "
+                         "a full-resolution level (several times slower)")
+    ap.add_argument("--reg-iters", type=int, nargs="+", default=[120, 60], dest="reg_iters",
+                    help="fit: optimiser steps per level")
+    ap.add_argument("--reg-max-rot", type=float, default=25.0, dest="reg_max_rot",
+                    help="fit: reject a fit rotating by more than this many degrees")
+    ap.add_argument("--reg-max-scale", type=float, default=0.25, dest="reg_max_scale",
+                    help="fit: reject a fit scaling any axis outside 1 +- this")
     ap.add_argument("--reg-min-cover", type=float, default=0.99, dest="reg_min_cover",
                     help="--reg-method affine only: keep an output slice when at least this "
                          "fraction of the REFERENCE'S BRAIN on it was drawn from real acquired "
@@ -1623,6 +1936,26 @@ def main():
                       f"{statistics.median(cv):.3f}  min {min(cv):.3f}")
                 print(f"  slices are kept only where >= {cfg.reg_min_cover:.0%} of the "
                       f"REFERENCE'S BRAIN is covered")
+        elif cfg.reg_method == "fit":
+            regs = [r or {} for _, _, r in reg_rows]
+            nc = [float(r.get("ncc", float("nan"))) for r in regs]
+            nc = [c for c in nc if c == c]
+            bad = sum(not r.get("fit_ok", False) for r in regs)
+            deg = lambda x: math.degrees(math.asin(min(abs(x), 1.0)))
+            ob = [float(r.get("oblique", 0.0)) for r in regs]
+            sc = [max(abs(x - 1.0) for x in r.get("scale", (1.0,))) for r in regs]
+            if nc:
+                low = sum(c < cfg.reg_min_ncc for c in nc)
+                print(f"  masked correlation with the reference after registration: median "
+                      f"{statistics.median(nc):.3f}  min {min(nc):.3f}  "
+                      f"{low}/{len(nc)} below --reg-min-ncc {cfg.reg_min_ncc} (reg_ncc attr)")
+            print(f"  rotation corrected: median {deg(statistics.median(ob)):.1f} deg  max "
+                  f"{deg(max(ob)):.1f} deg;  |scale - 1|: median {statistics.median(sc):.3f}  "
+                  f"max {max(sc):.3f}")
+            print(f"  fits rejected (study left on the centroid translation): {bad}/{len(regs)} "
+                  f"(reg_fit_ok attr)")
+            print("  The offset above is only the closest single translation; the transform "
+                  "applied is each file's `reg_matrix`.")
         elif cfg.reg_method in ("search", "centroid"):
             nc = [float((r or {}).get("ncc", float("nan"))) for _, _, r in reg_rows]
             nc = [c for c in nc if c == c]
