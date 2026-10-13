@@ -84,6 +84,11 @@ CONFIGS=(
     config/NYUMets/synth_sbguidedcdl_otherstudy_w0_sfree_flex.json
     config/NYUMets/synth_sbguidedcdl_otherstudy_w1_sfree_flex.json
     config/NYUMets/synth_sbguidedcdl_otherstudy_w2_sfree_flex.json
+    # 5-7: the guided runs at effective batch 64 (batch_size 32 x accum_steps 2). NOT in
+    # the default --array range: submit with  sbatch --array=5-7 bigpurple/synth_sbcdlnet_array.sbatch
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w0_sfree_flex_bs64.json
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w1_sfree_flex_bs64.json
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w2_sfree_flex_bs64.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
