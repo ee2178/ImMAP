@@ -29,7 +29,17 @@ WHAT IS DELIBERATELY DIFFERENT FROM train_i2sb
     loads it and says so when it is missing.
   * The critics' learning rates FOLLOW the regressor's schedule (same ratio to their base lr), so a
     cosine-annealed G is never facing a constant-lr D.
-  * No gradient accumulation and no learned DC; the entropy critic needs batch >= 2.
+  * No learned DC; the entropy critic needs data.batch_size >= 2.
+
+GRADIENT ACCUMULATION (`accum_steps` > 1; effective batch = data.batch_size * accum_steps, as in
+train_i2sb). The update stays ALTERNATING -- D and E step on the whole effective batch first, and
+G is then graded by the UPDATED critics -- which a single pass over the micro-batches cannot do,
+since G's graphs for all of them would have to be held at once. So the step runs in two passes:
+    pass 1   per micro-batch: chain + G with NO grad, D and E gradients accumulated; then D, E step
+    pass 2   per micro-batch: G again on the SAME x_t, with grad; G gradients accumulated; G steps
+at the price of one extra no-grad G evaluation per micro-batch. Each micro-batch draws its own
+stage j, so one step averages over `accum_steps` stages instead of using one. The entropy
+critic's negatives still come from within a micro-batch. accum_steps = 1 is the old single pass.
 
 LOGGING follows the repo preference: val/psnr, val/ssim, val/nrmse and IMAGES. Three panels: the
 chain (source | each stage's prediction | GT), the residual, and -- when conditioning exists -- the
@@ -136,6 +146,7 @@ def train_unsb(
     val_every_epochs=10,
     save_every_epochs=5,
     clip_grad=1.0,
+    accum_steps=1,                   # micro-batches per optimizer step (see the module docstring)
     use_mask=False,
     psnr_only=False,
     val_slices=None,
@@ -201,6 +212,12 @@ def train_unsb(
         raise ValueError(f"nce_extractor {nce_extractor!r} must be 'encoder' or 'tap'")
     if nce and nce_extractor == "tap" and not nce_layers:
         raise ValueError("nce_extractor='tap' needs nce_layers (names from net.named_modules())")
+    accum_steps = int(accum_steps)
+    if accum_steps < 1:
+        raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
+    if accum_steps > 1:
+        print(f"[unsb] gradient accumulation x{accum_steps}: one optimizer step (D, E and G) per "
+              f"{accum_steps} micro-batches")
     if lambda_gan <= 0:
         raise ValueError("lambda_gan must be > 0: the discriminator is the only term that defines "
                          "the target contrast")
@@ -334,49 +351,66 @@ def train_unsb(
         n_batches = 0
 
         for _ in range(steps_per_epoch):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
-            x0, x1, cond, mask, et, guide = _split_batch(batch, device)
-
-            # ----- one on-policy sample of the chain -----
-            g_fn = make_g_fn(net, bridge, x1, cond=cond, target_channels=target_channels,
-                             guide=guide)
-            state = unsb_forward(g_fn, bridge, x1, steps, sample_stage(num_stages),
-                                 noise_scale=train_noise_scale)
-
-            if pairing == "shuffle" and x0.shape[0] > 1:       # a real CT1 from ANOTHER case
-                x0_real = x0.roll(1, dims=0)
-                cond_real = None if cond is None else cond.roll(1, dims=0)
-            else:
-                x0_real, cond_real = x0, cond
-
-            # ----- D (and E) on the detached prediction -----
-            set_requires_grad(D, True)
+            # ----- pass 1: D (and E) on the detached predictions of every micro-batch -----
+            set_requires_grad([m for m in (D, E) if m is not None], True)
             opt_d.zero_grad(set_to_none=True)
-            loss_d = d_loss(D, state, x0_real, cond=cond, cond_real=cond_real, cond_d=cond_d)
-            loss_d.backward()
-            opt_d.step()
-            loss_e = None
             if E is not None:
-                set_requires_grad(E, True)
                 opt_e.zero_grad(set_to_none=True)
-                loss_e = e_loss(E, state)
-                loss_e.backward()
+            micro, vals = [], {}
+            for _ in range(accum_steps):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
+                x0, x1, cond, mask, et, guide = _split_batch(batch, device)
+
+                # one on-policy sample of the chain. Under accumulation G's graph is not kept
+                # here: pass 2 recomputes the prediction on the same x_t.
+                g_fn = make_g_fn(net, bridge, x1, cond=cond, target_channels=target_channels,
+                                 guide=guide)
+                with torch.set_grad_enabled(accum_steps == 1):
+                    state = unsb_forward(g_fn, bridge, x1, steps, sample_stage(num_stages),
+                                         noise_scale=train_noise_scale)
+
+                if pairing == "shuffle" and x0.shape[0] > 1:       # a real CT1 from ANOTHER case
+                    x0_real = x0.roll(1, dims=0)
+                    cond_real = None if cond is None else cond.roll(1, dims=0)
+                else:
+                    x0_real, cond_real = x0, cond
+
+                loss_d = d_loss(D, state, x0_real, cond=cond, cond_real=cond_real, cond_d=cond_d)
+                (loss_d / accum_steps).backward()
+                vals["d"] = vals.get("d", 0.0) + loss_d.detach() / accum_steps
+                if E is not None:
+                    loss_e = e_loss(E, state)
+                    (loss_e / accum_steps).backward()
+                    vals["e"] = vals.get("e", 0.0) + loss_e.detach() / accum_steps
+                micro.append((x0, x1, cond, mask, guide, state))
+            opt_d.step()
+            if E is not None:
                 opt_e.step()
 
-            # ----- G (+ NCE head), with the critics frozen so gradients reach only the generator -----
+            # ----- pass 2: G (+ NCE head), with the UPDATED critics frozen so gradients reach
+            # only the generator -----
             set_requires_grad([m for m in (D, E) if m is not None], False)
             opt.zero_grad(set_to_none=True)
             if opt_aux is not None:
                 opt_aux.zero_grad(set_to_none=True)
-            nce_fn = (make_nce_fn(extractor, pnce, bridge, cond=cond,
-                                  mask=mask if nce_mask else None) if nce else None)
-            total, terms = g_loss(D, E, state, bridge, x1, cond=cond, nce=nce_fn, cond_d=cond_d,
-                                  lambda_gan=lambda_gan, lambda_sb=lambda_sb, lambda_nce=lambda_nce)
-            total.backward()
+            for x0, x1, cond, mask, guide, state in micro:
+                if accum_steps > 1:
+                    g_fn = make_g_fn(net, bridge, x1, cond=cond, target_channels=target_channels,
+                                     guide=guide)
+                    state = state._replace(x_hat=g_fn(state.x_t, state.step))
+                nce_fn = (make_nce_fn(extractor, pnce, bridge, cond=cond,
+                                      mask=mask if nce_mask else None) if nce else None)
+                total, terms = g_loss(D, E, state, bridge, x1, cond=cond, nce=nce_fn, cond_d=cond_d,
+                                      lambda_gan=lambda_gan, lambda_sb=lambda_sb,
+                                      lambda_nce=lambda_nce)
+                (total / accum_steps).backward()
+                for k, v in {"g": total.detach(), **terms}.items():
+                    vals[k] = vals.get(k, 0.0) + v / accum_steps
+            del micro
             if clip_grad is not None:
                 torch.nn.utils.clip_grad_norm_(g_params, clip_grad)
             opt.step()
@@ -390,15 +424,13 @@ def train_unsb(
                 sched.step()
             _sync_lrs(opt, base_lr_g, lr_followers)
 
-            vals = {"g": total.detach(), "d": loss_d.detach(), **terms}
-            if loss_e is not None:
-                vals["e"] = loss_e.detach()
             for k, v in vals.items():
                 running[k] = running.get(k, 0.0) + v
             n_batches += 1
             pbar.update(1)
             if n_batches % POSTFIX_EVERY == 0:
-                pbar.set_postfix(g=f"{total.item():.3e}", d=f"{loss_d.item():.3e}", epoch=epoch)
+                pbar.set_postfix(g=f"{vals['g'].item():.3e}", d=f"{vals['d'].item():.3e}",
+                                 epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
         means = {k: float(v) / max(n_batches, 1) for k, v in running.items()}     # the ONE sync

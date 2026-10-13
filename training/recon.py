@@ -35,6 +35,19 @@ from operators import Mask, FFT2D, Sense
 # identical operator; the alias keeps this module's call sites unchanged.
 _embed = embed_for_net
 
+# NON-FINITE STEPS ARE SKIPPED, NOT APPLIED (2026-10-13; Sljiva's train.jl
+# guards `isnan(loss)` and `isnan(gradnorm)` before `Optimisers.update!`). A
+# step whose loss or gradient norm is NaN / inf used to go into the optimizer:
+# the weights and Adam's moments turned NaN, the rest of the epoch was wasted
+# on them, and the epoch-end check then restored the best checkpoint -- often
+# far older than the bad step -- at a lower learning rate. One bad batch is not
+# a diverged run, so it is now dropped and training carries on from where it
+# was.
+#
+# More than this share of an epoch's steps skipped means the WEIGHTS are the
+# problem, not a batch, and the epoch is handed to the existing restore.
+MAX_SKIPPED_FRACTION = 0.1
+
 
 def train_recon(
     net,
@@ -158,7 +171,9 @@ def train_recon(
     for epoch in range(start_epoch, num_epochs):
         net.train()
         running_loss = 0.0
-        n_batches = 0
+        n_batches = 0             # steps APPLIED: what the average is over
+        n_skipped = 0             # steps dropped for a non-finite loss / gradient
+        last_ok = None            # (image, recon, organ_mask) of the last applied step
         profiling_epoch = prof.on
 
         # ==================================================================
@@ -230,16 +245,31 @@ def train_recon(
             loss.backward()
             prof.mark("backward")
 
-            if clip_grad is not None:
-                nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
+            # The gradient norm BEFORE clipping. With no clip configured the
+            # norm is still needed for the check below; an infinite max_norm
+            # computes it and scales the gradients by exactly 1.
+            grad_norm = nn.utils.clip_grad_norm_(
+                net.parameters(),
+                clip_grad if clip_grad is not None else float("inf"))
 
-            opt.step()
+            # Apply the step only if both are finite (see MAX_SKIPPED_FRACTION).
+            # This is the step's one device sync: the host waits here for the
+            # backward pass it has just queued.
+            step_ok = bool(torch.isfinite(loss.detach()) & torch.isfinite(grad_norm))
+
+            if step_ok:
+                opt.step()
+            else:
+                opt.zero_grad(set_to_none=True)    # nothing of this step survives
+                n_skipped += 1
             prof.mark("opt")
 
-            if hasattr(net, "project"):
+            if step_ok and hasattr(net, "project"):
                 net.project()
             prof.mark("project")
 
+            # The schedule is a function of the step COUNT, skipped or not, so
+            # that it still spans exactly the configured number of steps.
             if sched is not None:
                 sched.step()
             prof.mark("opt")
@@ -248,11 +278,13 @@ def train_recon(
             prof.infer(net, y, E, sigma_n)
             prof.end(image.shape[-2:], embedded=not T.is_identity)
 
-            running_loss += loss.detach()          # on-device; no sync
-            n_batches += 1
+            if step_ok:
+                running_loss += loss.detach()      # on-device; no sync
+                n_batches += 1
+                last_ok = (image, recon.detach(), organ_mask)
 
             pbar.update(1)
-            if n_batches % POSTFIX_EVERY == 0:
+            if step_ok and n_batches % POSTFIX_EVERY == 0:
                 pbar.set_postfix(loss=f"{loss.item():.2e}", epoch=epoch)
 
         global_step = (epoch + 1) * steps_per_epoch
@@ -261,16 +293,26 @@ def train_recon(
         # END-OF-EPOCH: averaged-loss backtracking + checkpoint + logging
         # ==================================================================
         t_epoch_end = time.perf_counter()
-        avg_loss = float(running_loss) / max(n_batches, 1)   # the ONE sync
-        nonfinite = not math.isfinite(avg_loss)
+        # Averaged over the steps that were APPLIED. A skipped step's loss is
+        # non-finite by definition, and one of those in the sum would turn a
+        # dropped batch into a restore -- the thing skipping it avoids.
+        avg_loss = float(running_loss) / max(n_batches, 1)
+        too_many = n_skipped > MAX_SKIPPED_FRACTION * steps_per_epoch
+        nonfinite = n_batches == 0 or too_many or not math.isfinite(avg_loss)
+        if n_skipped:
+            print(f"[epoch {epoch}] skipped {n_skipped} of {steps_per_epoch} steps: "
+                  f"non-finite loss or gradient, not applied to the weights")
 
-        # Metrics on the last batch -- for LOGGING ONLY.
-        with torch.no_grad():
-            train_metrics = compute_metrics(
-                image.abs(), recon.abs(), mask=metric_mask(organ_mask))
-        train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
+        # Metrics on the last APPLIED batch -- for LOGGING ONLY.
+        train_metrics = {}
+        if last_ok is not None:
+            image_m, recon_m, organ_mask_m = last_ok
+            with torch.no_grad():
+                train_metrics = compute_metrics(
+                    image_m.abs(), recon_m.abs(), mask=metric_mask(organ_mask_m))
+            train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
-        # A non-finite loss always attempts a restore (protective: never let a
+        # A non-finite epoch always attempts a restore (protective: never let a
         # NaN update get checkpointed over a good model). The threshold check
         # only fires when backtracking is enabled.
         should_backtrack = nonfinite or (
@@ -278,7 +320,10 @@ def train_recon(
         )
 
         if should_backtrack:
-            reason = "non-finite loss" if nonfinite else (
+            reason = (
+                f"{n_skipped} of {steps_per_epoch} steps non-finite "
+                f"(more than {MAX_SKIPPED_FRACTION:.0%})" if (too_many or n_batches == 0)
+                else "non-finite loss" if nonfinite else
                 f"avg loss {avg_loss:.3e} > best {best_loss:.3e} + {backtrack_thresh}"
             )
             print(f"[epoch {epoch}] {reason} — backtracking")

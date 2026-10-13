@@ -42,6 +42,10 @@ The statistics pass runs the complex, eager path (the planar state and the
 fused kernels compute the same map; they are switched off so every quantity
 can be read). The gradient probe runs the run's OWN configuration.
 
+--params-only stops after the parameter report: no data, no forward pass and
+no GPU, so it runs on a login node in seconds. Everything else needs a GPU
+(the attention runs on the flex backend).
+
 --synthetic H W COILS uses a synthetic SENSE problem instead of the dataset
 (the code statistics then say less; the parameter report is unaffected).
 """
@@ -295,6 +299,7 @@ def gradient_probe(net, loss_of, clip):
     net.zero_grad(set_to_none=True)
     loss = loss_of()
     loss.backward()
+    loss = loss.detach()
     fam, top, bad = {}, [], 0
     for n, p in net.named_parameters():
         if p.grad is None:
@@ -333,6 +338,9 @@ def main():
     ap.add_argument("--n", type=int, default=3, help="validation slices")
     ap.add_argument("--sigma", type=float, default=None, help="default: the run's val noise")
     ap.add_argument("--synthetic", type=int, nargs=3, default=None, metavar=("H", "W", "COILS"))
+    ap.add_argument("--params-only", action="store_true",
+                    help="only the parameter report: no data, no forward pass, no GPU -- "
+                         "seconds on a login node")
     ap.add_argument("--no-grad-probe", action="store_true")
     ap.add_argument("--all-layers", action="store_true",
                     help="print the per-layer table for every slice, not just the first")
@@ -372,6 +380,20 @@ def main():
 
     rows, steps, alphas = parameter_report(net, sigma)
     print_parameters(rows, steps, alphas)
+    if args.params_only:
+        dest = os.path.join(args.run, "diagnose_group_params.json")
+        with open(dest, "w") as f:
+            json.dump(dict(run=args.run, ckpt=path, step=step, sigma=sigma, parameters=rows,
+                           lpds_steps=steps, alphas=alphas), f, indent=1)
+        print(f"\nwrote {dest}")
+        return
+    if device.type != "cuda" and getattr(net, "attn_backend", None) == "flex" \
+            and not args.synthetic:
+        raise SystemExit(
+            "\nThe per-layer statistics and the gradient probe need a GPU: this net's "
+            "attention runs on\nthe flex backend, whose CPU path materialises every "
+            "query-key score (tens of GB at this\nimage size) and has no backward. "
+            "Rerun on a GPU node, or use --params-only here.")
 
     loss_fn = LOSS_REGISTRY[train.get("loss_type", "magnitude-nl1-nl2")]
     use_mask = bool(train.get("use_organ_mask", False))
@@ -429,7 +451,10 @@ def main():
                 rec.on = False
                 first_call = first_call or run
                 g, o = masked(gt, out, m)
-                nrmse = float((g - o).abs().pow(2).sum().sqrt()
+                # on MAGNITUDES, as training's loss and metrics are: the target's
+                # phase reference (stored maps) is not the online maps', so a
+                # complex difference measures the phase convention, not the net
+                nrmse = float((g.abs() - o.abs()).pow(2).sum().sqrt()
                               / g.abs().pow(2).sum().sqrt().clamp_min(1e-30))
                 loss = float(loss_fn(g, o, sigma))
                 finite = bool(torch.isfinite(torch.view_as_real(out)).all())

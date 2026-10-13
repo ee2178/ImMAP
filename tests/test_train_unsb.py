@@ -215,6 +215,55 @@ def test_gan_only_runs_with_nothing_but_the_discriminator():
         assert st["pnce"] is None and st["E"] is None and st["opt_aux"] is None
 
 
+def test_gradient_accumulation_steps_every_optimizer_once_per_step():
+    """accum_steps micro-batches -> ONE step of G, D, E and the NCE head, and one scheduler tick."""
+    with tempfile.TemporaryDirectory() as d:
+        net = make_unet()
+        before = snapshot(net)
+        net, opt, sched = run(net, d, num_epochs=1, accum_steps=3, ema_decay=0.9, nce=True,
+                              nce_extractor="tap",
+                              nce_layers=["input_blocks.1", "input_blocks.3"], entropy=True,
+                              cond_d=True, wb=FakeWandb())
+        assert changed(net, before), "G did not train under accumulation"
+        st = torch.load(os.path.join(d, "unsb_nets.ckpt"), weights_only=False)
+        for key in ("opt_d", "opt_e", "opt_aux"):
+            n = {int(float(v["step"])) for v in st[key]["state"].values()}
+            assert n == {STEPS}, (key, n)
+        assert sched.last_epoch == STEPS
+        assert all(p.requires_grad for p in net.parameters())
+        raises(ValueError, lambda: run(make_unet(), d, num_epochs=1, accum_steps=0), "accum_steps")
+
+
+def test_accumulated_step_is_the_mean_over_micro_batches():
+    """Two IDENTICAL micro-batches at one fixed stage, no noise: the accumulated gradient equals a
+    single micro-batch's, so the weights after one step match accum_steps = 1 (Adam is
+    scale-free only up to eps, so this is a statement about the 1/accum_steps scaling)."""
+    import sb.unsb as U
+    import training.unsb as T
+    stage = T.sample_stage
+    try:
+        T.sample_stage = lambda K: 0                       # stage 0: x_t = x1, no chain noise
+        out = []
+        for accum in (1, 2):
+            with tempfile.TemporaryDirectory() as d:
+                net = make_unet()
+                opt = torch.optim.SGD(net.parameters(), lr=1e-2)
+                x0, x1 = torch.rand(2, 1, H, H), torch.rand(2, 1, H, H)
+                cond = torch.cat([x0 * 0.5, x1, x0 * 0.2], dim=1)
+                ld = DataLoader(TensorDataset(x0, x1, cond, torch.ones(2, 1, H, H)), batch_size=2)
+                torch.manual_seed(0)
+                T.train_unsb(net, opt, None, torch.device("cpu"), ld, None, num_epochs=1,
+                             steps_per_epoch=1, save_dir=d, num_stages=3, kind="brownian", tau=TAU,
+                             n_points=N, ndf=8, nce=False, entropy=False, clip_grad=None,
+                             accum_steps=accum, data_range=1.0)
+                out.append(snapshot(net))
+        err = max(float((a - b).abs().max()) for a, b in zip(*out))
+        assert err < 1e-5, err
+    finally:
+        T.sample_stage = stage
+    del U
+
+
 def test_guard_rails():
     with tempfile.TemporaryDirectory() as d:
         # prior_idx must index the source INSIDE cond (here T1 is cond[1], not cond[0])
