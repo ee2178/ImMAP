@@ -266,6 +266,16 @@ def main(config_path):
         "net.ckpt"
     )
 
+    # The relative backtrack threshold is on by default for reconstruction
+    # (training/recon.py::BACKTRACK_RATIO). Written into the run's config.json
+    # so the file records what the run trained under; a config that already
+    # carries the key -- `null` to turn the check off -- keeps its own value.
+    # Not written by the config generator, so a run launched before the key
+    # existed still matches its generated config and resumes.
+    if task == "recon":
+        from training.recon import BACKTRACK_RATIO
+        cfg["training"].setdefault("backtrack_ratio", BACKTRACK_RATIO)
+
     # Save args (now carries wandb id + ckpt path -> resume-ready)
     save_config(cfg)
 

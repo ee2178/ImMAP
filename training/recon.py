@@ -48,6 +48,22 @@ _embed = embed_for_net
 # problem, not a batch, and the epoch is handed to the existing restore.
 MAX_SKIPPED_FRACTION = 0.1
 
+# RELATIVE BACKTRACK THRESHOLD (2026-10-13; Sljiva's `backtrack_factor`, there
+# 100-500). An epoch whose average loss exceeds this many times the best
+# epoch's is restored from the checkpoint at a lower learning rate. Before
+# this, with `backtrack_thresh` None in every generated config, only a
+# NON-FINITE epoch was -- a run that blew up to a large finite loss, or
+# collapsed to an all-zero output, just kept training.
+#
+# A RATIO, because the losses used here are normalised by the target (nl1 + nl2:
+# an all-zero output scores ~2 whatever the anatomy), so one number serves every
+# cell and no loss scale has to be known in advance -- the reason the absolute
+# margin was never set. 2 is deliberately loose: the "best" it is compared with
+# is the luckiest of many noisy 50-step batch-1 averages, and a false alarm
+# costs an epoch and 10% of the learning rate for good; a genuinely diverged
+# run is far past it (a collapse from a best of 0.27 is 7x).
+BACKTRACK_RATIO = 2.0
+
 
 def train_recon(
     net,
@@ -113,6 +129,10 @@ def train_recon(
     # not a PSNR margin. None disables the threshold check (but a non-finite
     # loss will still trigger a protective restore). Tune to your loss scale.
     backtrack_thresh=None,
+    # The RELATIVE check: restore when the epoch's average loss exceeds
+    # `backtrack_ratio` x the best epoch's (see BACKTRACK_RATIO). None turns it
+    # off. Independent of `backtrack_thresh`; either one triggers a restore.
+    backtrack_ratio=BACKTRACK_RATIO,
     backtrack_factor=0.8,
     # Backtracking bookkeeping, threaded in from train.py so it survives a
     # requeue. `backtrack_count` sets the LR amplitude (lr0 * factor**count) and
@@ -313,17 +333,23 @@ def train_recon(
             train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
         # A non-finite epoch always attempts a restore (protective: never let a
-        # NaN update get checkpointed over a good model). The threshold check
-        # only fires when backtracking is enabled.
-        should_backtrack = nonfinite or (
-            backtrack_enabled and avg_loss > best_loss + backtrack_thresh
-        )
+        # NaN update get checkpointed over a good model). The two finite checks
+        # compare with the best epoch so far: by a ratio (on unless
+        # `backtrack_ratio` is None) and by an absolute margin (off unless
+        # `backtrack_thresh` is set). Neither can fire before a first
+        # checkpoint exists -- best_loss is +inf until then.
+        over_ratio = (backtrack_ratio is not None and math.isfinite(best_loss)
+                      and avg_loss > backtrack_ratio * best_loss)
+        over_margin = backtrack_enabled and avg_loss > best_loss + backtrack_thresh
+        should_backtrack = nonfinite or over_ratio or over_margin
 
         if should_backtrack:
             reason = (
                 f"{n_skipped} of {steps_per_epoch} steps non-finite "
                 f"(more than {MAX_SKIPPED_FRACTION:.0%})" if (too_many or n_batches == 0)
                 else "non-finite loss" if nonfinite else
+                f"avg loss {avg_loss:.3e} > {backtrack_ratio:g} x best {best_loss:.3e}"
+                if over_ratio else
                 f"avg loss {avg_loss:.3e} > best {best_loss:.3e} + {backtrack_thresh}"
             )
             print(f"[epoch {epoch}] {reason} — backtracking")
