@@ -769,6 +769,18 @@ def val_noise_std(anatomy):
 
 VAL_SEED = 1234
 
+# Max gradient norm for every cell (`training.clip_grad`). 0.05 since
+# 2026-10-13, 1.0 before: the nets proved sensitive to the averaged-loss
+# backtrack (a step large enough to trip it costs the epoch and halves the LR),
+# so the step size is bounded harder up front.
+#
+# LIKE NOISE_STD, CHANGING THIS INVALIDATES RUN DIRS. A cell launched at 1.0 is
+# REFUSED by the launch-once guard when its launcher is resubmitted (the config
+# differs in training.clip_grad) -- deliberately: it is a different training
+# setup. To continue such a run as it was, submit with CLIP_GRAD=1.0 (the
+# launcher passes it to --clip-grad) or use torch/mg_recon_resume.sbatch.
+CLIP_GRAD = 0.05
+
 
 def cells(anatomy=None, only=None, accels=None, every=False):
     """The canonical cell order, optionally for one anatomy.
@@ -1216,7 +1228,7 @@ def make_config(anatomy, r, model, args):
             "val_noise_std": val_noise_std(anatomy),
             "val_seed": VAL_SEED,
             "loss_type": "magnitude-nl1-nl2",
-            "clip_grad": 1.0,
+            "clip_grad": float(getattr(args, "clip_grad", CLIP_GRAD)),
             # Loss AND metrics AND the wandb panel -- see training/recon.py.
             "use_organ_mask": bool(getattr(args, "organ_mask", False)),
             # None disables the averaged-loss backtrack THRESHOLD (a non-finite
@@ -1319,6 +1331,10 @@ def main():
     p.add_argument("--steps-per-epoch", type=int, default=50)
     p.add_argument("--val-every-epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=5.0e-4)
+    p.add_argument("--clip-grad", type=float, default=CLIP_GRAD,
+                   help="max gradient norm (training.clip_grad), every cell. "
+                        "0.05 since 2026-10-13; pass 1.0 to regenerate the "
+                        "configs runs launched before that were trained under.")
     p.add_argument("--lr-group", type=float, default=2.0e-4,
                    help="initial LR for the group-attention cells "
                         "(MGGroupLPDS, and any GroupCDL/MGGroupCDL added "

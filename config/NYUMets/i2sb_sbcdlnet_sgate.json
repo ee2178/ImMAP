@@ -44,7 +44,8 @@
     },
     "data": {
         "train": {
-            "name": "i2sb",
+            "name": "nyumets_guided",
+            "guide_mode": "none",
             "root": "../datasets/NYUMets_h5_train",
             "x0_idx": 2,
             "x1_idx": 1,
@@ -55,6 +56,9 @@
             ],
             "image_key": "img_raw",
             "slice_range": [50, 90],
+            "mask_source": "t1ct1",
+            "mask_apply": true,
+            "mask_guides": "target",
             "et_mask": false,
             "scales": [
                 2800.0,
@@ -68,7 +72,8 @@
             "num_workers": 8
         },
         "val": {
-            "name": "i2sb",
+            "name": "nyumets_guided",
+            "guide_mode": "none",
             "root": "../datasets/NYUMets_h5_val",
             "x0_idx": 2,
             "x1_idx": 1,
@@ -79,6 +84,9 @@
             ],
             "image_key": "img_raw",
             "slice_range": [50, 90],
+            "mask_source": "t1ct1",
+            "mask_apply": true,
+            "mask_guides": "target",
             "et_mask": false,
             "scales": [
                 2800.0,

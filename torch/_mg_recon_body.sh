@@ -60,6 +60,12 @@
 #                   run's config.json, so later resumes keep it). A run that
 #                   already has it keeps it whatever this is set to; to switch
 #                   one back, resume it with IMMAP_PLANAR_STATE=0 exported.
+#   CLIP_GRAD       "" = the generator's default max gradient norm (0.05 since
+#                   2026-10-13). A cell launched before that carries 1.0, and
+#                   LAUNCH-ONCE refuses it under the new default; CLIP_GRAD=1.0
+#                   regenerates the configs it was launched with, so it is
+#                   skipped or resumed as before. Like ORGAN_MASK, regeneration
+#                   rewrites every config of the anatomy.
 #
 # ONLY / ACCELS narrow AND RENUMBER the cell list, so an experiment that runs a
 # subset gets its own dense 0..N-1 array range. The bound is checked at runtime
@@ -124,6 +130,7 @@ ORGAN_MASK="${ORGAN_MASK:-}"
 #                launcher of that anatomy.
 PHASE_CORRECT="${PHASE_CORRECT:-}"
 PLANAR_STATE="${PLANAR_STATE:-}"
+CLIP_GRAD="${CLIP_GRAD:-}"
 
 source ~/.bashrc
 conda activate gcdl
@@ -176,7 +183,8 @@ if [ "${REGENERATE}" = "1" ]; then
     # generator's default (measured). See the generator's module docstring.
     python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
         --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} \
-        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"}         ${PHASE_CORRECT:+--online-phase-correct} ${PLANAR_STATE:+--planar-state} >/dev/null
+        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"}         ${PHASE_CORRECT:+--online-phase-correct} ${PLANAR_STATE:+--planar-state} \
+        ${CLIP_GRAD:+--clip-grad "${CLIP_GRAD}"} >/dev/null
 fi
 
 if [ ! -f "${BASE_CONFIG}" ]; then

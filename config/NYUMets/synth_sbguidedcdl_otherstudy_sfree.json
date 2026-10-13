@@ -54,6 +54,9 @@
                 3
             ],
             "slice_range": [50, 90],
+            "mask_source": "t1ct1",
+            "mask_apply": true,
+            "mask_guides": "target",
             "crop_size": 128,
             "random_flips": true,
             "batch_size": 4,
@@ -85,6 +88,9 @@
                 3
             ],
             "slice_range": [50, 90],
+            "mask_source": "t1ct1",
+            "mask_apply": true,
+            "mask_guides": "target",
             "random_flips": false,
             "batch_size": 1,
             "num_workers": 8,

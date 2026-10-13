@@ -4,9 +4,9 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=h200
+#SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=128GB
+#SBATCH --mem=64GB
 #SBATCH --time=48:00:00
 #SBATCH --job-name=Exp12-MGGroup
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -16,7 +16,7 @@
 #SBATCH --array=0-3
 #
 # EXPERIMENT 12 -- the MULTIGRID-GROUP net, BRAIN and KNEE, R=8 and R=12,
-# FULL LENGTH, on an H200.
+# FULL LENGTH, on an L40S.
 #
 #   0   brain  R8    mggroup169v6
 #   1   brain  R12   mggroup169v6
@@ -66,9 +66,11 @@
 # mask, same map (tests/test_flex_block_size.py). The generator writes 16 for
 # these cells; it buys 1.57x, all of it in the backward pass.
 #
-# NODE TYPE. The constraint below is h200 because the group net "did not fit an
-# L40S". That was NOT the card's 48 GB. Timed on an L40S (job 19647191), the
-# flex kernel at the default B=128 fails to COMPILE:
+# NODE TYPE: L40S (since 2026-10-13; h200 before), the same card as the local
+# cells it is compared with (exp11, exp9), and 64 GB of host memory as in exp11.
+# The group net used to be sent to an H200 because it "did not fit an L40S".
+# That was NOT the card's 48 GB. Timed on an L40S (job 19647191), the flex
+# kernel at the default B=128 fails to COMPILE:
 #     OutOfMemoryError: out of resource: triton_tem_fused_flex_attention_0
 #     Required: 114688 Hardware limit: 101376
 # -- the kernel's per-block SHARED memory, which is 99 KB on an L40S and larger
@@ -77,11 +79,12 @@
 #     L40S, knee 640x368x15     mg169v6 287 ms / 8.7 GB
 #                               mggroup169v6 (B=16) 567 ms / 15.7 GB
 #
-# So this cell runs on an L40S, 1.28x slower per step than the H200:
-#     sbatch --constraint=l40s torch/exp12_mggroup.sbatch
-# but ONLY with flex_block_size=16 in its config -- at 128 every task dies at
-# its first forward with the error above. Online ESPIRiT adds its own per-slice
-# memory on top of these figures; probe before a full-length run.
+# So this cell runs on an L40S, 1.28x slower per step than the H200 -- but
+# ONLY with flex_block_size=16 in its config (what the generator writes for
+# mggroup<M>v6); at 128 every task dies at its first forward with the error
+# above. Online ESPIRiT adds its own per-slice memory on top of these figures;
+# probe before a full-length run. For the faster card instead:
+#     sbatch --constraint=h200 --mem=128GB torch/exp12_mggroup.sbatch
 # Every cell in one submission lands on one node type; `--constraint` cannot
 # vary per task. Say which hardware an arm ran on if timing is reported.
 #
