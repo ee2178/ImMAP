@@ -76,6 +76,7 @@ def build_nyumets_synth_loader(root=None,
                                guide_mode="none",
                                guide_idx=None,
                                guide_window=0,
+                               guide_enhancement=False,  # guide = the drawn slice's (CT1 - T1)_+ ; guide_idx ignored
                                guide_contrasts=None,
                                n_guides=1,
                                min_slice_gap=5,
@@ -110,6 +111,7 @@ def build_nyumets_synth_loader(root=None,
         guide_contrasts=guide_contrasts,
         n_guides=n_guides, min_slice_gap=min_slice_gap, guide_slice=guide_slice,
         guide_window=guide_window,
+        guide_enhancement=guide_enhancement,
         deterministic=deterministic,
         guide_as_cond=False,                   # the adapter concatenates; see _SynthView
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
@@ -128,7 +130,7 @@ def build_nyumets_synth_loader(root=None,
 
 
 def n_input_channels(cond_idx=(0, 1, 3), guide_mode="none", guide_idx=None, guide_window=0,
-                     n_guides=1, **unused):
+                     n_guides=1, guide_enhancement=False, **unused):
     """The `in_chans` a model needs for a given data block -- so a config cannot disagree with it.
 
     Mirrors NYUMetsGuidedDataset.n_guide_planes for the other_study case, which is the only guide
@@ -137,5 +139,6 @@ def n_input_channels(cond_idx=(0, 1, 3), guide_mode="none", guide_idx=None, guid
     modes = [guide_mode] if isinstance(guide_mode, str) else list(guide_mode)
     n = len(list(cond_idx))
     if "other_study" in modes:
-        n += len(list(guide_idx or [])) * (2 * int(guide_window) + 1) * int(n_guides)
+        per_slice = 1 if guide_enhancement else len(list(guide_idx or []))
+        n += per_slice * (2 * int(guide_window) + 1) * int(n_guides)
     return n

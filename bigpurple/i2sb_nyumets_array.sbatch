@@ -132,6 +132,10 @@ CONFIGS=(
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_w0_sfree_flex_bs64.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_w1_sfree_flex_bs64.json
     config/NYUMets/i2sb_sbguidedcdl_otherstudy_w2_sfree_flex_bs64.json
+    # 11-12: SBCDLNet +S at effective batch 64 and 256 (batch_size 32 x accum_steps 2 / 8), no EMA.
+    # Also outside the default --array range.
+    config/NYUMets/i2sb_sbcdlnet_sfree_bs64.json
+    config/NYUMets/i2sb_sbcdlnet_sfree_bs256.json
 )
 
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then

@@ -16,6 +16,7 @@
             "joint_softmax": true,
             "attn_backend": "flex",
             "flex_block_size": 16,
+            "guide_center": false,
             "sim_fun": "distance",
             "dK": 5,
             "share_attention": true,
@@ -70,6 +71,7 @@
             "batch_size": 32,
             "num_workers": 8,
             "guide_mode": "other_study",
+            "guide_enhancement": true,
             "guide_idx": [
                 2
             ],
@@ -106,6 +108,7 @@
             "batch_size": 8,
             "num_workers": 8,
             "guide_mode": "other_study",
+            "guide_enhancement": true,
             "guide_idx": [
                 2
             ],

@@ -70,6 +70,15 @@ offset -k..+k with the contrasts innermost:
 
     guide_idx=[1, 2], guide_window=1  ->  T1(z-1) CT1(z-1) T1(z) CT1(z) T1(z+1) CT1(z+1)
 
+THE ENHANCEMENT MAP AS THE GUIDE. `guide_enhancement=True` replaces the contrast lookup of every
+non-session guide mode: each drawn guide slice yields ONE plane,
+
+    S_guide = ( contrast x0_idx  -  contrast x1_idx )_+        = (CT1 - T1)_+ of that slice,
+
+formed after scaling and masking -- the same quantity, on the same scale, that the +S nets are
+supervised with for the target session (models.enhancement.enhancement_target). `guide_idx` is
+then ignored, and n_guide_planes = n_guides * (2k + 1).
+
 A neighbour past either end of the stored slices repeats the edge slice. With guide_as_cond the
 planes land after cond_idx in that order, so the net's C = 1 + len(cond_idx) + n_guide_planes, and
 n_guide_planes = n_guides * (2k + 1) * len(guide_idx).
@@ -145,6 +154,9 @@ def index_sessions(root):
     return paths, n_slices, patients
 
 
+ENHANCEMENT = -1          # pseudo-contrast in `guide_idx`: the slice's (x0 - x1)_+ ; see the docstring
+
+
 def _as_modes(guide_mode):
     modes = [guide_mode] if isinstance(guide_mode, str) else list(guide_mode)
     bad = [m for m in modes if m not in GUIDE_MODES]
@@ -170,6 +182,10 @@ class NYUMetsGuidedDataset(Dataset):
         self.guide_idx = [int(c) for c in gi] if isinstance(gi, (list, tuple)) else [int(gi)]
         if not self.guide_idx:
             raise ValueError("guide_idx must name at least one stored contrast")
+        # the guide is the drawn slice's enhancement map (x0 - x1)_+ instead of a stored contrast
+        self.guide_enhancement = bool(getattr(cfg, "guide_enhancement", False))
+        if self.guide_enhancement:
+            self.guide_idx = [ENHANCEMENT]
         # other_study only: also take the +-guide_window neighbouring slices of the SAME other
         # study around the matched one, so the net sees the prior scan's local through-plane
         # context (and some tolerance to a residual dz). 0 = just the matched slice.
@@ -438,7 +454,9 @@ class NYUMetsGuidedDataset(Dataset):
                         gimg = gimg * (mask_np if self.mask_guides == "target"
                                        else self._mask_of(gimg, gh, gz))
                     slices[(gf, gz)] = gimg
-                planes.append(slices[(gf, gz)][..., gc])
+                g = slices[(gf, gz)]
+                planes.append(np.clip(g[..., self.x0_idx] - g[..., self.x1_idx], 0.0, None)
+                              if gc == ENHANCEMENT else g[..., gc])
             guide = chw(np.stack(planes, axis=-1))        # (G, H, W)
 
         # Joint geometric transform: stack -> transform -> split. The guide rides the SAME

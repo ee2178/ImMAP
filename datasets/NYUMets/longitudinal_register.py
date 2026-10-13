@@ -37,6 +37,7 @@ def build_nyumets_guided_loader(root=None,
                                 guide_idx=None,           # other_study/*_slice contrast(s): int or list
                                                           # (e.g. [1, 2] = T1/CT1 pair); default x0
                                 guide_window=0,           # other_study: +-k neighbouring guide slices
+                                guide_enhancement=False,  # guide = the drawn slice's (CT1 - T1)_+ ; guide_idx ignored
                                 guide_contrasts=None,     # same_session contrasts; default T1,T2,FLAIR
                                 n_guides=1,               # planes per non-session mode
                                 min_slice_gap=5,          # far_slice: adjacent is too easy
@@ -74,6 +75,7 @@ def build_nyumets_guided_loader(root=None,
         guide_contrasts=guide_contrasts,
         n_guides=n_guides, min_slice_gap=min_slice_gap, guide_slice=guide_slice,
         guide_window=guide_window,
+        guide_enhancement=guide_enhancement,
         deterministic=deterministic, guide_as_cond=guide_as_cond,
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,
         slice_range=slice_range,

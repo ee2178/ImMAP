@@ -113,6 +113,12 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
                stores `last_S`; bridge_fidelity=False drops the target term. Under
                `task: synthesis` the call is net(X) with X = [cond..., guides...] -- the guides
                are split off and routed to the prox, never into a fidelity.
+    guide_center
+               True (default) subtracts each guide's own mean, as the target's DC is removed.
+               False leaves the guides as given -- for guides that are ENHANCEMENT MAPS (the
+               loader's guide_enhancement): (CT1 - T1)_+ is zero almost everywhere, and that
+               zero is what makes non-enhancing keys cheap to tell apart, the same reason the
+               s_cross branch does not centre S_prior.
     s_cross    True adds CROSS-ATTENTION BETWEEN ENHANCEMENT MAPS (needs s_mode). The prior
                study's enhancement map is known exactly, S_prior = (CT1_prior - T1_prior)_+, and
                the current estimate S_k is decoded from the code at layer k. One extra branch of
@@ -147,8 +153,10 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
                  kind="brownian", tau=0.19, n_points=1000, beta_max=0.3,
                  spectral_init=True, init=None,
                  s_mode=None, bridge_fidelity=True, gate_init=0.0,
-                 s_cross=False, s_cross_planes=(0, 1), s_cross_atoms=None):
+                 s_cross=False, s_cross_planes=(0, 1), s_cross_atoms=None,
+                 guide_center=True):
         super().__init__()
+        self.guide_center = bool(guide_center)
         if s_cross and s_mode is None:
             raise ValueError("s_cross attends between enhancement maps, so it needs an S model: "
                              "set s_mode='free' or 'gate'.")
@@ -301,7 +309,8 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
             if w.dim() != 4 or w.shape[1] != 1:
                 raise ValueError(f"each guide must be (B, 1, H, W); got {tuple(w.shape)}")
             w = w.to(ref.dtype)
-            w = w - w.mean(dim=(1, 2, 3), keepdim=True)          # its OWN DC, never the target's
+            if self.guide_center:
+                w = w - w.mean(dim=(1, 2, 3), keepdim=True)      # its OWN DC, never the target's
             w = F.pad(w, pad, mode="reflect")                     # same geometry as r and c
             if w.shape[-2:] != ref.shape[-2:]:
                 raise ValueError(
