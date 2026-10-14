@@ -46,6 +46,9 @@ loader (torchvision, wandb, ...) and this script needs none of them.
 
     # or from a JSON config: {"splits": {"train": 0.6, "val": 0.3, "test": 0.1}, "seed": 0}
     python datasets/NYUMets/make_split_symlinks.py --source ... --config split.json
+
+    # a SECOND build of the same cohort, with the same patients in each split as the first
+    python datasets/make_split_symlinks.py --source ../datasets/NYUMets_h5_fit         --like ../datasets/NYUMets_h5_split_record.json
 """
 
 import os
@@ -150,6 +153,11 @@ def main():
     ap.add_argument("--dest", default=None,
                     help="nest splits as <dest>/<name> instead of sibling <source>_<name>")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--like", default=None,
+                    help="an existing <source>_split_record.json: put every group in the SAME "
+                         "split it has there instead of drawing a new one. For a second build "
+                         "of the same cohort (e.g. another registration), so train/val/test "
+                         "hold the same patients in both. --splits / --seed are then ignored")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -157,6 +165,18 @@ def main():
     if args.config:
         with open(args.config) as f:
             file_cfg = json.load(f)
+
+    like = None
+    if args.like:
+        with open(args.like) as f:
+            like = json.load(f)
+        # the grouping rule decides what a "patient" is, so it has to be the record's own
+        file_cfg = dict(file_cfg, splits=like["splits"], seed=like.get("seed", 0),
+                        group=like.get("grouped_by", "none"),
+                        group_regex=like.get("group_regex"))
+        if args.splits or args.seed is not None:
+            print("  --like given: ignoring --splits / --seed, the record's assignment is used")
+            args.splits, args.seed = None, None
 
     splits = (parse_splits(args.splits) if args.splits
               else dict(file_cfg.get("splits") or DEFAULT_SPLITS))
@@ -198,21 +218,40 @@ def main():
         raise SystemExit(f"{record} exists; pass --force to redo the split.")
 
     names = list(splits)
-    counts = allocate(len(patients), [splits[n] for n in names])
-    for n, c in zip(names, counts):
-        if splits[n] > 0 and c == 0:
-            print(f"  !! split '{n}' asked for {splits[n]:.0%} but only "
-                  f"{len(patients)} groups exist -- it gets ZERO")
+    if like is not None:
+        # every group goes where the record put it; nothing is drawn
+        theirs = {p: n for n, ps in like["patients"].items() for p in ps}
+        assignment = {p: theirs[p] for p in patients if p in theirs}
+        new = [p for p in patients if p not in theirs]
+        gone = sorted(set(theirs) - set(patients))
+        print(f"  --like {args.like}: {len(assignment)} of {len(patients)} groups placed as "
+              f"in the record")
+        if new:
+            # a group the record never saw has no split to inherit; leaving it out is the
+            # only choice that cannot leak a patient across splits
+            print(f"  !! {len(new)} group(s) are not in the record and go in NO split: "
+                  f"{new[:8]}{' ...' if len(new) > 8 else ''}")
+        if gone:
+            print(f"  {len(gone)} group(s) of the record are missing from this source "
+                  f"(not built here): {gone[:8]}{' ...' if len(gone) > 8 else ''}")
+        patients = [p for p in patients if p in assignment]
+        counts = [sum(1 for p in patients if assignment[p] == n) for n in names]
+    else:
+        counts = allocate(len(patients), [splits[n] for n in names])
+        for n, c in zip(names, counts):
+            if splits[n] > 0 and c == 0:
+                print(f"  !! split '{n}' asked for {splits[n]:.0%} but only "
+                      f"{len(patients)} groups exist -- it gets ZERO")
 
-    rng = random.Random(seed)
-    shuffled = patients[:]
-    rng.shuffle(shuffled)
+        rng = random.Random(seed)
+        shuffled = patients[:]
+        rng.shuffle(shuffled)
 
-    assignment, at = {}, 0
-    for n, c in zip(names, counts):
-        for p in shuffled[at:at + c]:
-            assignment[p] = n
-        at += c
+        assignment, at = {}, 0
+        for n, c in zip(names, counts):
+            for p in shuffled[at:at + c]:
+                assignment[p] = n
+            at += c
 
     for d in dirs.values():
         _clean_link_dir(d)
@@ -230,6 +269,7 @@ def main():
         json.dump({"created": datetime.datetime.now().isoformat(timespec="seconds"),
                    "source": source, "seed": seed, "splits": splits,
                    "grouped_by": group, "group_regex": group_regex,
+                   "like": os.path.abspath(args.like) if args.like else None,
                    "n_patients": len(patients), "n_sessions": len(sessions),
                    "dirs": dirs,
                    "patients": {n: sorted(p for p, s in assignment.items() if s == n)
