@@ -62,7 +62,22 @@ MAX_SKIPPED_FRACTION = 0.1
 # is the luckiest of many noisy 50-step batch-1 averages, and a false alarm
 # costs an epoch and 10% of the learning rate for good; a genuinely diverged
 # run is far past it (a collapse from a best of 0.27 is 7x).
-BACKTRACK_RATIO = 2.0
+#
+# 500, SLJIVA'S VALUE, since 2026-10-14 (was 2). At 2 the check fired on the
+# ordinary epoch-to-epoch swings of early training, on runs that were not
+# diverging -- each false alarm a restore and a permanent learning-rate cut
+# (x `backtrack_factor`, 0.9 in the generated configs). Sljiva compares the
+# same thing every epoch (train.jl:455, `|avg_loss / bestloss| > factor`) with
+# `backtrack_factor: 500` from config/train.yaml (the train.jl default is 100).
+# NB the names cross: there `backtrack_factor` is this RATIO; here it is the
+# learning-rate multiplier.
+#
+# At 500 the check catches a genuine blow-up and little else. It will NOT catch
+# a collapse to an all-zero output (~2 on these normalised losses, ~7x a best of
+# 0.27) -- that is the price of not firing on noise. A non-finite epoch still
+# restores either way (that path does not use the ratio). `None` in a config's
+# `training.backtrack_ratio` turns the check off.
+BACKTRACK_RATIO = 500.0
 
 
 def train_recon(
@@ -130,8 +145,9 @@ def train_recon(
     # loss will still trigger a protective restore). Tune to your loss scale.
     backtrack_thresh=None,
     # The RELATIVE check: restore when the epoch's average loss exceeds
-    # `backtrack_ratio` x the best epoch's (see BACKTRACK_RATIO). None turns it
-    # off. Independent of `backtrack_thresh`; either one triggers a restore.
+    # `backtrack_ratio` x the best epoch's (see BACKTRACK_RATIO). None -- the
+    # default -- turns it off. Independent of `backtrack_thresh`; either one
+    # triggers a restore.
     backtrack_ratio=BACKTRACK_RATIO,
     backtrack_factor=0.8,
     # Backtracking bookkeeping, threaded in from train.py so it survives a

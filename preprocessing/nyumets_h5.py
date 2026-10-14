@@ -845,6 +845,11 @@ def register_patient(vols, cfg, ref=0, real=None):
         return _register_fit(vols, cfg, ref, real)
     if method == "affine":
         return _register_affine(vols, cfg, ref, real)
+    if method == "sitk":
+        # sitk registers the SOURCE NIfTIs before build_volume (main()); built volumes are
+        # already cropped and normalised, which is exactly what it exists to avoid
+        raise ValueError("reg_method 'sitk' runs on the source NIfTIs inside main(); it cannot "
+                         "register already-built volumes")
     return _register_xcorr(vols, cfg, ref, real)
 
 
@@ -1370,15 +1375,20 @@ def brain_mask(img, bg_frac):
     return (acc / img.shape[1]) > bg_frac
 
 
-def build_volume(files, cfg):
+def build_volume(files, cfg, arrays=None):
     """One session -> a FULL-DEPTH `Volume`, in-plane cropped, not yet slice-filtered.
+
+    `arrays` ({contrast: (H, W, D) canonical array, affine}, what load_ras returns) replaces
+    reading `files`: --reg-method sitk hands in a session already resampled onto its patient's
+    reference grid (preprocessing/sitk_register.register_sessions). Everything after loading --
+    support, brain mask, normalisation, crop -- is unchanged.
 
     Registration across a patient's studies runs on these full volumes (that is the whole
     reason the slice filtering is a separate step): a study whose h5 had already been cut to
     its own brain-bearing slices could only be aligned to another such cut, and the through-
     plane offset would be confounded with the difference in what each cut kept.
     """
-    vols, affines = zip(*(load_ras(files[c]) for c in CONTRASTS))
+    vols, affines = zip(*(arrays[c] if arrays else load_ras(files[c]) for c in CONTRASTS))
     if len({v.shape for v in vols}) != 1:
         raise ValueError(f"shapes differ: {[v.shape for v in vols]} -- not on a common grid")
     if cfg.require_affine and not all(np.allclose(a, affines[0], atol=1e-3) for a in affines):
@@ -1555,6 +1565,12 @@ def write_h5(path, raw, norm, mask, support, idx, stats, orig_depth, affine, key
              f"grid_sample onto the reference's grid (reg_matrix); reg_fit_ok False = the fit "
              f"was rejected and only the starting translation was applied"
              if r.get("method") == "fit" else
+             f"SimpleITK on the SOURCE NIfTIs, before any of this builder's processing: centre "
+             f"of mass, rigid, then {r.get('variant', '')!r} (preprocessing/sitk_register.py; "
+             f"mutual information, 3-level pyramid, regular-step gradient descent); every "
+             f"contrast resampled once (linear) onto the reference's native grid, then built as "
+             f"usual. reg_matrix maps a reference point to this study's point, LPS mm"
+             if r.get("method") == "sitk" else
              "rigid transform read off the NIfTI affines (inv(A_other) @ A_ref), applied by "
              "trilinear grid_sample onto the reference's grid: rotation AND translation, "
              "border padding for intensities, nearest-threshold for the masks"
@@ -1607,8 +1623,14 @@ def main():
                     help="do NOT align a patient's studies to one another (they are then "
                          "written on their own index axes, as before 2026-09-23)")
     ap.add_argument("--reg-method", default="centroid",
-                    choices=("centroid", "search", "fit", "affine", "xcorr"), dest="reg_method",
-                    help="fit: an image-based 3-D affine -- rotation, per-axis scale and shift, "
+                    choices=("centroid", "search", "fit", "sitk", "affine", "xcorr"),
+                    dest="reg_method",
+                    help="sitk: register the SOURCE NIfTIs with SimpleITK (centre of mass, "
+                         "rigid, then --reg-sitk-variant; mutual information, multi-resolution) "
+                         "BEFORE any of this builder's processing, resample every other study "
+                         "onto the reference's native grid, then build as usual -- see "
+                         "preprocessing/sitk_register.py. Needs `pip install SimpleITK`. "
+                         "fit: an image-based 3-D affine -- rotation, per-axis scale and shift, "
                          "found by gradient descent on the masked T1 correlation from the "
                          "centroid translation, then ONE resample onto the reference's grid. "
                          "The only method that corrects rotation and scale from the images; "
@@ -1626,6 +1648,13 @@ def main():
                          "cross-correlation, integer translation only -- it cannot remove the "
                          "~6.5 deg of median inter-session obliqueness the 2026-09-24 survey "
                          "measured, which leaves ~13 voxels of error at the edge of the head")
+    ap.add_argument("--reg-sitk-variant", default="affine", dest="reg_sitk_variant",
+                    choices=("rigid", "similarity", "affine", "affine_corr", "affine_s25"),
+                    help="sitk: which registration (VARIANTS in preprocessing/sitk_register.py)")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="build only every --nshards-th PATIENT starting at this one, so a job "
+                         "array can split the cohort; each shard writes manifest_shard<i>.csv")
+    ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--reg-dof", type=int, default=9, choices=FIT_DOF, dest="reg_dof",
                     help="fit: 6 rigid | 7 + one scale | 9 + one scale per axis (default: the "
                          "2026-10-13 diagnosis found slice offsets drifting along z, which a "
@@ -1702,6 +1731,8 @@ def main():
     cfg = ap.parse_args()
     if cfg.clip and float(cfg.clip[1]) <= 0:
         cfg.clip = None
+    if not 0 <= cfg.shard < cfg.nshards:
+        raise SystemExit(f"--shard {cfg.shard} is outside 0..{cfg.nshards - 1}")
 
     sessions = find_sessions(cfg.root)
     if cfg.limit:
@@ -1778,6 +1809,11 @@ def main():
     by_patient = {}
     for key, files in sessions.items():
         by_patient.setdefault(key[0], []).append((key, files))
+    if cfg.nshards > 1:
+        # every nshards-th patient: whole patients only, since registration is per patient
+        by_patient = dict(list(by_patient.items())[cfg.shard::cfg.nshards])
+        print(f"shard {cfg.shard}/{cfg.nshards}: {len(by_patient)} patient(s), "
+              f"{sum(len(v) for v in by_patient.values())} session(s)")
 
     def drop_stale(key):
         """Delete a session's EXISTING h5 when this run skips it. Without this a rebuild with
@@ -1797,10 +1833,30 @@ def main():
             done += len(items)
             continue
 
-        vols, keys = [], []
-        for (key, files), _ in zip(items, paths):
+        pre, sitk_ref = {}, None
+        if cfg.reg_method == "sitk" and cfg.register and len(items) > 1:
+            from preprocessing import sitk_register
             try:
-                vols.append(build_volume(files, cfg))
+                sitk_ref, pre = sitk_register.register_sessions(
+                    items, variant=cfg.reg_sitk_variant, contrasts=CONTRASTS)
+            except Exception as err:                   # noqa: BLE001 -- the reference itself
+                print(f"  !! {pid}: SimpleITK could not register this patient -- {err}")
+                for key, _ in items:
+                    skipped.append((key, f"sitk: {err}"))
+                    drop_stale(key)
+                done += len(items)
+                continue
+            failed = [key for key, _ in items if key != sitk_ref and key not in pre]
+            for key in failed:                         # register_sessions has printed why
+                skipped.append((key, "sitk registration failed"))
+                drop_stale(key)
+            items = [(key, files) for key, files in items if key not in failed]
+
+        vols, keys = [], []
+        for key, files in items:
+            try:
+                vols.append(build_volume(files, cfg, arrays=pre[key]["arrays"]
+                                         if key in pre else None))
                 keys.append(key)
             except Exception as err:
                 skipped.append((key, str(err)))
@@ -1818,7 +1874,41 @@ def main():
         valid = [np.ones(v.raw.shape[0], dtype=bool) for v in vols]
         ref = 0
         reg_ok = False       # recorded as reg_applied: True only if the pixels were really moved
-        if cfg.register and len(vols) > 1:
+        if cfg.reg_method == "sitk" and cfg.register and len(vols) > 1:
+            # already registered and resampled before build_volume: every study is on the
+            # reference's grid. What is left is the bookkeeping the other methods do here.
+            if sitk_ref not in keys:
+                for key in keys:
+                    skipped.append((key, "sitk: the reference study failed to build"))
+                    print(f"  !! {key[0]}/{key[1]}: the reference study failed to build")
+                    drop_stale(key)
+                continue
+            ref = keys.index(sitk_ref)
+            ci = CONTRASTS.index(cfg.reg_contrast)
+            A, MA = vols[ref].norm[:, ci].float(), vols[ref].fg.bool()
+            valid = []
+            for i, (v, key) in enumerate(zip(vols, keys)):
+                if i == ref:
+                    v.reg = {"method": "sitk", "variant": cfg.reg_sitk_variant,
+                             "matrix": np.eye(4), "oblique": 0.0, "cover": 1.0, "ncc": 1.0}
+                    valid.append(np.ones(v.raw.shape[0], dtype=bool))
+                    continue
+                cov = torch.from_numpy(np.ascontiguousarray(
+                    pre[key]["cover"].transpose(2, 0, 1)))
+                if cfg.crop:
+                    cov = center_crop_or_pad(cov, cfg.crop, h_axis=1, w_axis=2)
+                cov = cov.bool()
+                # a slice counts where >= --reg-min-cover of the REFERENCE'S BRAIN on it came
+                # from this study's real data (zero-filled outside its field of view)
+                num = (cov & MA).flatten(1).sum(1).float()
+                den = MA.flatten(1).sum(1).float()
+                frac = torch.where(den > 0, num / den.clamp_min(1.0), cov.flatten(1).float().mean(1))
+                valid.append((frac >= cfg.reg_min_cover).numpy())
+                v.reg = dict(pre[key]["reg"], cover=float(cov.float().mean()),
+                             ncc=masked_ncc(A, v.norm[:, ci].float(), MA, v.fg.bool(), (0, 0, 0),
+                                            cfg.reg_stride))
+            reg_ok = True
+        elif cfg.register and len(vols) > 1:
             ref = max(range(len(vols)), key=lambda i: (vols[i].raw.shape[0], -i))
             try:
                 offsets, valid = register_patient(vols, cfg, ref=ref)
@@ -1887,7 +1977,8 @@ def main():
             print(f"  {done}/{len(sessions)}  {len(rows)} written, {len(skipped)} skipped")
 
     os.makedirs(cfg.out, exist_ok=True)
-    with open(os.path.join(cfg.out, "manifest.csv"), "w", newline="") as f:
+    manifest = "manifest.csv" if cfg.nshards == 1 else f"manifest_shard{cfg.shard}.csv"
+    with open(os.path.join(cfg.out, manifest), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["patient", "session", "path", "n_slices",
                                           "orig_depth", "H", "W", "dz", "dh", "dw"])
         w.writeheader()
@@ -1956,7 +2047,7 @@ def main():
                   f"(reg_fit_ok attr)")
             print("  The offset above is only the closest single translation; the transform "
                   "applied is each file's `reg_matrix`.")
-        elif cfg.reg_method in ("search", "centroid"):
+        elif cfg.reg_method in ("search", "centroid", "sitk"):
             nc = [float((r or {}).get("ncc", float("nan"))) for _, _, r in reg_rows]
             nc = [c for c in nc if c == c]
             if nc:

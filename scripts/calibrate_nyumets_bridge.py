@@ -19,7 +19,7 @@ schedule that reduces to tau = varsigma/2.
 Reports varsigma whole-brain and, because the two disagree, emits a RANGE of beta_max rather
 than one number: whole-brain sets the floor, the high-residual tail sets the ceiling.
 
-    python -m scripts.calibrate_nyumets_bridge --root ~/scratch/datasets/NYUMets_h5_train
+    python -m scripts.calibrate_nyumets_bridge --root ~/scratch/datasets/NYUMets_h5_fit_train
 """
 
 import os

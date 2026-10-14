@@ -65,8 +65,17 @@ IMMAP_ROOT="${IMMAP_ROOT:-$HOME/scratch/ImMAP}"
 cd "$IMMAP_ROOT" || { echo "no such dir: $IMMAP_ROOT" >&2; exit 1; }
 
 CFG="${CFG:-config/NYUMets/i2sb_unet_all.json}"
-SOURCE="${SOURCE:-../datasets/NYUMets_h5}"
+SOURCE="${SOURCE:-../datasets/NYUMets_h5_fit}"
 SPLIT_CONFIG="${SPLIT_CONFIG:-config/NYUMets/split.json}"
+# The fit build's splits keep every patient in the split the centroid build gave it (--like the
+# centroid split record) and leave out every study registered worse than MIN_REG_NCC (its stored
+# reg_ncc). Used only if ${SOURCE}_train does not exist yet -- normally it is made once by hand:
+#   python datasets/make_split_symlinks.py --source ../datasets/NYUMets_h5_fit \
+#       --like ../datasets/NYUMets_h5_split_record.json --min-reg-ncc 0.6
+SPLIT_LIKE="${SPLIT_LIKE:-../datasets/NYUMets_h5_split_record.json}"
+MIN_REG_NCC="${MIN_REG_NCC:-0.6}"
+SPLIT_EXTRA=(--min-reg-ncc "$MIN_REG_NCC")
+[ -f "$SPLIT_LIKE" ] && SPLIT_EXTRA+=(--like "$SPLIT_LIKE")
 
 # --- GPU preflight, BEFORE any work ------------------------------------------------------
 # `nvidia-smi --query-gpu=name` answers over NVML and succeeds even when the device cannot be
@@ -131,7 +140,7 @@ do_split() {
     echo "[split] $SOURCE -> ${SOURCE}_{train,val,test}  ($SPLIT_CONFIG)"
     # A FILE, not `python -m`: datasets/__init__.py eagerly imports every registered loader
     # (torchvision, wandb) and this script needs none of them.
-    python datasets/make_split_symlinks.py --source "$SOURCE" --config "$SPLIT_CONFIG" "$@" \
+    python datasets/make_split_symlinks.py --source "$SOURCE" --config "$SPLIT_CONFIG" "${SPLIT_EXTRA[@]}" "$@" \
         || { echo "[split] FAILED" >&2; return 1; }
     # Calibrate against exactly what THIS config feeds the net -- image_key and the divisor
     # applied to the two bridge endpoints -- read from the config rather than hardcoded, so
@@ -171,7 +180,7 @@ case "${SPLIT:-auto}" in
         ;;
 esac
 
-# The config's data roots are RELATIVE TO THE REPO ROOT (../datasets/NYUMets_h5_{train,val},
+# The config's data roots are RELATIVE TO THE REPO ROOT (../datasets/NYUMets_h5_fit_{train,val},
 # i.e. $HOME/scratch/datasets/... given IMMAP_ROOT=$HOME/scratch/ImMAP) -- the same convention
 # the raw ../datasets/NYUMets symlink uses. They only resolve because of the cd above.
 python - "$CFG" <<'PY' || exit 1

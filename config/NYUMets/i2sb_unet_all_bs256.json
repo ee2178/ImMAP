@@ -52,7 +52,7 @@
         "train": {
             "name": "nyumets_guided",
             "guide_mode": "none",
-            "root": "../datasets/NYUMets_h5_train",
+            "root": "../datasets/NYUMets_h5_fit_train",
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [
@@ -75,7 +75,7 @@
         "val": {
             "name": "nyumets_guided",
             "guide_mode": "none",
-            "root": "../datasets/NYUMets_h5_val",
+            "root": "../datasets/NYUMets_h5_fit_val",
             "x0_idx": 2,
             "x1_idx": 1,
             "cond_idx": [

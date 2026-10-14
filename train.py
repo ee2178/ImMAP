@@ -266,7 +266,7 @@ def main(config_path):
         "net.ckpt"
     )
 
-    # The relative backtrack threshold is on by default for reconstruction
+    # The relative backtrack threshold defaults to Sljiva's 500 for reconstruction
     # (training/recon.py::BACKTRACK_RATIO). Written into the run's config.json
     # so the file records what the run trained under; a config that already
     # carries the key -- `null` to turn the check off -- keeps its own value.

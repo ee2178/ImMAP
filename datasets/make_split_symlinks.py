@@ -47,8 +47,10 @@ loader (torchvision, wandb, ...) and this script needs none of them.
     # or from a JSON config: {"splits": {"train": 0.6, "val": 0.3, "test": 0.1}, "seed": 0}
     python datasets/NYUMets/make_split_symlinks.py --source ... --config split.json
 
-    # a SECOND build of the same cohort, with the same patients in each split as the first
-    python datasets/make_split_symlinks.py --source ../datasets/NYUMets_h5_fit         --like ../datasets/NYUMets_h5_split_record.json
+    # a SECOND build of the same cohort, with the same patients in each split as the first,
+    # leaving out the studies registered worse than 0.6 (stored reg_ncc); one command:
+    python datasets/make_split_symlinks.py --source ../datasets/NYUMets_h5_fit
+        --like ../datasets/NYUMets_h5_split_record.json --min-reg-ncc 0.6
 """
 
 import os
@@ -96,6 +98,19 @@ def make_group_key(mode, pattern=None):
             return m.group(1) if m.groups() else m.group(0)
         return key
     raise SystemExit(f"--group must be none|prefix|regex, got {mode!r}")
+
+
+def reg_ncc_of(source, session):
+    """The stored `reg_ncc` of one session folder's h5, or NaN if it has none (h5py is imported
+    here so the plain splitting path keeps needing nothing beyond the standard library)."""
+    import glob
+    hits = sorted(glob.glob(os.path.join(source, session, "*_img.h5")))
+    if not hits:
+        return float("nan")
+    import h5py
+    with h5py.File(hits[0], "r") as f:
+        v = f.attrs.get("reg_ncc")
+    return float(v) if v is not None else float("nan")
 
 
 def parse_splits(spec):
@@ -158,6 +173,13 @@ def main():
                          "split it has there instead of drawing a new one. For a second build "
                          "of the same cohort (e.g. another registration), so train/val/test "
                          "hold the same patients in both. --splits / --seed are then ignored")
+    ap.add_argument("--min-reg-ncc", type=float, default=None, dest="min_reg_ncc",
+                    help="leave out every study whose stored `reg_ncc` (its masked T1 "
+                         "correlation with the patient's reference after registration, written "
+                         "by preprocessing/nyumets_h5.py) is below this. Studies without the "
+                         "attr -- single-study patients, unregistered builds -- are kept. "
+                         "Patients are assigned to splits BEFORE the filter, so it never moves "
+                         "a patient between splits; it only drops some of their studies")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -178,6 +200,8 @@ def main():
             print("  --like given: ignoring --splits / --seed, the record's assignment is used")
             args.splits, args.seed = None, None
 
+    if args.min_reg_ncc is None and file_cfg.get("min_reg_ncc") is not None:
+        args.min_reg_ncc = float(file_cfg["min_reg_ncc"])
     splits = (parse_splits(args.splits) if args.splits
               else dict(file_cfg.get("splits") or DEFAULT_SPLITS))
     seed = args.seed if args.seed is not None else int(file_cfg.get("seed", 0))
@@ -253,6 +277,23 @@ def main():
                 assignment[p] = n
             at += c
 
+    # ---- the registration-quality filter: AFTER assignment, so it only removes studies ----
+    excluded = {}
+    if args.min_reg_ncc is not None:
+        scores = {s: reg_ncc_of(source, s) for p in patients for s in by_patient[p]}
+        excluded = {s: v for s, v in scores.items() if v == v and v < args.min_reg_ncc}
+        scored = [v for v in scores.values() if v == v and v < 0.999999]   # non-reference
+        print(f"  --min-reg-ncc {args.min_reg_ncc}: {len(excluded)} of {len(scores)} studies "
+              f"left out ({len(scored)} non-reference studies scored"
+              + (f"; reg_ncc median {sorted(scored)[len(scored) // 2]:.3f}" if scored else "")
+              + f"; {sum(v != v for v in scores.values())} without a score, kept)")
+        for n in names:
+            k = sum(1 for p in patients if assignment[p] == n for s in by_patient[p]
+                    if s in excluded)
+            print(f"    {n:<6} {k} left out")
+        if not scored:
+            print("  !! no study under this source carries reg_ncc -- is it a registered build?")
+
     for d in dirs.values():
         _clean_link_dir(d)
 
@@ -261,6 +302,8 @@ def main():
         split = assignment[p]
         dst_root = dirs[split]
         for s in by_patient[p]:
+            if s in excluded:
+                continue
             os.symlink(os.path.relpath(os.path.join(source, s), dst_root),
                        os.path.join(dst_root, s))
             n_sess[split] += 1
@@ -270,6 +313,8 @@ def main():
                    "source": source, "seed": seed, "splits": splits,
                    "grouped_by": group, "group_regex": group_regex,
                    "like": os.path.abspath(args.like) if args.like else None,
+                   "min_reg_ncc": args.min_reg_ncc,
+                   "excluded": {s: round(v, 4) for s, v in sorted(excluded.items())},
                    "n_patients": len(patients), "n_sessions": len(sessions),
                    "dirs": dirs,
                    "patients": {n: sorted(p for p, s in assignment.items() if s == n)

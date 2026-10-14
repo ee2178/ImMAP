@@ -23,7 +23,7 @@
     "data": {
         "train": {
             "name": "nyumets_synth",
-            "root": "../datasets/NYUMets_h5_train",
+            "root": "../datasets/NYUMets_h5_fit_train",
             "image_key": "img_raw",
             "scales": [
                 2800.0,
@@ -49,7 +49,7 @@
         },
         "val": {
             "name": "nyumets_synth",
-            "root": "../datasets/NYUMets_h5_val",
+            "root": "../datasets/NYUMets_h5_fit_val",
             "image_key": "img_raw",
             "scales": [
                 2800.0,

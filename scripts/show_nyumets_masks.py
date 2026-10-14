@@ -1,13 +1,13 @@
 """
 Draw the h5 masks over NYUMets slices, to judge what a data-fidelity region should be.
 
-    python -m scripts.show_nyumets_masks --root ../datasets/NYUMets_h5_val --n 4 \
+    python -m scripts.show_nyumets_masks --root ../datasets/NYUMets_h5_fit_val --n 4 \
            --out figs/nyumets_masks.png
 
 or, in a notebook (returns the figure, nothing is written):
 
     from scripts.show_nyumets_masks import mask_panel
-    fig, rows = mask_panel("../datasets/NYUMets_h5_val", n=3, seed=0)
+    fig, rows = mask_panel("../datasets/NYUMets_h5_fit_val", n=3, seed=0)
 
 Each row is one slice: FLAIR, T1, CT1, T2 and the T1 - CT1 difference, with
 
@@ -131,7 +131,7 @@ def mask_panel(root, n=4, seed=0, image_key="img_median_mad", scale=3.0, erode=0
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default="../datasets/NYUMets_h5_val")
+    ap.add_argument("--root", default="../datasets/NYUMets_h5_fit_val")
     ap.add_argument("--n", type=int, default=4, help="sessions to sample")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--z", type=int, default=None, help="slice index (default: central)")

@@ -12,7 +12,7 @@
 #                             x_swap_ratio: ~1 means the conditioned E ignores CT1
 # The two are independent runs (own wandb run, own save_dir) and can go in parallel.
 #
-# PREREQUISITE: the train/val split (../datasets/NYUMets_h5_{train,val}). This script does NOT
+# PREREQUISITE: the train/val split (../datasets/NYUMets_h5_fit_{train,val}). This script does NOT
 # split -- run i2sb_unet_nyumets.sbatch or the array once first, or chain after it with
 #   sbatch --dependency=after:<jobid> ...
 # (`after`, not `afterok`: the split happens in the first minutes of a multi-day training job).

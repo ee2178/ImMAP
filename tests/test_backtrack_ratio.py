@@ -8,16 +8,17 @@ restored from the checkpoint at a lower learning rate -- the case the loop used
 to miss, a loss that goes large but stays FINITE. `train_recon` is driven on a
 toy problem with one epoch's loss inflated by a known factor:
 
-1. inflated 3x, ratio 2 (the default): the epoch is restored -- the weights
+1. inflated 3x, ratio 2 (set explicitly): the epoch is restored -- the weights
    are the checkpoint's again, Adam's state is cleared, the best loss on disk
    is untouched, and the reduction is counted;
-2. NEGATIVE CONTROL: the same run with the check off (`backtrack_ratio=None`,
-   the old behaviour) trains straight through it;
+2. NEGATIVE CONTROL: the same run with the check off (`backtrack_ratio=None`)
+   trains straight through it;
 3. inflated 1.5x (under the ratio): not restored;
 4. inflated in the FIRST epoch, before any checkpoint exists: not restored and
    no error -- there is no best to compare with yet;
-5. the default is on, and the absolute margin (`backtrack_thresh`) still
-   works on its own.
+5. the default is Sljiva's 500 (2 fired on the unstable early epochs of
+   healthy runs): a 3x epoch trains through it, a 600x one is restored; and
+   the absolute margin (`backtrack_thresh`) still works on its own.
 
 CPU only, a few seconds.
 """
@@ -90,8 +91,8 @@ def at_checkpoint(r):
 def main():
     last = EPOCHS - 1                     # inflate the final epoch: nothing trains after it
 
-    r = run(3.0, last)
-    check("3x the best, default ratio: the epoch is restored",
+    r = run(3.0, last, backtrack_ratio=2.0)
+    check("3x the best, ratio 2 set explicitly: the epoch is restored",
           "backtracking" in r["log"] and "x best" in r["log"] and "backtrack #1" in r["log"],
           [ln for ln in r["log"].splitlines() if "backtrack" in ln][:1])
     check("...the weights are the checkpoint's again and Adam's state is cleared",
@@ -105,17 +106,24 @@ def main():
           "backtracking" not in off["log"] and not at_checkpoint(off)
           and len(off["opt"].state) > 0)
 
-    mild = run(1.5, last)
+    mild = run(1.5, last, backtrack_ratio=2.0)
     check("1.5x the best (under the ratio): not restored",
           "backtracking" not in mild["log"] and not at_checkpoint(mild))
 
-    first = run(3.0, 0)
+    first = run(3.0, 0, backtrack_ratio=2.0)
     check("inflated in the first epoch, no checkpoint yet: not restored, no error",
           "backtracking" not in first["log"] and first["ckpt"]["step"] > STEPS)
 
-    check("the check is on by default, at a ratio above 1",
-          recon_mod.BACKTRACK_RATIO is not None and recon_mod.BACKTRACK_RATIO > 1.0,
+    check("the default ratio is Sljiva's 500",
+          recon_mod.BACKTRACK_RATIO == 500.0,
           f"BACKTRACK_RATIO = {recon_mod.BACKTRACK_RATIO}")
+    dflt = run(3.0, last)
+    check("  ...so at the default a 3x epoch trains straight through",
+          "backtracking" not in dflt["log"] and not at_checkpoint(dflt))
+    blown = run(600.0, last)
+    check("  ...and a 600x epoch (a blow-up) is restored",
+          "backtracking" in blown["log"] and "500 x best" in blown["log"]
+          and at_checkpoint(blown), str([ln for ln in blown["log"].splitlines() if "backtrack" in ln][:1]))
 
     margin = run(3.0, last, backtrack_ratio=None, backtrack_thresh=1e-6)
     check("the absolute margin still works on its own",

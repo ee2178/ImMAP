@@ -96,8 +96,17 @@ if [ ! -f "$CFG" ]; then
     exit 1
 fi
 
-SOURCE="${SOURCE:-../datasets/NYUMets_h5}"
+SOURCE="${SOURCE:-../datasets/NYUMets_h5_fit}"
 SPLIT_CONFIG="${SPLIT_CONFIG:-config/NYUMets/split.json}"
+# The fit build's splits keep every patient in the split the centroid build gave it (--like the
+# centroid split record) and leave out every study registered worse than MIN_REG_NCC (its stored
+# reg_ncc). Used only if ${SOURCE}_train does not exist yet -- normally it is made once by hand:
+#   python datasets/make_split_symlinks.py --source ../datasets/NYUMets_h5_fit \
+#       --like ../datasets/NYUMets_h5_split_record.json --min-reg-ncc 0.6
+SPLIT_LIKE="${SPLIT_LIKE:-../datasets/NYUMets_h5_split_record.json}"
+MIN_REG_NCC="${MIN_REG_NCC:-0.6}"
+SPLIT_EXTRA=(--min-reg-ncc "$MIN_REG_NCC")
+[ -f "$SPLIT_LIKE" ] && SPLIT_EXTRA+=(--like "$SPLIT_LIKE")
 
 echo "task   : $SLURM_ARRAY_JOB_ID[$SLURM_ARRAY_TASK_ID]  ->  $CFG"
 
@@ -151,7 +160,7 @@ fi
 # GPFS, which every node sees.
 do_split() {
     echo "[split] $SOURCE -> ${SOURCE}_{train,val,test}  ($SPLIT_CONFIG)"
-    python datasets/make_split_symlinks.py --source "$SOURCE" --config "$SPLIT_CONFIG" \
+    python datasets/make_split_symlinks.py --source "$SOURCE" --config "$SPLIT_CONFIG" "${SPLIT_EXTRA[@]}" \
         || { echo "[split] FAILED" >&2; return 1; }
     local KEY SCALE
     KEY=$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['data']['train']['image_key'])" "$CFG")
