@@ -11,8 +11,9 @@ cluster's `eval_dump/` directories.
 BROWSE -- scrub the set and mark the rows you want:
     left / right     slice -1 / +1              (shift: -5 / +5)
     up / down        previous / next volume
-    e                cycle which column is displayed
-    x                toggle the residual of that column (|ref - col|)
+    g                every column side by side (the default) / one at a time
+    e                one at a time: cycle which column is displayed
+    x                toggle the residual of each column (|ref - col|)
     d                toggle the inter-method disagreement overlay
     c                toggle the FOV crop
     - / =            dimmer / brighter          (session only; the value is
@@ -24,7 +25,8 @@ BROWSE -- scrub the set and mark the rows you want:
     esc              abort: discard everything this session changed
 
 ZOOM -- place each marked row's window:
-    click / drag     centre the box at the cursor
+    click / drag     centre the box at the cursor -- in ANY panel; every panel
+                     shows the same box, since a figure row crops one region
     arrow keys       nudge one pixel
     n / p or m       next / previous marked row
     d                overlay          r  revert to the automatic placement
@@ -48,6 +50,7 @@ exactly the ones that are a method's output.
 """
 
 import argparse
+import math
 import os
 import sys
 import tkinter as tk
@@ -61,7 +64,9 @@ from figures import common as fc
 from figures.common import (anatomy_mask, apply_cmap, auto_zoom, disagreement,
                             fov_box, load, nrmse, pretty, row_tag, to8, window)
 
-FIT = 680       # target on-screen size of the image, in pixels
+FIT = 680       # on-screen size of one panel (the most a grid panel gets), pixels
+GAP = 8         # pixels between panels in the grid
+GRID_COLS = 3   # panels per row in the grid: six columns -> 3 x 2
 
 
 class Picker:
@@ -77,6 +82,10 @@ class Picker:
         self.mode, self.dis, self.view, self.resid = "browse", False, 0, False
         self.crop = fc.CROP_FOV
         self.flash = ""
+        # Every column side by side (the default), or one at a time (`g`).
+        self.grid = True
+        self._spec = dict(fc.COLUMNS)
+        self._geom = None             # the last render's layout, for clicks
 
         # Picks are written as you go, so abort restores what was on disk at
         # startup rather than trying to buffer every edit.
@@ -121,7 +130,10 @@ class Picker:
         b("<Key-d>", lambda e: self.set(dis=not self.dis))
         b("<Key-x>", lambda e: self.set(resid=not self.resid))
         b("<Key-c>", lambda e: self.set(crop=not self.crop))
-        b("<Key-e>", lambda e: self.set(view=(self.view + 1) % len(fc.COLUMNS)))
+        b("<Key-g>", lambda e: self.set(grid=not self.grid))
+        # In the grid `e` drops to one column at a time; there it cycles.
+        b("<Key-e>", lambda e: (self.set(grid=False) if self.grid else
+                                self.set(view=(self.view + 1) % len(fc.COLUMNS))))
         b("<Key-r>", lambda e: self.auto())
         b("<Key-m>", lambda e: self.cycle_marked())
         b("<Key-minus>", lambda e: self.gain(1 / 1.15))
@@ -302,11 +314,19 @@ class Picker:
         self.render()
 
     def click(self, ev):
-        if self.mode != "zoom":
+        """Centre the zoom box on the cursor, in image pixels of the panel the
+        cursor is over. A click in the gap between panels does nothing."""
+        if self.mode != "zoom" or self._geom is None:
+            return
+        g = self._geom
+        col, row = int(ev.x // (g["P"] + GAP)), int(ev.y // (g["P"] + GAP))
+        if col >= g["per_row"] or row * g["per_row"] + col >= g["n"]:
+            return
+        lx, ly = ev.x - col * (g["P"] + GAP), ev.y - row * (g["P"] + GAP)
+        if not (0 <= lx < g["P"] and 0 <= ly < g["P"]):
             return
         c = self.current()
-        s = max(2, round(FIT / c["W"]))
-        self.set_zoom(ev.x / s - fc.ZOOM_W / 2, ev.y / s - fc.ZOOM_H / 2, c["W"])
+        self.set_zoom(lx / g["s"] - fc.ZOOM_W / 2, ly / g["s"] - fc.ZOOM_H / 2, c["W"])
 
     def nudge(self, dc, dr):
         c = self.current()
@@ -322,17 +342,33 @@ class Picker:
         self.render()
 
     # --- drawing -----------------------------------------------------------
-    def render(self):
-        if self.sel:                      # unmarking can leave si past the end
-            self.si %= len(self.sel)
-        c = self.current()
-        s = max(2, round(FIT / c["W"]))
+    def _layout(self, n):
+        """`(panel size in screen pixels, panels per row)` for n panels.
 
-        labels = [lab for lab, _ in fc.COLUMNS]
-        pick = labels[self.view % len(labels)]
-        shown = c["cols"][pick]
+        The size does NOT depend on the image: the FOV crop is fitted to each
+        slice's anatomy, so its width changes as you scroll, and a panel sized
+        from it grew and shrank with every slice. Instead every crop is
+        resampled into the same square -- FIT for one column, and for the grid
+        (GRID_COLS to a row, 3 x 2 for six columns) as large as fits on the
+        screen, capped at FIT.
+        """
+        if n == 1:
+            return FIT, 1
+        per_row = min(GRID_COLS, n)
+        rows = math.ceil(n / per_row)
+        sw = self.root.winfo_screenwidth() - 40
+        sh = self.root.winfo_screenheight() - 190     # title bar + status lines
+        P = min((sw - (per_row - 1) * GAP) // per_row,
+                (sh - (rows - 1) * GAP) // rows, FIT)
+        return max(1, int(P)), per_row
 
-        if self.resid:
+    def _panel(self, c, lab, heat):
+        """One column's image: the reconstruction, or its residual (`x`), with
+        the disagreement overlay (`d`) on top. The reference has no residual of
+        its own, so it stays the image in residual mode."""
+        shown = c["cols"][lab]
+        is_ref = fc.col_spec(self._spec[lab])[1] == "reference"
+        if self.resid and not is_ref:
             # The residual gets its own window: at the image's ceiling every
             # error map is black, which is exactly when you stop being able to
             # tell two methods apart.
@@ -344,35 +380,73 @@ class Picker:
                 "RGB" if fc.RESID_CMAP else "L").convert("RGB")
         else:
             img = Image.fromarray(to8(shown, c["vmax"]), "L").convert("RGB")
+        if heat is not None:
+            img = Image.blend(img, heat, 0.55)
+        return img
 
+    def _label(self, x, y, text):
+        """Yellow text on a black backing, so it reads over any image."""
+        t = self.canvas.create_text(x + 5, y + 4, anchor="nw", fill="yellow",
+                                    font=("Consolas", 10), text=text)
+        bb = self.canvas.bbox(t)
+        back = self.canvas.create_rectangle(bb[0] - 2, bb[1] - 1, bb[2] + 2, bb[3] + 1,
+                                            fill="black", outline="")
+        self.canvas.tag_lower(back, t)
+
+    def render(self):
+        if self.sel:                      # unmarking can leave si past the end
+            self.si %= len(self.sel)
+        c = self.current()
+
+        labels = [lab for lab, _ in fc.COLUMNS]
+        shown = labels if self.grid else [labels[self.view % len(labels)]]
+
+        heat = None
         if self.dis:
             dis = disagreement(c["ref"], c["methods"])
             heat = Image.fromarray(
                 apply_cmap(dis / (dis.max() + 1e-12), fc.RESID_CMAP or "inferno"),
                 "RGB")
-            img = Image.blend(img, heat, 0.55)
 
-        self.photo = ImageTk.PhotoImage(
-            img.resize((c["W"] * s, c["W"] * s), Image.NEAREST))
-        self.canvas.config(width=c["W"] * s, height=c["W"] * s)
+        P, per_row = self._layout(len(shown))
+        rows = math.ceil(len(shown) / per_row)
+        self.canvas.config(width=per_row * P + (per_row - 1) * GAP,
+                           height=rows * P + (rows - 1) * GAP)
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self._geom = dict(s=P / c["W"], P=P, per_row=per_row, n=len(shown))
 
         marked = any(row_tag(r) == row_tag(dict(volume=c["vol"], slice=c["sl"]))
                      for r in self.sel)
-        if self.mode == "zoom":
-            c0, r0 = self.zoom_of(c)
-            self.canvas.create_rectangle(
-                c0 * s, r0 * s, (c0 + fc.ZOOM_W) * s, (r0 + fc.ZOOM_H) * s,
-                outline="#00dc00", width=2)
-        elif marked:
-            self.canvas.create_rectangle(
-                1, 1, c["W"] * s - 1, c["W"] * s - 1, outline="#00dc00", width=3)
-
-        tag = pick + (" residual" if self.resid else "")
-        self.canvas.create_text(5, 4, anchor="nw", fill="yellow",
-                                font=("Consolas", 11),
-                                text=tag + (" + disagreement" if self.dis else ""))
+        zoom = self.zoom_of(c) if self.mode == "zoom" else None
+        m = fc.STATUS_METRIC
+        # A whole-number magnification keeps hard pixels; any other ratio is
+        # resampled smoothly, since an uneven nearest-neighbour stretch reads
+        # as structure on a reconstruction.
+        resample = Image.NEAREST if P % c["W"] == 0 else Image.LANCZOS
+        self.photos = []                  # Tk drops an image nobody references
+        for i, lab in enumerate(shown):
+            x0, y0 = (i % per_row) * (P + GAP), (i // per_row) * (P + GAP)
+            ph = ImageTk.PhotoImage(self._panel(c, lab, heat).resize((P, P), resample))
+            self.photos.append(ph)
+            self.canvas.create_image(x0, y0, anchor="nw", image=ph)
+            k = P / c["W"]
+            if zoom is not None:
+                c0, r0 = zoom
+                self.canvas.create_rectangle(
+                    x0 + c0 * k, y0 + r0 * k,
+                    x0 + (c0 + fc.ZOOM_W) * k, y0 + (r0 + fc.ZOOM_H) * k,
+                    outline="#00dc00", width=2)
+            elif marked:
+                self.canvas.create_rectangle(x0 + 1, y0 + 1, x0 + P - 1, y0 + P - 1,
+                                             outline="#00dc00", width=3)
+            text = lab
+            if self.resid and fc.col_spec(self._spec[lab])[1] != "reference":
+                text += " |ref - x|"
+            if lab in c["stored"] and m in c["stored"][lab]:
+                text += f"   {m} {c['stored'][lab][m]:.2f}"
+            if self.dis and i == 0:
+                text += "   + disagreement"
+            self._label(x0, y0, text)
         self.status.config(text=self._status(c, marked))
 
     def _status(self, c, marked):
@@ -393,11 +467,11 @@ class Picker:
                 if self.mode == "browse" else
                 f"ZOOM [{self.si + 1}/{len(self.sel)}] {pretty(c['vol'])} "
                 f"slice {c['sl']}")
-        keys = ("<-/-> slice (shift 5) | up/dn volume | e column | x residual | "
+        keys = ("<-/-> slice (shift 5) | up/dn volume | g all/one | e column | x residual | "
                 "d overlay | c crop | -/= gain | space mark | m next | "
                 "enter zoom | q save+quit | esc abort"
                 if self.mode == "browse" else
-                "click/drag place | arrows nudge | n/p next row | r auto | "
+                "click/drag place (any panel) | arrows nudge | n/p next row | r auto | "
                 "b browse | q save+quit | esc abort")
         note = self.flash
         self.flash = ""

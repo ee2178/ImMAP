@@ -7,7 +7,7 @@
 #SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32GB
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=MGDump
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
@@ -29,10 +29,21 @@
 # beside the checkpoint that produced it. Pull those down and open them with
 # figures/viewer.py -- see docs/plotting.md.
 #
-# This is INFERENCE over a handful of slices, so it is minutes, not hours. The
-# 2 h walltime is slack for the model builds, and the GPU is worth asking for
-# because the unrolled nets are slow on CPU. Nothing here writes a config or a
-# checkpoint: a dump is derived data and rerunning it is always safe.
+# This is INFERENCE, then an aliasing scan over what was dumped
+# (scripts/alias_scan.py, CPU only; SCAN=0 skips it). At the default 60 brain /
+# 40 knee volumes expect ~1 h of dumping per anatomy -- mostly HDF5 compression,
+# not the nets -- and a few minutes of scan; 4 h is slack. The GPU is worth
+# asking for because the unrolled nets are slow on CPU. Nothing here writes a
+# config or a checkpoint: a dump is derived data and rerunning it is always safe.
+#
+# DISK: ~5 MB per dumped slice per run, so 60 brain volumes x 8 slices x 8 runs
+# (4 methods x R8/R12) is ~19 GB, and knee about the same. That stays on the
+# cluster: the scan writes its ranking and PNGs of the worst slices to
+#
+#     trained_nets/mg_recon/<anatomy>/alias_scan/scan_R<R>.{txt,csv}, R*_*.png
+#
+# which is all you need to pull down. rsync individual volumes for the viewer
+# once the scan has said which ones are worth looking at.
 #
 # NOTE: this is a NEW script, not an edit to the frozen Greene launchers. It
 # does not source _mg_recon_body.sh -- that body regenerates configs and calls
@@ -42,7 +53,7 @@ ANATOMIES=(brain knee)
 
 # Substring filters on the run path, passed to --only. The trailing underscore
 # keeps `lpdsnet_` from also selecting a future cell whose name contains it.
-ONLY="${ONLY:-lpdsnet_ mglpds_ varnetmaps_}"
+ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ varnetmaps_}"
 # EXACT=1: the ONLY entries are run directory NAMES, matched exactly, so a cell
 # is dumped without its tagged probes (<cell>_500ep, <cell>_prof, ...):
 #   EXACT=1 ONLY="varnetmaps_R12 lpdsnet_R12 mg81v6_R12" sbatch --array=0 ...
@@ -54,9 +65,13 @@ EXACT="${EXACT:-}"
 # legitimate thing to do, but know that you are then looking at slices the
 # network never saw.
 SLICES=("0:8" "12:25")
-# Knee is the expensive one: a wider matrix and more slices, so fewer volumes
-# for a comparable transfer. Raise once you know the range is the one you want.
-NVOLS=(6 4)
+# HOW MANY VOLUMES. Enough to catch a failure that only some patients
+# trigger: if a fraction p of volumes shows it, n volumes miss it with
+# probability (1-p)^n -- 60 catches a 5%-of-volumes artifact 95% of the time,
+# where the old 6 caught it 26% of the time. Knee has 13 slices to brain's 8,
+# so 40 knee volumes is about the same number of slices. N_VOLUMES=<n>
+# overrides both; N_VOLUMES=0 dumps EVERY volume in the val split.
+NVOLS=(60 40)
 
 METRICS="${METRICS:-psnr ssim nrmse}"   # lpips is deliberately absent: it
                                         # downloads weights on first use, and a
@@ -65,6 +80,9 @@ SEED="${SEED:-1234}"
 SIGMA="${SIGMA:-}"                      # empty = each run's own val_noise_std
 OUT="${OUT:-}"                          # empty = <run>/eval_dump/
 WORKERS="${WORKERS:-4}"
+SCAN="${SCAN:-1}"                       # 0 = dump only, no aliasing scan
+SCAN_TARGET="${SCAN_TARGET:-lpdsnet}"   # the method under suspicion
+SCAN_PNG="${SCAN_PNG:-12}"              # render this many of its worst slices
 
 # sbatch does NOT execute this file in place: it copies the script to the node's
 # spool dir and runs that copy, so $BASH_SOURCE points at the spool and cannot
@@ -105,7 +123,7 @@ fi
 
 ANATOMY="${ANATOMIES[${SLURM_ARRAY_TASK_ID}]}"
 SLICE_RANGE="${SLICES[${SLURM_ARRAY_TASK_ID}]}"
-N_VOLUMES="${NVOLS[${SLURM_ARRAY_TASK_ID}]}"
+N_VOLUMES="${N_VOLUMES:-${NVOLS[${SLURM_ARRAY_TASK_ID}]}}"
 RUNS_ROOT="trained_nets/mg_recon/${ANATOMY}"
 
 if [ ! -d "${RUNS_ROOT}" ]; then
@@ -131,4 +149,16 @@ python scripts/dump_eval.py \
     ${OUT:+--out "${OUT}/${ANATOMY}"}
 
 echo "[dump] ${ANATOMY} done $(date '+%F %T')"
-du -sh "${RUNS_ROOT}"/*/eval_dump 2>/dev/null || true
+DUMPED="${OUT:+${OUT}/${ANATOMY}}"
+DUMPED="${DUMPED:-${RUNS_ROOT}}"
+du -sh "${DUMPED}"/*/eval_dump 2>/dev/null || true
+
+if [ "${SCAN}" != "0" ]; then
+    echo "[scan] aliasing scan of ${SCAN_TARGET} over ${DUMPED} $(date '+%F %T')"
+    python scripts/alias_scan.py \
+        --runs "${DUMPED}" \
+        --target "${SCAN_TARGET}" \
+        --png "${SCAN_PNG}" \
+        --out "${DUMPED}/alias_scan"
+    echo "[scan] done $(date '+%F %T') -> ${DUMPED}/alias_scan"
+fi

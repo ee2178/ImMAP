@@ -12,4 +12,8 @@ __pycache__/
 
 # eval dumps: regenerable from a checkpoint, and large
 eval_dump/
+alias_scan/
+*_dumps.tgz
+*_dumps.tar*
+*_dumps.zip
 figures/out/

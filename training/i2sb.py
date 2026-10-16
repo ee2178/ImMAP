@@ -299,7 +299,11 @@ def train_i2sb(
                                      # only -- val/loss stays the x0 loss, so runs with and
                                      # without it remain comparable. Validation logs the val/S
                                      # image and the collapse/* indicators (CollapseMeter).
-    learned_dc=None,                 # {"ckpt": ..., "sigma_E": null|float, "feed_cond": false}:
+    u_weight=0.0,                    # > 0 adds u_weight * (the same bridge loss) on the net's
+                                     # `last_u`: the UNet estimate inside SBUnetLGGS, kept a CT1
+                                     # estimate rather than any pre-image the LGGS stage maps onto
+                                     # CT1. TRAIN term only, like s_weight.
+    learned_dc=None,                # {"ckpt": ..., "sigma_E": null|float, "feed_cond": false}:
                                      # a frozen learned operator E supplies data consistency and the
                                      # net gets a nonlinear operator instead of Identity(). See
                                      # sb/learned_dc.py; needs a net with a nonlinear branch (CDLNet).
@@ -458,6 +462,15 @@ def train_i2sb(
                 if s_weight:
                     # the S map of THIS forward, against the one-sided difference
                     loss = loss + s_weight * enhancement_loss(net, x0, x1, mask, use_mask)
+                if u_weight:
+                    u = getattr(net, "last_u", None)
+                    if u is None:
+                        raise ValueError(f"u_weight > 0 needs a net that stores `last_u` "
+                                         f"(SBUnetLGGS); {type(net).__name__} does not")
+                    loss = loss + u_weight * _bridge_loss(
+                        loss_fn, loss_type, x0, u[:, :target_channels], mask, use_mask, et,
+                        et_weight, std_fwd, loss_weight, loss_params,
+                        loss_weight_max=loss_weight_max)
                 prof.mark("forward")
 
                 (loss / accum_steps).backward()

@@ -23,6 +23,7 @@ from .sb_groupcdl import SBGroupCDL
 from .sb_guided_groupcdl import SBGuidedGroupCDL
 from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
+from .sb_unet_lggs import SBUnetLGGS
 from .unsb_nets import PatchDiscriminator, PatchEncoder, FeatureTap, PatchNCE, build_critics
 from .forward_ops import ForwardOp
 
@@ -89,6 +90,11 @@ def build_model(cfg):
     # own schedule copy, so model.params must match cfg["i2sb"].
     elif model_type == "SBUnet":
         return SBUnet(**params)
+
+    # SBUnet -> K LGGS sweeps on its CT1 estimate (E = Identity), the prior study's CT1 as the
+    # guide. Train with training.u_weight > 0 so the UNet output stays a CT1 estimate.
+    elif model_type == "SBUnetLGGS":
+        return SBUnetLGGS(**params)
 
     # Multi*level* family (models/ml_cdlnet.py): the hierarchy is the MODEL
     # (x = D_1 D_2 ... D_L g_L), not a solver device, so the transfer operators

@@ -20,6 +20,26 @@
 #   11  synth_sbguidedcdl_otherstudy_w2_sfree_flex_bs64    SBGuidedGroupCDL  synthesis 5 guides
 #   12  unsb_unet_all_bs64                                 SBUnet            unsb      FLAIR, T1, T2; paired D
 #   13  unsb_unet_t1_bs64                                  SBUnet            unsb      T1 only; unpaired
+#   14  i2sb_unet2m_otherstudy_pair_w2_bs64                SBUnet (~2M)      bridge    as 1, at ~2M parameters
+#
+# 14 is the CAPACITY CONTROL: index 1 narrowed, model_channels 20 (was 64) and num_head_channels
+# 20 (was 32), nothing else -- 2.26M parameters against 23.0M for 1 and ~2.0M for the unrolled nets
+# (2, 3-6). If it still beats them, the gap is not capacity. NOT in the default --array range
+# below:  sbatch --array=14 bigpurple/nyumets_bs64_array.sbatch
+#
+#   15  i2sb_unetlggs_k10_guided_otherstudy_w2_bs64        SBUnetLGGS        bridge    0's UNet -> 10 LGGS sweeps, prior CT1 z-2..z+2 guides
+#   16  i2sb_unetlggs_k10_unguided_otherstudy_w2_bs64      SBUnetLGGS        bridge    the same sweeps, no guide (control)
+#
+# 15-16: the UNet sees ONLY x_t and the current FLAIR/T1/T2 (index 0's inputs); the prior study
+# reaches the estimate only through the LGGS adjacency. The UNet is WARM-STARTED from index 0
+# (paths.init_ckpt) and fine-tuned together with the LGGS stage: 150k steps at lr 1e-4 (about
+# where 0's cosine is at its midpoint), u_weight 0.1 on the UNet estimate. Snapshot 0's average
+# FIRST, so both arms start from the same weights and a file the running job is not rewriting:
+#   cp trained_nets/nyumets/I2SB_Unet_NYUMets_CT1_from_all_bs64/net_ema.ckpt \n#      trained_nets/nyumets/I2SB_Unet_NYUMets_CT1_from_all_bs64/net_ema_warmstart.ckpt
+#   sbatch --array=15-16 bigpurple/nyumets_bs64_array.sbatch
+# Compare 15 with 16 (what the prior adds through the prior term), both with 0 at 300k steps (the
+# same total budget: ~150k before the snapshot + 150k here), and 15 with 1 (the prior as a guided
+# prior vs the prior as input channels).
 #
 # WHAT STILL DIFFERS BETWEEN NETS, deliberately: each keeps its own learning rate and loss
 # (the bridge UNets lr 2e-4 with sigma weighting, the unrolled nets 1e-4, UNSB its GAN Adam
@@ -80,6 +100,9 @@ CONFIGS=(
     config/NYUMets/synth_sbguidedcdl_otherstudy_w2_sfree_flex_bs64.json
     config/NYUMets/unsb_unet_all_bs64.json
     config/NYUMets/unsb_unet_t1_bs64.json
+    config/NYUMets/i2sb_unet2m_otherstudy_pair_w2_bs64.json
+    config/NYUMets/i2sb_unetlggs_k10_guided_otherstudy_w2_bs64.json
+    config/NYUMets/i2sb_unetlggs_k10_unguided_otherstudy_w2_bs64.json
 )
 
 
