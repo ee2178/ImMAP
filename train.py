@@ -266,15 +266,18 @@ def main(config_path):
         "net.ckpt"
     )
 
-    # The relative backtrack threshold defaults to Sljiva's 500 for reconstruction
-    # (training/recon.py::BACKTRACK_RATIO). Written into the run's config.json
-    # so the file records what the run trained under; a config that already
-    # carries the key -- `null` to turn the check off -- keeps its own value.
-    # Not written by the config generator, so a run launched before the key
-    # existed still matches its generated config and resumes.
+    # The backtrack thresholds for reconstruction -- training loss 100x its best,
+    # validation loss 2x its best (training/recon.py::BACKTRACK_RATIO,
+    # VAL_BACKTRACK_RATIO). Written into the run's config.json so the file
+    # records what the run trained under; a config that already carries a key
+    # -- `null` to turn that check off -- keeps its own value, so a run launched
+    # under an older default keeps it on resume (scripts/set_backtrack.py
+    # changes it). Not written by the config generator, so a run launched
+    # before a key existed still matches its generated config and resumes.
     if task == "recon":
-        from training.recon import BACKTRACK_RATIO
+        from training.recon import BACKTRACK_RATIO, VAL_BACKTRACK_RATIO
         cfg["training"].setdefault("backtrack_ratio", BACKTRACK_RATIO)
+        cfg["training"].setdefault("val_backtrack_ratio", VAL_BACKTRACK_RATIO)
 
     # Save args (now carries wandb id + ckpt path -> resume-ready)
     save_config(cfg)

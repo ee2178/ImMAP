@@ -189,6 +189,7 @@ def save_ckpt(
     backtrack_count=None,
     best_loss=None,
     ema=None,
+    best_val_loss=None,
 ):
     """
     Save checkpoint.
@@ -216,6 +217,9 @@ def save_ckpt(
             "scheduler_state_dict": get_state_dict(scheduler),
             "backtrack_count": backtrack_count,
             "best_loss": best_loss,
+            # The validation bar (training/recon.py's val backtracking); None
+            # for tasks that do not keep one.
+            "best_val_loss": best_val_loss,
             # The averaged weights, NOT a substitute for model_state_dict: resuming has to
             # continue from the live parameters, so both are stored. `save_ema_ckpt` writes the
             # average out as a loadable model checkpoint for sampling.

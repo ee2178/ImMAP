@@ -72,12 +72,48 @@ MAX_SKIPPED_FRACTION = 0.1
 # NB the names cross: there `backtrack_factor` is this RATIO; here it is the
 # learning-rate multiplier.
 #
-# At 500 the check catches a genuine blow-up and little else. It will NOT catch
-# a collapse to an all-zero output (~2 on these normalised losses, ~7x a best of
-# 0.27) -- that is the price of not firing on noise. A non-finite epoch still
-# restores either way (that path does not use the ratio). `None` in a config's
-# `training.backtrack_ratio` turns the check off.
-BACKTRACK_RATIO = 500.0
+# 100 since 2026-10-19 (Sljiva's train.jl default; was 500). At 500 two
+# MG-Group cells (M=169 brain R12, M=169 knee R8) diverged and never came back:
+# the blow-up sat under 500x the best and was never restored. 100 is still far
+# above the early-training swings that made 2 fire on healthy runs.
+#
+# It will NOT catch a collapse to an all-zero output (~2 on these normalised
+# losses, ~7x a best of 0.27) -- the validation check below is what catches a
+# model that has gone bad without its training loss exploding. A non-finite
+# epoch still restores either way (that path does not use the ratio). `None` in
+# a config's `training.backtrack_ratio` turns the check off.
+BACKTRACK_RATIO = 100.0
+
+# VALIDATION BACKTRACKING (2026-10-19). A validation pass whose loss exceeds
+# this many times the best validation loss so far -- or is non-finite -- is
+# restored from the BEST-VALIDATION checkpoint (`net_bestval.ckpt`, written on
+# every improving validation pass) at a lower learning rate, exactly as the
+# training check restores `net.ckpt`.
+#
+# Its own checkpoint, because `net.ckpt` is the best TRAINING-loss model, and
+# that can be the very model whose validation blew up: the training check then
+# restores it faithfully and validation stays bad -- what MG-Group runs showed.
+# After a validation restore `net.ckpt` is rewritten with the restored weights
+# (and the training loss recorded beside them), so a later training backtrack
+# or a requeue lands on the good model too, not back on the bad one.
+#
+# 2, not the training check's 100: the validation loss has none of the epoch
+# loss's noise -- the same slices, the same seeded noise and masks every pass
+# (`val_seed`) -- so it moves only when the weights do, and a doubling between
+# passes 100 epochs apart is a model that got worse, not an unlucky batch.
+# `None` in a config's `training.val_backtrack_ratio` turns it off (a
+# non-finite validation loss still restores).
+VAL_BACKTRACK_RATIO = 2.0
+BESTVAL_CKPT = "net_bestval.ckpt"
+
+
+def _ckpt_field(path, key):
+    """One bookkeeping value out of a checkpoint, or None."""
+    try:
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:                                   # torch < 1.13
+        ck = torch.load(path, map_location="cpu")
+    return ck.get(key)
 
 
 def train_recon(
@@ -149,6 +185,10 @@ def train_recon(
     # default -- turns it off. Independent of `backtrack_thresh`; either one
     # triggers a restore.
     backtrack_ratio=BACKTRACK_RATIO,
+    # The VALIDATION check: restore the best-validation checkpoint when a
+    # validation pass's loss exceeds `val_backtrack_ratio` x the best one's
+    # (see VAL_BACKTRACK_RATIO). None turns it off.
+    val_backtrack_ratio=VAL_BACKTRACK_RATIO,
     backtrack_factor=0.8,
     # Backtracking bookkeeping, threaded in from train.py so it survives a
     # requeue. `backtrack_count` sets the LR amplitude (lr0 * factor**count) and
@@ -156,6 +196,9 @@ def train_recon(
     # either one on resume is what let a backtracked run climb back to full LR.
     backtrack_count=0,
     best_loss=float("inf"),
+    # The validation bar. NOT threaded from train.py: it is read back from
+    # net_bestval.ckpt below on a resume, which is the file it describes.
+    best_val_loss=float("inf"),
     wandb=None,
 ):
     net.to(device)
@@ -163,6 +206,18 @@ def train_recon(
 
     loss_fn = LOSS_REGISTRY[loss_type]
     ckpt_path = os.path.join(save_dir, "net.ckpt")
+    bestval_path = os.path.join(save_dir, BESTVAL_CKPT)
+    # A best-val checkpoint is trusted only on a RESUME. On a fresh start one
+    # left in the directory belongs to an earlier run (FORCE_RESTART does not
+    # delete files) and must neither set the bar nor be restored from; it is
+    # overwritten by this run's first validation pass.
+    bestval_ok = start_epoch > 0 and os.path.exists(bestval_path)
+    if bestval_ok:
+        v = _ckpt_field(bestval_path, "best_val_loss")
+        if v is not None and math.isfinite(v):
+            best_val_loss = min(best_val_loss, float(v))
+            print(f"resuming with best validation loss {best_val_loss:.4e} "
+                  f"({BESTVAL_CKPT})")
 
     def metric_mask(m):
         """The mask to hand `compute_metrics` / the panel, or None when off.
@@ -398,6 +453,7 @@ def train_recon(
                 scheduler=sched,
                 backtrack_count=backtrack_count,
                 best_loss=avg_loss,
+                best_val_loss=best_val_loss,
             )
             best_loss = avg_loss
 
@@ -579,6 +635,53 @@ def train_recon(
             print(f"[VAL] epoch={epoch}: validation + logging took "
                   f"{time.perf_counter() - t_val:.1f} s over {num_val_batches} "
                   f"slices", flush=True)
+
+            # ---- validation backtracking (see VAL_BACKTRACK_RATIO) ----
+            vloss = float(mean_metrics["loss"])
+            v_nonfinite = not math.isfinite(vloss)
+            v_over = (val_backtrack_ratio is not None and math.isfinite(best_val_loss)
+                      and vloss > val_backtrack_ratio * best_val_loss)
+            if v_nonfinite or v_over:
+                why = ("non-finite val loss" if v_nonfinite else
+                       f"val loss {vloss:.3e} > {val_backtrack_ratio:g} x best val "
+                       f"{best_val_loss:.3e}")
+                src = bestval_path if bestval_ok else ckpt_path
+                if os.path.exists(src):
+                    print(f"[VAL] epoch={epoch}: {why} -- backtracking to "
+                          f"{os.path.basename(src)}")
+                    backtrack_count, new_lr = do_backtrack(
+                        src, model=net, optimizer=opt, scheduler=sched,
+                        device=device, backtrack_count=backtrack_count,
+                        backtrack_factor=backtrack_factor)
+                    print(f"val backtrack #{backtrack_count} -> LR {new_lr}")
+                    # net.ckpt may hold the model that just failed validation:
+                    # replace it with the restored one, and its bar with the
+                    # training loss that model had, so neither a training
+                    # backtrack nor a requeue goes back to the bad weights.
+                    if src == bestval_path:
+                        b = _ckpt_field(bestval_path, "best_loss")
+                        if b is not None and math.isfinite(b):
+                            best_loss = float(b)
+                    if save_ckpt_fn is not None:
+                        save_ckpt_fn(ckpt_path, model=net, step=global_step,
+                                     optimizer=opt, scheduler=sched,
+                                     backtrack_count=backtrack_count,
+                                     best_loss=best_loss, best_val_loss=best_val_loss)
+                else:
+                    print(f"[VAL] epoch={epoch}: {why}, but there is no checkpoint "
+                          f"to restore yet -- continuing")
+            elif vloss < best_val_loss:
+                best_val_loss = vloss
+                if save_ckpt_fn is not None:
+                    # The training loss stored with it is that of the weights
+                    # in hand: the epoch average, or -- when this epoch was
+                    # itself restored -- the checkpoint's.
+                    save_ckpt_fn(bestval_path, model=net, step=global_step,
+                                 optimizer=opt, scheduler=sched,
+                                 backtrack_count=backtrack_count,
+                                 best_loss=best_loss if should_backtrack else avg_loss,
+                                 best_val_loss=best_val_loss)
+                    bestval_ok = True
 
             net.train()
 

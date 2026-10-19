@@ -16,9 +16,12 @@ toy problem with one epoch's loss inflated by a known factor:
 3. inflated 1.5x (under the ratio): not restored;
 4. inflated in the FIRST epoch, before any checkpoint exists: not restored and
    no error -- there is no best to compare with yet;
-5. the default is Sljiva's 500 (2 fired on the unstable early epochs of
-   healthy runs): a 3x epoch trains through it, a 600x one is restored; and
-   the absolute margin (`backtrack_thresh`) still works on its own.
+5. the default is 100 (2 fired on the unstable early epochs of healthy runs;
+   500 let two MG-Group cells diverge for good): a 3x epoch trains through it,
+   a 600x one is restored; and the absolute margin (`backtrack_thresh`) still
+   works on its own.
+
+The VALIDATION check is tests/test_val_backtrack.py.
 
 CPU only, a few seconds.
 """
@@ -114,15 +117,15 @@ def main():
     check("inflated in the first epoch, no checkpoint yet: not restored, no error",
           "backtracking" not in first["log"] and first["ckpt"]["step"] > STEPS)
 
-    check("the default ratio is Sljiva's 500",
-          recon_mod.BACKTRACK_RATIO == 500.0,
+    check("the default ratio is 100",
+          recon_mod.BACKTRACK_RATIO == 100.0,
           f"BACKTRACK_RATIO = {recon_mod.BACKTRACK_RATIO}")
     dflt = run(3.0, last)
     check("  ...so at the default a 3x epoch trains straight through",
           "backtracking" not in dflt["log"] and not at_checkpoint(dflt))
     blown = run(600.0, last)
     check("  ...and a 600x epoch (a blow-up) is restored",
-          "backtracking" in blown["log"] and "500 x best" in blown["log"]
+          "backtracking" in blown["log"] and "100 x best" in blown["log"]
           and at_checkpoint(blown), str([ln for ln in blown["log"].splitlines() if "backtrack" in ln][:1]))
 
     margin = run(3.0, last, backtrack_ratio=None, backtrack_thresh=1e-6)
