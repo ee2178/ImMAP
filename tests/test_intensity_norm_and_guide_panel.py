@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Two loader-side additions for the longitudinal runs.
 
-1. intensity_norm="volume_median": every contrast of every volume divided by ITS OWN in-brain
+1. intensity_norm="volume_scale": every contrast of every volume divided by ITS OWN in-brain
    median (the h5's norm_stats centre) instead of one fixed `scales` per contrast. On a phantom
    whose second study is the first at 1.7x the scanner gain, the prior guide must come back on the
    current study's scale -- and with the fixed scales it must not.
@@ -71,16 +71,16 @@ def ratio_prior_to_current(root, norm):
     return float(prior_ct1[m].median() / ct1[m].median()), float(ct1[m].median())
 
 
-def test_fixed_scales_keep_the_gain_and_volume_median_removes_it(root):
+def test_fixed_scales_keep_the_gain_and_volume_scale_removes_it(root):
     r_fixed, _ = ratio_prior_to_current(root, "none")
-    r_norm, med = ratio_prior_to_current(root, "volume_median")
+    r_norm, med = ratio_prior_to_current(root, "volume_scale")
     # the loader serves study 0 and study 1 in turn, so the ratio is GAIN or 1/GAIN
     assert min(abs(r_fixed - GAIN), abs(r_fixed - 1 / GAIN)) < 0.02, r_fixed
     assert abs(r_norm - 1.0) < 0.02, r_norm
     assert abs(med - 1.0) < 0.05, med                  # tissue lands near 1
 
 
-def test_volume_median_needs_the_attr(root, tmp_path):
+def test_volume_scale_needs_the_attr(root, tmp_path):
     import shutil
     d = tmp_path / "copy"
     shutil.copytree(root, d)
@@ -88,7 +88,7 @@ def test_volume_median_needs_the_attr(root, tmp_path):
         with h5py.File(f, "a") as h:
             del h.attrs["norm_stats"]
     with pytest.raises(KeyError, match="norm_stats"):
-        next(iter(build_loader(block(str(d), intensity_norm="volume_median"), shuffle=False,
+        next(iter(build_loader(block(str(d), intensity_norm="volume_scale"), shuffle=False,
                                drop_last=False)))
 
 

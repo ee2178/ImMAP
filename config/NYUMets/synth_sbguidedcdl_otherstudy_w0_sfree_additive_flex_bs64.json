@@ -16,7 +16,6 @@
             "joint_softmax": false,
             "attn_backend": "flex",
             "flex_block_size": 16,
-            "guide_center": false,
             "sim_fun": "distance",
             "dK": 5,
             "share_attention": true,
@@ -48,7 +47,7 @@
             "name": "nyumets_synth",
             "root": "../datasets/NYUMets_h5_fit_train",
             "image_key": "img_raw",
-            "intensity_norm": "volume_median",
+            "intensity_norm": "volume_scale",
             "scales": [
                 2800.0,
                 2500.0,
@@ -74,7 +73,6 @@
             "batch_size": 32,
             "num_workers": 8,
             "guide_mode": "other_study",
-            "guide_enhancement": true,
             "guide_idx": [
                 2
             ],
@@ -87,7 +85,7 @@
             "name": "nyumets_synth",
             "root": "../datasets/NYUMets_h5_fit_val",
             "image_key": "img_raw",
-            "intensity_norm": "volume_median",
+            "intensity_norm": "volume_scale",
             "scales": [
                 2800.0,
                 2500.0,
@@ -112,7 +110,6 @@
             "batch_size": 8,
             "num_workers": 8,
             "guide_mode": "other_study",
-            "guide_enhancement": true,
             "guide_idx": [
                 2
             ],

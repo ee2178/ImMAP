@@ -3,29 +3,28 @@
 # EVERY LONGITUDINAL NET (one that sees another study of the patient), retrained at the default
 # recipe: effective batch 64 (data.batch_size 32 x training.accum_steps 2), EMA 0.99 with warm-up,
 # 300,000 optimizer steps, the fit-registered data, the T1 & CT1 loader mask, slices [50, 90),
-# and PER-VOLUME intensity normalization (intensity_norm "volume_median": every contrast of every
-# volume divided by its own in-brain median, instead of one fixed scale per contrast -- which left
-# each scan's gain in the data, so prior and current studies were on different brightness scales).
-# The guide each net takes is in its config; [guide_enhancement] below = the prior study's
-# (CT1 - T1)+ instead of its CT1 (state of the configs when this file was written).
+# and PER-VOLUME intensity SCALING (intensity_norm "volume_scale": x -> x / s_v per volume and
+# contrast, s_v = that volume's in-brain median; nothing is subtracted). It replaces the one fixed
+# scale per contrast, which left each scan's gain in the data, so prior and current studies were
+# on different brightness scales. The guided nets take the prior study's CT1 as their guide.
 #
 #   idx  config                                                   model             task      what
 #   ---  -------------------------------------------------------  ----------------  --------  ----
 #    0  i2sb_unet_otherstudy_pair_w2_bs64                        SBUnet            bridge    prior T1/CT1 at z-2..z+2 as input channels
-#    1  i2sb_sbguidedcdl_otherstudy_w0_sfree_flex_bs64           SBGuidedGroupCDL  bridge    guided prox, prior (CT1-T1)+ at z [guide_enhancement]
-#    2  i2sb_sbguidedcdl_otherstudy_w1_sfree_flex_bs64           SBGuidedGroupCDL  bridge    prior (CT1-T1)+ at z-1..z+1 [guide_enhancement]
-#    3  i2sb_sbguidedcdl_otherstudy_w2_sfree_flex_bs64           SBGuidedGroupCDL  bridge    prior (CT1-T1)+ at z-2..z+2 [guide_enhancement]
+#    1  i2sb_sbguidedcdl_otherstudy_w0_sfree_flex_bs64           SBGuidedGroupCDL  bridge    guided prox, prior CT1 at z
+#    2  i2sb_sbguidedcdl_otherstudy_w1_sfree_flex_bs64           SBGuidedGroupCDL  bridge    prior CT1 at z-1..z+1
+#    3  i2sb_sbguidedcdl_otherstudy_w2_sfree_flex_bs64           SBGuidedGroupCDL  bridge    prior CT1 at z-2..z+2
 #    4  synth_unet_otherstudy_pair_w2                            Unet2D            synthesis end-to-end UNet, prior T1/CT1 z-2..z+2 as channels
-#    5  synth_sbguidedcdl_otherstudy_w0_sfree_flex_bs64          SBGuidedGroupCDL  synthesis guided prox, prior (CT1-T1)+ at z [guide_enhancement]
-#    6  synth_sbguidedcdl_otherstudy_w1_sfree_flex_bs64          SBGuidedGroupCDL  synthesis prior (CT1-T1)+ at z-1..z+1 [guide_enhancement]
-#    7  synth_sbguidedcdl_otherstudy_w2_sfree_flex_bs64          SBGuidedGroupCDL  synthesis prior (CT1-T1)+ at z-2..z+2 [guide_enhancement]
-#    8  synth_sbguidedcdl_otherstudy_w0_sfree_additive_flex_bs64 SBGuidedGroupCDL  synthesis w0, additive variant [guide_enhancement]
-#    9  synth_sbguidedcdl_otherstudy_w0_sfree_sw5_e500_flex_bs64 SBGuidedGroupCDL  synthesis w0, s_weight 5, 500 epochs [guide_enhancement]
+#    5  synth_sbguidedcdl_otherstudy_w0_sfree_flex_bs64          SBGuidedGroupCDL  synthesis guided prox, prior CT1 at z
+#    6  synth_sbguidedcdl_otherstudy_w1_sfree_flex_bs64          SBGuidedGroupCDL  synthesis prior CT1 at z-1..z+1
+#    7  synth_sbguidedcdl_otherstudy_w2_sfree_flex_bs64          SBGuidedGroupCDL  synthesis prior CT1 at z-2..z+2
+#    8  synth_sbguidedcdl_otherstudy_w0_sfree_additive_flex_bs64 SBGuidedGroupCDL  synthesis w0, additive variant
+#    9  synth_sbguidedcdl_otherstudy_w0_sfree_sw5_e500_flex_bs64 SBGuidedGroupCDL  synthesis w0, s_weight 5, 500 epochs
 #
 # THE SAME CONFIG FILES as bigpurple/nyumets_bs64_array.sbatch (bridge 1, 3-5; synthesis 9-11) and
-# bigpurple/nyumets_followup_array.sbatch (4, 5), so each run writes the folder it always has:
-# SUBMITTING AN INDEX RESTARTS THAT RUN FROM SCRATCH, OVER WHATEVER IS THERE. Copy a folder
-# under trained_nets/nyumets/ first if you want to keep it. Do not submit one config from two arrays.
+# bigpurple/nyumets_followup_array.sbatch (4, 5), so each run writes the folder it always has.
+# SUBMITTING AN INDEX RESTARTS THAT RUN FROM SCRATCH, OVER WHATEVER IS THERE. Copy a
+# folder under trained_nets/nyumets/ first if you want to keep it. Do not submit one config from two arrays.
 # To resume instead:  python train.py trained_nets/nyumets/<run name>/config.json
 #
 # Not listed: the enhancement cross-attention (xS) and UNet2M / UNet2M+LGGS runs (set aside for

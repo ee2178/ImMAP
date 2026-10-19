@@ -72,7 +72,7 @@ def build_nyumets_synth_loader(root=None,
                                cond_idx=(0, 1, 3),       # FLAIR, T1, T2 -> X channels 0..2
                                image_key="img_median_mad",
                                scales=None,
-                               intensity_norm="none",    # "volume_median": each volume / its own in-brain median
+                               intensity_norm="none",    # "volume_scale": x / (its volume's in-brain median), scaling only
                                # --- guide (the prior study) ---
                                guide_mode="none",
                                guide_idx=None,

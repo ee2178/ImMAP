@@ -25,7 +25,7 @@
             "name": "nyumets_synth",
             "root": "../datasets/NYUMets_h5_fit_train",
             "image_key": "img_raw",
-            "intensity_norm": "volume_median",
+            "intensity_norm": "volume_scale",
             "scales": [
                 2800.0,
                 2500.0,
@@ -61,7 +61,7 @@
             "name": "nyumets_synth",
             "root": "../datasets/NYUMets_h5_fit_val",
             "image_key": "img_raw",
-            "intensity_norm": "volume_median",
+            "intensity_norm": "volume_scale",
             "scales": [
                 2800.0,
                 2500.0,

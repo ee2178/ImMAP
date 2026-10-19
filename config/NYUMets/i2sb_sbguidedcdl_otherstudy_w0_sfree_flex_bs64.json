@@ -16,7 +16,6 @@
             "joint_softmax": true,
             "attn_backend": "flex",
             "flex_block_size": 16,
-            "guide_center": false,
             "sim_fun": "distance",
             "dK": 5,
             "share_attention": true,
@@ -62,7 +61,7 @@
                 3
             ],
             "image_key": "img_raw",
-            "intensity_norm": "volume_median",
+            "intensity_norm": "volume_scale",
             "slice_range": [
                 50,
                 90
@@ -77,7 +76,6 @@
                 2370.0
             ],
             "guide_mode": "other_study",
-            "guide_enhancement": true,
             "guide_idx": [
                 2
             ],
@@ -101,7 +99,7 @@
                 3
             ],
             "image_key": "img_raw",
-            "intensity_norm": "volume_median",
+            "intensity_norm": "volume_scale",
             "slice_range": [
                 50,
                 90
@@ -116,7 +114,6 @@
                 2370.0
             ],
             "guide_mode": "other_study",
-            "guide_enhancement": true,
             "guide_idx": [
                 2
             ],

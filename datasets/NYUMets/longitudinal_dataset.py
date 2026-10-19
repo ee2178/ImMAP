@@ -154,7 +154,7 @@ def index_sessions(root):
     return paths, n_slices, patients
 
 
-INTENSITY_NORMS = ("none", "volume_median")
+INTENSITY_NORMS = ("none", "volume_scale")
 ENHANCEMENT = -1          # pseudo-contrast in `guide_idx`: the slice's (x0 - x1)_+ ; see the docstring
 
 
@@ -245,11 +245,12 @@ class NYUMetsGuidedDataset(Dataset):
         # PER-VOLUME intensity scale. MRI intensities are in arbitrary units that change with the
         # scanner, receiver gain and protocol, so one fixed divisor per contrast (`scales`) leaves
         # each acquisition's own gain in the data: two studies of a patient, and even T1 and CT1
-        # of one session, can sit at different brightness. "volume_median" divides every contrast
-        # of every volume by ITS OWN in-brain median -- the `norm_stats` centre the h5 build
-        # stores (preprocessing/nyumets_h5.py) -- INSTEAD of `scales`. Scale only, no centring:
-        # zero stays zero (the mask, the T1 & CT1 support) and ratios survive, so the additive
-        # model T1 = CT1 - S keeps its meaning; tissue lands near 1. "none" = `scales` as before.
+        # of one session, can sit at different brightness. "volume_scale" is a PURE SCALING per
+        # volume and contrast, x -> x / s_v, with s_v = that volume's in-brain median (the
+        # `norm_stats` centre the h5 build stores, preprocessing/nyumets_h5.py), INSTEAD of the
+        # fixed `scales`. Nothing is subtracted -- the median is only the divisor -- so zero stays
+        # zero (the mask, the T1 & CT1 support), ratios survive, the additive model
+        # T1 = CT1 - S keeps its meaning, and tissue lands near 1. "none" = `scales` as before.
         self.intensity_norm = str(getattr(cfg, "intensity_norm", "none") or "none")
         if self.intensity_norm not in INTENSITY_NORMS:
             raise ValueError(f"intensity_norm must be one of {INTENSITY_NORMS}, "
@@ -416,7 +417,7 @@ class NYUMetsGuidedDataset(Dataset):
             raise KeyError(f"'{self.image_key}' not in {self.img_paths[fi]} "
                            f"(keys={list(h.keys())})")
         img = np.asarray(h[self.image_key][li])           # (H, W, Cstored)
-        if self.intensity_norm == "volume_median":
+        if self.intensity_norm == "volume_scale":
             img = img / self._volume_centre(fi, h)[None, None, :]
         elif self.scales is not None:
             img = img / self.scales[None, None, :]
@@ -427,7 +428,7 @@ class NYUMetsGuidedDataset(Dataset):
         c = self._centre.get(fi)
         if c is None:
             if "norm_stats" not in h.attrs:
-                raise KeyError(f"intensity_norm='volume_median' needs the norm_stats attr, which "
+                raise KeyError(f"intensity_norm='volume_scale' needs the norm_stats attr, which "
                                f"{self.img_paths[fi]} does not have; rebuild it with "
                                f"preprocessing/nyumets_h5.py")
             c = np.asarray(h.attrs["norm_stats"], dtype=np.float32).reshape(-1, 2)[:, 0]
