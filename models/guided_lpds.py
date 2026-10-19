@@ -208,7 +208,7 @@ class LGGSNet(nn.Module):
                  rho0=1.0, gamma0=0.8, rho_inv=True,
                  init_strategy="semi_orthogonal", attn_backend="gather",
                  flex_block_size=128, is_complex=True, preproc="kspace",
-                 spectral_init=True):
+                 spectral_init=True, guide_blend=None, guide_gain0=1.0):
         super().__init__()
         self.K, self.M, self.C, self.P, self.s = int(K), int(M), int(C), int(P), int(s)
         self.is_complex = bool(is_complex)
@@ -224,6 +224,8 @@ class LGGSNet(nn.Module):
                         gamma0=gamma0, rho_inv=rho_inv,
                         init_strategy=init_strategy, attn_backend=attn_backend,
                         flex_block_size=flex_block_size)
+        if guide_blend is not None:            # "additive": models/guided_prox.py
+            prox_kws.update(guide_blend=guide_blend, guide_gain0=guide_gain0)
         layer_kws = dict(P=P, stride=s, lam0=lam0, tau0=tau0, theta0=theta0,
                          degrees=degrees, is_complex=is_complex, window=window,
                          guide_window=guide_window, joint_softmax=joint_softmax,

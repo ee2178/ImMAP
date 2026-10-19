@@ -227,6 +227,10 @@ class CollapseMeter:
     """Data-side collapse indicators, pooled over a validation pass.
 
         S_rms_ratio    rms(S_hat) / rms((CT1 - T1)_+)       -> 0: S collapsed to zero (1 = right size)
+        S_rel_err      rms(S_hat - (CT1 - T1)_+) / rms((CT1 - T1)_+)
+                                                            ACCURACY of S: 1 = no better than S = 0.
+                                                            S_rms_ratio alone rewards energy in the
+                                                            wrong place; read the two together
         S_neg_frac     share of S_hat's energy below zero   -> large: S is not an enhancement map
         T1_resid       rms(x_hat - S_hat - T1) / rms(T1 - mean)
                                                             -> 1: the model's T1 no longer explains T1
@@ -237,7 +241,7 @@ class CollapseMeter:
     """
 
     def __init__(self):
-        self.s2 = self.t2 = self.neg2 = self.res2 = self.y2 = self.dens = 0.0
+        self.s2 = self.t2 = self.neg2 = self.res2 = self.y2 = self.dens = self.err2 = 0.0
         self.n = 0
 
     @torch.no_grad()
@@ -252,6 +256,7 @@ class CollapseMeter:
         t1c = t1 - t1.mean(dim=(1, 2, 3), keepdim=True)       # the DC the net carries separately
         self.s2 += float((S ** 2 * w).sum())
         self.t2 += float((tgt ** 2 * w).sum())
+        self.err2 += float(((S - tgt) ** 2 * w).sum())
         self.neg2 += float((S.clamp(max=0.0) ** 2 * w).sum())
         self.res2 += float(((x_hat - S - t1) ** 2 * w).sum())
         self.y2 += float((t1c ** 2 * w).sum())
@@ -266,6 +271,7 @@ class CollapseMeter:
             return {}
         eps = 1e-30
         out = {"S_rms_ratio": (self.s2 / max(self.t2, eps)) ** 0.5,
+               "S_rel_err": (self.err2 / max(self.t2, eps)) ** 0.5,
                "S_neg_frac": self.neg2 / max(self.s2, eps),
                "T1_resid": (self.res2 / max(self.y2, eps)) ** 0.5,
                "code_density": self.dens / self.n}

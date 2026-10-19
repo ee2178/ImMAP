@@ -10,9 +10,12 @@
 #   ---  -------------------------------------------------  ----------------  --------  ----
 #    0  i2sb_unet2m_otherstudy_pair_w2_bs64                SBUnet (2.26M)    bridge    bs64 #1 narrowed to ~2M
 #    1  synth_unet2m_all_bs64                              Unet2D (2.23M)    synthesis bs64 #7 narrowed to ~2M
-#    2  i2sb_unetlggs_k10_guided_otherstudy_w2_bs64        SBUnetLGGS        bridge    UNet(FLAIR,T1,T2) -> 10 LGGS sweeps,
-#                                                                                      prior CT1 z-2..z+2 as guides
-#    3  i2sb_unetlggs_k10_unguided_otherstudy_w2_bs64      SBUnetLGGS        bridge    the same sweeps, no guide (control)
+#    2  i2sb_unet2mlggs_k10_guided_otherstudy_w2_bs64      SBUnetLGGS (2.65M) bridge  ~2M UNet(FLAIR,T1,T2) -> 10 LGGS
+#                                                                                      sweeps, prior CT1 z-2..z+2 as guides
+#    3  i2sb_unet2mlggs_k10_unguided_otherstudy_w2_bs64    SBUnetLGGS (2.65M) bridge  the same sweeps, no guide (control)
+#    4  synth_sbguidedcdl_otherstudy_w0_sfree_additive_flex_bs64  SBGuidedGroupCDL  synthesis  bs64 #9, ADDITIVE guide blend
+#    5  synth_sbguidedcdl_otherstudy_w0_sfree_sw5_e500_flex_bs64  SBGuidedGroupCDL  synthesis  bs64 #9, s_weight 5, 500 epochs
+#    6  i2sb_unet2m_all_bs64                               SBUnet (2.26M)    bridge    bs64 #0 narrowed to ~2M: 2-3's UNet alone
 #
 # CAPACITY CONTROLS (0-1). The unrolled nets are ~2.0M parameters; the UNets they lose to are
 # 23.0M (bridge) and 5.7M (synthesis). 0 and 1 change ONLY the width of bs64 #1 / #7 (bridge:
@@ -20,20 +23,39 @@
 # 256 -> 160). Compare 0 with bs64 #2-6 and 1 with bs64 #8-11: if the ~2M UNet still wins, the
 # gap is not capacity.
 #
-# UNET + LGGS (2-3), models/sb_unet_lggs.py. The UNet sees only x_t and the current FLAIR/T1/T2
-# and gives a CT1 estimate u; 10 LGGS sweeps (E = Identity) then refine it, with the prior study's
-# CT1 entering ONLY the guided group threshold's adjacency:  x0_hat ~ argmin 1/2||x - u||^2 +
-# lambda R(Ax; Aw). The UNet is WARM-STARTED from bs64 #0 (paths.init_ckpt) and fine-tuned with
-# the LGGS stage: 150k steps at lr 1e-4, u_weight 0.1 keeping u a CT1 estimate. Snapshot bs64 #0's
-# average FIRST, so both arms start from the same weights (the tasks refuse to start without it):
-#   cp trained_nets/nyumets/I2SB_Unet_NYUMets_CT1_from_all_bs64/net_ema.ckpt #      trained_nets/nyumets/I2SB_Unet_NYUMets_CT1_from_all_bs64/net_ema_warmstart.ckpt
-# Compare 2 with 3 (what the prior adds through the prior term), both with bs64 #0 at 300k steps
-# (the same total budget: ~150k before the snapshot + 150k here), and 2 with bs64 #1 (the prior
-# as a guided prior vs as input channels). Judge them on lesion regions of patients whose disease
-# changed, not only whole-image PSNR: the guided threshold favours what the prior confirms.
+# UNET + LGGS (2-3, 6), models/sb_unet_lggs.py. A LIGHT UNet -- the ~2M width of 0 and 6
+# (model_channels 20) -- sees only x_t and the current FLAIR/T1/T2 and gives a CT1 estimate u; 10
+# LGGS sweeps (E = Identity) then refine it, with the prior study's CT1 entering ONLY the guided
+# group threshold's adjacency:  x0_hat ~ argmin 1/2||x - u||^2 + lambda R(Ax; Aw). Trained
+# jointly FROM SCRATCH for the full 300k steps (lr 1e-4, u_weight 0.1 keeping u a CT1 estimate):
+# no warm start and no snapshot needed. 6 is the same UNet trained alone, on the same recipe as
+# the other bridge UNets (lr 2e-4). Compare
+#   2 vs 3   what the prior study adds THROUGH THE PRIOR, beyond extra refinement capacity
+#   2-3 vs 6 whether the LGGS stage helps the light UNet at all (same UNet, same steps)
+#   2 vs 0   the prior study as a guided prior vs as input channels, both ~2M UNets
+# Judge them on lesion regions of patients whose disease changed, not only whole-image PSNR:
+# the guided threshold favours what the prior confirms. (The earlier 23M warm-started hybrids,
+# i2sb_unetlggs_k10_*, are no longer in this array; their configs are kept.)
 #
-# RUNTIME, NOT MEASURED: the ~2M UNets well under a day or two; 2 roughly 2.5 days (10 guided
-# sweeps over 5 guides, scaled from the 30-iteration guided CDL net's ~9.5 days), 3 about 1.
+# ENHANCEMENT ENERGY (4-5). The guided synthesis nets beat SynthCDL on the metrics but lose
+# enhancement detail. Both start from bs64 #9 (one guide: the prior study's (CT1 - T1)_+ at z) and
+# change one thing each:
+#   4  guide_blend "additive" (models/guided_prox.py): the guide's pooled energy is ADDED to the
+#      self energy with a learned gain kappa >= 0, instead of competing with it in one softmax.
+#      Under the joint softmax a guide that is empty near a pixel still takes weight from the self
+#      term, so the threshold there is STRICTER than no guide -- new enhancement the prior study
+#      lacks gets shrunk hardest. Additive can only relax the shrinkage; kappa = 0 is the unguided
+#      threshold. Full 300k steps: compare with #9 at the end.
+#   5  s_weight 5 (was 1) on the S-map loss. 500 epochs = 50k steps, with #9's schedule unchanged
+#      (T_max still 300k), so the LR matches #9's first 500 epochs: compare with #9's own epoch-500
+#      validation, not its final one.
+# Judge both on val/S and collapse/S_rms_ratio (how much enhancement energy the net produces), not
+# only PSNR/SSIM -- a gain in enhancement can cost a little whole-image MSE.
+#
+# RUNTIME, NOT MEASURED: the ~2M UNets (0, 1, 6) well under a day or two; 2 roughly 3 days for
+# 300k steps, nearly all of it the 10 guided sweeps over 5 guides (scaled from the 30-iteration
+# guided CDL net's ~9.5 days), 3 about 1-2;
+# 4 about #9's ~3.5 days; 5 about 0.6 days (a sixth of #9's steps).
 #
 # Submit all (at most 4 GPUs at once):  sbatch bigpurple/nyumets_followup_array.sbatch
 # A subset:                            sbatch --array=0-1 bigpurple/nyumets_followup_array.sbatch
@@ -44,7 +66,7 @@
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=nyumets-followup
-#SBATCH --array=0-3%4
+#SBATCH --array=0-6%4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -63,8 +85,11 @@
 CONFIGS=(
     config/NYUMets/i2sb_unet2m_otherstudy_pair_w2_bs64.json
     config/NYUMets/synth_unet2m_all_bs64.json
-    config/NYUMets/i2sb_unetlggs_k10_guided_otherstudy_w2_bs64.json
-    config/NYUMets/i2sb_unetlggs_k10_unguided_otherstudy_w2_bs64.json
+    config/NYUMets/i2sb_unet2mlggs_k10_guided_otherstudy_w2_bs64.json
+    config/NYUMets/i2sb_unet2mlggs_k10_unguided_otherstudy_w2_bs64.json
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w0_sfree_additive_flex_bs64.json
+    config/NYUMets/synth_sbguidedcdl_otherstudy_w0_sfree_sw5_e500_flex_bs64.json
+    config/NYUMets/i2sb_unet2m_all_bs64.json
 )
 
 

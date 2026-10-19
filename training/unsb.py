@@ -479,8 +479,6 @@ def train_unsb(
                     print(f"[epoch {epoch}] new best val psnr {best_psnr:.3f} -> {best_path}")
             val_sec = time.time() - t_val
             print(f"[epoch {epoch}] validation took {val_sec:.0f}s on {len(val_loader.dataset)} slices")
-            if wandb:
-                wandb.log({"val/seconds": val_sec}, step=global_step)
 
     pbar.close()
     save_nets()

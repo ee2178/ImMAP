@@ -43,6 +43,20 @@ own row-softmax and blends them with a learned, noise-adaptive scalar
 
     xi_a^2 = omega * Phi (W_alpha z)^2 + |1 - omega| * sum_g Omega_g (W_alpha v_g)^2
 
+`guide_blend="additive"` drops the competition between self and guide altogether: each branch
+keeps its own row-softmax and the guide energy is ADDED, scaled by a learned gain kappa >= 0
+(noise-adaptive like tau) and averaged over the G guides:
+
+    xi_a^2 = Phi (W_alpha z)^2 + kappa * (1/G) sum_g Omega_g (W_alpha v_g)^2
+
+so a guide can only RAISE xi -- only relax the shrinkage -- and kappa = 0 is the self-only
+threshold exactly. Under both blends above, a guide with no energy near a pixel still takes
+weight from the self term, so the guided threshold there is STRICTER than no guide at all: new
+enhancement the prior study lacks is shrunk harder. Read as a penalty (fixed adjacency,
+W_alpha = W_beta = I), the additive threshold is a shrinkage step on tau sqrt(|z|^2 + kappa e(v)):
+plain l1 where the guide is empty, a rounded corner where the prior study has structure. It runs
+on every backend (independent branches, like the convex blend).
+
 Note `window` and `guide_window` are independent.  The LGGS configs run
 `windowsize=1` with `guide_windowsize=15`: a 1x1 self window is a single
 neighbour, so under a joint softmax the self branch reduces to "this pixel's own
@@ -163,6 +177,11 @@ class GuidedGroupThreshold(GroupThreshold):
     joint_softmax : bool
         Normalise self + guide branches in ONE simplex (True, the LGGS setting)
         or independently with a learned blend `omega` (False).
+    guide_blend : None | "joint" | "convex" | "additive"
+        How the guide energy meets the self energy. None follows `joint_softmax`
+        ("joint" / "convex"); given, it OVERRIDES `joint_softmax`. "additive" adds
+        the guides' mean energy scaled by a learned gain `guide_gain` (kappa >= 0,
+        starting at `guide_gain0`); see the module docstring.
 
     `forward` takes the guide explicitly: `prox(z, guide, sigma, cache)`.  With
     `guide=None` it falls back to `GroupThreshold.forward` -- the self-only view
@@ -170,12 +189,19 @@ class GuidedGroupThreshold(GroupThreshold):
     `GroupThreshold(ggt)` on the no-guide code path.
     """
 
-    def __init__(self, M, guide_window=None, joint_softmax=True, **kws):
+    def __init__(self, M, guide_window=None, joint_softmax=True, guide_blend=None,
+                 guide_gain0=1.0, **kws):
         super().__init__(M, **kws)
         self.guide_window = int(self.window if guide_window is None
                                 else guide_window)
         assert self.guide_window % 2 == 1, "guide window side must be odd"
-        self.joint_softmax = bool(joint_softmax)
+        if guide_blend is None:
+            guide_blend = "joint" if joint_softmax else "convex"
+        if guide_blend not in ("joint", "convex", "additive"):
+            raise ValueError(f"guide_blend must be 'joint', 'convex' or 'additive'; "
+                             f"got {guide_blend!r}")
+        self.guide_blend = guide_blend
+        self.joint_softmax = guide_blend == "joint"
 
         # joint softmax on flex / triton: exact, through the branches' log-sum-exps
         # (module docstring, `merge_joint`)
@@ -184,8 +210,12 @@ class GuidedGroupThreshold(GroupThreshold):
         # Only the non-joint path has a blend to learn; the joint softmax makes
         # the branches compete directly, so `omega` would be redundant there
         # (`guided_gt.jl` installs a NoOpLayer in exactly that case).
-        self.omega = None if self.joint_softmax else \
-            Polynomial(self.nheads, degrees=0, tau0=0.5)
+        self.omega = Polynomial(self.nheads, degrees=0, tau0=0.5) \
+            if guide_blend == "convex" else None
+        # the additive gain kappa: per head, noise-adaptive with the threshold's own degree
+        self.guide_gain = Polynomial(self.nheads, degrees=self.tau.degrees,
+                                     tau0=float(guide_gain0)) \
+            if guide_blend == "additive" else None
 
     # -- projections ---------------------------------------------------------
     def _rho_scale(self, x, sq):
@@ -321,9 +351,9 @@ class GuidedGroupThreshold(GroupThreshold):
                          self.guide_window)
 
     # -- blend weight --------------------------------------------------------
-    def _omega_map(self, z, sigma):
-        """`omega` broadcast from per-head to the Mh channels of the energy."""
-        w = self.omega(sigma, ref=z)                     # (1, nheads, 1, 1)
+    def _omega_map(self, z, sigma, poly=None):
+        """`omega` (or another per-head Polynomial) broadcast to the Mh channels of the energy."""
+        w = (self.omega if poly is None else poly)(sigma, ref=z)    # (1, nheads, 1, 1)
         if self.nheads > 1:
             width = (self.Mh if self.grouped else self.M) // self.nheads
             w = w.repeat_interleave(width, dim=1)
@@ -372,6 +402,9 @@ class GuidedGroupThreshold(GroupThreshold):
                 e_guide = term if e_guide is None else e_guide + term
             if e_guide is None:                   # a cross branch with no ordinary guide
                 e_guide = torch.zeros_like(e_self)
+            elif self.guide_blend == "additive":
+                # each branch on its own simplex; the guides can only ADD energy
+                e_guide = self._omega_map(z, sigma, self.guide_gain) * e_guide / len(terms)
             elif not self.joint_softmax:
                 w = self._omega_map(z, sigma)
                 e_self = w * e_self
@@ -456,10 +489,12 @@ class GuidedGroupThreshold(GroupThreshold):
         super().project_()
         if self.omega is not None:
             self.omega.project_(lo=0.05, hi=0.95)
+        if self.guide_gain is not None:
+            self.guide_gain.project_(lo=0.0)
 
     def extra_repr(self):
         return (f"{super().extra_repr()}, guide_window={self.guide_window}, "
-                f"joint_softmax={self.joint_softmax}")
+                f"guide_blend={self.guide_blend}")
 
 
 class GuidedFenchelProx(nn.Module):

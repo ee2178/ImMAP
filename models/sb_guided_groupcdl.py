@@ -99,6 +99,10 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
     window, guide_window, joint_softmax, sim_fun, nheads, dK, rho0, gamma0, rho_inv,
     init_strategy, attn_backend, flex_block_size, share_attention
         The guided prox, as in GuidedGroupCDL. `joint_softmax=True` runs on every backend.
+    guide_blend, guide_gain0
+        None (default) keeps `joint_softmax`'s blend. "additive" ADDS the guides' energy to
+        the self energy with a learned gain >= 0 (models/guided_prox.py), so a guide can only
+        relax the shrinkage, never make it stricter than the unguided threshold.
     C          input width = 1 + len(cond_idx); >= 2 because the bridge prior x_1 lives in cond.
     prior_idx  which CONDITIONING channel is x_1 (0-based within cond).
     t0         constant term of the threshold; MUST be > 0 (see the module docstring).
@@ -154,7 +158,7 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
                  spectral_init=True, init=None,
                  s_mode=None, bridge_fidelity=True, gate_init=0.0,
                  s_cross=False, s_cross_planes=(0, 1), s_cross_atoms=None,
-                 guide_center=True):
+                 guide_center=True, guide_blend=None, guide_gain0=1.0):
         super().__init__()
         self.guide_center = bool(guide_center)
         if s_cross and s_mode is None:
@@ -204,6 +208,8 @@ class SBGuidedGroupCDL(BridgeScheduleMixin, nn.Module):
         prox_kws = dict(nheads=nheads, dK=dK, sim_fun=sim_fun, rho0=rho0, gamma0=gamma0,
                         rho_inv=rho_inv, init_strategy=init_strategy,
                         attn_backend=attn_backend, flex_block_size=flex_block_size)
+        if guide_blend is not None:            # None: joint_softmax decides, as before
+            prox_kws.update(guide_blend=guide_blend, guide_gain0=guide_gain0)
         proto = make_guided_lista_layer(
             1, M, spectral_init=spectral_init, P=P, stride=s, tau0=t0, degrees=deg_tau,
             is_complex=False, window=window, guide_window=guide_window,

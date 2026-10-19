@@ -63,8 +63,8 @@ from visualization.params import get_param_logs
 #     prediction gets stretched back to full range and looks correct.
 #   * deriving it from data_range couples the picture to a METRICS knob, so changing how PSNR
 #     is normalized would silently re-window the images.
-# A wrong window is not silent either way: val/display_clip_frac reports how much of the brain
-# falls outside it.
+# A wrong window shows as a clipped or black val/example panel; scripts/diagnose_val_images.py
+# measures how much of the brain falls outside it.
 DISPLAY_VMIN, DISPLAY_VMAX = -1.0, 1.0
 
 
@@ -568,11 +568,9 @@ def train_i2sb(
                     display_mask=display_mask, loss_weight_max=loss_weight_max,
                     loss_params=loss_params, val_lpips=val_lpips, dc=dc,
                 )
-            # wall-clock cost of this validation, next to the training throughput it competes with
+            # wall-clock cost of this validation: printed to the log, not sent to wandb
             val_sec = time.time() - t_val
             print(f"[epoch {epoch}] validation took {val_sec:.0f}s on {len(val_loader.dataset)} slices")
-            if wandb:
-                wandb.log({"val/seconds": val_sec}, step=global_step)
             if isinstance(sched, ReduceLROnPlateau) and val_loss is not None:
                 sched.step(val_loss)
 
@@ -769,11 +767,6 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         # Display-only rotation into a conventional axial view; applied AFTER the window and
         # the mask, so every scalar logged below is computed on the stored axes either way.
         grid, res = orient_tensor(grid, display_orient), orient_tensor(res, display_orient)
-        # How much of the BRAIN falls outside that window, and how bright the panel came out.
-        # These turn "the image is black" into two numbers: clip_frac ~ 1 means the data is not
-        # on the [-1, 1] scale the window assumes (rescale `scales`), while grid_mean ~ 0 with
-        # clip_frac ~ 0 means the mask is empty. Cheap scalars, logged every validation.
-        inb = x0_m[:1][mask[:1] > 0.5]
         if s_last is not None:
             # same sample as val/example; at a single_pass step this is S at THAT bridge step
             s_rgb, s_cap = enhancement_panel(s_last, x0_u, x1, mask if show_masked else None)
@@ -786,10 +779,6 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
         wandb.log({
             "val/example": wandb_image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
             "val/residual": wandb_image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
-            "val/display_clip_frac": (float(((inb < lo) | (inb > hi)).float().mean())
-                                      if inb.numel() else float("nan")),
-            "val/display_grid_mean": float(grid.mean()),
-            "val/mask_frac": float((mask[:1] > 0.5).float().mean()),
             **{f"val/{k}": v for k, v in mean_metrics.items()},
         }, step=global_step)
         # learned dictionary filters (works for real or complex CDLNet); no-op if absent
