@@ -72,6 +72,7 @@ def build_nyumets_synth_loader(root=None,
                                cond_idx=(0, 1, 3),       # FLAIR, T1, T2 -> X channels 0..2
                                image_key="img_median_mad",
                                scales=None,
+                               intensity_norm="none",    # "volume_median": each volume / its own in-brain median
                                # --- guide (the prior study) ---
                                guide_mode="none",
                                guide_idx=None,
@@ -105,7 +106,7 @@ def build_nyumets_synth_loader(root=None,
         # x1 is irrelevant to a direct regressor, but the dataset requires a valid index and
         # returns it; the adapter drops it.
         x0_idx=x0_idx, x1_idx=x1_idx, cond_idx=list(cond_idx),
-        image_key=image_key, scales=scales,
+        image_key=image_key, scales=scales, intensity_norm=intensity_norm,
         guide_mode=guide_mode,
         guide_idx=x0_idx if guide_idx is None else guide_idx,
         guide_contrasts=guide_contrasts,

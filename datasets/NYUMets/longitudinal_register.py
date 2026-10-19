@@ -32,6 +32,7 @@ def build_nyumets_guided_loader(root=None,
                                 cond_idx=(0, 1, 3),       # FLAIR, T1, T2
                                 image_key="img_median_mad",
                                 scales=None,
+                                intensity_norm="none",    # "volume_median": each volume / its own in-brain median
                                 # --- guide ---
                                 guide_mode="none",        # str or list; see GUIDE_MODES
                                 guide_idx=None,           # other_study/*_slice contrast(s): int or list
@@ -69,7 +70,7 @@ def build_nyumets_guided_loader(root=None,
     ds_cfg = SimpleNamespace(
         root=root,
         x0_idx=x0_idx, x1_idx=x1_idx, cond_idx=list(cond_idx),
-        image_key=image_key, scales=scales,
+        image_key=image_key, scales=scales, intensity_norm=intensity_norm,
         guide_mode=guide_mode,
         guide_idx=x0_idx if guide_idx is None else guide_idx,
         guide_contrasts=guide_contrasts,

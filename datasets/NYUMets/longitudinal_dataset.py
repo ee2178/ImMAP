@@ -154,6 +154,7 @@ def index_sessions(root):
     return paths, n_slices, patients
 
 
+INTENSITY_NORMS = ("none", "volume_median")
 ENHANCEMENT = -1          # pseudo-contrast in `guide_idx`: the slice's (x0 - x1)_+ ; see the docstring
 
 
@@ -241,6 +242,19 @@ class NYUMetsGuidedDataset(Dataset):
 
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
+        # PER-VOLUME intensity scale. MRI intensities are in arbitrary units that change with the
+        # scanner, receiver gain and protocol, so one fixed divisor per contrast (`scales`) leaves
+        # each acquisition's own gain in the data: two studies of a patient, and even T1 and CT1
+        # of one session, can sit at different brightness. "volume_median" divides every contrast
+        # of every volume by ITS OWN in-brain median -- the `norm_stats` centre the h5 build
+        # stores (preprocessing/nyumets_h5.py) -- INSTEAD of `scales`. Scale only, no centring:
+        # zero stays zero (the mask, the T1 & CT1 support) and ratios survive, so the additive
+        # model T1 = CT1 - S keeps its meaning; tissue lands near 1. "none" = `scales` as before.
+        self.intensity_norm = str(getattr(cfg, "intensity_norm", "none") or "none")
+        if self.intensity_norm not in INTENSITY_NORMS:
+            raise ValueError(f"intensity_norm must be one of {INTENSITY_NORMS}, "
+                             f"got {self.intensity_norm!r}")
+        self._centre = {}                                 # per-file (C,) medians
 
         tfms = []
         if getattr(cfg, "center_crop", None) is not None:
@@ -402,9 +416,26 @@ class NYUMetsGuidedDataset(Dataset):
             raise KeyError(f"'{self.image_key}' not in {self.img_paths[fi]} "
                            f"(keys={list(h.keys())})")
         img = np.asarray(h[self.image_key][li])           # (H, W, Cstored)
-        if self.scales is not None:
+        if self.intensity_norm == "volume_median":
+            img = img / self._volume_centre(fi, h)[None, None, :]
+        elif self.scales is not None:
             img = img / self.scales[None, None, :]
         return img, h
+
+    def _volume_centre(self, fi, h):
+        """(C,) in-brain median of each stored contrast of volume `fi` (cached per worker)."""
+        c = self._centre.get(fi)
+        if c is None:
+            if "norm_stats" not in h.attrs:
+                raise KeyError(f"intensity_norm='volume_median' needs the norm_stats attr, which "
+                               f"{self.img_paths[fi]} does not have; rebuild it with "
+                               f"preprocessing/nyumets_h5.py")
+            c = np.asarray(h.attrs["norm_stats"], dtype=np.float32).reshape(-1, 2)[:, 0]
+            if not (np.all(np.isfinite(c)) and np.all(c > 0)):
+                raise ValueError(f"{self.img_paths[fi]}: norm_stats medians {c} are not all "
+                                 f"positive; cannot normalize this volume by them")
+            self._centre[fi] = c
+        return c
 
     def _mask_of(self, img, h, li):
         """(H, W, 1) float32 mask of one stored slice, by `mask_source`."""

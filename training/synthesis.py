@@ -64,6 +64,7 @@ import numpy as np
 import torch
 from visualization.image import orient_tensor
 from visualization.wandb_image import wandb_image
+from visualization.guide_panel import guide_layout, guide_panel, sample_guides
 import torch.nn as nn
 import torchvision.utils as vutils
 from tqdm import tqdm
@@ -547,6 +548,7 @@ def train_synthesis(
                     agg.update({"delta_psnr": 0.0, "delta_ssim": 0.0, "delta_nrmse": 0.0,
                                 "resid_ratio": 0.0})
                 n_samples = 0
+                layout = guide_layout(val_loader)          # val/guides; None without guides
                 s_last, collapse = None, CollapseMeter()   # enhancement map: the val/S panel
                                                            # and the collapse/* indicators
                 with torch.no_grad():
@@ -659,6 +661,19 @@ def train_synthesis(
                             caption=f"residual (T1ce - T1): GT | Pred | ET mask  "
                                     f"[bwr, white=0, ±{float(vmax):.3f}] "
                                     f"rms(pred)/rms(gt)={rr:.3f}")
+
+                    g = sample_guides(layout, X=Xv)
+                    if g is not None:
+                        # the guides THIS net was given for the sample in val/example: the tail
+                        # of its input X, after the ordinary conditioning channels
+                        cur = ([("T1 now", Xv[0, layout["t1_pos"]])]
+                               if layout["t1_pos"] is not None else []) + [("CT1 target", yv[0])]
+                        lo_hi = (display_window if display_window is not None
+                                 else (float(yv[:1].min()), float(yv[:1].max())))
+                        g_grid, g_cap = guide_panel(cur, g, layout, lo_hi, organ_maskv[0])
+                        log["val/guides"] = wandb_image(vutils.make_grid(
+                            orient_tensor(g_grid, display_orient), nrow=g_grid.shape[0]),
+                            caption=g_cap)
 
                     if s_last is not None:
                         s_rgb, s_cap = enhancement_panel(

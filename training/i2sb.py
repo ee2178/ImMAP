@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from visualization.image import orient_tensor
 from visualization.wandb_image import wandb_image
+from visualization.guide_panel import guide_layout, guide_panel, sample_guides
 import torch.nn.functional as F
 import torchvision.utils as vutils
 from tqdm import tqdm
@@ -678,6 +679,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
                                  # batches contain little or no tumor, so a mean of per-batch
                                  # ET-PSNRs would be dominated by the emptiest ones
     last = None
+    layout = guide_layout(val_loader)          # val/guides: None for a loader with no guides
     s_last, collapse = None, CollapseMeter()   # enhancement map (nets with s_mode): the val/S
                                                # panel and the collapse/* indicators
     if val_seed is not None:
@@ -731,6 +733,7 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
             et_n += float(et.sum())
         n_samples += bs
         last = (x1, xt, x0_m, pred_m, x0, pred, mask, step)
+        last_guides = sample_guides(layout, cond=cond, guide=guide)
 
     mean_metrics = {k: v / max(n_samples, 1) for k, v in agg.items()}
     if lp_n:
@@ -776,6 +779,14 @@ def _validate(net, bridge, val_loader, device, *, interval, val_mode, val_seed,
                 orient_tensor(s_rgb, display_orient), nrow=3), caption=s_cap),
                        **{f"collapse/{k}": v for k, v in collapse.result(net).items()}},
                       step=global_step)
+        if layout is not None and last_guides is not None:
+            # the guides THIS net was given for the sample in val/example, on the same window
+            g_grid, g_cap = guide_panel([("x1 (T1 now)", x1[0]), ("CT1 target", x0_u[0])],
+                                        last_guides, layout, (lo, hi),
+                                        mask[0] if show_masked else None)
+            wandb.log({"val/guides": wandb_image(vutils.make_grid(
+                orient_tensor(g_grid, display_orient), nrow=g_grid.shape[0]), caption=g_cap)},
+                step=global_step)
         wandb.log({
             "val/example": wandb_image(vutils.make_grid(grid, nrow=len(cols)), caption=cap),
             "val/residual": wandb_image(vutils.make_grid(res, nrow=1), caption="| GT - pred |"),
