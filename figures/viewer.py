@@ -3,6 +3,7 @@
 Scrub the dumped reconstructions, mark the rows a figure should show, place their zooms.
 
     python figures/viewer.py configs/mg_brain_R8.py -n 3
+    python figures/viewer.py configs/main_brain_R12.py --volume 2000045 --slice 6
 
 Reads only what `scripts/dump_eval.py` wrote -- no torch, no checkpoints -- so
 it starts instantly and runs on a laptop against an rsync'd copy of the
@@ -11,6 +12,9 @@ cluster's `eval_dump/` directories.
 BROWSE -- scrub the set and mark the rows you want:
     left / right     slice -1 / +1              (shift: -5 / +5)
     up / down        previous / next volume
+    o                open a volume by name: type any part of it (e.g. 2000045),
+                     optionally followed by a slice number (2000045 6), then
+                     enter -- or pick from the filtered list
     g                every column side by side (the default) / one at a time
     e                one at a time: cycle which column is displayed
     x                toggle the residual of each column (|ref - col|)
@@ -70,7 +74,7 @@ GRID_COLS = 3   # panels per row in the grid: six columns -> 3 x 2
 
 
 class Picker:
-    def __init__(self, target):
+    def __init__(self, target, volume=None, sl=None):
         self.vols = fc.volumes()
         if not self.vols:
             raise SystemExit(
@@ -102,6 +106,16 @@ class Picker:
             self.vi = self.vols.index(rows[0]["volume"])
             self.pos = self._pos_of(rows[0]["volume"], rows[0]["slice"])
 
+        # --volume / --slice: start there instead.
+        if volume is not None:
+            hit = self.find_volume(volume)
+            if hit is None:
+                raise SystemExit(f"--volume {volume!r} matches "
+                                 f"{self._matches(volume)[:5] or 'no volume'} -- "
+                                 f"give enough of the name to pick ONE")
+            self.vi = hit
+            self.pos = self._pos_of(self.vols[hit], sl) if sl is not None else 0
+
         for w in fc.check_comparable(self.vols[0]):
             print(f"[warning] {w}")
 
@@ -120,6 +134,7 @@ class Picker:
         b("<Right>", lambda e: self.horiz(1))
         b("<Shift-Left>",  lambda e: self.horiz(-5))
         b("<Shift-Right>", lambda e: self.horiz(5))
+        b("<Key-o>", lambda e: self.chooser())
         b("<Up>",   lambda e: self.vert(-1))
         b("<Down>", lambda e: self.vert(1))
         b("<space>", lambda e: self.mark())
@@ -213,6 +228,94 @@ class Picker:
         self.vi = (self.vi + d) % len(self.vols)
         self.pos = 0
         self.render()
+
+    def _matches(self, query):
+        q = query.strip().lower()
+        return [v for v in self.vols if q in v.lower()]
+
+    def find_volume(self, query):
+        """Index of the ONE volume `query` names: an exact name, or a substring
+        only one volume contains. None if it names none or several."""
+        q = query.strip().lower()
+        exact = [i for i, v in enumerate(self.vols) if v.lower() in (q, "file_" + q)]
+        if exact:
+            return exact[0]
+        hits = [i for i, v in enumerate(self.vols) if q in v.lower()]
+        return hits[0] if len(hits) == 1 else None
+
+    def goto(self, vi, sl=None):
+        """Show volume `vi` at SOURCE slice `sl` (the number the status line and
+        the scan report), or its first slice."""
+        self.vi = vi
+        self.pos = self._pos_of(self.vols[vi], sl) if sl is not None else 0
+        if sl is not None and self.current()["sl"] != sl:
+            self.flash = f"(slice {sl} is not in this dump -- showing its first)"
+        self.render()
+
+    def chooser(self):
+        """`o`: pick a volume from a list that filters as you type."""
+        if self.mode != "browse":
+            return
+        top = tk.Toplevel(self.root)
+        top.title("open volume")
+        top.transient(self.root)
+        tk.Label(top, anchor="w", justify="left", font=("Consolas", 9),
+                 text="type any part of the name, optionally then a slice "
+                      "(2000045 6)\nenter opens the highlighted one, esc cancels"
+                 ).pack(fill="x", padx=6, pady=(6, 2))
+        entry = tk.Entry(top, font=("Consolas", 11), width=44)
+        entry.pack(fill="x", padx=6)
+        lb = tk.Listbox(top, font=("Consolas", 10), height=min(20, len(self.vols)),
+                        width=44, activestyle="dotbox", exportselection=False)
+        lb.pack(fill="both", expand=True, padx=6, pady=6)
+        shown = []
+
+        def parse():
+            parts = entry.get().split()
+            sl = None
+            if len(parts) > 1 and parts[-1].lstrip("-").isdigit():
+                sl = int(parts.pop())
+            return " ".join(parts), sl
+
+        def refresh(*_):
+            q, _sl = parse()
+            shown[:] = [i for i, v in enumerate(self.vols) if q.lower() in v.lower()]
+            lb.delete(0, "end")
+            for i in shown:
+                lb.insert("end", f"{i + 1:>4}  {pretty(self.vols[i])}")
+            if shown:
+                cur = shown.index(self.vi) if self.vi in shown else 0
+                lb.selection_set(cur)
+                lb.see(cur)
+
+        def move(d):
+            if not shown:
+                return "break"
+            cur = (lb.curselection() or (0,))[0]
+            cur = max(0, min(len(shown) - 1, cur + d))
+            lb.selection_clear(0, "end")
+            lb.selection_set(cur)
+            lb.see(cur)
+            return "break"
+
+        def accept(*_):
+            if not shown:
+                return
+            _q, sl = parse()
+            i = shown[(lb.curselection() or (0,))[0]]
+            top.destroy()
+            self.goto(i, sl)
+
+        entry.bind("<KeyRelease>", lambda e: None if e.keysym in
+                   ("Up", "Down", "Return", "Escape") else refresh())
+        entry.bind("<Up>", lambda e: move(-1))
+        entry.bind("<Down>", lambda e: move(1))
+        top.bind("<Return>", accept)
+        lb.bind("<Double-Button-1>", accept)
+        top.bind("<Escape>", lambda e: top.destroy())
+        refresh()
+        entry.focus_set()
+        top.grab_set()
 
     def cycle(self, d):
         if self.mode == "zoom" and self.sel:
@@ -467,7 +570,7 @@ class Picker:
                 if self.mode == "browse" else
                 f"ZOOM [{self.si + 1}/{len(self.sel)}] {pretty(c['vol'])} "
                 f"slice {c['sl']}")
-        keys = ("<-/-> slice (shift 5) | up/dn volume | g all/one | e column | x residual | "
+        keys = ("<-/-> slice (shift 5) | up/dn volume | o open | g all/one | e column | x residual | "
                 "d overlay | c crop | -/= gain | space mark | m next | "
                 "enter zoom | q save+quit | esc abort"
                 if self.mode == "browse" else
@@ -486,6 +589,9 @@ def main():
     ap.add_argument("-n", "--rows", type=int, default=3, help="how many rows to pick")
     ap.add_argument("--name", help="override the variant name")
     ap.add_argument("--dump-root", help="override DUMP_ROOT")
+    ap.add_argument("--volume", help="start at this volume (any unique part of its "
+                                     "name, e.g. 2000045)")
+    ap.add_argument("--slice", type=int, help="...and this source slice number")
     a = ap.parse_args()
 
     if a.config:
@@ -495,7 +601,7 @@ def main():
     if a.dump_root:
         fc.DUMP_ROOT = a.dump_root
 
-    Picker(a.rows).root.mainloop()
+    Picker(a.rows, volume=a.volume, sl=a.slice).root.mainloop()
 
 
 if __name__ == "__main__":
