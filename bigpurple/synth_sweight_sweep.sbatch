@@ -2,19 +2,19 @@
 #
 # s_weight SWEEP on SynthCDL (config/NYUMets/synth_sbcdlnet_sfree_bs64.json): pick the weight of the
 # enhancement-map loss  s_weight * MSE(S_hat, (CT1 - T1)_+)  for the runs that follow. Each arm is
-# that config with ONLY s_weight, num_epochs (300 = 30k steps) and val_every_epochs (25) changed
+# that config with ONLY s_weight, num_epochs (500 = 50k steps) and val_every_epochs (25) changed
 # -- config/NYUMets/sweep_sweight/, written by one script, checked to differ in nothing else.
 #
 #   idx  s_weight   config
 #   ---  --------   -----------------------------------------------------------------
-#    0     0        sweep_sweight/synth_sbcdlnet_sfree_sw0_e300_bs64    no S supervision
-#    1     1        sweep_sweight/synth_sbcdlnet_sfree_sw1_e300_bs64    the current setting
-#    2     2        sweep_sweight/synth_sbcdlnet_sfree_sw2_e300_bs64
-#    3     5        sweep_sweight/synth_sbcdlnet_sfree_sw5_e300_bs64
-#    4    10        sweep_sweight/synth_sbcdlnet_sfree_sw10_e300_bs64
-#    5    20        sweep_sweight/synth_sbcdlnet_sfree_sw20_e300_bs64
+#    0     0        sweep_sweight/synth_sbcdlnet_sfree_sw0_e500_bs64    no S supervision
+#    1     1        sweep_sweight/synth_sbcdlnet_sfree_sw1_e500_bs64    the current setting
+#    2     2        sweep_sweight/synth_sbcdlnet_sfree_sw2_e500_bs64
+#    3     5        sweep_sweight/synth_sbcdlnet_sfree_sw5_e500_bs64
+#    4    10        sweep_sweight/synth_sbcdlnet_sfree_sw10_e500_bs64
+#    5    20        sweep_sweight/synth_sbcdlnet_sfree_sw20_e500_bs64
 #
-# SAME LR AS THE FULL RUN: T_max stays 300k, so 300 epochs is the near-constant-LR start of the
+# SAME LR AS THE FULL RUN: T_max stays 300k, so 500 epochs is the near-constant-LR start of the
 # full cosine and the arms differ in s_weight alone. Short runs RANK the weights; they do not
 # show converged numbers.
 #
@@ -29,8 +29,8 @@
 # Pick the largest s_weight that lowers S_rel_err without costing whole-image PSNR/SSIM beyond
 # what you will accept; a weight past the knee usually buys S_rms_ratio and nothing else.
 #
-# RUNTIME, NOT MEASURED for 30k steps: SBCDLNet is ~1.3 days per 300k at batch 64 (bridge,
-# measured), so ~3 h of training per arm plus 12 validations; the 12 h limit is generous.
+# RUNTIME, NOT MEASURED for 50k steps: SBCDLNet is ~1.3 days per 300k at batch 64 (bridge,
+# measured), so ~5 h of training per arm plus 20 validations, inside the 12 h limit.
 #
 # Submit (at most 6 GPUs at once):  sbatch bigpurple/synth_sweight_sweep.sbatch
 #
@@ -55,12 +55,12 @@
 # No `set -euo pipefail` -- it breaks conda activate (unset $PS1 / $CONDA_SHLVL under -u).
 
 CONFIGS=(
-    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw0_e300_bs64.json
-    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw1_e300_bs64.json
-    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw2_e300_bs64.json
-    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw5_e300_bs64.json
-    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw10_e300_bs64.json
-    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw20_e300_bs64.json
+    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw0_e500_bs64.json
+    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw1_e500_bs64.json
+    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw2_e500_bs64.json
+    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw5_e500_bs64.json
+    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw10_e500_bs64.json
+    config/NYUMets/sweep_sweight/synth_sbcdlnet_sfree_sw20_e500_bs64.json
 )
 
 
