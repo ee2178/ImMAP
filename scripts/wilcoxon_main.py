@@ -47,6 +47,31 @@ from scipy.stats import rankdata, wilcoxon
 HIGHER_IS_BETTER = {"psnr": True, "ssim": True, "nrmse": False, "lpips": False}
 ORDER = ["E2E-VarNet", "LPDSNet", "MGLPDS-Small", "MGLPDS-Big"]
 
+# Runs that share a display label (brain's MGLPDS-Big stopgap `mglpds` and the
+# real `mg169v6`): keep the FIRST of these present, never pool the two.
+PREFERRED_CELLS = ["mg169v6", "mglpds"]
+
+
+def _cell(run):
+    head, sep, tail = run.rpartition("_R")
+    return head if sep and tail.isdigit() else run
+
+
+def one_run_per_net(rows):
+    """Drop rows of a less-preferred run where two runs share (anatomy, R, net)."""
+    runs = {}
+    for r in rows:
+        runs.setdefault((r["anatomy"], r["R"], r["net"]), set()).add(r.get("run", ""))
+    keep = {}
+    for key, rs in runs.items():
+        rank = sorted(rs, key=lambda x: (PREFERRED_CELLS.index(_cell(x))
+                                         if _cell(x) in PREFERRED_CELLS else 99, x))
+        keep[key] = rank[0]
+        if len(rs) > 1:
+            print(f"[{key[0]} R{key[1]}] {key[2]}: using {rank[0]}, ignoring "
+                  f"{', '.join(rank[1:])}", file=sys.stderr)
+    return [r for r in rows if r.get("run", "") == keep[(r["anatomy"], r["R"], r["net"])]]
+
 
 def holm(ps):
     """Holm step-down adjusted p-values, in the input order."""
@@ -75,6 +100,7 @@ def load(path, unit):
         rows = list(csv.DictReader(f))
     if not rows:
         raise SystemExit(f"{path} is empty")
+    rows = one_run_per_net(rows)
     metrics = [m for m in HIGHER_IS_BETTER if m in rows[0]]
     key = (lambda r: r["volume"]) if unit == "volumes" else \
           (lambda r: (r["volume"], r["slice"]))

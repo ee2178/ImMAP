@@ -258,11 +258,16 @@ def combine(out_root):
     for name, rows, lead in (("slices.csv", s_rows, ["volume", "slice"]),
                              ("volumes.csv", v_rows, ["volume", "n_slices"])):
         path = os.path.join(out_root, name)
-        with open(path, "w", newline="") as f:
+        # Written aside and renamed: torch/main_eval.sbatch merges at the end of
+        # every task, so the file may be read (or copied) while another task is
+        # rewriting it.
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["anatomy", "R", "net", "run"] + lead
                                + metric_cols, restval="")
             w.writeheader()
             w.writerows(rows)
+        os.replace(tmp, path)
         print(f"wrote {len(rows)} rows to {path}")
 
 

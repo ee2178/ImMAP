@@ -1,0 +1,200 @@
+"""
+RAM (Reconstruct Anything Model) as an ImMAP model.
+
+The network is `_upstream/ram.py`, vendored from github.com/matthieutrs/ram
+with one import moved (see that file's header). Nothing here changes the
+architecture; this is the calling-convention adapter, and every difference
+between the two codebases is handled in one place so the baseline stays honest.
+
+WHAT HAS TO BE TRANSLATED
+-------------------------
+                    ImMAP                          RAM / deepinv
+  measurement       y (B, C, H, W) complex         real tensor; here (B, 2, C, H, W)
+  operator          E = Mask @ FFT2D @ Sense       a deepinv LinearPhysics: A, A_adjoint
+  image             (B, 1, H, W) complex           (B, 2, H, W) real, [re; im] -- the
+                                                   2-channel head RAM uses for complex
+  noise level       sigma (B, 1, 1, 1): std of     physics.noise_model.sigma: std of
+                    the COMPLEX noise, E|z|^2 = 1  EACH REAL COMPONENT
+
+`_ImMAPPhysics` exposes `E` to RAM as a deepinv `LinearPhysics` and nothing
+more: RAM only ever calls `A`, `A_adjoint` and (through its own multiscale /
+padding wrappers) deepinv's generic `LinearPhysics.prox_l2`, the conjugate-
+gradient solve it uses to realign its input. Those run unmodified from the
+installed deepinv, so the data-consistency path is deepinv's code, not a
+re-implementation of it.
+
+THE NOISE LEVEL. ImMAP's noise is complex with E|z|^2 = 1 (operators/noise.py),
+so each real component has std sigma / sqrt(2). deepinv's GaussianNoise draws
+each real entry with std sigma, so the level RAM is conditioned on -- and the
+one its realignment SNR divides by -- is sigma / sqrt(2). That is a fixed
+factor, which a model trained from scratch would absorb; it is converted anyway
+so the conditioning means what it meant in the paper, and so pretrained weights
+see the levels they were trained on.
+
+Noise is still added the ImMAP way (coil-image domain, before the mask), so
+unsampled k-space bins are exactly zero rather than pure noise. RAM never sees
+how y was generated, only A and sigma, so nothing in the network depends on it.
+
+THE ONE REPRODUCED METHOD. `RAM.forward` is re-stated in `_ram_forward` below
+because it turns sigma into a one-element tensor with Python's `max`, which
+works only for a scalar; ImMAP passes one level per batch element. The change is
+`max(sigma, 1e-3)` -> `sigma.clamp_min(1e-3)` over a (B,) tensor. With B = 1
+(every generated config) the two are identical -- tests/test_ram.py checks the
+outputs against upstream's `forward` bit for bit.
+
+GRID SIZE. `pad_stride = 1`: RAM pads its own input to a multiple of 8 (its
+`Pad` physics, top-left), so no image-domain embedding is needed here and
+`training/common.py::embed_for_net` leaves the operator alone -- as for VarNet.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+
+try:
+    from models.ram._upstream.ram import RAM as _UpstreamRAM, Pad
+except ModuleNotFoundError as e:                       # pragma: no cover
+    if e.name != "deepinv":
+        raise
+    raise ModuleNotFoundError(
+        "the RAM baseline needs deepinv (tested with 0.4.2). Install it on a "
+        "LOGIN node -- see the setup note at the top of torch/exp13_ram.sbatch, "
+        "which checks it will not replace your CUDA torch.", name="deepinv") from e
+
+
+def _physics_base():
+    # deepinv is imported lazily so `import models` keeps working in an env
+    # without it; only building a RAM needs it.
+    from deepinv.physics import GaussianNoise, LinearPhysics
+    return GaussianNoise, LinearPhysics
+
+
+def _make_physics(E, sigma):
+    """ImMAP's `E` as a deepinv LinearPhysics in deepinv's real layout.
+
+    `sigma` is (B,), the per-REAL-component std -- see the module docstring.
+    """
+    GaussianNoise, LinearPhysics = _physics_base()
+
+    class _ImMAPPhysics(LinearPhysics):
+        def __init__(self, E, sigma):
+            super().__init__(noise_model=GaussianNoise(sigma=sigma))
+            self.E = E
+
+        def A(self, x, **kwargs):
+            # (B, 2, H, W) real -> E -> (B, C, H, W) complex -> (B, 2, C, H, W)
+            y = self.E.forward(torch.complex(x[:, 0:1], x[:, 1:2]))
+            return torch.stack((y.real, y.imag), dim=1)
+
+        def A_adjoint(self, y, **kwargs):
+            # (B, 2, C, H, W) -> complex (B, C, H, W) -> E^H -> (B, 2, H, W)
+            x = self.E.adjoint(torch.complex(y[:, 0], y[:, 1]))
+            return torch.cat((x.real, x.imag), dim=1)
+
+    return _ImMAPPhysics(E, sigma)
+
+
+def _ram_forward(net, y, physics, sigma):
+    """`RAM.forward` (upstream ram.py, lines 294-318), per-sample sigma.
+
+    Upstream, with the physics' noise model a GaussianNoise and no gain:
+
+        sigma = physics.noise_model.sigma
+        sigma = torch.tensor([max(sigma, 1e-3)], ...)
+        gamma = 5e-3                      # noise model has no `gain`
+        gamma = torch.tensor([max(gamma, 1e-3)], ...)
+
+    Here sigma is a (B,) tensor, so `max` becomes `clamp_min`; gamma is the
+    same constant, broadcast to (B,). Everything else is line for line,
+    including the adjoint computed twice (once only to read off the padding).
+    """
+    x_temp = physics.A_adjoint(y)
+    pad = (-x_temp.size(-2) % 8, -x_temp.size(-1) % 8)
+    physics = Pad(physics, pad)
+
+    x_in = physics.A_adjoint(y)
+
+    sigma = sigma.to(x_in.device).clamp_min(1e-3)
+    gamma = torch.full_like(sigma, max(5e-3, 1e-3))
+
+    out = net.forward_unet(x_in, sigma=sigma, gamma=gamma, physics=physics, y=y)
+
+    out = physics.remove_pad(out)
+
+    return out
+
+
+class RAM(nn.Module):
+    """RAM behind ImMAP's `(y, E, sigma) -> (x_hat, extra)`.
+
+    Parameters
+    ----------
+    in_channels : list of int
+        RAM's input heads. `[2]` (the default) builds only the complex head,
+        which is all MRI uses -- the right choice from scratch, since unused
+        heads would sit in the optimizer receiving no gradient and inflate the
+        parameter count. Upstream's default `[1, 2, 3]` is required to load
+        the published weights.
+    pretrained : False, True or str
+        False: random init (from scratch). True: upstream's own download from
+        Hugging Face (`mterris/ram`) -- a login node only, compute nodes have
+        no route out. A path: load that state dict (the same file, fetched
+        beforehand), e.g. `ram.pth.tar`.
+    """
+
+    # Read by training/common.py::embed_for_net; 1 = no embedding (RAM pads).
+    pad_stride = 1
+    # A complex image, the same quantity the unrolled nets produce.
+    returns_magnitude = False
+    # RAM uses the operator's coil maps through A / A_adjoint.
+    uses_operator_smaps = True
+
+    def __init__(self, in_channels=(2,), pretrained=False):
+        super().__init__()
+        in_channels = [int(c) for c in in_channels]
+        if 2 not in in_channels:
+            raise ValueError(
+                f"in_channels={in_channels} has no 2-channel head, which is the "
+                f"one RAM uses for complex images; MRI cannot run without it.")
+        if pretrained and in_channels != [1, 2, 3]:
+            raise ValueError(
+                "the published weights carry heads for 1, 2 and 3 channels; "
+                "load them with in_channels=[1, 2, 3].")
+        self.in_channels = in_channels
+        self.net = _UpstreamRAM(in_channels=in_channels,
+                                pretrained=(pretrained is True))
+        if isinstance(pretrained, str):
+            state = torch.load(pretrained, map_location="cpu")
+            self.net.load_state_dict(state.get("model_state_dict", state)
+                                     if isinstance(state, dict) else state)
+        self.pretrained = pretrained
+
+    def forward(self, y, E=None, sigma=None, **_):
+        if E is None:
+            raise ValueError("RAM needs the encoding operator E: it reconstructs "
+                             "through A and A^H, not from an adjoint image.")
+        if sigma is None:
+            raise ValueError("RAM is noise-conditioned; pass the noise level sigma.")
+        if not torch.is_complex(y):
+            raise ValueError(f"expected complex k-space, got {y.dtype}.")
+
+        B = y.shape[0]
+        # ImMAP's complex std -> deepinv's per-real-component std.
+        s = torch.as_tensor(sigma, device=y.device, dtype=torch.float32)
+        s = s.reshape(-1).expand(B) if s.numel() == 1 else s.reshape(B)
+        s = s / math.sqrt(2.0)
+
+        physics = _make_physics(E, s)
+        y_r = torch.stack((y.real, y.imag), dim=1).contiguous()   # (B, 2, C, H, W)
+        out = _ram_forward(self.net, y_r, physics, s)
+        return torch.complex(out[:, 0:1], out[:, 1:2]), {}
+
+    def project(self):
+        """No constraint set. Present so the training loop's hasattr holds."""
+        return self
+
+    def extra_repr(self):
+        return f"in_channels={self.in_channels}, pretrained={self.pretrained!r}"

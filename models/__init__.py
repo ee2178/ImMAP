@@ -281,6 +281,13 @@ def build_model(cfg):
         from .e2evarnet import E2EVarNet
         return E2EVarNet(**params)
 
+    elif model_type == "RAM":
+        # The Reconstruct Anything Model (github.com/matthieutrs/ram), vendored
+        # under models/ram/_upstream/ with one import moved. Imported lazily:
+        # it needs deepinv, which no other model here does.
+        from .ram import RAM
+        return RAM(**params)
+
     elif model_type == "AltSplitCDLNet":
         return AltSplitCDLNet(**params)
 

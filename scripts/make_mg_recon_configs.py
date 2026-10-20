@@ -644,6 +644,28 @@ MODELS.update({
 })
 EXP12_CELLS = tuple(f"mggroup{m}v6" for m in EXP12_M)
 
+# RAM (exp13): the Reconstruct Anything Model (Terris et al. 2025,
+# github.com/matthieutrs/ram), trained FROM SCRATCH under this grid's protocol --
+# same data, noise range, organ-masked loss, schedule and LR as every other cell.
+# models/ram/ vendors upstream's network unmodified; the adapter only wraps E as
+# a deepinv physics (RAM reconstructs through A and A^H with the operator's coil
+# maps, like the unrolled nets) and hands it sigma / sqrt(2), deepinv's
+# per-real-component std. Only the complex (2-channel) head is built: the 1- and
+# 3-channel heads of the published model would receive no gradient here.
+#
+# 33.6M parameters -- about VarNet's size (29.5M), ~9x mglpds. Every one of its
+# 28 residual blocks applies A^H A (a multicoil FFT pair) three times at FULL
+# resolution, so expect it to be the slowest cell per step; probe its it/s
+# before committing a full-length run (torch/exp13_ram.sbatch).
+MODELS["ram"] = dict(
+    type="RAM",
+    params=dict(in_channels=[2], pretrained=False),
+    note=("Reconstruct Anything Model (matthieutrs/ram), vendored unmodified, "
+          "trained from scratch on this grid's protocol. Complex head only; "
+          "conditioned on sigma/sqrt(2) (deepinv's per-component std). Uses "
+          "the operator's coil maps through A and A^H."),
+)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -655,7 +677,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
-          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP12_CELLS
+          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP12_CELLS + ("ram",)
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -973,6 +995,9 @@ def _pad_multiple(spec, params):
         # Works at the measured size; its NormUnet pads internally to a
         # multiple of 16. No image-domain embedding, so no constraint.
         return 1
+    if spec.get("type") == "RAM":
+        # Pads its own input to a multiple of 8 (upstream's Pad physics).
+        return 1
     p = params.get("denoiser_kws", params)
     s_ = int(p.get("s", 1) or 1)
     if "L" in p:
@@ -1028,6 +1053,9 @@ def _display_name(spec_type, params):
         if params.get("coarse_op", "galerkin") != "galerkin":
             tag += "_rd"
         return "%s_%s" % (spec_type, tag)
+    if spec_type == "RAM":
+        # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.
+        return "RAM"
     if spec_type == "E2EVarNet" and params.get("use_smaps"):
         # `varnet` and `varnetmaps` are the same class with the same variant,
         # so the table below cannot separate them -- and two cells under one

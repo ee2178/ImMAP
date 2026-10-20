@@ -10,7 +10,11 @@
 #                                the unrolled nets get
 #   LPDSNet        `lpdsnet`     K=30, M=169
 #   MGLPDS-Small   `mg81v6`      K=[6,[4,4,6]], M=81
-#   MGLPDS-Big     `mg169v6`     K=[6,[4,4,6]], M=169
+#   MGLPDS-Big     `mg169v6`     K=[6,[4,4,6]], M=169 -- or, until a
+#                                full-length brain mg169v6 exists, the saved
+#                                `mglpds` run (same width; Galerkin coarse Gram
+#                                and Gauss complex conv, computational only).
+#                                The first of the two with a dump is used.
 #
 # A column whose run has not been dumped is LEFT OUT (and named on stderr)
 # rather than stopping the viewer, so this config works while some of the runs
@@ -39,7 +43,7 @@ _CANDIDATES = [
     ("E2E-VarNet",    "varnetmaps_R12"),
     ("LPDSNet",       "lpdsnet_R12"),
     ("MGLPDS-Small",  "mg81v6_R12"),
-    ("MGLPDS-Big",    "mg169v6_R12"),
+    ("MGLPDS-Big",    ("mg169v6_R12", "mglpds_R12")),     # real run, then stopgap
 ]
 
 
@@ -50,8 +54,21 @@ def _dumped(run):
     return False
 
 
-_have = [(label, run) for label, run in _CANDIDATES if _dumped(run)]
-_missing = [run for _, run in _CANDIDATES if not _dumped(run)]
+def _pick(runs):
+    """The first run of `runs` (one name or a preference list) with a dump."""
+    for run in ((runs,) if isinstance(runs, str) else runs):
+        if _dumped(run):
+            return run
+    return None
+
+
+_have = [(label, _pick(runs)) for label, runs in _CANDIDATES if _pick(runs)]
+_missing = [runs if isinstance(runs, str) else "/".join(runs)
+            for _, runs in _CANDIDATES if not _pick(runs)]
+for label, run in _have:
+    if run.startswith("mglpds_"):
+        print(f"[main_brain_R12] {label} = {run} (stopgap: no brain mg169v6 dump yet)",
+              file=sys.stderr)
 if _missing:
     print(f"[main_brain_R12] no dump for: {' '.join(_missing)} -- column(s) left out",
           file=sys.stderr)

@@ -24,8 +24,13 @@
 #    8-11  knee  R8   varnetmaps lpdsnet mg81v6 mg169v6
 #   12-15  knee  R12  varnetmaps lpdsnet mg81v6 mg169v6
 #
-# Brain's MGLPDS-Big is `mglpds` (no full-length brain mg169v6 exists); knee's
-# is `mg169v6`. Slices: each run's training range (brain 0:8, knee 12:25).
+# BRAIN'S MGLPDS-Big IS A STOPGAP: the saved `mglpds` run, until a full-length
+# brain mg169v6 has trained. Same width (M=169) and the same V-cycle; it differs
+# only in computational choices (Galerkin coarse Gram, Gauss complex conv) that
+# do not change what the net can represent. Knee's is `mg169v6`. The run is
+# found under either name -- `mglpds_R<r>`, or `mg169v6_R<r>` carrying
+# RENAMED_FROM_mglpds.txt (the rename of 2026-10-16) -- and a task whose run
+# cannot be found FAILS rather than exiting clean with nothing scored. Slices: each run's training range (brain 0:8, knee 12:25).
 #
 # BEFORE THE FIRST SUBMIT, on a LOGIN node (compute nodes have no route out, and
 # LPIPS needs pretrained AlexNet weights in ~/.cache/torch):
@@ -40,9 +45,11 @@
 # resubmitting the same task finishes the volumes that are missing. A newer
 # checkpoint or a different sigma/seed/slices starts that run over.
 #
-# Then (login node, or the laptop after copying results/main/ down -- only CSVs):
-#   python scripts/eval_per_volume.py --combine
-#   python scripts/wilcoxon_main.py
+# MERGED AUTOMATICALLY: every task ends by merging all runs written so far into
+# results/main/slices.csv and volumes.csv, so the last task to finish leaves the
+# complete set -- no separate --combine step. Then copy volumes.csv down (it is
+# all the plots and tests read) and:
+#   python figures/plot_main_bars.py
 #   python scripts/wilcoxon_main.py --ref MGLPDS-Big
 
 RUNS=(
@@ -93,6 +100,22 @@ ENTRY="${RUNS[${SLURM_ARRAY_TASK_ID}]}"
 ANATOMY="${ENTRY%%/*}"
 RUN="${ENTRY#*/}"
 
+# The brain stopgap under its renamed directory (see BRAIN'S MGLPDS-Big above).
+RUNS_ROOT="trained_nets/mg_recon"
+if [ ! -d "${RUNS_ROOT}/${ANATOMY}/${RUN}" ] && [ "${RUN%_R*}" = "mglpds" ]; then
+    _alt="mg169v6_R${RUN##*_R}"
+    if [ -f "${RUNS_ROOT}/${ANATOMY}/${_alt}/RENAMED_FROM_mglpds.txt" ]; then
+        echo "[eval] ${ENTRY}: using ${ANATOMY}/${_alt}, the renamed mglpds run (stopgap)"
+        RUN="${_alt}"
+    fi
+fi
+if [ ! -f "${RUNS_ROOT}/${ANATOMY}/${RUN}/config.json" ] \
+        || [ ! -f "${RUNS_ROOT}/${ANATOMY}/${RUN}/net.ckpt" ]; then
+    echo "[eval] ${RUNS_ROOT}/${ANATOMY}/${RUN} has no config.json + net.ckpt --" \
+         "nothing to evaluate for ${ENTRY}" >&2
+    exit 1
+fi
+
 for e in ${EMBEDDED_OFF}; do
     if [ "${e}" = "${ENTRY}" ]; then
         export IMMAP_REDISCRETIZE_EMBEDDED=0
@@ -114,3 +137,10 @@ python scripts/eval_per_volume.py \
     ${EXTRA}
 
 echo "[eval] ${ENTRY} done $(date '+%F %T')"
+
+# Merge every run written so far (see MERGED AUTOMATICALLY above). Array tasks
+# can finish at the same moment, so the merge runs under a lock; it writes
+# through a temporary file, so a reader never sees a half-written CSV.
+mkdir -p "${OUT}"
+flock "${OUT}/.combine.lock" python scripts/eval_per_volume.py --out "${OUT}" --combine
+echo "[eval] merged into ${OUT}/volumes.csv -- copy that down for the plots"
