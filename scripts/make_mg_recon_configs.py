@@ -665,6 +665,23 @@ MODELS["ram"] = dict(
           "conditioned on sigma/sqrt(2) (deepinv's per-component std). Uses "
           "the operator's coil maps through A and A^H."),
 )
+# `ramdrunet` (2026-10-20): `ram` started the way the paper starts it -- the
+# U-Net trunk from deepinv's pretrained GRAYSCALE DRUNet (models/ram/adapter.py
+# ::init_trunk_from_drunet; ~97% of the parameters), the complex head/tail and
+# the measurement-conditioning blocks at upstream's init -- then trained on
+# this grid's protocol exactly like `ram`. NOT the published RAM weights: those
+# carry the paper's multi-task training, which no other cell gets, so the
+# training budgets would stop being comparable. Gray rather than color: MRI
+# magnitudes are single-channel images. A new cell rather than a change to
+# `ram`, so the from-scratch runs keep their directories and stay comparable.
+MODELS["ramdrunet"] = dict(
+    type="RAM",
+    params=dict(in_channels=[2], pretrained=False, init_from="drunet_gray"),
+    note=("Reconstruct Anything Model (matthieutrs/ram), vendored unmodified; "
+          "U-Net trunk initialised from deepinv's pretrained grayscale DRUNet as "
+          "in the paper, then trained on this grid's protocol. Complex head only; "
+          "conditioned on sigma/sqrt(2). Uses the operator's coil maps."),
+)
 
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
@@ -677,7 +694,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
-          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP12_CELLS + ("ram",)
+          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP12_CELLS + ("ram", "ramdrunet")
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -1055,7 +1072,9 @@ def _display_name(spec_type, params):
         return "%s_%s" % (spec_type, tag)
     if spec_type == "RAM":
         # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.
-        return "RAM"
+        # The init is in the name, or `ram` and `ramdrunet` share one wandb run.
+        init = params.get("init_from")
+        return "RAM" if not init else "RAM_" + init.replace("_", "")
     if spec_type == "E2EVarNet" and params.get("use_smaps"):
         # `varnet` and `varnetmaps` are the same class with the same variant,
         # so the table below cannot separate them -- and two cells under one

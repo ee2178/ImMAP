@@ -145,23 +145,29 @@ def nrmse(
     mask=None,
 ):
     """
-    Normalized RMSE using joint dynamic range.
+    Normalized RMSE: sqrt( total squared error / total ground-truth energy ),
 
-    Deliberately takes no `data_range`: it divides by the range MEASURED from
-    (gt, pred), so it is already scale-free and a nominal range would double-count.
+        NRMSE = || gt - pred ||_2 / || gt ||_2
+
+    the fastMRI / relative-L2 definition. Scale-free (multiplying both images by
+    c leaves it unchanged) and needs no `data_range`.
+
+    CHANGED 2026-10-20 from RMSE / (joint max - min of gt and pred). Values
+    from before that date are a different quantity -- do not put them in one
+    table or one wandb curve with values from after it.
+
+    "Total" is over everything passed in: one slice from evaluation/metrics.py
+    (which calls this per sample), the whole batch from `compute_metrics`.
 
     Parameters
     ----------
     mask : torch.Tensor, optional
-        Binary organ mask. BOTH halves are restricted to it: the RMSE averages
-        over mask pixels, and the dynamic range is the span of the masked
-        pixels. Restricting only the numerator would divide a masked error by
-        an unmasked span and quietly re-admit the background -- which for a
-        knee slice is most of the image, and whose min sets the bottom of the
-        range.
+        Binary organ mask. BOTH sums are restricted to it: error and energy
+        over the organ pixels only. Normalising a masked error by the energy of
+        the whole image would let the background's share of the energy (zero for
+        a SENSE target, but not in general) deflate the value.
 
-        Takes real (magnitude) input, as it already did: `.max()` on a complex
-        tensor raises.
+        Works on real (magnitude) or complex input; `.abs()` is taken.
 
     Returns
     -------
@@ -170,26 +176,14 @@ def nrmse(
     """
 
     se = (gt - pred).abs() ** 2
+    energy = gt.abs() ** 2
     w = _as_weight(mask, se)
 
-    xy = torch.cat(
-        (gt, pred),
-        dim=0,
-    )
-
     if w is None:
-        rmse = torch.sqrt(torch.mean(se))
-        dyn_range = xy.max() - xy.min()
-        return rmse / (dyn_range + eps)
+        return torch.sqrt(se.sum() / (energy.sum() + eps))
 
     area = w.sum()
-    rmse = torch.sqrt((se * w).sum() / area.clamp_min(1))
-
-    ww = torch.cat((w, w), dim=0)
-    hi = torch.where(ww > 0, xy, xy.new_full((), float("-inf"))).max()
-    lo = torch.where(ww > 0, xy, xy.new_full((), float("inf"))).min()
-
-    return _nan_if_empty(rmse / (hi - lo + eps), area)
+    return _nan_if_empty(torch.sqrt((se * w).sum() / ((energy * w).sum() + eps)), area)
 
 
 # ============================================================
@@ -371,7 +365,7 @@ def ssim(
 
 def compute_metrics(gt, recon, psnr_only=False, data_range=1.0, mask=None):
     """PSNR / NRMSE / SSIM. `data_range` is the signal's peak-to-peak range and feeds
-    PSNR and SSIM (NRMSE measures its own -- see nrmse). Default 1.0 keeps every
+    PSNR and SSIM (NRMSE is scale-free -- see nrmse). Default 1.0 keeps every
     existing caller bit-identical; pass 2.0 for data in [-1, 1].
 
     `mask` is the `organ_mask` the recon loader returns (the coil-sensitivity

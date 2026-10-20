@@ -120,9 +120,21 @@ def test_ssim_map_not_inputs():
 
 
 def test_nrmse_range_is_masked_too():
-    """A background BRIGHTER than the organ would widen an unmasked range."""
-    print("\n[NRMSE normalises by the masked range]")
+    """A bright, CORRECT background adds energy, not error: unmasked it deflates NRMSE."""
+    print("\n[NRMSE normalises by the masked energy]")
     gt, pred, m = scene()
+
+    # The definition itself (2026-10-20): ||gt - pred|| / ||gt||, over the mask.
+    g, p, mf = gt.abs(), pred.abs(), m.float()
+    want_u = torch.sqrt(((g - p) ** 2).sum() / (g ** 2).sum())
+    want_m = torch.sqrt((((g - p) ** 2) * mf).sum() / ((g ** 2) * mf).sum())
+    check("NRMSE = ||gt - pred|| / ||gt|| (unmasked and masked)",
+          abs(float(nrmse(g, p)) - float(want_u)) < 1e-6
+          and abs(float(nrmse(g, p, mask=m)) - float(want_m)) < 1e-6,
+          f"{float(nrmse(g, p)):.6f} vs {float(want_u):.6f}")
+    check("NRMSE is scale-free", abs(float(nrmse(7 * g, 7 * p, mask=m))
+                                     - float(nrmse(g, p, mask=m))) < 1e-6)
+    check("NRMSE of a zero prediction is 1", abs(float(nrmse(g, 0 * g)) - 1) < 1e-6)
     gt2 = gt + 3.0 * (~m)                     # bright background, in BOTH
     pred2 = pred + 3.0 * (~m)
 

@@ -36,10 +36,9 @@ def _mag(x):
     Every metric here is computed on magnitudes, which is what
     `training/recon.py` does (`compute_metrics(image.abs(), recon.abs())`) and
     therefore what makes these numbers comparable to the logged val curves.
-    It is also load-bearing, not cosmetic: `training.metrics.nrmse` calls
-    `.max()` on the stacked pair, which raises on a complex tensor, and
-    `psnr` on complex inputs would fold phase error into the value -- a
-    different quantity from the one training reports.
+    It is also load-bearing, not cosmetic: `psnr` and `nrmse` on complex
+    inputs would fold phase error into the value -- a different quantity from
+    the one training reports.
     """
     return x.abs() if torch.is_complex(x) else x
 
@@ -140,9 +139,18 @@ def lpips(gt, recon, mask=None, net="alex"):
 REGISTRY = {
     "psnr":  dict(fn=psnr,  higher_is_better=True,  fmt="{:.2f}"),
     "ssim":  dict(fn=ssim,  higher_is_better=True,  fmt="{:.4f}"),
-    "nrmse": dict(fn=nrmse, higher_is_better=False, fmt="{:.4f}"),
+    # `version` names the DEFINITION; bump it whenever one changes, so stored
+    # values can say which one made them (scripts/eval_per_volume.py records it
+    # and refuses to mix). Absent = "v1", the original.
+    "nrmse": dict(fn=nrmse, higher_is_better=False, fmt="{:.4f}",
+                  version="relative-l2"),    # ||gt-pred||/||gt||, since 2026-10-20
     "lpips": dict(fn=lpips, higher_is_better=False, fmt="{:.4f}"),
 }
+
+
+def metric_version(name):
+    """The definition tag of metric `name` (see REGISTRY); "v1" if never changed."""
+    return REGISTRY[name].get("version", "v1")
 
 DEFAULT_METRICS = ["psnr", "ssim", "nrmse"]     # lpips is opt-in: it downloads weights
 

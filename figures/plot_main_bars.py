@@ -14,7 +14,7 @@ volume). One panel per metric; within a panel one group of bars per experiment
 
     bar         mean over the volumes ALL FOUR nets were scored on, so every bar
                 in a group and every test on it use the same patients
-    whisker     95% confidence interval of that mean (t, over volumes). It
+    whisker     standard error of that mean, std / sqrt(n) over volumes. It
                 describes ONE net's spread; it is NOT the significance test --
                 two overlapping whiskers can still differ significantly,
                 because the test is paired
@@ -46,7 +46,7 @@ import os
 import sys
 
 import numpy as np
-from scipy.stats import t as student_t, wilcoxon
+from scipy.stats import wilcoxon
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -95,9 +95,10 @@ def stars(p):
     return "***" if p < 1e-3 else "**" if p < 1e-2 else "*" if p < 0.05 else "n.s."
 
 
-def ci95(x):
+def sem(x):
+    """Standard error of the mean: sample std / sqrt(n)."""
     n = len(x)
-    return 0.0 if n < 2 else float(student_t.ppf(0.975, n - 1) * x.std(ddof=1) / np.sqrt(n))
+    return 0.0 if n < 2 else float(x.std(ddof=1) / np.sqrt(n))
 
 
 def _f(v):
@@ -163,6 +164,10 @@ def write_tikz(path, panels, nets, colors, groups, note, ncol):
                      f"line width=0.5pt}}] coordinates {{{coords}}};")
             if k == 0:
                 L.append(f"\\addlegendentry{{{n}}}")
+        # The bars run down past ymin and are clipped there AFTER the axis line
+        # is drawn, so they cover it everywhere but the gaps. Redraw it on top.
+        L.append("\\draw[mbmuted, line width=0.4pt] (rel axis cs:0,0) -- "
+                 "(rel axis cs:1,0);")
         for x1, x2, y, yb, lab, sig in pn["brackets"]:
             L.append(f"\\draw[mbink, line width=0.45pt] (axis cs:{_f(x1)},{_f(yb)}) -- "
                      f"(axis cs:{_f(x1)},{_f(y)}) -- (axis cs:{_f(x2)},{_f(y)}) -- "
@@ -255,7 +260,7 @@ def main():
             x = {n: np.array([data[g][n][v][m] for v in vols]) for n in nets}
             stats[(g, m)] = dict(n=len(vols), x=x,
                                  mean={n: float(x[n].mean()) for n in nets},
-                                 ci={n: ci95(x[n]) for n in nets})
+                                 ci={n: sem(x[n]) for n in nets})
             if a.pairs == "all":
                 pairs = list(itertools.combinations(nets, 2))
             else:
@@ -295,7 +300,8 @@ def main():
         ax = axes[k // ncol][k % ncol]
         ax.set_facecolor(SURFACE)
         tops, bottoms = [], []
-        for gi, g in enumerate(groups):
+        labelled = set()             # legend entry on a net's FIRST bar, wherever
+        for gi, g in enumerate(groups):   # that is -- not only in group 0
             s = stats.get((g, m))
             if s is None:
                 continue
@@ -308,7 +314,8 @@ def main():
                 mu, ci = s["mean"][n], s["ci"][n]
                 ax.bar(xc, mu, width * 0.92, color=COLORS.get(back.get(n, n), MUTED),
                        edgecolor=SURFACE, linewidth=0.8, zorder=2,
-                       label=n if gi == 0 else None)
+                       label=None if n in labelled else n)
+                labelled.add(n)
                 ax.errorbar(xc, mu, yerr=ci, color=INK, lw=0.8, capsize=1.6, zorder=3)
                 pbars.append((n, xc, mu, ci))
                 tops.append(mu + ci)
@@ -363,7 +370,7 @@ def main():
                bbox_to_anchor=(0.5, 1.0), handlelength=1.0, columnspacing=1.2)
     ns = sorted({s["n"] for s in stats.values()})
     what = (f"vs {a.ref}" if a.pairs == "ref" else "all pairs")
-    note = (f"mean ± 95% CI over {ns[0] if len(ns) == 1 else f'{ns[0]}-{ns[-1]}'} "
+    note = (f"mean ± s.e.m. over {ns[0] if len(ns) == 1 else f'{ns[0]}-{ns[-1]}'} "
             f"volumes; brackets: paired Wilcoxon {what}, Holm-adjusted"
             + ("" if a.zero else "; value axes do not start at 0"))
     fig.text(0.5, 0.005, note, ha="center", va="bottom", fontsize=7, color=MUTED)

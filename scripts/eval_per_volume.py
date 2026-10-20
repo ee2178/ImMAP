@@ -6,6 +6,17 @@ Score trained runs on EVERY volume of the val split, per slice and per volume.
     python scripts/eval_per_volume.py --anatomy knee --run varnetmaps_R8 lpdsnet_R8 \
         mg81v6_R8 mg169v6_R8 --metrics psnr ssim nrmse lpips
     python scripts/eval_per_volume.py --combine          # merge everything written
+    python scripts/eval_per_volume.py --anatomy knee --run lpdsnet_R8 --recompute nrmse
+
+`--recompute nrmse` re-scores the rows a run ALREADY HAS for that metric only,
+leaving every other column as it is -- for a metric whose definition changed
+(NRMSE, 2026-10-20). It reruns inference (same per-slice noise, so the same
+reconstructions) but skips the other metrics, LPIPS included. Resumable: its
+progress goes to <run>.recompute-<metrics>.csv and is merged into the run's
+file when every row is done. Each run's meta.json records the definition of
+every metric it holds (`metric_versions`); a normal pass refuses to extend a
+file whose values came from an older definition, and --combine leaves such
+values out (blank) rather than mixing two definitions in one column.
 
 For the main comparison's significance tests (scripts/wilcoxon_main.py), which
 pair the nets VOLUME BY VOLUME. `scripts/evaluate.py` reports a mean and std
@@ -63,7 +74,7 @@ sys.path.insert(0, HERE)
 import datasets                              # noqa: F401,E402  registers the loaders
 from datasets.registry import build_loader   # noqa: E402
 from evaluation.metrics import REGISTRY as METRIC_REGISTRY  # noqa: E402
-from evaluation.metrics import build_metrics, warm_up       # noqa: E402
+from evaluation.metrics import build_metrics, metric_version, warm_up  # noqa: E402
 from evaluation.tasks import build_adapter, default_sigma    # noqa: E402
 
 # Display names of the main comparison. Keyed by CELL (the run name without
@@ -123,15 +134,13 @@ def _done_volumes(csv_path, n_slices_of):
     return done, [r for r in rows if r["volume"] in done]
 
 
-@torch.no_grad()
-def eval_run(run_dir, anatomy, args, metric_names, device):
+def _setup(run_dir, anatomy, args, metric_names, device):
+    """Load the run and build its meta, loader and output paths."""
     import dump_eval as de
 
     run = os.path.basename(os.path.normpath(run_dir))
     dest = os.path.join(args.out, anatomy)
     os.makedirs(dest, exist_ok=True)
-    csv_path = os.path.join(dest, f"{run}.slices.csv")
-    meta_path = os.path.join(dest, f"{run}.meta.json")
 
     cfg, model, n_params, step = de.load_run(run_dir, device)
     sigma = args.sigma if args.sigma is not None else default_sigma(cfg)
@@ -146,49 +155,21 @@ def eval_run(run_dir, anatomy, args, metric_names, device):
                 label=label_of(run), n_params=int(n_params),
                 val_source={k: cfg["data"]["val"].get(k) for k in
                             ("name", "anatomy", "kspace_root", "smap_root", "scale_fac")},
-                rediscretize_embedded=os.environ.get("IMMAP_REDISCRETIZE_EMBEDDED", "1"))
-
-    # Resume only what was computed under the SAME settings; anything else
-    # (a newer checkpoint, another sigma) starts the run's file over.
-    if os.path.exists(meta_path) and not args.overwrite:
-        with open(meta_path) as f:
-            old = json.load(f)
-        if any(old.get(k) != meta[k] for k in META_KEYS):
-            changed = [k for k in META_KEYS if old.get(k) != meta[k]]
-            print(f"  [{run}] settings changed ({', '.join(changed)}) -- starting over")
-            if os.path.exists(csv_path):
-                os.remove(csv_path)
-    elif os.path.exists(csv_path) and (args.overwrite or not os.path.exists(meta_path)):
-        os.remove(csv_path)                  # rows of unknown provenance
-    _write_meta(meta_path, meta)
+                rediscretize_embedded=os.environ.get("IMMAP_REDISCRETIZE_EMBEDDED", "1"),
+                metric_versions={m: metric_version(m) for m in metric_names})
 
     val = dict(cfg["data"]["val"])
     val.update(enumerate_slices=True, start_slice=lo, end_slice=hi,
                volumes=volumes, batch_size=1, num_workers=args.workers)
     loader = build_loader(val, shuffle=False, drop_last=False)
-    ds = loader.dataset
-    n_slices_of = {}
-    for f, sl in ds.index:
-        v = os.path.splitext(f)[0]
-        n_slices_of[v] = n_slices_of.get(v, 0) + 1
+    return dict(run=run, cfg=cfg, model=model, meta=meta, sigma=sigma, loader=loader,
+                csv=os.path.join(dest, f"{run}.slices.csv"),
+                meta_path=os.path.join(dest, f"{run}.meta.json"), dest=dest)
 
-    done, kept = _done_volumes(csv_path, n_slices_of)
-    todo = [i for i, (f, _) in enumerate(ds.index)
-            if os.path.splitext(f)[0] not in done]
-    if args.limit:
-        todo = todo[:args.limit]
-    print(f"  [{run}] {label_of(run)}  R={meta['R']}  sigma={sigma:g}  slices {slices}  "
-          f"{len(volumes)} volumes / {len(ds)} slices; {len(done)} volumes already done")
-    if not todo:
-        return csv_path
 
-    # Rewrite the file with only the complete volumes, then append.
-    fields = ["volume", "slice"] + list(metric_names)
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows({k: r[k] for k in fields} for r in kept)
-
+def _score(S, todo, metric_names, args, device, write_row, flush):
+    """Push dataset items `todo` through the net; `write_row` gets each scored row."""
+    ds, loader, cfg = S["loader"].dataset, S["loader"], S["cfg"]
     metrics = build_metrics(metric_names)
     adapter = build_adapter(cfg["task"])
     gen = torch.Generator(device=device)
@@ -200,26 +181,166 @@ def eval_run(run_dir, anatomy, args, metric_names, device):
         collate_fn=loader.collate_fn, pin_memory=device.type == "cuda")
 
     running = {m: [] for m in metric_names}
+    for j, batch in enumerate(sub_loader):
+        vol, sl = ds.item_id(todo[j])
+        gen.manual_seed(slice_seed(args.seed, vol, sl))
+        gt, recon, mmask = adapter(S["model"], batch, cfg, device, S["sigma"], gen)
+        row = {"volume": vol, "slice": sl}
+        for name, fn in metrics.items():
+            v = float(fn(gt, recon, mask=mmask).reshape(-1)[0])
+            row[name] = f"{v:.6g}"
+            running[name].append(v)
+        write_row(row)
+        if (j + 1) % 200 == 0 or j + 1 == len(todo):
+            flush()
+            shown = "  ".join(
+                f"{m}={METRIC_REGISTRY[m]['fmt'].format(sum(x) / len(x))}"
+                for m, x in running.items())
+            print(f"    {j + 1:>6}/{len(todo)}  {shown}", flush=True)
+
+
+def _stale(old_meta, names):
+    """Metrics among `names` whose stored values used another definition."""
+    have = old_meta.get("metric_versions", {})
+    return [m for m in names if have.get(m, "v1") != metric_version(m)]
+
+
+@torch.no_grad()
+def eval_run(run_dir, anatomy, args, metric_names, device):
+    S = _setup(run_dir, anatomy, args, metric_names, device)
+    run, meta, csv_path, meta_path = S["run"], S["meta"], S["csv"], S["meta_path"]
+
+    # Resume only what was computed under the SAME settings; anything else
+    # (a newer checkpoint, another sigma) starts the run's file over.
+    if os.path.exists(meta_path) and not args.overwrite:
+        with open(meta_path) as f:
+            old = json.load(f)
+        if any(old.get(k) != meta[k] for k in META_KEYS):
+            changed = [k for k in META_KEYS if old.get(k) != meta[k]]
+            print(f"  [{run}] settings changed ({', '.join(changed)}) -- starting over")
+            if os.path.exists(csv_path):
+                os.remove(csv_path)
+        elif os.path.exists(csv_path) and _stale(old, metric_names):
+            # Extending this file would put two definitions in one column.
+            stale = _stale(old, metric_names)
+            raise SystemExit(
+                f"[{run}] {csv_path} holds {', '.join(stale)} under an older "
+                f"definition. Re-score it first:  --recompute {' '.join(stale)}  "
+                f"(or --overwrite to redo every metric).")
+    elif os.path.exists(csv_path) and (args.overwrite or not os.path.exists(meta_path)):
+        os.remove(csv_path)                  # rows of unknown provenance
+    _write_meta(meta_path, meta)
+
+    ds = S["loader"].dataset
+    n_slices_of = {}
+    for f, sl in ds.index:
+        v = os.path.splitext(f)[0]
+        n_slices_of[v] = n_slices_of.get(v, 0) + 1
+
+    done, kept = _done_volumes(csv_path, n_slices_of)
+    todo = [i for i, (f, _) in enumerate(ds.index)
+            if os.path.splitext(f)[0] not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"  [{run}] {label_of(run)}  R={meta['R']}  sigma={S['sigma']:g}  "
+          f"slices {meta['slices']}  {meta['n_volumes']} volumes / {len(ds)} slices; "
+          f"{len(done)} volumes already done")
+    if not todo:
+        return csv_path
+
+    # Rewrite the file with only the complete volumes, then append.
+    fields = ["volume", "slice"] + list(metric_names)
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows({k: r[k] for k in fields} for r in kept)
+
     with open(csv_path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
-        for j, batch in enumerate(sub_loader):
-            vol, sl = ds.item_id(todo[j])
-            gen.manual_seed(slice_seed(args.seed, vol, sl))
-            gt, recon, mmask = adapter(model, batch, cfg, device, sigma, gen)
-            row = {"volume": vol, "slice": sl}
-            for name, fn in metrics.items():
-                v = float(fn(gt, recon, mask=mmask).reshape(-1)[0])
-                row[name] = f"{v:.6g}"
-                running[name].append(v)
-            w.writerow(row)
-            if (j + 1) % 200 == 0 or j + 1 == len(todo):
-                f.flush()
-                shown = "  ".join(
-                    f"{m}={METRIC_REGISTRY[m]['fmt'].format(sum(x) / len(x))}"
-                    for m, x in running.items())
-                print(f"    {j + 1:>6}/{len(todo)}  {shown}", flush=True)
+        _score(S, todo, metric_names, args, device, w.writerow, f.flush)
 
-    del model
+    del S["model"]
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return csv_path
+
+
+@torch.no_grad()
+def recompute_run(run_dir, anatomy, args, names, device):
+    """Re-score the rows a run already has, for metrics `names` only."""
+    S = _setup(run_dir, anatomy, args, names, device)
+    run, meta, csv_path, meta_path = S["run"], S["meta"], S["csv"], S["meta_path"]
+    if not (os.path.exists(csv_path) and os.path.exists(meta_path)):
+        raise SystemExit(f"[{run}] nothing to recompute: no {csv_path} -- run it normally")
+    with open(meta_path) as f:
+        old = json.load(f)
+    # The reconstructions must be the ones the kept columns came from.
+    changed = [k for k in META_KEYS if k != "metrics" and old.get(k) != meta[k]]
+    if changed:
+        raise SystemExit(
+            f"[{run}] settings changed since its rows were computed ({', '.join(changed)}); "
+            f"re-scoring one column would mix two setups. Rerun it with --overwrite.")
+    missing = [m for m in names if m not in old["metrics"]]
+    if missing:
+        raise SystemExit(f"[{run}] has no {', '.join(missing)} column to recompute")
+
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    fields = list(rows[0].keys()) if rows else ["volume", "slice"] + old["metrics"]
+    want = {(r["volume"], int(r["slice"])) for r in rows}
+
+    part_path = os.path.join(S["dest"], f"{run}.recompute-{'-'.join(names)}.csv")
+    got = {}
+    if os.path.exists(part_path):
+        with open(part_path, newline="") as f:
+            for r in csv.DictReader(f):
+                got[(r["volume"], int(r["slice"]))] = r
+    ds = S["loader"].dataset
+    ids = [ds.item_id(i) for i in range(len(ds))]
+    lost = want - set(ids)
+    if lost:
+        raise SystemExit(f"[{run}] {len(lost)} stored rows are not in the current val set "
+                         f"(e.g. {sorted(lost)[:2]}); rerun it with --overwrite")
+    todo = [i for i, k in enumerate(ids) if k in want and k not in got]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"  [{run}] recompute {', '.join(names)}: {len(want)} rows, "
+          f"{len(got)} already redone, {len(todo)} to go")
+
+    if todo:
+        new_file = not os.path.exists(part_path)
+        with open(part_path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["volume", "slice"] + list(names))
+            if new_file:
+                w.writeheader()
+
+            def keep(row):
+                w.writerow(row)
+                got[(row["volume"], int(row["slice"]))] = row
+            _score(S, todo, names, args, device, keep, f.flush)
+
+    left = want - set(got)
+    if left:
+        print(f"  [{run}] {len(left)} rows still to recompute -- run again")
+        return csv_path
+
+    # Every row redone: swap the columns in, then record the new definitions.
+    for r in rows:
+        new = got[(r["volume"], int(r["slice"]))]
+        for m in names:
+            r[m] = new[m]
+    tmp = f"{csv_path}.tmp{os.getpid()}"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, csv_path)
+    old.setdefault("metric_versions", {})
+    old["metric_versions"].update({m: metric_version(m) for m in names})
+    _write_meta(meta_path, old)
+    os.remove(part_path)
+    print(f"  [{run}] {', '.join(names)} recomputed for all {len(rows)} rows")
+    del S["model"]
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return csv_path
@@ -241,6 +362,13 @@ def combine(out_root):
             rows = list(csv.DictReader(f))
         ms = [m for m in meta["metrics"]]
         metric_cols += [m for m in ms if m not in metric_cols]
+        # Values made under an older definition stay OUT of the merged files
+        # (blank), so one column never holds two definitions.
+        stale = _stale(meta, ms)
+        if stale:
+            print(f"  [{meta['run']}] {', '.join(stale)}: older definition -- left "
+                  f"blank; re-score with --recompute {' '.join(stale)}")
+            ms = [m for m in ms if m not in stale]
         key = dict(anatomy=meta["anatomy"], R=meta["R"], net=meta["label"],
                    run=meta["run"])
         per_vol = {}
@@ -294,6 +422,9 @@ def main():
     p.add_argument("--limit", type=int, help="stop after N slices (smoke test)")
     p.add_argument("--overwrite", action="store_true",
                    help="discard this run's previous rows instead of resuming")
+    p.add_argument("--recompute", nargs="+", metavar="METRIC",
+                   help="re-score these metrics on the rows each run already has, "
+                        "keeping every other column (e.g. --recompute nrmse)")
     p.add_argument("--combine", action="store_true",
                    help="after evaluating (or alone), merge every run under --out")
     args = p.parse_args()
@@ -303,14 +434,18 @@ def main():
             raise SystemExit("--run needs --anatomy")
         device = torch.device(args.device or
                               ("cuda" if torch.cuda.is_available() else "cpu"))
-        warm_up(args.metrics, device)        # LPIPS weights load now, not mid-run
+        warm_up(args.recompute or args.metrics, device)   # LPIPS loads now, not mid-run
         for run in args.run:
             run_dir = os.path.join(args.runs_root, args.anatomy, run)
             if not (os.path.exists(os.path.join(run_dir, "config.json"))
                     and os.path.exists(os.path.join(run_dir, "net.ckpt"))):
                 print(f"[skip] {run_dir}: no config.json + net.ckpt")
                 continue
-            eval_run(run_dir, args.anatomy, args, args.metrics, device)
+            if args.recompute:
+                build_metrics(args.recompute)    # a typo fails before any inference
+                recompute_run(run_dir, args.anatomy, args, args.recompute, device)
+            else:
+                eval_run(run_dir, args.anatomy, args, args.metrics, device)
     elif not args.combine:
         raise SystemExit("nothing to do: give --anatomy and --run, or --combine")
 

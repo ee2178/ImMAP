@@ -15,13 +15,21 @@
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
 #SBATCH --array=0-3
 #
-# EXPERIMENT 13 -- RAM (Reconstruct Anything Model) trained FROM SCRATCH as a
-# baseline, BRAIN and KNEE, R=8 and R=12, under the same protocol as every other
-# cell of the main table (measured k-space + AWGN at sigma ~ U[0.01, 0.02], val
-# 0.015, Julia masks, online ESPIRiT maps, organ-masked magnitude-nl1-nl2 loss,
-# 6000 x 50 steps, Adam 5e-4).
+# EXPERIMENT 13 -- RAM (Reconstruct Anything Model) as a baseline, BRAIN and
+# KNEE, R=8 and R=12, under the same protocol as every other cell of the main
+# table (measured k-space + AWGN at sigma ~ U[0.01, 0.02], val 0.015, Julia
+# masks, online ESPIRiT maps, organ-masked magnitude-nl1-nl2 loss, 6000 x 50
+# steps, Adam 5e-4).
 #
 #   0  brain R8    1  brain R12    2  knee R8    3  knee R12
+#
+# TWO CELLS. The default since 2026-10-20 is `ramdrunet`: the U-Net trunk
+# initialised from deepinv's pretrained grayscale DRUNet, as the paper starts
+# RAM, then trained exactly like the rest (run dirs ramdrunet_R<r>). `ram` is
+# the same network from a random init (ONLY=ram; run dirs ram_R<r>). Neither
+# loads the published RAM weights -- those carry the paper's multi-task
+# training, and no other cell gets pretraining it could be matched against.
+# ramdrunet needs the DRUNet weights cached (ONE-TIME SETUP below).
 #
 # ONE SETTING DIFFERS FROM THE EARLIER CELLS, DELIBERATELY: backtracking. These
 # runs get the defaults of 2026-10-19 -- restore when the epoch loss exceeds 100x
@@ -48,6 +56,9 @@
 #     pip install einops natsort torchmetrics
 # 0.4.2 is the version the port was tested against (2026-10-20). Verify with
 #     python -m tests.test_ram
+# and, for `ramdrunet`, cache the pretrained grayscale DRUNet (~130 MB, into
+# ~/.cache/torch/hub/checkpoints, which compute nodes then read):
+#     python -c "from deepinv.models import DRUNet; DRUNet(1, 1, pretrained='download')"
 #
 # COST. Every one of RAM's 28 residual blocks applies A^H A three times at FULL
 # resolution (a 20-coil FFT pair each), on top of a 33.6M-parameter U-Net at
@@ -70,7 +81,7 @@
 #   sbatch torch/exp13_ram.sbatch
 
 ANATOMIES="${ANATOMIES:-brain knee}"
-ONLY="${ONLY:-ram}"
+ONLY="${ONLY:-ramdrunet}"
 ACCELS="${ACCELS:-8 12}"
 # PLANAR_STATE and ATTN do nothing to RAM (the generator writes neither for it).
 # They are set to what exp11/exp12 use because REGENERATE rewrites EVERY config
@@ -139,5 +150,17 @@ if ! ( cd "${IMMAP_ROOT}" && python -m tests.test_ram ); then
     echo "[exp13] tests/test_ram.py FAILED on $(hostname) -- not training." >&2
     exit 1
 fi
+# ramdrunet builds from the CACHED DRUNet; without it the first build would try
+# to download from a node with no route out. Fail here, with the fix.
+case " ${ONLY//,/ } " in
+    *" ramdrunet "*)
+        _drunet="$(python -c 'import torch, os; print(os.path.join(torch.hub.get_dir(), "checkpoints", "drunet_deepinv_gray_finetune_26k.pth"))')"
+        if [ ! -f "${_drunet}" ]; then
+            echo "[exp13] ramdrunet needs the pretrained DRUNet at ${_drunet}." >&2
+            echo "[exp13] On a LOGIN node: python -c \"from deepinv.models import DRUNet; DRUNet(1, 1, pretrained='download')\"" >&2
+            exit 1
+        fi
+        ;;
+esac
 
 source "${IMMAP_ROOT}/torch/_mg_recon_body.sh"

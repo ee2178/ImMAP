@@ -41,6 +41,13 @@
 #   sbatch torch/main_eval.sbatch                  # all 16
 #   sbatch --array=8-15 torch/main_eval.sbatch     # knee only
 #
+# RE-SCORING ONE METRIC (NRMSE was redefined 2026-10-20 to ||gt-pred||/||gt||):
+#   RECOMPUTE=nrmse sbatch torch/main_eval.sbatch
+# reruns inference on the rows each run already has and replaces ONLY that
+# column -- PSNR / SSIM / LPIPS are kept, and LPIPS is not even recomputed.
+# Resumable like the main pass. Until a run is re-scored, the merge leaves its
+# NRMSE blank rather than mixing the two definitions.
+#
 # RESUMABLE: rows are written as they go to results/main/<anatomy>/<run>.slices.csv;
 # resubmitting the same task finishes the volumes that are missing. A newer
 # checkpoint or a different sigma/seed/slices starts that run over.
@@ -70,6 +77,7 @@ SEED="${SEED:-1234}"
 SIGMA="${SIGMA:-}"                     # empty = each run's own val_noise_std
 OUT="${OUT:-results/main}"
 WORKERS="${WORKERS:-6}"
+RECOMPUTE="${RECOMPUTE:-}"             # e.g. RECOMPUTE=nrmse: re-score that column only
 EXTRA="${EXTRA:-}"                     # e.g. EXTRA="--n-volumes 3" for a probe
 
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do
@@ -134,6 +142,7 @@ python scripts/eval_per_volume.py \
     --workers "${WORKERS}" \
     --out "${OUT}" \
     ${SIGMA:+--sigma "${SIGMA}"} \
+    ${RECOMPUTE:+--recompute ${RECOMPUTE}} \
     ${EXTRA}
 
 echo "[eval] ${ENTRY} done $(date '+%F %T')"

@@ -146,6 +146,95 @@ def _ram_forward(net, y, physics, sigma):
     return out
 
 
+# ---------------------------------------------------------------------------
+# DRUNet initialisation -- how the paper starts training ("We use the
+# pretrained weights of the DRUNet denoiser to initialize our model", Terris et
+# al. 2025, Sec. 4). RAM is DRUNet's U-Net with a measurement-conditioning
+# branch added to every residual block, so the TRUNK maps one to one:
+#
+#   RAM                                  DRUNet (deepinv)
+#   m_down{k}.enc[i].conv1 / conv2       m_down{k}[i].res[0] / res[2]
+#   pool{k}                              m_down{k}[nb]          (strided conv)
+#   m_body.enc[i].conv1 / conv2          m_body[i].res[0] / res[2]
+#   up{k}                                m_up{k}[0]             (transposed conv)
+#   m_up{k}.enc[i].conv1 / conv2         m_up{k}[1 + i].res[0] / res[2]
+#
+# 62 convolutions, ~97% of RAM's parameters. NOT copied, because DRUNet has no
+# counterpart: the complex (2-channel) head and tail -- DRUNet's are 1- or
+# 3-channel, and the paper does not say how its 2-channel head was started --
+# and every MeasCondBlock / gain (RAM's additions). Those keep upstream's own
+# initialisation. The paper does not publish its init code; this is the
+# mapping the shared module structure fixes.
+# ---------------------------------------------------------------------------
+DRUNET_INITS = {"drunet_gray": 1, "drunet_color": 3}
+
+
+def drunet_trunk_pairs(ram, drunet, nb=4):
+    """[(ram_conv, drunet_conv)] for every trunk convolution, in order."""
+    pairs = []
+    for k in (1, 2, 3):
+        down, up = getattr(drunet, f"m_down{k}"), getattr(drunet, f"m_up{k}")
+        r_down, r_up = getattr(ram, f"m_down{k}"), getattr(ram, f"m_up{k}")
+        for i in range(nb):
+            pairs += [(r_down.enc[i].conv1, down[i].res[0]),
+                      (r_down.enc[i].conv2, down[i].res[2])]
+        pairs.append((getattr(ram, f"pool{k}"), down[nb]))
+        pairs.append((getattr(ram, f"up{k}"), up[0]))
+        for i in range(nb):
+            pairs += [(r_up.enc[i].conv1, up[1 + i].res[0]),
+                      (r_up.enc[i].conv2, up[1 + i].res[2])]
+    for i in range(nb):
+        pairs += [(ram.m_body.enc[i].conv1, drunet.m_body[i].res[0]),
+                  (ram.m_body.enc[i].conv2, drunet.m_body[i].res[2])]
+    return pairs
+
+
+@torch.no_grad()
+def init_trunk_from_drunet(ram, drunet, nb=4):
+    """Copy DRUNet's trunk into an upstream RAM; returns the number of tensors copied.
+
+    Strict both ways: every pair must match in shape, and every DRUNet
+    parameter outside its head and tail must be used exactly once -- so a
+    deepinv release that reshapes DRUNet fails here, at construction, rather
+    than leaving part of the trunk silently random.
+    """
+    used, n = set(), 0
+    for dst, src in drunet_trunk_pairs(ram, drunet, nb):
+        for name, p in src.named_parameters(recurse=False):
+            q = getattr(dst, name)
+            if q is None or q.shape != p.shape:
+                raise ValueError(f"DRUNet -> RAM shape mismatch at {type(dst).__name__}."
+                                 f"{name}: {None if q is None else tuple(q.shape)} "
+                                 f"vs {tuple(p.shape)}")
+            q.copy_(p)
+            used.add(id(p))
+            n += 1
+        if dst.bias is not None and src.bias is None:
+            dst.bias.zero_()
+    left = [name for name, p in drunet.named_parameters()
+            if id(p) not in used and not name.startswith(("m_head", "m_tail"))]
+    if left:
+        raise ValueError(f"DRUNet parameters with no place in RAM's trunk: {left[:6]}"
+                         f"{' ...' if len(left) > 6 else ''}")
+    return n
+
+
+def load_drunet(kind, weights=None):
+    """deepinv's pretrained DRUNet: `kind` is "drunet_gray" or "drunet_color".
+
+    `weights`, if given, is a path to that DRUNet's state dict; otherwise
+    deepinv's own download, which reads ~/.cache/torch/hub/checkpoints first --
+    so fetch it once on a LOGIN node (compute nodes have no route out):
+        python -c "from deepinv.models import DRUNet; DRUNet(1, 1, pretrained='download')"
+    (3, 3 for drunet_color).
+    """
+    if kind not in DRUNET_INITS:
+        raise ValueError(f"init_from={kind!r}; known: {sorted(DRUNET_INITS)}")
+    from deepinv.models import DRUNet
+    c = DRUNET_INITS[kind]
+    return DRUNet(in_channels=c, out_channels=c, pretrained=weights or "download")
+
+
 class RAM(nn.Module):
     """RAM behind ImMAP's `(y, E, sigma) -> (x_hat, extra)`.
 
@@ -162,6 +251,16 @@ class RAM(nn.Module):
         Hugging Face (`mterris/ram`) -- a login node only, compute nodes have
         no route out. A path: load that state dict (the same file, fetched
         beforehand), e.g. `ram.pth.tar`.
+    init_from : None, "drunet_gray" or "drunet_color"
+        Start the TRUNK from deepinv's pretrained DRUNet, as the paper does
+        (see `init_trunk_from_drunet`); everything else keeps upstream's init.
+        Training is otherwise from scratch. Exclusive with `pretrained`.
+    init_weights : str, optional
+        Path to that DRUNet's state dict, instead of deepinv's cached download.
+
+    The DRUNet load happens on EVERY construction, a resumed or evaluated run
+    included (its checkpoint then overwrites the trunk) -- so the cached
+    weights must exist wherever a `ramdrunet` run is built.
     """
 
     # Read by training/common.py::embed_for_net; 1 = no embedding (RAM pads).
@@ -171,8 +270,12 @@ class RAM(nn.Module):
     # RAM uses the operator's coil maps through A / A_adjoint.
     uses_operator_smaps = True
 
-    def __init__(self, in_channels=(2,), pretrained=False):
+    def __init__(self, in_channels=(2,), pretrained=False, init_from=None,
+                 init_weights=None):
         super().__init__()
+        if init_from is not None and pretrained:
+            raise ValueError("init_from (DRUNet trunk) and pretrained (the published "
+                             "RAM) are alternatives; give one.")
         in_channels = [int(c) for c in in_channels]
         if 2 not in in_channels:
             raise ValueError(
@@ -190,6 +293,10 @@ class RAM(nn.Module):
             self.net.load_state_dict(state.get("model_state_dict", state)
                                      if isinstance(state, dict) else state)
         self.pretrained = pretrained
+        self.init_from = init_from
+        if init_from is not None:
+            n = init_trunk_from_drunet(self.net, load_drunet(init_from, init_weights))
+            print(f"[RAM] trunk initialised from {init_from}: {n} tensors")
 
     def forward(self, y, E=None, sigma=None, **_):
         if E is None:
@@ -216,4 +323,5 @@ class RAM(nn.Module):
         return self
 
     def extra_repr(self):
-        return f"in_channels={self.in_channels}, pretrained={self.pretrained!r}"
+        return (f"in_channels={self.in_channels}, pretrained={self.pretrained!r}, "
+                f"init_from={self.init_from!r}")

@@ -21,6 +21,9 @@ Run with `python -m tests.test_ram`. Needs deepinv. CPU, about a minute.
 7. GRADIENTS: the learned realignment weight is trained, and the ONLY
    parameters without a gradient are the six kinds upstream defines but never
    uses in forward.
+10. DRUNet TRUNK INIT (the `ramdrunet` cell): the installed deepinv's DRUNet
+   copies into RAM's trunk conv for conv, leaves the rest alone, and a
+   mismatched DRUNet is refused; plus the cached pretrained weights, if present.
 """
 
 from __future__ import annotations
@@ -209,6 +212,45 @@ def main():
               and gnet.net.fact_realign.grad is not None)
     else:
         print("[skip] no CUDA here -- run on a GPU node to exercise the device path")
+
+    # 10 -----------------------------------------------------------------
+    # DRUNet TRUNK INIT (`ramdrunet`), against the INSTALLED deepinv's DRUNet:
+    # every trunk conv copied, nothing else touched, and a DRUNet that does
+    # not fit refused rather than half-copied.
+    from deepinv.models import DRUNet
+    torch.manual_seed(0)
+    d = DRUNet(in_channels=1, out_channels=1, pretrained=None)
+    r = ad.RAM(in_channels=[2])
+    head0 = r.net.m_head.conv0.weight.clone()
+    cond0 = r.net.m_body.enc[0].PhysicsBlock.encoding_conv.state_dict()
+    n = ad.init_trunk_from_drunet(r.net, d)
+    pairs = ad.drunet_trunk_pairs(r.net, d)
+    check("DRUNet init: 62 trunk convolutions copied, each exactly",
+          n == 62 and all(torch.equal(a.weight, b.weight) for a, b in pairs), f"n={n}")
+    check("DRUNet init: complex head and measurement blocks keep upstream's init",
+          torch.equal(r.net.m_head.conv0.weight, head0)
+          and all(torch.equal(v, r.net.m_body.enc[0].PhysicsBlock.encoding_conv
+                              .state_dict()[k]) for k, v in cond0.items()))
+    try:
+        ad.init_trunk_from_drunet(ad.RAM(in_channels=[2]).net,
+                                  DRUNet(in_channels=1, out_channels=1, nb=5,
+                                         pretrained=None))
+        check("DRUNet init: a DRUNet of another depth is refused", False)
+    except ValueError:
+        check("DRUNet init: a DRUNet of another depth is refused", True)
+    # The pretrained weights themselves, when cached (a compute node cannot
+    # download them; torch/exp13_ram.sbatch says how to fetch them).
+    cached = os.path.join(torch.hub.get_dir(), "checkpoints",
+                          "drunet_deepinv_gray_finetune_26k.pth")
+    if os.path.exists(cached):
+        rp = build_model({"model": {"type": "RAM", "params": {
+            "in_channels": [2], "init_from": "drunet_gray"}}})
+        ref = ad.load_drunet("drunet_gray")
+        check("DRUNet init: the cached PRETRAINED gray DRUNet lands in the trunk",
+              all(torch.equal(a.weight, b.weight)
+                  for a, b in ad.drunet_trunk_pairs(rp.net, ref)))
+    else:
+        print(f"[skip] no cached pretrained DRUNet at {cached}")
 
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")
     return 1 if FAIL else 0

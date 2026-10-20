@@ -120,6 +120,68 @@ def test_eval(tmp, ks, sm):
           and epv.label_of("mg169v6_R8") == "MGLPDS-Big")
 
 
+def test_recompute(tmp, ks, sm):
+    """--recompute nrmse: one column re-scored, the rest kept, never mixed."""
+    cfg = base_cfg(ks, sm)
+    cfg["data"]["train"] = dict(cfg["data"]["val"], start_slice=1, end_slice=4)
+    runs_root, out = os.path.join(tmp, "runs_rc"), os.path.join(tmp, "res_rc")
+    make_run(runs_root, "knee", "lpdsnet_R4", cfg)
+    run_dir = os.path.join(runs_root, "knee", "lpdsnet_R4")
+    dev = torch.device("cpu")
+    p = epv.eval_run(run_dir, "knee", args_for(runs_root, out), METRICS, dev)
+    fresh = {(r["volume"], r["slice"]): r for r in read(p)}
+    meta_p = os.path.join(out, "knee", "lpdsnet_R4.meta.json")
+    check("a new run records each metric's definition",
+          json.load(open(meta_p))["metric_versions"]["nrmse"] == "relative-l2")
+
+    # Pretend these rows predate the NRMSE change: old version, wrong values,
+    # and a PSNR sentinel that recompute must leave alone.
+    meta = json.load(open(meta_p))
+    meta["metric_versions"] = {"psnr": "v1", "ssim": "v1"}       # nrmse absent = v1
+    json.dump(meta, open(meta_p, "w"))
+    rows = read(p)
+    for r in rows:
+        r["nrmse"], r["psnr"] = "999", "123"
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+    try:
+        epv.eval_run(run_dir, "knee", args_for(runs_root, out), METRICS, dev)
+        check("a normal pass refuses to extend an old-definition file", False)
+    except SystemExit as e:
+        check("a normal pass refuses to extend an old-definition file",
+              "--recompute nrmse" in str(e))
+    epv.combine(out)
+    v = read(os.path.join(out, "volumes.csv"))
+    check("combine leaves old-definition values out (blank), keeps the rest",
+          all(r["nrmse"] == "" and r["psnr"] == "123" for r in v))
+
+    try:
+        epv.recompute_run(run_dir, "knee", args_for(runs_root, out, sigma=0.2), ["nrmse"], dev)
+        check("recompute refuses when the reconstructions would differ", False)
+    except SystemExit as e:
+        check("recompute refuses when the reconstructions would differ", "sigma" in str(e))
+
+    epv.recompute_run(run_dir, "knee", args_for(runs_root, out, limit=4), ["nrmse"], dev)
+    check("interrupted recompute leaves the run's file untouched",
+          all(r["nrmse"] == "999" for r in read(p))
+          and os.path.exists(os.path.join(out, "knee", "lpdsnet_R4.recompute-nrmse.csv")))
+    epv.recompute_run(run_dir, "knee", args_for(runs_root, out), ["nrmse"], dev)
+    done = read(p)
+    check("recompute restores exactly the fresh values, every row once",
+          len(done) == len(fresh)
+          and all(r["nrmse"] == fresh[(r["volume"], r["slice"])]["nrmse"] for r in done))
+    check("recompute keeps every other column as it was",
+          all(r["psnr"] == "123" for r in done))
+    check("recompute records the new definition and cleans up",
+          json.load(open(meta_p))["metric_versions"]["nrmse"] == "relative-l2"
+          and not os.path.exists(os.path.join(out, "knee", "lpdsnet_R4.recompute-nrmse.csv")))
+    epv.eval_run(run_dir, "knee", args_for(runs_root, out), METRICS, dev)
+    check("after recompute a normal pass resumes without complaint", len(read(p)) == len(fresh))
+
+
 def test_wilcoxon(tmp):
     rng = np.random.default_rng(1)
     n = 30
@@ -164,6 +226,7 @@ def main():
     try:
         ks, sm = build_trees(tmp)
         test_eval(tmp, ks, sm)
+        test_recompute(tmp, ks, sm)
         test_wilcoxon(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
