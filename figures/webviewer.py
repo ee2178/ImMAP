@@ -12,16 +12,22 @@ until its runs are dumped), so one viewer reaches all of them; switching
 reloads that config's options, columns and its own picks. A config given on the
 command line is only where it opens.
 
-It prints the tunnel command and the page URL. ON YOUR LAPTOP, in a new
-terminal -- standard port forwarding, as for a Jupyter server:
+It prints the tunnel command and the page URL for where it runs. Two ways:
+
+ON A LOGIN NODE (the default): Torch's login nodes cannot reach each other's
+ports, so the tunnel must ride the SSH session the viewer runs in:
+
+    ssh -o ExitOnForwardFailure=yes -L 8765:127.0.0.1:8765 <you>@login.torch.hpc.nyu.edu
+    python -m figures.webviewer &        # in that same session
+    open http://127.0.0.1:8765
+
+ON A COMPUTE NODE (torch/webviewer.sbatch) -- standard port forwarding, as
+for a Jupyter server: the job log prints, for a NEW laptop terminal,
 
     ssh -N -L 8765:<node>:8765 <you>@login.torch.hpc.nyu.edu
     open http://127.0.0.1:8765/?token=<printed token>
 
-<node> is the cluster-internal name it prints; the login node you land on
-resolves it, so it does not matter which one that is. If the login nodes turn
-out not to reach each other's ports, run with --host 127.0.0.1 and forward on
-the same SSH session instead (it prints that recipe then).
+and any login node can reach a compute node.
 
 Same core as the Tk viewer (figures/viewer.py::PickerCore), so the same
 columns, the same panel images, and the same picks files -- rows/<VARIANT>.json
@@ -416,11 +422,12 @@ def main(argv=None):
     ap.add_argument("--slice", type=int, help="...and this source slice number")
     ap.add_argument("--port", type=int, default=8765,
                     help="first port to try (the next free one is used if taken)")
-    ap.add_argument("--host", default="0.0.0.0",
-                    help="interface to listen on. 0.0.0.0 (default): the node's own "
-                         "network, so a STANDARD tunnel through any login node reaches "
-                         "it (ssh -N -L P:<node>:P you@<login>), guarded by a token. "
-                         "127.0.0.1: only a tunnel riding the same SSH session can")
+    ap.add_argument("--host", default=None,
+                    help="interface to listen on. Default: 127.0.0.1 on a login node "
+                         "(Torch's login nodes cannot reach each other's ports, so the "
+                         "tunnel must ride the same SSH session), 0.0.0.0 inside a "
+                         "Slurm job (a compute node: a STANDARD tunnel through any "
+                         "login node reaches it), guarded by a token")
     ap.add_argument("--login-host", default=os.environ.get("IMMAP_LOGIN_HOST",
                                                            "login.torch.hpc.nyu.edu"),
                     help="what you ssh into from the laptop, for the printed command")
@@ -451,6 +458,8 @@ def main(argv=None):
     sess = Session(a.rows, configs, start, volume=a.volume, sl=a.slice,
                    overrides=overrides)
     picker = sess.picker
+    if a.host is None:
+        a.host = "0.0.0.0" if os.environ.get("SLURM_JOB_ID") else "127.0.0.1"
     local_only = a.host in ("127.0.0.1", "localhost")
     token = None if local_only else secrets.token_urlsafe(16)
     server, port = serve(sess, a.host, a.port, token=token)
@@ -465,8 +474,10 @@ def main(argv=None):
         print("[webviewer] on your laptop, in a NEW terminal (standard port forwarding):")
         print(f"    ssh -N -L {port}:{node}:{port} {user}@{a.login_host}")
         print(f"    then open {url}")
-        print("    (if the page never loads, the login nodes may not reach each other's "
-              "ports: restart with --host 127.0.0.1 for the same-session tunnel)")
+        if not os.environ.get("SLURM_JOB_ID"):
+            print("    (on a LOGIN node this does not work on Torch -- the login nodes "
+                  "cannot reach each other's ports; use torch/webviewer.sbatch, or "
+                  "drop --host for the same-session tunnel)")
     else:
         print("[webviewer] listening on 127.0.0.1 only: forward the port on the SAME ssh "
               "session you start the viewer from:")

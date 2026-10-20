@@ -27,6 +27,21 @@ study acting through the prior, not extra refinement capacity.
 `u_weight * loss(u, x0)` (training/i2sb.py) -- the term that keeps u a CT1 estimate rather than
 whatever pre-image LGGS maps best onto CT1.
 
+MEASUREMENT NOISE (`meas_noise`, training only). u is not a faithful measurement: the UNet's
+error is unknown and grows along the bridge. With meas_noise = {"max": s, "p_zero": p}, every
+TRAINING sample draws its own level sigma_n ~ U(0, s) (exactly 0 with probability p) and LGGS sees
+
+    u_noisy = u + sigma_n * eps,    sigma_lggs = sqrt(sigma_t^2 + sigma_n^2)
+
+-- a noise-level-conditional denoiser: the noise forces the prox (and so the guide's grouping) to
+do real work instead of settling at the identity, and LGGS is TOLD the level, so its thresholds
+learn the whole family. At validation / test sigma_n = 0 and the stage behaves as without it.
+`u_weight` still supervises the clean u. The default None is the model exactly as before.
+
+UNET ONLY (`refine=False`): x0_hat = u, the LGGS stage is skipped. The baseline for this family,
+run through the SAME loader (multi-study patients only, the same guide planes available to the
+UNet through `unet_guides`), so a gain of LGGS over it is not a difference in training data.
+
 WARM START. `load_state_dict` also accepts a plain SBUnet state dict (no `unet.` / `lggs.`
 prefixes) and loads it into the UNet alone, leaving LGGS at its init. So `paths.init_ckpt` --
 which train.py pops before saving the run's config and never re-applies on a requeue -- can
@@ -40,6 +55,7 @@ import torch
 import torch.nn as nn
 
 from models.guided_lpds import LGGSNet
+from models.prox import as_noise_map
 from models.sb_unet import SBUnet
 
 
@@ -59,7 +75,7 @@ class SBUnetLGGS(nn.Module):
     """
 
     def __init__(self, C, n_guide_planes, lggs_guides, unet, lggs, unet_guides=(),
-                 guided=True):
+                 guided=True, meas_noise=None, refine=True):
         super().__init__()
         self.C = int(C)
         self.n_guide_planes = int(n_guide_planes)
@@ -71,6 +87,13 @@ class SBUnetLGGS(nn.Module):
                 raise ValueError(f"{name} {idx} must be a{' non-empty' if need else ''} subset "
                                  f"of range({self.n_guide_planes})")
         self.guided = bool(guided)
+        self.refine = bool(refine)
+        self.meas_noise = None
+        if meas_noise:
+            mx, p0 = float(meas_noise.get("max", 0.0)), float(meas_noise.get("p_zero", 0.0))
+            if not (mx > 0 and 0.0 <= p0 < 1.0):
+                raise ValueError(f"meas_noise needs max > 0 and 0 <= p_zero < 1; got {meas_noise}")
+            self.meas_noise = (mx, p0)
 
         unet = dict(unet)
         unet_C = self.C + len(self.unet_guides)
@@ -105,8 +128,19 @@ class SBUnetLGGS(nn.Module):
         u, _ = self.unet(unet_in, sigma=sigma)
         u = u[:, :1]
         self.last_u = u
+        if not self.refine:
+            return u, None                                # the UNet-only baseline
+        meas, s_lggs = u, sigma
+        if self.meas_noise is not None and self.training:
+            mx, p0 = self.meas_noise
+            B = u.shape[0]
+            sn = torch.rand(B, 1, 1, 1, device=u.device, dtype=u.dtype) * mx
+            sn = torch.where(torch.rand_like(sn) < p0, torch.zeros_like(sn), sn)
+            meas = u + sn * torch.randn_like(u)
+            s0 = as_noise_map(sigma, u)
+            s_lggs = torch.sqrt(s0 * s0 + sn * sn)
         g = guide[:, self.lggs_guides] if self.guided else None
-        x, state = self.lggs(u, guide=g, sigma=sigma)
+        x, state = self.lggs(meas, guide=g, sigma=s_lggs)
         return x, state
 
     # -- hooks the trainer looks for ------------------------------------------
@@ -129,4 +163,4 @@ class SBUnetLGGS(nn.Module):
     def extra_repr(self):
         return (f"C={self.C}, n_guide_planes={self.n_guide_planes}, "
                 f"lggs_guides={self.lggs_guides}, unet_guides={self.unet_guides}, "
-                f"guided={self.guided}")
+                f"guided={self.guided}, refine={self.refine}, meas_noise={self.meas_noise}")

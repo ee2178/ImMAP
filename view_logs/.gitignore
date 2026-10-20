@@ -1,0 +1,5 @@
+# Logs of torch/webviewer.sbatch. The directory is tracked (Slurm will not
+# create a missing --output directory, and the job would die without a log);
+# its contents are not.
+*
+!.gitignore
