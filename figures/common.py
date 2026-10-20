@@ -115,10 +115,61 @@ def apply_config(path):
     # rows/ and zooms/ key off the CONFIG, never off a --name override, so a
     # renamed rebuild still uses that config's hand-picked selection.
     globals()["VARIANT"] = ns.get("NAME", stem)
+    # The config's own columns, kept aside: the viewer's model menu can replace
+    # COLUMNS with a hand-picked set (cols/<VARIANT>.json), and needs these to
+    # offer the config's labels and to reset to them.
+    globals()["CONFIG_COLUMNS"] = list(COLUMNS)
+    if os.path.exists(cols_file()):
+        with open(cols_file()) as f:
+            globals()["COLUMNS"] = [(lab, spec) for lab, spec in json.load(f)]
 
 
 def variant():
     return VARIANT or NAME
+
+
+# ---------------------------------------------------------------------------
+# Hand-picked columns -- which runs a variant compares
+# ---------------------------------------------------------------------------
+# The third picks file beside rows/ and zooms/: the viewer's model menu writes
+# the checked runs here, and apply_config uses them in place of the config's
+# COLUMNS -- so the viewer and figures/make_figure.py compare the SAME nets.
+# Deleting the file (the menu's reset) restores the config's columns.
+CONFIG_COLUMNS = []
+
+
+def cols_file():
+    return os.path.join(HERE, "cols", f"{variant()}.json")
+
+
+def save_columns(cols):
+    os.makedirs(os.path.dirname(cols_file()), exist_ok=True)
+    with open(cols_file(), "w") as f:
+        json.dump([[lab, spec] for lab, spec in cols], f, indent=2)
+
+
+def clear_columns():
+    if os.path.exists(cols_file()):
+        os.remove(cols_file())
+
+
+def catalogue():
+    """Every run with a dump under DUMP_ROOT, as (spec, n_volumes), sorted.
+
+    What the model menu offers: anything dumped for this dataset, not only the
+    runs the config happens to name.
+    """
+    out = []
+    if not os.path.isdir(DUMP_ROOT):
+        return out
+    for run in sorted(os.listdir(DUMP_ROOT)):
+        for cand in (os.path.join(DUMP_ROOT, run, "eval_dump"), os.path.join(DUMP_ROOT, run)):
+            if os.path.isdir(cand):
+                n = sum(f.endswith(".h5") for f in os.listdir(cand))
+                if n:
+                    out.append((run, n))
+                    break
+    return out
 
 
 def outdir():
@@ -557,6 +608,7 @@ def pretty(name):
 # BRIGHTNESS, say) leaks into the next.
 _DEFAULTS = {k: globals()[k] for k in CONFIGURABLE}
 _DEFAULTS["VARIANT"] = None
+_DEFAULTS["CONFIG_COLUMNS"] = []
 
 
 def reset():

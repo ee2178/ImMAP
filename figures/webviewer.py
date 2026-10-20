@@ -132,6 +132,7 @@ class WebPicker(PickerCore):
             vols=[pretty(v) for v in self.vols], vi=self.vi, vol=pretty(c["vol"]),
             pos=c["pos"], n=c["n"], sl=c["sl"],
             all_columns=[lab for lab, _ in fc.COLUMNS], shown=self.shown_labels(),
+            hidden=sorted(self.hidden),
             grid=self.grid, view=self.view % len(fc.COLUMNS),
             resid=self.resid, dis=self.dis, crop=self.crop,
             brightness=fc.BRIGHTNESS, key=key,
@@ -162,6 +163,8 @@ class WebPicker(PickerCore):
             self.goto(int(a["vi"]), None if sl in (None, "") else int(sl))
         elif op == "toggle" and a.get("name") in ("resid", "dis", "crop", "grid"):
             self.set(**{a["name"]: not getattr(self, a["name"])})
+        elif op == "hide":
+            self.toggle_column(a.get("label"))
         elif op == "view":
             i = int(a["i"])
             self.set(grid=True) if i < 0 else self.set(grid=False, view=i)
@@ -257,10 +260,117 @@ class Session:
             if hit is not None and hit["path"] != self.path:
                 self.open(hit["path"])
             return
+        if op == "model":
+            return self.set_model(a.get("spec"), bool(a.get("on")))
+        if op == "rename":
+            return self.rename(a.get("spec"), str(a.get("label", "")).strip())
+        if op == "reset_models":
+            fc.clear_columns()
+            return self.reopen("columns back to the config's")
         self.picker.do(op, a)
+
+    # --- which runs are compared (the reference viewer's model menu) -------------
+    # The checked runs ARE the columns: they decide the panels, the metric
+    # readout, the disagreement overlay, the automatic zoom and the shared volume
+    # list -- and, saved to cols/<VARIANT>.json, the columns figures/make_figure.py
+    # prints. Unchecking is not hiding: an unchecked run is out of everything.
+    @staticmethod
+    def _spec(s):
+        return None if s == "@reference" else s
+
+    def models(self):
+        cfg = {spec: lab for lab, spec in fc.CONFIG_COLUMNS}
+        cur = {spec: lab for lab, spec in fc.COLUMNS}
+        out, seen = [], set()
+
+        def add(spec, kind, n=None, default=None):
+            seen.add(spec)
+            out.append(dict(spec="@reference" if spec is None else spec, kind=kind, n=n,
+                            on=spec in cur,
+                            label=cur.get(spec) or cfg.get(spec) or default or spec))
+        add("@zero_filled", "input", default="Zero-filled")
+        for run, n in fc.catalogue():
+            add(run, "run", n=n)
+        for lab, spec in list(fc.COLUMNS) + list(fc.CONFIG_COLUMNS):
+            if spec not in seen and spec is not None:  # e.g. "run:sense" datasets
+                add(spec, "run")
+        add(None, "reference", default="Ground truth")
+        return out
+
+    def _order(self, specs):
+        """Zero-filled first, then runs in the config's order, then the rest by
+        name, then the ground truth last -- the figure's column order."""
+        cfg = [spec for _, spec in fc.CONFIG_COLUMNS]
+
+        def key(spec):
+            if spec == "@zero_filled":
+                return (0, 0, "")
+            if spec is None:
+                return (3, 0, "")
+            return (1, cfg.index(spec), "") if spec in cfg else (2, 0, spec)
+        return sorted(specs, key=key)
+
+    def _apply_columns(self, cols, done):
+        """Save `cols`, reload at the same volume/slice; undo if nothing is left."""
+        old = list(fc.COLUMNS)
+        had = os.path.exists(fc.cols_file())
+        fc.save_columns(cols)
+        try:
+            self.reopen(done)
+        except (SystemExit, Exception) as e:     # noqa: BLE001 -- e.g. no common volume
+            fc.save_columns(old) if had else fc.clear_columns()
+            self.reopen()
+            self.picker.flash = ("not changed: " + (str(e).splitlines()[0] if str(e)
+                                                    else type(e).__name__))
+
+    def set_model(self, spec, on):
+        spec = self._spec(spec)
+        cols = dict((sp, lab) for lab, sp in fc.COLUMNS)
+        if on and spec not in cols:
+            entry = next((m for m in self.models()
+                          if self._spec(m["spec"]) == spec), None)
+            label = entry["label"] if entry else str(spec)
+            taken = set(cols.values())
+            base, i = label, 2
+            while label in taken:                # labels key the panels: unique
+                label, i = f"{base} ({i})", i + 1
+            cols[spec] = label
+        elif not on and spec in cols:
+            if spec not in (None, "@zero_filled") and sum(
+                    1 for sp in cols if sp not in (None, "@zero_filled")) <= 1:
+                self.picker.flash = "keep at least one run checked"
+                return
+            del cols[spec]
+        else:
+            return
+        self._apply_columns([(cols[sp], sp) for sp in self._order(list(cols))],
+                            f"{'added' if on else 'removed'} {spec or 'ground truth'}")
+
+    def rename(self, spec, label):
+        spec = self._spec(spec)
+        cols = [(lab, sp) for lab, sp in fc.COLUMNS]
+        if not label or any(lab == label and sp != spec for lab, sp in cols):
+            self.picker.flash = f"name {label!r} is empty or already used"
+            return
+        if spec in [sp for _, sp in cols]:
+            self._apply_columns([(label if sp == spec else lab, sp) for lab, sp in cols],
+                                f"renamed to {label}")
+
+    def reopen(self, flash=""):
+        """Reload the config (and its saved columns), staying on this slice."""
+        c = self.picker.current()
+        mode_note = " (box placement left; press it again)" if self.picker.mode == "zoom" else ""
+        try:
+            self.open(self.path, volume=c["vol"], sl=c["sl"])
+        except (SystemExit, Exception):          # noqa: BLE001 -- volume not in the new set
+            self.open(self.path)
+        if flash:
+            self.picker.flash = flash + mode_note
 
     def state(self):
         st = self.picker.state()
+        st["models"] = self.models()
+        st["models_saved"] = os.path.exists(fc.cols_file())
         st["configs"] = [dict(name=c["name"], n=c["n_volumes"], cols=len(c["columns"]),
                               error=c["error"]) for c in self.configs]
         st["config"] = fc.variant()
@@ -349,6 +459,16 @@ def make_handler(sess, server_box, token=None):
                         picker.strip(c, shown[i], zoom).save(buf, format="PNG",
                                                              compress_level=1)
                     self._send(200, buf.getvalue(), "image/png")
+                elif u.path == "/api/snapshot":
+                    # The current view as a PNG download (lands on the laptop).
+                    with sess.lock:
+                        picker = sess.picker
+                        c = picker.current()
+                        buf = io.BytesIO()
+                        picker.snapshot(c).save(buf, format="PNG")
+                        name = picker.snapshot_name(c)
+                    self._send(200, buf.getvalue(), "image/png",
+                               (("Content-Disposition", f'attachment; filename="{name}"'),))
                 elif u.path == "/api/panel":
                     q = parse_qs(u.query)
                     i = int(q.get("i", ["0"])[0])
@@ -548,6 +668,8 @@ td.k{color:var(--muted);font-size:11px}
   background:#13261a;border-bottom:1px solid var(--good);font-size:13px}
 #grid{display:flex;flex-wrap:wrap;gap:8px;align-content:flex-start}
 .cell{display:flex;flex-direction:column;gap:3px;flex:none}
+.mrow{display:flex;align-items:center;gap:6px;margin:3px 0}
+.mrow .mlab{flex:1;min-width:0;font-size:12px;padding:2px 4px}
 .pnl{position:relative;background:#000;flex:none;user-select:none}
 .strip{display:none;image-rendering:pixelated;border:1px solid var(--box);
   box-sizing:border-box;background:#000}
@@ -591,6 +713,15 @@ td.k{color:var(--muted);font-size:11px}
   </section>
 
   <section>
+    <h2>Models</h2>
+    <div class="hint">Checked runs are the comparison: panels, metrics, overlay,
+      automatic zoom, and the figure (saved per dataset). Names are editable.</div>
+    <div id="models"></div>
+    <div class="row"><button id="mreset">Use the config's columns</button>
+      <span class="hint" id="msaved"></span></div>
+  </section>
+
+  <section>
     <h2>Display</h2>
     <label class="chk"><input type="checkbox" id="t_resid"> Residual |ref &minus; x|</label>
     <label class="chk"><input type="checkbox" id="t_dis"> Disagreement overlay</label>
@@ -598,6 +729,8 @@ td.k{color:var(--muted);font-size:11px}
     <label class="chk"><input type="checkbox" id="t_pix"> Hard pixels (no smoothing)</label>
     <div class="row"><span class="hint" style="width:70px">Columns</span>
       <select id="viewsel" style="flex:1"></select></div>
+    <div class="row"><button id="snap" title="download the current view as a PNG">
+      Snapshot &#8681;</button></div>
     <div class="row"><span class="hint" style="width:70px">Brightness</span>
       <input type="range" id="bright" min="-1.5" max="1.5" step="0.01" value="0">
       <span class="mono" id="brightv"></span></div>
@@ -693,11 +826,13 @@ function apply(s) {
   const sld = $("slider"); sld.max = s.n - 1; if (!sld.matches(":active")) sld.value = s.pos;
   // display
   $("t_resid").checked = s.resid; $("t_dis").checked = s.dis; $("t_crop").checked = s.crop;
-  const vs = $("viewsel");
-  if (vs.options.length !== s.all_columns.length + 1) {
+  const vs = $("viewsel"), colKey = s.all_columns.join("|");
+  if (vs.dataset.key !== colKey) {       // labels, not count: datasets differ
+    vs.dataset.key = colKey;
     vs.innerHTML = "<option value='-1'>All, side by side</option>" +
       s.all_columns.map((c, i) => `<option value='${i}'>${esc(c)} only</option>`).join("");
   }
+  fillModels();
   vs.value = s.grid ? "-1" : String(s.view);
   $("brightv").textContent = s.brightness.toFixed(2);
   if (!$("bright").matches(":active")) $("bright").value = Math.log2(s.brightness);
@@ -858,6 +993,31 @@ $("slider").addEventListener("input", e => send("slice_to", {pos: +e.target.valu
 for (const n of ["resid", "dis", "crop"]) $("t_" + n).onchange = () => send("toggle", {name: n});
 $("t_pix").onchange = () => panels.forEach(d => d.classList.toggle("pix", $("t_pix").checked));
 $("viewsel").onchange = e => send("view", {i: +e.target.value});
+// Models: every dumped run of this dataset; checking one adds it to the comparison.
+let lastModelKey = "";
+function fillModels() {
+  const key = JSON.stringify(S.models) + S.config;
+  if (key === lastModelKey) return;
+  lastModelKey = key;
+  $("models").innerHTML = S.models.map((m, i) =>
+    `<div class="mrow"><input type="checkbox" data-i="${i}"${m.on ? " checked" : ""}>` +
+    `<input type="text" class="mlab" data-i="${i}" value="${esc(m.label)}"` +
+    `${m.on ? "" : " disabled"} title="${esc(m.spec)}">` +
+    `<span class="hint">${m.n != null ? m.n + " vol" : m.kind === "reference" ? "target" : "input"}</span></div>`
+  ).join("");
+  $("models").querySelectorAll("input[type=checkbox]").forEach(cb => cb.onchange = () =>
+    send("model", {spec: S.models[+cb.dataset.i].spec, on: cb.checked}));
+  $("models").querySelectorAll("input.mlab").forEach(t => t.onchange = () =>
+    send("rename", {spec: S.models[+t.dataset.i].spec, label: t.value}));
+  $("msaved").textContent = S.models_saved ? "saved for this dataset" : "config's columns";
+  $("mreset").disabled = !S.models_saved;
+}
+$("mreset").onclick = () => send("reset_models");
+$("snap").onclick = () => {             // a download, with the auth cookie
+  const a = document.createElement("a");
+  a.href = "/api/snapshot?t=" + Date.now(); a.download = "";
+  document.body.appendChild(a); a.click(); a.remove();
+};
 $("bright").addEventListener("input", e => send("brightness", {value: Math.pow(2, +e.target.value)}));
 $("mark").onclick = () => send("mark");
 $("nextmarked").onclick = () => send("next_marked");

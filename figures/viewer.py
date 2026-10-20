@@ -20,6 +20,8 @@ BROWSE -- scrub the set and mark the rows you want:
                      optionally followed by a slice number (2000045 6), then
                      enter -- or pick from the filtered list
     g                every column side by side (the default) / one at a time
+    1 .. 9           switch column 1..9 on/off in the side-by-side view
+    s                snapshot: the current view as a PNG, figures/out/snapshots/
     e                one at a time: cycle which column is displayed
     x                toggle the residual of each column (|ref - col|)
     d                toggle the inter-method disagreement overlay
@@ -103,6 +105,9 @@ class PickerCore:
         self.flash = ""
         # Every column side by side (the default), or one at a time (`g`).
         self.grid = True
+        # Columns switched OFF in the side-by-side view (by label). The figure
+        # is unaffected -- that is the config's COLUMNS -- this only declutters.
+        self.hidden = set()
         self._spec = dict(fc.COLUMNS)
         self._geom = None             # the last render's layout, for clicks
 
@@ -139,15 +144,37 @@ class PickerCore:
 
     # --- display-independent helpers -------------------------------------
     def shown_labels(self):
-        """The columns on screen: all of them (grid), or the one in view."""
+        """The columns on screen: every one not switched off (grid), or the one
+        in view (a column picked on its own is shown even if switched off)."""
         labels = [lab for lab, _ in fc.COLUMNS]
-        return labels if self.grid else [labels[self.view % len(labels)]]
+        if not self.grid:
+            return [labels[self.view % len(labels)]]
+        return [lab for lab in labels if lab not in self.hidden] or labels
+
+    def visible_methods(self, c):
+        """The methods not switched off -- what the disagreement overlay and the
+        automatic zoom placement compare, so a hidden net does not steer them."""
+        vis = {k: v for k, v in c["methods"].items() if k not in self.hidden}
+        return vis or c["methods"]
+
+    def toggle_column(self, lab):
+        """Switch a column on/off; the last visible one cannot be switched off."""
+        labels = [l for l, _ in fc.COLUMNS]
+        if lab not in labels:
+            return
+        if lab in self.hidden:
+            self.hidden.discard(lab)
+        elif len([l for l in labels if l not in self.hidden]) > 1:
+            self.hidden.add(lab)
+        else:
+            self.flash = "at least one column has to stay on"
+        self.render()
 
     def heat(self, c):
         """The disagreement overlay as an RGB image, or None when it is off."""
         if not self.dis:
             return None
-        dis = disagreement(c["ref"], c["methods"])
+        dis = disagreement(c["ref"], self.visible_methods(c))
         return Image.fromarray(
             apply_cmap(dis / (dis.max() + 1e-12), fc.RESID_CMAP or "inferno"),
             "RGB")
@@ -191,6 +218,55 @@ class PickerCore:
         pos = (self.pos if self.mode == "browse"
                else self._pos_of(vol, self.sel[self.si]["slice"]))
         return fc.slice_view(vol, pos, crop=self.crop)
+
+    def snapshot(self, c=None):
+        """The current view as one image: every panel on screen in a row, its
+        label, and -- while placing boxes -- the box and the figure's strip under
+        each panel. For notes and slides; the manuscript figure is
+        figures/make_figure.py."""
+        from PIL import ImageDraw, ImageFont
+        c = c or self.current()
+        shown = self.shown_labels()
+        heat = self.heat(c)
+        zoom = self.zoom_of(c) if self.mode == "zoom" else None
+        k = max(1, int(np.ceil(400 / c["W"])))            # panels at least ~400 px
+        P, gap = c["W"] * k, 6
+        size = max(14, P // 22)                            # readable at any panel size
+        try:                                               # matplotlib ships DejaVu
+            from matplotlib import font_manager
+            font = ImageFont.truetype(font_manager.findfont("DejaVu Sans Mono"), size)
+        except Exception:                                  # noqa: BLE001
+            try:
+                font = ImageFont.load_default(size=size)
+            except TypeError:                              # Pillow < 10.1
+                font = ImageFont.load_default()
+        head = size + 14
+        Hs = int(round(P * fc.ZOOM_H / (2 * fc.ZOOM_W + 1))) if zoom else 0
+        H = P + (gap + Hs if zoom else 0)
+        img = Image.new("RGB", (len(shown) * P + (len(shown) - 1) * gap, head + H),
+                        (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        d.text((4, 6), f"{fc.variant()}   {fc.pretty(c['vol'])}   slice {c['sl']}",
+               fill=(0, 0, 0), font=font)
+        for i, lab in enumerate(shown):
+            x = i * (P + gap)
+            img.paste(self._panel(c, lab, heat).resize((P, P), Image.NEAREST), (x, head))
+            t = self.panel_text(c, lab, i)
+            bb = d.textbbox((x + 5, head + 4), t, font=font)
+            d.rectangle((bb[0] - 3, bb[1] - 2, bb[2] + 3, bb[3] + 2), fill=(0, 0, 0))
+            d.text((x + 5, head + 4), t, fill=(255, 216, 74), font=font)
+            if zoom is not None:
+                c0, r0 = zoom
+                d.rectangle((x + c0 * k, head + r0 * k, x + (c0 + fc.ZOOM_W) * k - 1,
+                             head + (r0 + fc.ZOOM_H) * k - 1), outline=(0, 220, 0), width=2)
+                img.paste(self.strip(c, lab, zoom).resize((P, Hs), Image.NEAREST),
+                          (x, head + P + gap))
+        return img
+
+    def snapshot_name(self, c=None):
+        c = c or self.current()
+        return (f"{fc.variant()}_{fc.pretty(c['vol'])}_s{c['sl']}"
+                + ("_zoom" if self.mode == "zoom" else "") + ".png")
 
     def strip(self, c, lab, zoom):
         """What the figure puts UNDER column `lab`'s panel: the magnified box
@@ -327,7 +403,7 @@ class PickerCore:
     def zoom_of(self, c):
         z = fc.load_zooms().get(row_tag(self.sel[self.si]))
         return tuple(z) if z else auto_zoom(
-            c["ref"], disagreement(c["ref"], c["methods"]), c["W"])
+            c["ref"], disagreement(c["ref"], self.visible_methods(c)), c["W"])
 
     def set_zoom(self, c0, r0, W):
         z = (int(np.clip(c0, 0, max(0, W - fc.ZOOM_W))),
@@ -391,9 +467,9 @@ class PickerCore:
                 if self.mode == "browse" else
                 f"ZOOM [{self.si + 1}/{len(self.sel)}] {pretty(c['vol'])} "
                 f"slice {c['sl']}")
-        keys = ("<-/-> slice (shift 5) | up/dn volume | o open | g all/one | e column | x residual | "
-                "d overlay | c crop | -/= gain | space mark | m next | "
-                "enter zoom | q save+quit | esc abort"
+        keys = ("<-/-> slice (shift 5) | up/dn volume | o open | g all/one | e column | "
+                "1-9 column on/off | x residual | d overlay | c crop | -/= gain | "
+                "s snapshot | space mark | m next | enter zoom | q save+quit | esc abort"
                 if self.mode == "browse" else
                 "click/drag place (any panel) | arrows nudge | n/p next row | r auto | "
                 "b browse | q save+quit | esc abort")
@@ -438,6 +514,10 @@ class Picker(PickerCore):
         b("<Key-p>", lambda e: self.cycle(-1))
         b("<Key-d>", lambda e: self.set(dis=not self.dis))
         b("<Key-x>", lambda e: self.set(resid=not self.resid))
+        b("<Key-s>", lambda e: self.save_snapshot())
+        for i in range(1, 10):          # 1..9: switch column i on/off (grid view)
+            b(f"<Key-{i}>", lambda e, i=i: self.toggle_column(
+                ([l for l, _ in fc.COLUMNS] + [None] * 9)[i - 1]))
         b("<Key-c>", lambda e: self.set(crop=not self.crop))
         b("<Key-g>", lambda e: self.set(grid=not self.grid))
         # In the grid `e` drops to one column at a time; there it cycles.
@@ -521,6 +601,16 @@ class Picker(PickerCore):
         entry.focus_set()
         top.grab_set()
 
+    def save_snapshot(self):
+        """`s`: the current view as a PNG under figures/out/snapshots/."""
+        c = self.current()
+        path = os.path.join(fc.HERE, "out", "snapshots", self.snapshot_name(c))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.snapshot(c).save(path)
+        self.flash = f"snapshot -> {os.path.relpath(path, fc.ROOT)}"
+        print(self.flash)
+        self.render()
+
     def click(self, ev):
         """Centre the zoom box on the cursor, in image pixels of the panel the
         cursor is over. A click in the gap between panels does nothing."""
@@ -571,15 +661,8 @@ class Picker(PickerCore):
             self.si %= len(self.sel)
         c = self.current()
 
-        labels = [lab for lab, _ in fc.COLUMNS]
-        shown = labels if self.grid else [labels[self.view % len(labels)]]
-
-        heat = None
-        if self.dis:
-            dis = disagreement(c["ref"], c["methods"])
-            heat = Image.fromarray(
-                apply_cmap(dis / (dis.max() + 1e-12), fc.RESID_CMAP or "inferno"),
-                "RGB")
+        shown = self.shown_labels()
+        heat = self.heat(c)
 
         zoom = self.zoom_of(c) if self.mode == "zoom" else None
         # In ZOOM each panel carries the figure's strip beneath it -- the

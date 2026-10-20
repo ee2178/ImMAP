@@ -49,6 +49,13 @@ kernel served the training pass, a third arm times the planar state with that
 switched off (`SoftThreshold.FUSED_GRAD`), so the hand-written backward is
 measured on its own as well.
 
+--ab-coarse times every multigrid net a second time with the OTHER coarse
+operator (operators/coarse.py: "rediscretize" <-> "galerkin"), same weights,
+straight after its normal timing, and prints the pair -- what rediscretizing the
+coarse Grams actually saves. It also counts, for one inference forward of each,
+how many SENSE Gram applications run on which grid: Galerkin runs every coarse
+Gram's FFTs at the FINE size, rediscretize at the coarse one.
+
 --compile times every net a second time under `torch.compile`, straight after
 its eager timing on the same node, and prints the pair: the one switch that can
 be applied identically to LPDSNet, the multigrid nets and E2E-VarNet. It also
@@ -142,7 +149,7 @@ def _first_line(e, width=160):
 
 
 def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
-                compile_mode=None, planar_state=False, sizes=None):
+                compile_mode=None, planar_state=False, sizes=None, ab_coarse=False):
     with open(cfg_path) as f:
         cfg = json.load(f)
     mode = set_complex_mode(cfg.get("training", {}).get("complex_conv") or "gauss")
@@ -283,7 +290,8 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
                             mixed={k: stats(v) for k, v in m.items()} or None))
         return dict(first_s=first_s, sizes=out)
 
-    cols, peak, first_s, _ = measure(net)
+    cols, peak, first_s, infer_base = measure(net)
+    grams = gram_counts(infer_base) if ab_coarse else None
 
     p = cfg["model"]["params"]
     K = p.get("K", p.get("denoiser_kws", {}).get("K"))
@@ -293,10 +301,14 @@ def time_config(cfg_path, hw, coils, R, reps, warmup, device, with_step, ckpt,
                type=cfg["model"]["type"], K=K, M=p.get("M"), params=n_par,
                coarse_op=p.get("coarse_op"), complex_conv=mode, state=rep,
                embedded=not T.is_identity, peak_mb=peak, first_s=first_s, **cols)
+    if grams is not None:
+        row["grams"] = grams
     if sizes:
         row["sizes"] = measure_sizes(net, sizes)
     if planar_state:
         row["planar_state"] = time_planar_state(net, measure)
+    if ab_coarse:
+        row["coarse_ab"] = time_coarse_ab(net, measure)
     if compile_mode:
         # With --planar-state as well, the compiled arm runs ON the planar
         # state where the net has one: real tensors are what the compiler can
@@ -380,6 +392,78 @@ def print_sizes(rows, with_step):
     if with_step:
         print("  (each timed step also ran the optimizer and the projection, as in the "
               "main table; those columns are not repeated here)")
+
+
+def gram_counts(infer_once):
+    """{(H, W): n} -- SENSE Gram applications by the grid their FFTs run on,
+    over ONE inference forward."""
+    from operators.fourier import FFT2D as _F
+    orig, counts = _F.sense_gram, {}
+
+    def counted(self, x, smaps, mask):
+        hw = tuple(int(n) for n in x.shape[-2:])
+        counts[hw] = counts.get(hw, 0) + 1
+        return orig(self, x, smaps, mask)
+    _F.sense_gram = counted
+    try:
+        infer_once()
+    finally:
+        _F.sense_gram = orig
+    return {f"{h}x{w}": n for (h, w), n in sorted(counts.items(), reverse=True)}
+
+
+def time_coarse_ab(net, measure):
+    """The net timed again with the other coarse operator; the configured one is
+    restored after. Every module carrying `coarse_op` is switched (MGLPDSNet,
+    its V-cycles, their downsamplers) -- it is read on every forward, and the
+    coarse operators are rebuilt per pass, so nothing stale survives."""
+    from operators.coarse import COARSE_OPS
+    mods = [m for m in net.modules() if hasattr(m, "coarse_op")]
+    if not mods:
+        return dict(skipped="no coarse operator (not a multigrid net)")
+    base = mods[0].coarse_op
+    other = next(o for o in COARSE_OPS if o != base)
+    out = dict(base=base, other=other)
+    try:
+        for m in mods:
+            m.coarse_op = other
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        cols, peak, _, infer = measure(net)
+        out.update(peak_mb=peak, **cols)
+        out["grams_other"] = gram_counts(infer)
+    finally:
+        for m in mods:
+            m.coarse_op = base
+    return out
+
+
+def print_coarse_ab(rows):
+    """Configured coarse operator against the other one, per net."""
+    print("\ncoarse operator A/B -- same weights, timed back to back "
+          "(ms, median; x = galerkin / rediscretize, above 1 = rediscretize is faster):")
+    print(f"  {'config':<16}{'':<14}{'infer':>9}{'forward':>9}{'backward':>10}"
+          f"{'fwd+bwd':>9}{'peak MB':>9}   Gram applications per forward, by FFT grid")
+    for r in rows:
+        ab = r.get("coarse_ab") or {}
+        if not ab or "skipped" in ab:
+            print(f"  {r['name']:<16}{ab.get('skipped', 'not run')}")
+            continue
+        arms = {ab["base"]: (r, r.get("grams")), ab["other"]: (ab, ab.get("grams_other"))}
+        for op in ("rediscretize", "galerkin"):
+            a, g = arms[op]
+            fb = a["forward"]["median"] + a["backward"]["median"]
+            print(f"  {r['name'] if op == 'rediscretize' else '':<16}{op:<14}"
+                  f"{a['infer']['median']:>9.1f}{a['forward']['median']:>9.1f}"
+                  f"{a['backward']['median']:>10.1f}{fb:>9.1f}{a['peak_mb']:>9.0f}   "
+                  + ", ".join(f"{k}: {n}" for k, n in (g or {}).items()))
+        rd, gk = arms["rediscretize"][0], arms["galerkin"][0]
+        x = {k: gk[k]["median"] / rd[k]["median"] for k in ("infer", "forward", "backward")}
+        fbx = ((gk["forward"]["median"] + gk["backward"]["median"])
+               / (rd["forward"]["median"] + rd["backward"]["median"]))
+        print(f"  {'':<16}{'x':<14}{x['infer']:>8.2f}x{x['forward']:>8.2f}x"
+              f"{x['backward']:>9.2f}x{fbx:>8.2f}x"
+              f"{gk['peak_mb'] / max(rd['peak_mb'], 1e-9):>8.2f}x")
 
 
 def time_planar_state(net, measure):
@@ -638,6 +722,10 @@ def main():
                     choices=("default", "reduce-overhead", "max-autotune"),
                     help="also time each net under torch.compile, right after its "
                          "eager timing; optionally a compile mode")
+    ap.add_argument("--ab-coarse", action="store_true",
+                    help="also time each multigrid net with the other coarse operator "
+                         "(rediscretize <-> galerkin), same weights, and count its "
+                         "Gram applications by grid")
     ap.add_argument("--no-cudnn-benchmark", action="store_true")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -678,7 +766,8 @@ def main():
         raise SystemExit(f"--compile needs torch >= 2.0 (this is {torch.__version__})")
     rows = [time_config(c, hw, args.coils, args.R, args.reps, args.warmup, device,
                         args.step, args.ckpt, compile_mode=args.compile,
-                        planar_state=args.planar_state, sizes=sizes)
+                        planar_state=args.planar_state, sizes=sizes,
+                        ab_coarse=args.ab_coarse)
             for c in args.configs]
 
     cols = ["infer", "forward", "backward"] + (["opt", "project"] if args.step else [])
@@ -711,6 +800,8 @@ def main():
     print_sizes(rows, args.step)
     if args.planar_state:
         print_planar_state(rows)
+    if args.ab_coarse:
+        print_coarse_ab(rows)
     if args.compile:
         print_compiled(rows, args.compile)
     meta = dict(size=list(hw), coils=args.coils, device=str(device),

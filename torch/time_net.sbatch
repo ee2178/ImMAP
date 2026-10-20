@@ -69,6 +69,14 @@
 #                                 A second table times the planar training pass
 #                                 with and without the fused thresholding kernel's
 #                                 hand-written backward (SoftThreshold.FUSED_GRAD)
+#   AB_COARSE=1                   step 2 also times every multigrid net with the
+#                                 OTHER coarse operator (rediscretize <-> galerkin),
+#                                 same weights, and counts its Gram applications by
+#                                 grid; then a 4th step times ONE Gram application
+#                                 per level (scripts/time_coarse_gram.py): fine,
+#                                 galerkin, rediscretize, and galerkin with a
+#                                 hand-written backward. Pair with SKIP_ESPIRIT=1
+#                                 SKIP_BREAKDOWN=1 and e.g. MODELS="mg81v6 mg169v6"
 #   COMPILE=1                     step 2 also times every net under torch.compile,
 #                                 paired with its eager timing (COMPILE=reduce-overhead
 #                                 picks a mode). Compiling can take minutes per net:
@@ -159,8 +167,15 @@ if [ -z "${SKIP_NETS:-}" ]; then
     esac
     python scripts/time_net.py --configs "${CFGS[@]}" --size ${IMG} --coils "${COILS}" \
         --reps "${REPS}" --step ${COMPILE_FLAG} ${PAIR_PLANAR} "${SIZES_ARGS[@]}" \
+        ${AB_COARSE:+--ab-coarse} \
         --json-out "${OUT}/time_net.json" \
         --fig-out "${OUT}/time_net.png"
+fi
+
+if [ -n "${AB_COARSE:-}" ]; then
+    echo; echo "================ 2b. one Gram application per level ================"
+    python scripts/time_coarse_gram.py --size ${IMG} --coils "${COILS}" --R "${R}" \
+        --reps "${REPS}" | tee "${OUT}/coarse_gram.txt"
 fi
 
 if [ -z "${SKIP_BREAKDOWN:-}" ]; then

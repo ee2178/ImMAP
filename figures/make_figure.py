@@ -17,6 +17,8 @@ Reads what figures/viewer.py (or webviewer.py) picked for this config:
 
     rows/<VARIANT>.json    which volume and slice each row shows
     zooms/<VARIANT>.json   where each row's zoom box sits (else automatic)
+    cols/<VARIANT>.json    which runs are the columns (the web viewer's Models
+                           menu), else the config's COLUMNS
 
 and the dumps scripts/dump_eval.py wrote. The crop, window, zoom and residual
 come from figures/common.py -- `slice_view` and `zoom_pair`, the same functions
@@ -221,6 +223,9 @@ def main():
 
     src = "rows/" + fc.variant() + ".json" if os.path.exists(fc.rows_file()) else "config ROWS"
     print(f"{fc.variant()}: {len(rows)} row(s) from {src}, {len(zooms)} saved zoom(s)")
+    print("columns: " + ", ".join(lab for lab, _ in fc.COLUMNS)
+          + (f"   [from cols/{fc.variant()}.json -- the viewer's model menu]"
+             if os.path.exists(fc.cols_file()) else "   [from the config]"))
     for ri, row in enumerate(rows):
         vol, sl = row["volume"], int(row["slice"])
         pos = fc.pos_of(vol, sl)
