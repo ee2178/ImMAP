@@ -75,7 +75,8 @@ import datasets                              # noqa: F401,E402  registers the lo
 from datasets.registry import build_loader   # noqa: E402
 from evaluation.metrics import REGISTRY as METRIC_REGISTRY  # noqa: E402
 from evaluation.metrics import build_metrics, metric_version, warm_up  # noqa: E402
-from evaluation.tasks import build_adapter, default_sigma, val_kspace_type  # noqa: E402
+from evaluation.tasks import (build_adapter, default_sigma, force_organ_mask,  # noqa: E402
+                              metric_mask_source, val_kspace_type)
 
 # Display names of the main comparison. Keyed by CELL (the run name without
 # its _R<r> suffix). Brain's MGLPDS-Big is the full-length `mglpds` run (Galerkin
@@ -90,6 +91,7 @@ LABELS = {
 
 DEFAULT_METRICS = ["psnr", "ssim", "nrmse", "lpips"]
 META_KEYS = ("run", "anatomy", "R", "step", "sigma", "seed", "slices", "val_kspace_type",
+             "mask_source",
              "metrics", "n_volumes", "use_organ_mask", "rediscretize_embedded")
 
 
@@ -145,7 +147,11 @@ def _setup(run_dir, anatomy, args, metric_names, device):
     cfg, model, n_params, step = de.load_run(run_dir, device)
     # Rows written before `val_kspace_type` was recorded were measured the
     # training way -- what the run's config said then (it had no val key).
-    legacy = {"val_kspace_type": cfg.get("mri", {}).get("kspace_type", "simulated")}
+    legacy = {"val_kspace_type": cfg.get("mri", {}).get("kspace_type", "simulated"),
+              # ...and scored on whatever mask the run itself used
+              "mask_source": metric_mask_source(cfg)}
+    if getattr(args, "mask", "organ") == "organ":
+        force_organ_mask(cfg)
     if args.val_kspace_type:
         cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
     sigma = args.sigma if args.sigma is not None else default_sigma(cfg)
@@ -157,6 +163,7 @@ def _setup(run_dir, anatomy, args, metric_names, device):
                 step=int(step or 0), sigma=float(sigma), seed=int(args.seed),
                 slices=slices, metrics=list(metric_names), n_volumes=len(volumes),
                 use_organ_mask=bool(cfg.get("training", {}).get("use_organ_mask", False)),
+                mask_source=metric_mask_source(cfg),
                 label=label_of(run), n_params=int(n_params),
                 val_source={k: cfg["data"]["val"].get(k) for k in
                             ("name", "anatomy", "kspace_root", "smap_root", "scale_fac")},
@@ -440,6 +447,11 @@ def main():
     p.add_argument("--n-volumes", type=int, default=None,
                    help="first N volumes only (smoke tests); default all")
     p.add_argument("--sigma", type=float)
+    p.add_argument("--mask", choices=["organ", "run"], default="organ",
+                   help="'organ' (default): score every run inside the organ mask "
+                        "from its stored coil maps (background out of every metric; "
+                        "LPIPS compares with the background zeroed). 'run': the mask "
+                        "setting each run trained with")
     p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
                    help="how the evaluation measurement is made; default = the run's "
                         "training.val_kspace_type, else its training kspace_type. "

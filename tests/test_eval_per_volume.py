@@ -47,7 +47,7 @@ def make_run(root, anatomy, run, cfg):
 def args_for(runs_root, out, **kw):
     a = dict(runs_root=runs_root, out=out, metrics=METRICS, slices=None,
              volumes=None, n_volumes=None, sigma=None, seed=1234, workers=0,
-             limit=None, overwrite=False, val_kspace_type=None)
+             limit=None, overwrite=False, val_kspace_type=None, mask="organ")
     a.update(kw)
     return argparse.Namespace(**a)
 
@@ -255,6 +255,34 @@ def test_val_kspace(tmp, ks, sm):
           and json.load(open(meta_p))["val_kspace_type"] == "simulated")
 
 
+def test_force_mask(tmp, ks, sm):
+    """Every run is scored inside the stored-map organ mask unless --mask run."""
+    cfg = base_cfg(ks, sm)
+    cfg["data"]["train"] = dict(cfg["data"]["val"], start_slice=1, end_slice=3)
+    cfg["training"]["use_organ_mask"] = False            # trained unmasked
+    cfg["data"]["val"]["organ_mask_source"] = "none"
+    runs_root, dev = os.path.join(tmp, "runs_fm"), torch.device("cpu")
+    run_dir = make_run(runs_root, "knee", "lpdsnet_R4", cfg)
+
+    out = os.path.join(tmp, "res_fm_organ")
+    epv.eval_run(run_dir, "knee", args_for(runs_root, out), METRICS, dev)
+    meta = json.load(open(os.path.join(out, "knee", "lpdsnet_R4.meta.json")))
+    check("default: an unmasked run is scored inside the smaps organ mask",
+          meta["use_organ_mask"] is True and meta["mask_source"] == "smaps", str(meta))
+
+    out2 = os.path.join(tmp, "res_fm_run")
+    epv.eval_run(run_dir, "knee", args_for(runs_root, out2, mask="run"), METRICS, dev)
+    meta2 = json.load(open(os.path.join(out2, "knee", "lpdsnet_R4.meta.json")))
+    check("--mask run keeps the run's own setting",
+          meta2["use_organ_mask"] is False and meta2["mask_source"] == "none")
+    try:
+        epv.recompute_run(run_dir, "knee", args_for(runs_root, out2), ["nrmse"], dev)
+        check("recompute refuses rows scored on another mask", False)
+    except SystemExit as e:
+        check("recompute refuses rows scored on another mask",
+              "use_organ_mask" in str(e) or "mask_source" in str(e), str(e)[:90])
+
+
 def test_wilcoxon(tmp):
     rng = np.random.default_rng(1)
     n = 30
@@ -301,6 +329,7 @@ def main():
         test_eval(tmp, ks, sm)
         test_recompute(tmp, ks, sm)
         test_val_kspace(tmp, ks, sm)
+        test_force_mask(tmp, ks, sm)
         test_wilcoxon(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

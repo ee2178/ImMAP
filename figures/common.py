@@ -84,12 +84,16 @@ FIG_METRICS = ("psnr", "ssim")  # printed top-right of each panel, in this order
                           # any of psnr, ssim, nrmse
 FIG_TITLE = None          # a line above the column headers, e.g. r"Knee, $R{=}8$"
 IMG_WIDTH = "3cm"         # displayed width of one panel in the PDF
+FLIP = ""                 # display orientation: "" as stored, "ud" upside down,
+                          # "lr" mirrored, "both". Display only -- metrics and
+                          # dumps are untouched; zoom boxes live in the
+                          # displayed frame, so changing FLIP moves saved ones
 
 CONFIGURABLE = (
     "NAME", "DUMP_ROOT", "COLUMNS", "ROWS", "ZOOM_W", "ZOOM_H", "ZOOM_UP",
     "WINDOW_PCT", "WINDOW_SCALE", "BRIGHTNESS", "GAMMA", "RESID_GAIN",
     "RESID_CMAP", "CROP_FOV", "CROP_PAD", "MASK_THRESH", "STATUS_METRIC",
-    "FIG_METRICS", "FIG_TITLE", "IMG_WIDTH",
+    "FIG_METRICS", "FIG_TITLE", "IMG_WIDTH", "FLIP",
 )
 
 
@@ -529,6 +533,14 @@ def pos_of(volume, sl):
     return load(spec, volume).at(sl)
 
 
+def _flipper():
+    """The display flip FLIP asks for, as a function on (H, W) arrays."""
+    if FLIP not in ("", None, "ud", "lr", "both"):
+        raise SystemExit(f"FLIP={FLIP!r}: use '', 'ud', 'lr' or 'both'")
+    ud, lr = FLIP in ("ud", "both"), FLIP in ("lr", "both")
+    return lambda a: a[::-1 if ud else 1, ::-1 if lr else 1]
+
+
 def slice_view(vol, pos, crop=True):
     """Everything one row shows, for the viewer AND the figure -- one function,
     so what you place in the viewer is exactly what the figure prints.
@@ -550,8 +562,9 @@ def slice_view(vol, pos, crop=True):
 
     first = next(iter(cols.values()))
     sl = int(first.slice_index[pos])
-    ref_s = first.ref[pos]
-    organ = first.organ[pos] if first.organ is not None else anatomy_mask(ref_s)
+    fl = _flipper()
+    ref_s = fl(first.ref[pos])
+    organ = fl(first.organ[pos]) if first.organ is not None else anatomy_mask(ref_s)
 
     vmax = window(ref_s, organ)
     if crop:
@@ -563,8 +576,8 @@ def slice_view(vol, pos, crop=True):
     return dict(
         vol=vol, pos=pos, sl=sl, W=W, vmax=vmax,
         ref=cut(ref_s), organ=cut(organ),
-        cols={k: cut(v.img[pos]) for k, v in cols.items()},
-        methods={k: cut(v.img[pos]) for k, v in methods.items()},
+        cols={k: cut(fl(v.img[pos])) for k, v in cols.items()},
+        methods={k: cut(fl(v.img[pos])) for k, v in methods.items()},
         stored={k: {m: vals[pos] for m, vals in v.metrics.items()}
                 for k, v in methods.items()},
         masked={k: bool(v.attrs.get("use_organ_mask", False)) for k, v in methods.items()},

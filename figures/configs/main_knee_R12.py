@@ -61,3 +61,6 @@ ROWS = []
 STATUS_METRIC = "psnr"
 ZOOM_W = ZOOM_H = 48
 BRIGHTNESS = 1.3
+# The stored knee slices are upside down (tibia on top); show them the standard
+# way round. Display only -- dumps and metrics are untouched.
+FLIP = "ud"

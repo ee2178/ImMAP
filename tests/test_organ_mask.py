@@ -299,6 +299,33 @@ def test_gradients_flow():
           bool(g[~m.expand_as(g)].abs().sum() == 0))
 
 
+def test_lpips_background_masked():
+    """LPIPS compares with the background zeroed in BOTH images (2026-10-20)."""
+    print("\n[LPIPS ignores a wrecked background when masked]")
+    import evaluation.metrics as em
+    real = em._lpips_model
+    em._lpips_model = lambda net, dev: (lambda a, b: (a - b).abs().mean().reshape(1))
+    try:
+        gt, pred, m = scene(field=96)
+        _, wrecked, _ = scene(field=96, bg=0.5)
+        a = float(em.lpips(gt, pred, mask=m))
+        b = float(em.lpips(gt, wrecked, mask=m))
+        check("masked: a wrecked background changes nothing", abs(a - b) < 1e-7,
+              f"{a:.6f} vs {b:.6f}")
+        check("masked: an error inside the organ still counts", a > 1e-4, f"{a:.6f}")
+        u, v = float(em.lpips(gt, pred)), float(em.lpips(gt, wrecked))
+        check("unmasked: the background error does count", v - u > 1e-3,
+              f"{u:.5f} -> {v:.5f}")
+        ga, ra = em.lpips_inputs(gt, wrecked, m)
+        check("both inputs are flat outside the mask",
+              bool((ga[..., ~m[0, 0]] == ga[..., ~m[0, 0]].flatten()[0]).all()
+                   and (ra[..., ~m[0, 0]] == ga[..., ~m[0, 0]].flatten()[0]).all()))
+        check("lpips is versioned, so stale values are re-scored",
+              em.metric_version("lpips") == "bg-masked")
+    finally:
+        em._lpips_model = real
+
+
 if __name__ == "__main__":
     test_masked_ignores_background()
     test_masked_ignores_background_size()
@@ -308,6 +335,7 @@ if __name__ == "__main__":
     test_coil_axis_regression()
     test_batch_and_channels()
     test_gradients_flow()
+    test_lpips_background_masked()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     for f in FAIL:
         print(f"  FAILED: {f}")

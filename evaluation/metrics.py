@@ -2,9 +2,10 @@
 Metric registry for the evaluation sweep.
 
 Every metric here takes `(gt, recon, mask=None)` and returns ONE VALUE PER
-SAMPLE, shape `(B,)`. `mask` is the recon loader's `organ_mask`; a metric that
-cannot restrict itself to a region (lpips) accepts and ignores it, so the sweep
-can pass it uniformly. That is the difference from `training.metrics.compute_metrics`, which
+SAMPLE, shape `(B,)`. `mask` is the recon loader's `organ_mask`: PSNR / SSIM /
+NRMSE are computed over it, and LPIPS -- which cannot be restricted to a region
+-- compares the two images with the background zeroed in both (see `lpips`).
+That is the difference from `training.metrics.compute_metrics`, which
 reduces over the whole tensor including the batch axis: at `batch_size=1` the
 two agree exactly, but above it `compute_metrics` returns a batch-pooled number
 whose value depends on the batch size. A sweep has to be able to change the
@@ -105,15 +106,32 @@ def _to_lpips_input(x, lo, hi):
     return (2.0 * x - 1.0).clamp(-1.0, 1.0).repeat(1, 3, 1, 1)
 
 
+def lpips_inputs(gt, recon, mask=None):
+    """The (gt, recon) pair LPIPS compares, one sample: magnitudes, with the
+    BACKGROUND ZEROED in both when `mask` is given, jointly min-max normalised
+    to [-1, 1] and replicated to 3 channels."""
+    g, r = gt.abs().float(), recon.abs().float()
+    if mask is not None:
+        m = mask.to(device=g.device, dtype=g.dtype)
+        g, r = g * m, r * m
+    lo = torch.minimum(g.min(), r.min())
+    hi = torch.maximum(g.max(), r.max())
+    return _to_lpips_input(g, lo, hi), _to_lpips_input(r, lo, hi)
+
+
 def lpips(gt, recon, mask=None, net="alex"):
     """Perceptual distance on JOINTLY min-max normalised magnitude images.
 
-    `mask` is ACCEPTED AND IGNORED. LPIPS is a deep-feature distance with a
-    receptive field spanning far more than one pixel, so there is no honest way
-    to restrict it to a region: zeroing outside the mask changes the features
-    everywhere near the boundary, and averaging its output spatially is not
-    what the metric computes. Reported unmasked; say so if it is quoted next to
-    masked PSNR.
+    With `mask` (the organ mask -- the support of the stored coil maps), the
+    BACKGROUND IS ZEROED in BOTH images before the comparison (since
+    2026-10-20). LPIPS cannot be restricted to a region the way PSNR can -- it
+    is a deep-feature distance with a receptive field far wider than a pixel --
+    but blanking the background in both removes it from the comparison: the
+    two backgrounds are then identical, so whatever a network leaves outside
+    the anatomy (E2E-VarNet, trained only on a masked loss, leaves plenty) no
+    longer counts. Features near the boundary still see the edge of the mask,
+    the same edge in both images. Without `mask` the whole frame is compared,
+    as before that date.
 
     LPIPS is not scale invariant, so the normalisation is part of the metric's
     definition, not a detail. Normalising gt and recon TOGETHER (per sample, by
@@ -126,11 +144,10 @@ def lpips(gt, recon, mask=None, net="alex"):
     model = _lpips_model(net, gt.device)
     out = []
     for i in range(gt.shape[0]):
-        g, r = gt[i:i + 1].abs().float(), recon[i:i + 1].abs().float()
-        lo = torch.minimum(g.min(), r.min())
-        hi = torch.maximum(g.max(), r.max())
+        a, b = lpips_inputs(gt[i:i + 1], recon[i:i + 1],
+                            None if mask is None else mask[i:i + 1])
         with torch.no_grad():
-            d = model(_to_lpips_input(g, lo, hi), _to_lpips_input(r, lo, hi))
+            d = model(a, b)
         out.append(d.reshape(()))
     return torch.stack(out)
 
@@ -144,7 +161,8 @@ REGISTRY = {
     # and refuses to mix). Absent = "v1", the original.
     "nrmse": dict(fn=nrmse, higher_is_better=False, fmt="{:.4f}",
                   version="relative-l2"),    # ||gt-pred||/||gt||, since 2026-10-20
-    "lpips": dict(fn=lpips, higher_is_better=False, fmt="{:.4f}"),
+    "lpips": dict(fn=lpips, higher_is_better=False, fmt="{:.4f}",
+                  version="bg-masked"),      # background zeroed, since 2026-10-20
 }
 
 

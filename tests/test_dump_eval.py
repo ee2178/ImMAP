@@ -311,6 +311,35 @@ def test_figures(dump_root, tmp):
           fc.active_rows() == rows and fc.load_zooms() == {"volA_s3": (5, 7)})
 
 
+def test_flip(dump_root):
+    """FLIP turns the DISPLAYED slice; the dumps and metrics are untouched."""
+    fc.DUMP_ROOT = dump_root
+    fc.COLUMNS = [("Stub", "stub"), ("Ground truth", None)]
+    old = fc.FLIP
+    try:
+        fc.FLIP = ""
+        a = fc.slice_view("volA", 0, crop=False)
+        fc.FLIP = "ud"
+        b = fc.slice_view("volA", 0, crop=False)
+        fc.FLIP = "lr"
+        c = fc.slice_view("volA", 0, crop=False)
+        check("FLIP='ud' turns every column and the reference upside down",
+              np.array_equal(b["ref"], a["ref"][::-1])
+              and np.array_equal(b["cols"]["Stub"], a["cols"]["Stub"][::-1])
+              and np.array_equal(b["organ"], a["organ"][::-1]))
+        check("FLIP='lr' mirrors", np.array_equal(c["ref"], a["ref"][:, ::-1]))
+        check("the stored metrics are not touched by a flip",
+              a["stored"] == b["stored"])
+        fc.FLIP = "sideways"
+        try:
+            fc.slice_view("volA", 0)
+            check("an unknown FLIP is refused", False)
+        except SystemExit:
+            check("an unknown FLIP is refused", True)
+    finally:
+        fc.FLIP = old
+
+
 def test_shipped_configs():
     """Every config under figures/configs must LOAD. They all place DUMP_ROOT
     relative to `__file__`, which `apply_config` did not define -- so until
@@ -351,6 +380,8 @@ if __name__ == "__main__":
         dump_root = test_dump_run(ks, sm, tmp)
         print("\n--- figures ---")
         test_figures(dump_root, tmp)
+        print("\n--- flip ---")
+        test_flip(dump_root)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

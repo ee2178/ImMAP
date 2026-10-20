@@ -73,7 +73,7 @@ import datasets                              # noqa: F401  registers the loaders
 from datasets.registry import build_loader
 from evaluation.metrics import DEFAULT_METRICS, REGISTRY as METRIC_REGISTRY
 from evaluation.metrics import build_metrics, warm_up
-from evaluation.tasks import build_adapter, default_sigma, val_kspace_type
+from evaluation.tasks import build_adapter, default_sigma, force_organ_mask, val_kspace_type
 
 DUMP_VERSION = 1
 
@@ -336,6 +336,10 @@ def main():
                    help="noise level; default is each run's val_noise_std. "
                         "One value only -- a dump is a single operating point, "
                         "and columns at different sigmas are not comparable")
+    p.add_argument("--mask", choices=["organ", "run"], default="organ",
+                   help="'organ' (default): the stored per-slice metrics use the "
+                        "organ mask from the stored coil maps for every run; 'run': "
+                        "each run's own setting")
     p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
                    help="how the measurement is made; default = the run's "
                         "training.val_kspace_type, else its training kspace_type")
@@ -386,6 +390,8 @@ def main():
             del model
             continue
 
+        if args.mask == "organ":
+            force_organ_mask(cfg)        # metrics inside the stored-map organ mask
         if args.val_kspace_type:
             cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
         sigma = args.sigma if args.sigma is not None else default_sigma(cfg)

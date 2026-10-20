@@ -154,6 +154,27 @@ def build_adapter(task):
     return REGISTRY[task]
 
 
+def metric_mask_source(cfg):
+    """Which organ mask this run's metrics use: the val loader's
+    `organ_mask_source` when the run applies the mask, else "none"."""
+    if not cfg.get("training", {}).get("use_organ_mask", False):
+        return "none"
+    return cfg.get("data", {}).get("val", {}).get("organ_mask_source", "smaps")
+
+
+def force_organ_mask(cfg):
+    """Score this run inside the organ mask from its STORED coil maps, whatever
+    it was trained with (2026-10-20): `use_organ_mask` on, and the val loader's
+    `organ_mask_source = "smaps"` -- the loader's own `smaps.abs().sum(0) > 0`,
+    the support the stored SENSE ground truth is nonzero on, so it costs
+    nothing to compute (datasets/fastmri/loader.py). Every net in a table is
+    then judged on the same pixels, and the background -- which only some nets
+    were trained to leave empty -- is out of every metric. Modifies `cfg`."""
+    cfg.setdefault("training", {})["use_organ_mask"] = True
+    cfg.setdefault("data", {}).setdefault("val", {})["organ_mask_source"] = "smaps"
+    return cfg
+
+
 def val_kspace_type(cfg):
     """How a validation / evaluation measurement is made for this run.
 
