@@ -73,6 +73,14 @@ def upstream_file():
 
 
 def main():
+    # Few threads: the workload is tiny (~7 s on a laptop), and on a cluster
+    # LOGIN node torch otherwise starts one thread per visible core while the
+    # session is capped to a couple -- the convolutions then crawl (seen
+    # 2026-10-20: stalled at the first RAM forward on torch-login-b-3).
+    # OMP_NUM_THREADS, if set, still wins.
+    if "OMP_NUM_THREADS" not in os.environ:
+        torch.set_num_threads(min(2, torch.get_num_threads()))
+
     # 1 ------------------------------------------------------------------
     src = upstream_file()
     if src is None:
@@ -161,6 +169,46 @@ def main():
           and bool(torch.isfinite(net.net.fact_realign.grad).all()))
     check("only upstream's never-used parameters lack a gradient",
           unused == UPSTREAM_UNUSED, f"{sorted(unused)}")
+
+    # 8 ------------------------------------------------------------------
+    # THE NOISE MODEL STAYS PUT. deepinv 0.4's LinearPhysics.__init__ calls
+    # self.to("cpu") by default, and RAM's Pad / MultiScalePhysics wrap the
+    # physics without a device and share its noise model -- on a GPU that moved
+    # sigma to the CPU mid-forward (RAM_knee_R12, 2026-10-20). The mechanism is
+    # a parent's `.to()` recursing into the noise model, which a dtype move
+    # exercises on any machine; the control shows the check can fail.
+    from deepinv.physics import GaussianNoise
+    sig = torch.tensor([0.01])
+    phys = ad._make_physics(E, sig)
+    before = phys.noise_model.sigma
+    wrapped = up.MultiScaleLinearPhysics(up.Pad(phys, (0, 0)), (2, 52, 60))
+    wrapped.to(torch.float64)
+    after = wrapped.noise_model.sigma
+    check("a parent's .to() leaves RAM's noise model (sigma) where it was",
+          after is before and after.dtype == torch.float32,
+          f"sigma {before.dtype} -> {after.dtype}")
+    plain = up.Pad(type(phys)(E, sig), (0, 0))
+    plain.noise_model = GaussianNoise(sigma=torch.tensor([0.01]))
+    plain.to(torch.float64)
+    check("  control: an unpinned GaussianNoise IS moved by the same call",
+          plain.noise_model.sigma.dtype == torch.float64)
+
+    # 9 ------------------------------------------------------------------
+    # The real thing, wherever there is a GPU (a compute node; skipped here).
+    if torch.cuda.is_available():
+        dev = torch.device("cuda")
+        gnet = build_model({"model": {"type": "RAM",
+                                      "params": {"in_channels": [2]}}}).to(dev)
+        xg, Eg, yg = problem()
+        Eg = Mask(Eg.ops[0].mask.to(dev)) @ FFT2D() @ Sense(Eg.ops[2].smaps.to(dev))
+        yg = Eg.forward(xg.to(dev))
+        out, _ = gnet(yg, E=Eg, sigma=torch.full((1, 1, 1, 1), 0.015, device=dev))
+        (out.abs() - xg.to(dev).abs()).abs().mean().backward()
+        check("on CUDA: forward + backward run, output on the GPU",
+              out.is_cuda and bool(torch.isfinite(out).all())
+              and gnet.net.fact_realign.grad is not None)
+    else:
+        print("[skip] no CUDA here -- run on a GPU node to exercise the device path")
 
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")
     return 1 if FAIL else 0

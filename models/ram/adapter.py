@@ -79,9 +79,28 @@ def _make_physics(E, sigma):
     """
     GaussianNoise, LinearPhysics = _physics_base()
 
+    class _PinnedGaussianNoise(GaussianNoise):
+        """A GaussianNoise that no parent `.to()` can move.
+
+        deepinv 0.4's `LinearPhysics.__init__` ends in `self.to(device)` with
+        `device` defaulting to "cpu", and that recurses into the noise model.
+        RAM's `Pad` and `MultiScalePhysics` (upstream ram.py) wrap this physics
+        WITHOUT a device and share its noise model, so on a GPU they moved sigma
+        to the CPU mid-forward and `realign_input` failed mixing cuda and cpu
+        (seen 2026-10-20, RAM_knee_R12). The noise model is built per forward,
+        on sigma's device, and has no reason to move -- so it doesn't. Upstream
+        was written against deepinv 0.3, where the physics did not move itself.
+        """
+
+        def _apply(self, fn, recurse=True):
+            return self
+
     class _ImMAPPhysics(LinearPhysics):
         def __init__(self, E, sigma):
-            super().__init__(noise_model=GaussianNoise(sigma=sigma))
+            # device= so this wrapper's own `self.to(device)` is a no-op rather
+            # than a move to deepinv's default "cpu".
+            super().__init__(noise_model=_PinnedGaussianNoise(sigma=sigma),
+                             device=sigma.device)
             self.E = E
 
         def A(self, x, **kwargs):

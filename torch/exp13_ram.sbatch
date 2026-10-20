@@ -128,4 +128,16 @@ if [ ! -f "${IMMAP_ROOT:-}/torch/_mg_recon_body.sh" ]; then
     exit 1
 fi
 
+# PRE-FLIGHT on this job's own GPU: tests/test_ram.py runs RAM forward + backward
+# on CUDA (its section 9) besides the CPU checks, so a device or install problem
+# fails here in seconds instead of after wandb/data setup -- the first exp13
+# submission died on a cuda/cpu mix in realign_input. Same activation as the body
+# (activate first, guards after; see the note there).
+source ~/.bashrc
+conda activate gcdl
+if ! ( cd "${IMMAP_ROOT}" && python -m tests.test_ram ); then
+    echo "[exp13] tests/test_ram.py FAILED on $(hostname) -- not training." >&2
+    exit 1
+fi
+
 source "${IMMAP_ROOT}/torch/_mg_recon_body.sh"
