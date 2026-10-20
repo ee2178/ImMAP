@@ -12,13 +12,16 @@ until its runs are dumped), so one viewer reaches all of them; switching
 reloads that config's options, columns and its own picks. A config given on the
 command line is only where it opens.
 
-It prints the tunnel command for the node it is on. ON YOUR LAPTOP:
+It prints the tunnel command and the page URL. ON YOUR LAPTOP, in a new
+terminal -- standard port forwarding, as for a Jupyter server:
 
-    ssh -o ExitOnForwardFailure=yes -L 8765:127.0.0.1:8765 <you>@<login host>
-    (a LOGIN node: start the viewer inside that same session; its internal
-    name does not resolve from outside, and the public address picks any
-    login node)
-    open http://127.0.0.1:8765
+    ssh -N -L 8765:<node>:8765 <you>@login.torch.hpc.nyu.edu
+    open http://127.0.0.1:8765/?token=<printed token>
+
+<node> is the cluster-internal name it prints; the login node you land on
+resolves it, so it does not matter which one that is. If the login nodes turn
+out not to reach each other's ports, run with --host 127.0.0.1 and forward on
+the same SSH session instead (it prints that recipe then).
 
 Same core as the Tk viewer (figures/viewer.py::PickerCore), so the same
 columns, the same panel images, and the same picks files -- rows/<VARIANT>.json
@@ -32,9 +35,12 @@ figure's strip under it -- the magnified box and its |residual|, as
 figures/make_figure.py prints them. The Tk viewer's keys work too (arrows,
 space, enter, b, n/p, x, d, c, g, r, -/=).
 
-The server listens on 127.0.0.1 only: nothing on the cluster network can reach
-it, only your own SSH tunnel. Standard library + numpy + Pillow + h5py -- no
-web framework to install, and no internet needed on the node.
+The server listens on the node's network (0.0.0.0) so that tunnel can reach
+it, which also makes it reachable by other users of the cluster -- so, as
+Jupyter does, every request must carry a random token: in the printed URL once,
+then in a cookie the page sets. --host 127.0.0.1 listens on loopback only and
+needs no token. Standard library + numpy + Pillow + h5py -- no web framework to
+install, and no internet needed on the node.
 """
 
 from __future__ import annotations
@@ -42,9 +48,11 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import hmac
 import io
 import json
 import os
+import secrets
 import socket
 import sys
 import threading
@@ -256,15 +264,41 @@ class Session:
 # =============================================================================
 #  HTTP
 # =============================================================================
-def make_handler(sess, server_box):
+def make_handler(sess, server_box, token=None):
+    """`token`: when set, every request must carry it -- once as `?token=` on the
+    page URL (which then sets a cookie), afterwards via that cookie -- because a
+    server listening on the node's network interface is reachable by every user
+    of the cluster, not just through your tunnel. Jupyter does the same."""
     page = PAGE.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):          # quiet: one line per image is noise
             pass
 
-        def _send(self, code, body, ctype):
+        def _cookie_name(self):
+            # per port, so two viewers on one laptop do not share a cookie
+            return f"wvtoken{self.server.server_address[1]}"
+
+        def _authorized(self, u):
+            if token is None:
+                return True
+            q = parse_qs(u.query).get("token", [""])[0]
+            if q and hmac.compare_digest(q, token):
+                return True
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == self._cookie_name() and hmac.compare_digest(v, token):
+                    return True
+            return False
+
+        def _refuse(self):
+            self._send(403, b"This viewer needs its access token: open the URL with "
+                            b"?token=... that it printed in the terminal.", "text/plain")
+
+        def _send(self, code, body, ctype, headers=()):
             self.send_response(code)
+            for k, v in headers:
+                self.send_header(k, v)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store" if ctype != "image/png"
@@ -277,9 +311,14 @@ def make_handler(sess, server_box):
 
         def do_GET(self):
             u = urlparse(self.path)
+            if not self._authorized(u):
+                return self._refuse()
             try:
                 if u.path == "/":
-                    self._send(200, page, "text/html; charset=utf-8")
+                    cookie = (() if token is None else
+                              (("Set-Cookie", f"{self._cookie_name()}={token}; Path=/; "
+                                               "HttpOnly; SameSite=Strict"),))
+                    self._send(200, page, "text/html; charset=utf-8", cookie)
                 elif u.path == "/api/state":
                     with sess.lock:
                         self._json(sess.state())
@@ -329,6 +368,8 @@ def make_handler(sess, server_box):
 
         def do_POST(self):
             u = urlparse(self.path)
+            if not self._authorized(u):
+                return self._refuse()
             if u.path != "/api/do":
                 return self._send(404, b"not found", "text/plain")
             try:
@@ -347,12 +388,12 @@ def make_handler(sess, server_box):
     return Handler
 
 
-def serve(sess, host, port, tries=20):
+def serve(sess, host, port, tries=20, token=None):
     """Bind the first free port from `port` up; return (server, port)."""
     box = [None]
     for p in range(port, port + tries):
         try:
-            box[0] = ThreadingHTTPServer((host, p), make_handler(sess, box))
+            box[0] = ThreadingHTTPServer((host, p), make_handler(sess, box, token))
             return box[0], p
         except OSError:
             continue
@@ -375,9 +416,14 @@ def main(argv=None):
     ap.add_argument("--slice", type=int, help="...and this source slice number")
     ap.add_argument("--port", type=int, default=8765,
                     help="first port to try (the next free one is used if taken)")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="interface to listen on. Keep 127.0.0.1: then only your "
-                         "own SSH tunnel can reach it")
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="interface to listen on. 0.0.0.0 (default): the node's own "
+                         "network, so a STANDARD tunnel through any login node reaches "
+                         "it (ssh -N -L P:<node>:P you@<login>), guarded by a token. "
+                         "127.0.0.1: only a tunnel riding the same SSH session can")
+    ap.add_argument("--login-host", default=os.environ.get("IMMAP_LOGIN_HOST",
+                                                           "login.torch.hpc.nyu.edu"),
+                    help="what you ssh into from the laptop, for the printed command")
     a = ap.parse_args(argv)
 
     configs = fc.list_configs(a.configs)
@@ -405,26 +451,29 @@ def main(argv=None):
     sess = Session(a.rows, configs, start, volume=a.volume, sl=a.slice,
                    overrides=overrides)
     picker = sess.picker
-    server, port = serve(sess, a.host, a.port)
-    node, user = socket.gethostname(), getpass.getuser()
+    local_only = a.host in ("127.0.0.1", "localhost")
+    token = None if local_only else secrets.token_urlsafe(16)
+    server, port = serve(sess, a.host, a.port, token=token)
+    node, user = socket.getfqdn(), getpass.getuser()
     print(f"[webviewer] {fc.variant()}: {len(picker.vols)} volumes, "
           f"columns {', '.join(lab for lab, _ in fc.COLUMNS)}")
-    print(f"[webviewer] serving on http://{a.host}:{port}  (node {node})")
-    # 127.0.0.1, not "localhost": the server listens on IPv4 only, and localhost
-    # can resolve to ::1 on either end.
-    if os.environ.get("SLURM_JOB_ID"):
-        print("[webviewer] on your laptop (this is a compute node; hop through a login node):")
-        print(f"    ssh -N -L {port}:127.0.0.1:{port} -J {user}@<login host> {user}@{node}")
+    print(f"[webviewer] serving on {a.host}:{port}  (node {node})")
+    # The laptop side always uses 127.0.0.1, never "localhost", which can
+    # resolve to ::1 while ssh listens on IPv4.
+    url = f"http://127.0.0.1:{port}/" + (f"?token={token}" if token else "")
+    if not local_only:
+        print("[webviewer] on your laptop, in a NEW terminal (standard port forwarding):")
+        print(f"    ssh -N -L {port}:{node}:{port} {user}@{a.login_host}")
+        print(f"    then open {url}")
+        print("    (if the page never loads, the login nodes may not reach each other's "
+              "ports: restart with --host 127.0.0.1 for the same-session tunnel)")
     else:
-        # A login node. Its cluster-internal name does not resolve from outside,
-        # and the public login address lands on ANY login node -- so the tunnel
-        # has to ride the same SSH session this was started from.
-        print("[webviewer] this is a login node: forward the port on the SAME ssh session")
-        print("    you start the viewer from (the public login address picks a login node")
-        print(f"    at random, and {node.split('.')[0]} is not reachable by name from outside):")
-        print(f"    ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} {user}@<login host>")
+        print("[webviewer] listening on 127.0.0.1 only: forward the port on the SAME ssh "
+              "session you start the viewer from:")
+        print(f"    ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} "
+              f"{user}@{a.login_host}")
         print("    then start this viewer in that session (append & to keep the shell)")
-    print(f"    and open http://127.0.0.1:{port}")
+        print(f"    and open {url}")
     print("[webviewer] picks are saved as you go; Ctrl+C or 'Done' in the page to stop")
     try:
         server.serve_forever()
