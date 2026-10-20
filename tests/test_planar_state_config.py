@@ -235,6 +235,20 @@ def test_launch_guard(tmp, off, on):
               isinstance(r3, str) and "training.clip_grad" in r3
               and "planar_state" not in r3, str(r3)[:110])
 
+    # training.val_kspace_type (2026-10-20) is validation-only: a run launched
+    # before the generator wrote it is the same launch, resumed, not refused.
+    new = copy.deepcopy(on["lpdsnet_R12"])
+    check("the generator writes val_kspace_type=simulated for measured configs",
+          new["training"].get("val_kspace_type") == "simulated")
+    old = copy.deepcopy(new)
+    old["training"].pop("val_kspace_type", None)
+    run_dir = tempfile.mkdtemp(dir=tmp)
+    gen = os.path.join(run_dir, "config.gen.json")
+    r0 = guard(write("old_val.json", old), gen, run_dir)
+    r1 = guard(write("new_val.json", new), gen, run_dir)
+    check("launched before val_kspace_type existed: same launch, not refused",
+          r0 is None and r1 == 3, f"first {r0!r}, with the key {r1!r}")
+
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:

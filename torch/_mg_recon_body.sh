@@ -353,7 +353,11 @@ if os.path.exists(out) and not force:
     # at every value (tests/test_flex_block_size.py). A resumed run keeps the
     # value in its own config.json; this only stops a changed default from
     # making an existing run look like a different experiment.
-    _EXEC_KEYS = ("training.planar_state", "model.params.flex_block_size")
+    # `val_kspace_type` (2026-10-20) changes only how VALIDATION is measured,
+    # never the trained net; a run launched before it existed resumes from its
+    # own config.json and keeps validating the way it always did.
+    _EXEC_KEYS = ("training.planar_state", "model.params.flex_block_size",
+                  "training.val_kspace_type")
     a, b = _flat(old), _flat(cfg)
     diff = sorted(k for k in set(a) | set(b)
                   if a.get(k) != b.get(k) and k not in _EXEC_KEYS)

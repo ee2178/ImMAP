@@ -75,7 +75,7 @@ import datasets                              # noqa: F401,E402  registers the lo
 from datasets.registry import build_loader   # noqa: E402
 from evaluation.metrics import REGISTRY as METRIC_REGISTRY  # noqa: E402
 from evaluation.metrics import build_metrics, metric_version, warm_up  # noqa: E402
-from evaluation.tasks import build_adapter, default_sigma    # noqa: E402
+from evaluation.tasks import build_adapter, default_sigma, val_kspace_type  # noqa: E402
 
 # Display names of the main comparison. Keyed by CELL (the run name without
 # its _R<r> suffix). Brain's MGLPDS-Big is the full-length `mglpds` run (Galerkin
@@ -89,7 +89,7 @@ LABELS = {
 }
 
 DEFAULT_METRICS = ["psnr", "ssim", "nrmse", "lpips"]
-META_KEYS = ("run", "anatomy", "R", "step", "sigma", "seed", "slices",
+META_KEYS = ("run", "anatomy", "R", "step", "sigma", "seed", "slices", "val_kspace_type",
              "metrics", "n_volumes", "use_organ_mask", "rediscretize_embedded")
 
 
@@ -143,6 +143,11 @@ def _setup(run_dir, anatomy, args, metric_names, device):
     os.makedirs(dest, exist_ok=True)
 
     cfg, model, n_params, step = de.load_run(run_dir, device)
+    # Rows written before `val_kspace_type` was recorded were measured the
+    # training way -- what the run's config said then (it had no val key).
+    legacy = {"val_kspace_type": cfg.get("mri", {}).get("kspace_type", "simulated")}
+    if args.val_kspace_type:
+        cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
     sigma = args.sigma if args.sigma is not None else default_sigma(cfg)
     slices = args.slices if args.slices is not None else train_slices(cfg)
     lo, hi = de.parse_slices(slices)
@@ -156,6 +161,7 @@ def _setup(run_dir, anatomy, args, metric_names, device):
                 val_source={k: cfg["data"]["val"].get(k) for k in
                             ("name", "anatomy", "kspace_root", "smap_root", "scale_fac")},
                 rediscretize_embedded=os.environ.get("IMMAP_REDISCRETIZE_EMBEDDED", "1"),
+                val_kspace_type=val_kspace_type(cfg),
                 metric_versions={m: metric_version(m) for m in metric_names})
 
     val = dict(cfg["data"]["val"])
@@ -163,6 +169,7 @@ def _setup(run_dir, anatomy, args, metric_names, device):
                volumes=volumes, batch_size=1, num_workers=args.workers)
     loader = build_loader(val, shuffle=False, drop_last=False)
     return dict(run=run, cfg=cfg, model=model, meta=meta, sigma=sigma, loader=loader,
+                legacy=legacy,
                 csv=os.path.join(dest, f"{run}.slices.csv"),
                 meta_path=os.path.join(dest, f"{run}.meta.json"), dest=dest)
 
@@ -199,6 +206,11 @@ def _score(S, todo, metric_names, args, device, write_row, flush):
             print(f"    {j + 1:>6}/{len(todo)}  {shown}", flush=True)
 
 
+def _was(old_meta, key, S):
+    """`key` as an older meta.json recorded it, or its value from before it was recorded."""
+    return old_meta.get(key, S["legacy"].get(key))
+
+
 def _stale(old_meta, names):
     """Metrics among `names` whose stored values used another definition."""
     have = old_meta.get("metric_versions", {})
@@ -215,8 +227,8 @@ def eval_run(run_dir, anatomy, args, metric_names, device):
     if os.path.exists(meta_path) and not args.overwrite:
         with open(meta_path) as f:
             old = json.load(f)
-        if any(old.get(k) != meta[k] for k in META_KEYS):
-            changed = [k for k in META_KEYS if old.get(k) != meta[k]]
+        changed = [k for k in META_KEYS if _was(old, k, S) != meta[k]]
+        if changed:
             print(f"  [{run}] settings changed ({', '.join(changed)}) -- starting over")
             if os.path.exists(csv_path):
                 os.remove(csv_path)
@@ -275,7 +287,7 @@ def recompute_run(run_dir, anatomy, args, names, device):
     with open(meta_path) as f:
         old = json.load(f)
     # The reconstructions must be the ones the kept columns came from.
-    changed = [k for k in META_KEYS if k != "metrics" and old.get(k) != meta[k]]
+    changed = [k for k in META_KEYS if k != "metrics" and _was(old, k, S) != meta[k]]
     if changed:
         raise SystemExit(
             f"[{run}] settings changed since its rows were computed ({', '.join(changed)}); "
@@ -383,6 +395,18 @@ def combine(out_root):
               f"{len(per_vol):>4} volumes / {len(rows):>5} slices "
               f"(of {meta['n_volumes']} volumes)")
 
+    kinds = {}
+    for mp in metas:
+        with open(mp) as f:
+            m = json.load(f)
+        kinds.setdefault(m.get("val_kspace_type", "unrecorded (before 2026-10-20)"),
+                         []).append(f"{m['anatomy']}/{m['run']}")
+    if len(kinds) > 1:
+        print("  [WARNING] runs here were measured differently -- their numbers are "
+              "not comparable; keep each kind in its own --out:")
+        for k, runs in sorted(kinds.items()):
+            print(f"      {k}: {', '.join(runs)}")
+
     for name, rows, lead in (("slices.csv", s_rows, ["volume", "slice"]),
                              ("volumes.csv", v_rows, ["volume", "n_slices"])):
         path = os.path.join(out_root, name)
@@ -416,6 +440,11 @@ def main():
     p.add_argument("--n-volumes", type=int, default=None,
                    help="first N volumes only (smoke tests); default all")
     p.add_argument("--sigma", type=float)
+    p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
+                   help="how the evaluation measurement is made; default = the run's "
+                        "training.val_kspace_type, else its training kspace_type. "
+                        "'simulated': the SENSE ground truth through the stored maps, "
+                        "mask and AWGN, so the noise is exactly sigma"),
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)

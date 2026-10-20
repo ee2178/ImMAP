@@ -73,7 +73,7 @@ import datasets                              # noqa: F401  registers the loaders
 from datasets.registry import build_loader
 from evaluation.metrics import DEFAULT_METRICS, REGISTRY as METRIC_REGISTRY
 from evaluation.metrics import build_metrics, warm_up
-from evaluation.tasks import build_adapter, default_sigma
+from evaluation.tasks import build_adapter, default_sigma, val_kspace_type
 
 DUMP_VERSION = 1
 
@@ -245,7 +245,9 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
                       else int(mri["acs_lines"])),
         "center_frac": float(mri.get("center_frac") or 0.0),
         "adjust_accel": bool(mri.get("adjust_accel", False)),
-        "kspace_type": str(mri.get("kspace_type", "simulated")),
+        # The measurement the IMAGES came from (validation k-space), which is
+        # what a figure compares -- not necessarily what the net trained on.
+        "kspace_type": str(val_kspace_type(cfg)),
         "online_smaps": str(mri.get("online_smaps") or ""),
         "mask_dist": mri.get("mask_dist", ""),
         "sigma": float(sigma),
@@ -334,6 +336,9 @@ def main():
                    help="noise level; default is each run's val_noise_std. "
                         "One value only -- a dump is a single operating point, "
                         "and columns at different sigmas are not comparable")
+    p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
+                   help="how the measurement is made; default = the run's "
+                        "training.val_kspace_type, else its training kspace_type")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)
@@ -381,6 +386,8 @@ def main():
             del model
             continue
 
+        if args.val_kspace_type:
+            cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
         sigma = args.sigma if args.sigma is not None else default_sigma(cfg)
         dest = out_dir(run_dir, args.runs, args.out)
         n = dump_run(run_dir, cfg, model, n_params, step, args, volumes,

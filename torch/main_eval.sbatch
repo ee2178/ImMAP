@@ -41,8 +41,20 @@
 #   sbatch torch/main_eval.sbatch                  # all 16
 #   sbatch --array=8-15 torch/main_eval.sbatch     # knee only
 #
-# RE-SCORING ONE METRIC (NRMSE was redefined 2026-10-20 to ||gt-pred||/||gt||):
-#   RECOMPUTE=nrmse sbatch torch/main_eval.sbatch
+# THE TEST MEASUREMENT (2026-10-20): SIMULATED k-space by default -- the SENSE
+# ground truth through the stored maps, mask and AWGN, so the noise is exactly
+# sigma -- while the nets were TRAINED on measured k-space + AWGN. The operator
+# still uses online ESPIRiT maps, as in training. Results go to their own tree,
+# so the earlier measured-k-space results in results/main are left alone:
+#   sbatch torch/main_eval.sbatch                         -> results/main_simulated
+#   SIGMA=0.03 sbatch torch/main_eval.sbatch              -> results/main_simulated_s0.03
+#   VAL_KSPACE=measurement_awgn sbatch ...                -> results/main (the old setup)
+# SIGMA empty = each run's val_noise_std (0.015). Point the table at the tree:
+#   python figures/table_main.py --in results/main_simulated/volumes.csv
+#
+# RE-SCORING ONE METRIC (NRMSE was redefined 2026-10-20 to ||gt-pred||/||gt||),
+# on the measured-k-space results already in results/main:
+#   VAL_KSPACE=measurement_awgn RECOMPUTE=nrmse sbatch torch/main_eval.sbatch
 # reruns inference on the rows each run already has and replaces ONLY that
 # column -- PSNR / SSIM / LPIPS are kept, and LPIPS is not even recomputed.
 # Resumable like the main pass. Until a run is re-scored, the merge leaves its
@@ -75,7 +87,9 @@ EMBEDDED_OFF="${EMBEDDED_OFF:-brain/mg81v6_R12}"
 METRICS="${METRICS:-psnr ssim nrmse lpips}"
 SEED="${SEED:-1234}"
 SIGMA="${SIGMA:-}"                     # empty = each run's own val_noise_std
-OUT="${OUT:-results/main}"
+VAL_KSPACE="${VAL_KSPACE:-simulated}"  # or measurement_awgn (how the nets trained)
+if [ "${VAL_KSPACE}" = "measurement_awgn" ]; then _out="results/main"; else _out="results/main_${VAL_KSPACE}"; fi
+OUT="${OUT:-${_out}${SIGMA:+_s${SIGMA}}}"
 WORKERS="${WORKERS:-6}"
 RECOMPUTE="${RECOMPUTE:-}"             # e.g. RECOMPUTE=nrmse: re-score that column only
 EXTRA="${EXTRA:-}"                     # e.g. EXTRA="--n-volumes 3" for a probe
@@ -130,7 +144,7 @@ for e in ${EMBEDDED_OFF}; do
     fi
 done
 
-echo "[eval] ${ENTRY}  metrics='${METRICS}' seed=${SEED}" \
+echo "[eval] ${ENTRY}  metrics='${METRICS}' seed=${SEED} val_kspace=${VAL_KSPACE} out=${OUT}" \
      "IMMAP_REDISCRETIZE_EMBEDDED=${IMMAP_REDISCRETIZE_EMBEDDED:-1}"
 echo "[eval] $(date '+%F %T')  node=$(hostname)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
@@ -142,6 +156,7 @@ python scripts/eval_per_volume.py \
     --workers "${WORKERS}" \
     --out "${OUT}" \
     ${SIGMA:+--sigma "${SIGMA}"} \
+    --val-kspace-type "${VAL_KSPACE}" \
     ${RECOMPUTE:+--recompute ${RECOMPUTE}} \
     ${EXTRA}
 

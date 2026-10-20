@@ -156,3 +156,17 @@ viewer reads HDF5 + numpy + PIL only — no torch, no checkpoints — so it star
 instantly and needs no GPU. Picks land in `figures/rows/<variant>.json` and
 `figures/zooms/<variant>.json`, kept apart so re-picking one never discards the
 other. See the module docstrings for the key bindings and the file contract.
+
+Then build the manuscript figure from those picks:
+
+```bash
+python figures/make_figure.py figures/configs/mg_brain_R8.py
+```
+
+One picked slice per row, one method per column. Each panel is the slice with a
+green box and its metrics (`FIG_METRICS`, default PSNR and SSIM) in the corner,
+and directly beneath it the magnified box (left) and its |residual| (right). It
+writes pixel-exact PNGs, a standalone tikz `.tex`, and — when `pdflatex` is
+found (MiKTeX's per-user install included) — the PDF and a 300 dpi PNG, all
+under `figures/out/<NAME>/`. The viewer's zoom mode shows the same strips under
+its panels, drawn by the same code, so the box you place is the inset you get.

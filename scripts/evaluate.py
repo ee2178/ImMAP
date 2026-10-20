@@ -112,6 +112,9 @@ def main():
     p.add_argument("--sigmas", type=float, nargs="*",
                    help="noise levels; default is each run's val_noise_std")
     p.add_argument("--seed", type=int)
+    p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
+                   help="how the measurement is made; default = each run's "
+                        "training.val_kspace_type, else its training kspace_type")
     p.add_argument("--device")
     p.add_argument("--limit", type=int, help="stop after N batches (smoke test)")
     args = p.parse_args()
@@ -130,6 +133,7 @@ def main():
     metric_names = opt("metrics", DEFAULT_METRICS)
     sigmas = opt("sigmas", None)
     seed = opt("seed", 1234)
+    val_kspace = opt("val_kspace_type", None)
     device = torch.device(opt("device",
                               "cuda" if torch.cuda.is_available() else "cpu"))
     limit = opt("limit", None)
@@ -156,6 +160,8 @@ def main():
         except Exception as e:                 # a bad cell must not sink the sweep
             print(f"[skip] {rel}: {type(e).__name__}: {e}")
             continue
+        if val_kspace:
+            cfg.setdefault("training", {})["val_kspace_type"] = val_kspace
 
         loader = build_loader(cfg["data"]["val"], shuffle=False, drop_last=False)
         if limit:

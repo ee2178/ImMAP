@@ -47,7 +47,7 @@ def make_run(root, anatomy, run, cfg):
 def args_for(runs_root, out, **kw):
     a = dict(runs_root=runs_root, out=out, metrics=METRICS, slices=None,
              volumes=None, n_volumes=None, sigma=None, seed=1234, workers=0,
-             limit=None, overwrite=False)
+             limit=None, overwrite=False, val_kspace_type=None)
     a.update(kw)
     return argparse.Namespace(**a)
 
@@ -182,6 +182,79 @@ def test_recompute(tmp, ks, sm):
     check("after recompute a normal pass resumes without complaint", len(read(p)) == len(fresh))
 
 
+def test_val_kspace(tmp, ks, sm):
+    """Validation measurement: simulated k-space, chosen per run, never mixed."""
+    import inspect
+    from evaluation import tasks
+    from training.recon import train_recon
+
+    check("train_recon takes val_kspace_type (config key reaches it)",
+          "val_kspace_type" in inspect.signature(train_recon).parameters)
+
+    seen = []
+    real = tasks.prepare_measurement
+    def spy(*a, **k):
+        seen.append(k["kspace_type"])
+        return real(*a, **k)
+    tasks.prepare_measurement = spy
+    try:
+        cfg = base_cfg(ks, sm)
+        batch = next(iter(epv.build_loader(dict(cfg["data"]["val"], num_workers=0),
+                                           shuffle=False, drop_last=False)))
+        tasks.recon(StubNet(), batch, cfg, torch.device("cpu"), 0.05)
+        cfg2 = base_cfg(ks, sm)
+        cfg2["mri"]["kspace_type"] = "measurement_awgn"
+        cfg2["training"]["val_kspace_type"] = "simulated"
+        tasks.recon(StubNet(), batch, cfg2, torch.device("cpu"), 0.05)
+    finally:
+        tasks.prepare_measurement = real
+    check("no val key: the eval measurement is the training kspace_type",
+          seen[0] == "simulated")
+    check("training.val_kspace_type wins over the training kspace_type",
+          seen[1] == "simulated" and tasks.val_kspace_type(cfg2) == "simulated")
+    cfg3 = base_cfg(ks, sm)
+    cfg3["mri"]["kspace_type"] = "measurement_awgn"
+    check("an old measured run with no val key evaluates on measured k-space",
+          tasks.val_kspace_type(cfg3) == "measurement_awgn")
+
+    # eval_per_volume: rows from before the key existed count as the run's
+    # training kspace_type, so they resume when that matches and start over when not.
+    cfg = base_cfg(ks, sm)
+    cfg["data"]["train"] = dict(cfg["data"]["val"], start_slice=1, end_slice=4)
+    runs_root, out = os.path.join(tmp, "runs_vk"), os.path.join(tmp, "res_vk")
+    run_dir = make_run(runs_root, "knee", "lpdsnet_R4", cfg)
+    dev = torch.device("cpu")
+    p = epv.eval_run(run_dir, "knee", args_for(runs_root, out, val_kspace_type="simulated"),
+                     METRICS, dev)
+    meta_p = os.path.join(out, "knee", "lpdsnet_R4.meta.json")
+    check("the eval records how the measurement was made",
+          json.load(open(meta_p))["val_kspace_type"] == "simulated")
+    meta = json.load(open(meta_p))
+    del meta["val_kspace_type"]                     # an older meta.json
+    json.dump(meta, open(meta_p, "w"))
+    rows = read(p)
+    for r in rows:
+        r["psnr"] = "123"                          # a sentinel a recompute would erase
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    epv.eval_run(run_dir, "knee", args_for(runs_root, out, val_kspace_type="simulated"),
+                 METRICS, dev)
+    check("old rows made on the same k-space resume (kept, not redone)",
+          all(r["psnr"] == "123" for r in read(p)))
+    meta = json.load(open(meta_p))
+    del meta["val_kspace_type"]
+    json.dump(meta, open(meta_p, "w"))
+    cfg["mri"]["kspace_type"] = "measurement_awgn"  # they were MEASURED rows
+    json.dump(cfg, open(os.path.join(run_dir, "config.json"), "w"))
+    epv.eval_run(run_dir, "knee", args_for(runs_root, out, val_kspace_type="simulated"),
+                 METRICS, dev)
+    check("old rows made on measured k-space are redone for a simulated eval",
+          all(r["psnr"] != "123" for r in read(p))
+          and json.load(open(meta_p))["val_kspace_type"] == "simulated")
+
+
 def test_wilcoxon(tmp):
     rng = np.random.default_rng(1)
     n = 30
@@ -227,6 +300,7 @@ def main():
         ks, sm = build_trees(tmp)
         test_eval(tmp, ks, sm)
         test_recompute(tmp, ks, sm)
+        test_val_kspace(tmp, ks, sm)
         test_wilcoxon(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

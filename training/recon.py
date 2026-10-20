@@ -150,6 +150,15 @@ def train_recon(
     # move because the model moved, not because the noise did.
     val_noise_std=None,
     val_seed=None,
+    # How the VALIDATION measurement is made; None = the training `kspace_type`.
+    # "simulated" (the measured-protocol default since 2026-10-20) pushes the
+    # SENSE ground truth through the STORED maps, mask and AWGN, so the noise
+    # in y is exactly `val_noise_std` -- measured k-space already carries the
+    # scanner's own noise on top of what is added -- and sigma can be set
+    # outside the training range to test noise adaptivity. The operator still
+    # gets its maps the training way (online ESPIRiT from the measurement's
+    # ACS), so the forward model is not handed the maps that made the data.
+    val_kspace_type=None,
     ### Loss
     loss_type="complex-mse",
     # `organ_mask` is the coil-sensitivity support the recon loader returns.
@@ -521,7 +530,7 @@ def train_recon(
                         kspace=kspace_v,
                         mask=mask_v,
                         smaps=smaps_v,
-                        kspace_type=kspace_type,
+                        kspace_type=val_kspace_type or kspace_type,
                         noise_std=val_std,
                         noise_dist=noise_dist,
                         whiten_kspace=whiten_kspace,

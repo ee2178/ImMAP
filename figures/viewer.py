@@ -32,9 +32,12 @@ BROWSE -- scrub the set and mark the rows you want:
     q                save and quit
     esc              abort: discard everything this session changed
 
-ZOOM -- place each marked row's window:
-    click / drag     centre the box at the cursor -- in ANY panel; every panel
-                     shows the same box, since a figure row crops one region
+ZOOM -- place each marked row's window. Under every panel sits the strip the
+figure prints there: the magnified box (left) and its |residual| (right), from
+the same code as figures/make_figure.py, so what you place is what you get.
+    click / drag     centre the box at the cursor -- in ANY panel's image (not
+                     its strip); every panel shows the same box, since a
+                     figure row crops one region
     arrow keys       nudge one pixel
     n / p or m       next / previous marked row
     d                overlay          r  revert to the automatic placement
@@ -74,6 +77,7 @@ from figures.common import (anatomy_mask, apply_cmap, auto_zoom, disagreement,
 FIT = 680       # on-screen size of one panel (the most a grid panel gets), pixels
 GAP = 8         # pixels between panels in the grid
 GRID_COLS = 3   # panels per row in the grid: six columns -> 3 x 2
+STRIP_GAP = 3   # pixels between a panel and its zoom strip (ZOOM mode)
 
 
 class PickerCore:
@@ -175,59 +179,26 @@ class PickerCore:
 
     # --- data --------------------------------------------------------------
     def _pos_of(self, volume, sl):
-        """Stack position of source slice `sl`, or 0 if this dump lacks it.
-
-        Rows are saved with the SOURCE slice number, not a stack position, so a
-        re-dump over a different `--slices` range still resolves them.
-        """
-        spec = next(s for _, s in fc.COLUMNS if fc.col_spec(s)[0] is not None)
-        pos = load(spec, volume).at(sl)
+        """Stack position of source slice `sl`, or 0 if this dump lacks it."""
+        pos = fc.pos_of(volume, sl)
         return 0 if pos is None else pos
 
     def current(self):
-        """Everything needed to draw the current view.
-
-        `cols` is every column, in config order, for display. `methods` is the
-        subset that is actually a network's output -- the reference and the
-        zero-filled adjoint are not methods, and letting them into the
-        disagreement map would swamp it with the undersampling artifact.
-        """
+        """Everything needed to draw the current view -- `figures.common.slice_view`,
+        the same function the figure builder uses."""
         vol = (self.vols[self.vi] if self.mode == "browse"
                else self.sel[self.si]["volume"])
-        cols, methods, ref, stack_n = {}, {}, None, None
-        for lab, spec in fc.COLUMNS:
-            v = load(spec, vol)
-            ref = v.ref if ref is None else ref
-            stack_n = len(v) if stack_n is None else min(stack_n, len(v))
-            cols[lab] = v
-            if fc.col_spec(spec)[0] is not None:
-                methods[lab] = v
-
         pos = (self.pos if self.mode == "browse"
                else self._pos_of(vol, self.sel[self.si]["slice"]))
-        pos = int(np.clip(pos, 0, stack_n - 1))
+        return fc.slice_view(vol, pos, crop=self.crop)
 
-        first = next(iter(cols.values()))
-        sl = int(first.slice_index[pos])
-        ref_s = first.ref[pos]
-        organ = first.organ[pos] if first.organ is not None else anatomy_mask(ref_s)
-
-        vmax = window(ref_s, organ)
-        if self.crop:
-            c0, r0, W = fov_box(ref_s)
-            crop = lambda a: a[r0:r0 + W, c0:c0 + W]
-        else:
-            W, crop = min(ref_s.shape), (lambda a: a)
-
-        return dict(
-            vol=vol, pos=pos, sl=sl, W=W, vmax=vmax,
-            ref=crop(ref_s), organ=crop(organ),
-            cols={k: crop(v.img[pos]) for k, v in cols.items()},
-            methods={k: crop(v.img[pos]) for k, v in methods.items()},
-            stored={k: {m: vals[pos] for m, vals in v.metrics.items()}
-                    for k, v in methods.items()},
-            n=stack_n,
-        )
+    def strip(self, c, lab, zoom):
+        """What the figure puts UNDER column `lab`'s panel: the magnified box
+        (left) and its |residual| (right), side by side with a 1-pixel gap, at
+        source resolution. The front end scales it to the panel's width."""
+        left, right = fc.zoom_pair(c, lab, zoom)
+        gap = np.full((left.shape[0], 1, 3), 255, np.uint8)
+        return Image.fromarray(np.concatenate([left, gap, right], axis=1), "RGB")
 
     # --- navigation --------------------------------------------------------
     def horiz(self, d):
@@ -556,16 +527,16 @@ class Picker(PickerCore):
         if self.mode != "zoom" or self._geom is None:
             return
         g = self._geom
-        col, row = int(ev.x // (g["P"] + GAP)), int(ev.y // (g["P"] + GAP))
+        col, row = int(ev.x // (g["P"] + GAP)), int(ev.y // (g["H"] + GAP))
         if col >= g["per_row"] or row * g["per_row"] + col >= g["n"]:
             return
-        lx, ly = ev.x - col * (g["P"] + GAP), ev.y - row * (g["P"] + GAP)
-        if not (0 <= lx < g["P"] and 0 <= ly < g["P"]):
+        lx, ly = ev.x - col * (g["P"] + GAP), ev.y - row * (g["H"] + GAP)
+        if not (0 <= lx < g["P"] and 0 <= ly < g["P"]):   # the strip is not a target
             return
         c = self.current()
         self.set_zoom(lx / g["s"] - fc.ZOOM_W / 2, ly / g["s"] - fc.ZOOM_H / 2, c["W"])
 
-    def _layout(self, n):
+    def _layout(self, n, extra=0.0):
         """`(panel size in screen pixels, panels per row)` for n panels.
 
         The size does NOT depend on the image: the FOV crop is fitted to each
@@ -581,8 +552,9 @@ class Picker(PickerCore):
         rows = math.ceil(n / per_row)
         sw = self.root.winfo_screenwidth() - 40
         sh = self.root.winfo_screenheight() - 190     # title bar + status lines
+        # `extra`: the strip under each panel in ZOOM, as a fraction of P
         P = min((sw - (per_row - 1) * GAP) // per_row,
-                (sh - (rows - 1) * GAP) // rows, FIT)
+                int((sh - (rows - 1) * GAP) / rows / (1.0 + extra)), FIT)
         return max(1, int(P)), per_row
 
     def _label(self, x, y, text):
@@ -609,16 +581,23 @@ class Picker(PickerCore):
                 apply_cmap(dis / (dis.max() + 1e-12), fc.RESID_CMAP or "inferno"),
                 "RGB")
 
-        P, per_row = self._layout(len(shown))
+        zoom = self.zoom_of(c) if self.mode == "zoom" else None
+        # In ZOOM each panel carries the figure's strip beneath it -- the
+        # magnified box and its residual -- so the box is placed by what it
+        # will look like in the figure, not just where it sits.
+        ratio = fc.ZOOM_H / (2 * fc.ZOOM_W + 1)
+        P, per_row = self._layout(len(shown),
+                                  extra=(ratio + STRIP_GAP / FIT) if zoom else 0.0)
+        Hs = int(round(P * ratio)) if zoom is not None else 0
+        H = P + (STRIP_GAP + Hs if zoom is not None else 0)
         rows = math.ceil(len(shown) / per_row)
         self.canvas.config(width=per_row * P + (per_row - 1) * GAP,
-                           height=rows * P + (rows - 1) * GAP)
+                           height=rows * H + (rows - 1) * GAP)
         self.canvas.delete("all")
-        self._geom = dict(s=P / c["W"], P=P, per_row=per_row, n=len(shown))
+        self._geom = dict(s=P / c["W"], P=P, H=H, per_row=per_row, n=len(shown))
 
         marked = any(row_tag(r) == row_tag(dict(volume=c["vol"], slice=c["sl"]))
                      for r in self.sel)
-        zoom = self.zoom_of(c) if self.mode == "zoom" else None
         m = fc.STATUS_METRIC
         # A whole-number magnification keeps hard pixels; any other ratio is
         # resampled smoothly, since an uneven nearest-neighbour stretch reads
@@ -626,10 +605,18 @@ class Picker(PickerCore):
         resample = Image.NEAREST if P % c["W"] == 0 else Image.LANCZOS
         self.photos = []                  # Tk drops an image nobody references
         for i, lab in enumerate(shown):
-            x0, y0 = (i % per_row) * (P + GAP), (i // per_row) * (P + GAP)
+            x0, y0 = (i % per_row) * (P + GAP), (i // per_row) * (H + GAP)
             ph = ImageTk.PhotoImage(self._panel(c, lab, heat).resize((P, P), resample))
             self.photos.append(ph)
             self.canvas.create_image(x0, y0, anchor="nw", image=ph)
+            if zoom is not None:
+                st = ImageTk.PhotoImage(
+                    self.strip(c, lab, zoom).resize((P, Hs), Image.NEAREST))
+                self.photos.append(st)
+                self.canvas.create_image(x0, y0 + P + STRIP_GAP, anchor="nw", image=st)
+                self.canvas.create_rectangle(x0, y0 + P + STRIP_GAP, x0 + P - 1,
+                                             y0 + P + STRIP_GAP + Hs - 1,
+                                             outline="#00dc00", width=1)
             k = P / c["W"]
             if zoom is not None:
                 c0, r0 = zoom

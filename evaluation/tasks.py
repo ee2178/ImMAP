@@ -71,7 +71,10 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None):
 
     y, sigma_n, extra = prepare_measurement(
         image=image, kspace=kspace, mask=mask, smaps=smaps,
-        kspace_type=mri.get("kspace_type", "simulated"),
+        # The VALIDATION measurement, as training validates: the run's
+        # `training.val_kspace_type` if it has one (an eval script's
+        # --val-kspace-type writes it there), else the training kspace_type.
+        kspace_type=val_kspace_type(cfg),
         noise_std=sigma,                        # a number: pinned, not sampled
         noise_dist=cfg["training"].get("noise_dist", "uniform"),
         whiten_kspace=mri.get("whiten_kspace", False),
@@ -149,6 +152,18 @@ def build_adapter(task):
             f"no evaluation adapter for task {task!r}; registered: "
             f"{sorted(REGISTRY)}. Add one to evaluation/tasks.py.")
     return REGISTRY[task]
+
+
+def val_kspace_type(cfg):
+    """How a validation / evaluation measurement is made for this run.
+
+    `training.val_kspace_type` when set -- "simulated" for every measured-
+    protocol config generated since 2026-10-20, and what the eval scripts'
+    --val-kspace-type overrides -- otherwise the run's training `kspace_type`,
+    which is what runs generated before then validated on.
+    """
+    return (cfg.get("training", {}).get("val_kspace_type")
+            or cfg.get("mri", {}).get("kspace_type", "simulated"))
 
 
 def default_sigma(cfg):

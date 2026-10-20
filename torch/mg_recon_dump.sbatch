@@ -80,6 +80,12 @@ METRICS="${METRICS:-psnr ssim nrmse}"   # lpips is deliberately absent: it
                                         # compute node has no route out
 SEED="${SEED:-1234}"
 SIGMA="${SIGMA:-}"                      # empty = each run's own val_noise_std
+# How the measurement is made (2026-10-20): simulated k-space -- the SENSE ground
+# truth through the stored maps, mask and AWGN -- as the evaluation tables use
+# (torch/main_eval.sbatch). VAL_KSPACE=measurement_awgn reproduces the earlier
+# dumps. The dump records it, and the viewer warns when dumps made both ways
+# are put side by side.
+VAL_KSPACE="${VAL_KSPACE:-simulated}"
 OUT="${OUT:-}"                          # empty = <run>/eval_dump/
 WORKERS="${WORKERS:-4}"
 SCAN="${SCAN:-1}"                       # 0 = dump only, no aliasing scan
@@ -148,6 +154,7 @@ python scripts/dump_eval.py \
     --seed "${SEED}" \
     --workers "${WORKERS}" \
     ${SIGMA:+--sigma "${SIGMA}"} \
+    --val-kspace-type "${VAL_KSPACE}" \
     ${OUT:+--out "${OUT}/${ANATOMY}"}
 
 echo "[dump] ${ANATOMY} done $(date '+%F %T')"

@@ -79,10 +79,17 @@ STATUS_METRIC = "psnr"    # which stored per-slice metric the viewer reports
 NAME = "default"          # output identity
 VARIANT = None            # input identity for rows/ and zooms/; None follows NAME
 
+# The manuscript figure (figures/make_figure.py).
+FIG_METRICS = ("psnr", "ssim")  # printed top-right of each panel, in this order;
+                          # any of psnr, ssim, nrmse
+FIG_TITLE = None          # a line above the column headers, e.g. r"Knee, $R{=}8$"
+IMG_WIDTH = "3cm"         # displayed width of one panel in the PDF
+
 CONFIGURABLE = (
     "NAME", "DUMP_ROOT", "COLUMNS", "ROWS", "ZOOM_W", "ZOOM_H", "ZOOM_UP",
     "WINDOW_PCT", "WINDOW_SCALE", "BRIGHTNESS", "GAMMA", "RESID_GAIN",
     "RESID_CMAP", "CROP_FOV", "CROP_PAD", "MASK_THRESH", "STATUS_METRIC",
+    "FIG_METRICS", "FIG_TITLE", "IMG_WIDTH",
 )
 
 
@@ -461,6 +468,140 @@ def nrmse(ref, x, mask=None):
     return float(np.sqrt(d / max(n, 1e-30)))
 
 
+def pos_of(volume, sl):
+    """Stack position of SOURCE slice `sl` in this volume's dump, or None.
+
+    Rows are saved with the source slice number, not a stack position, so a
+    re-dump over a different `--slices` range still resolves them.
+    """
+    spec = next(s for _, s in COLUMNS if col_spec(s)[0] is not None)
+    return load(spec, volume).at(sl)
+
+
+def slice_view(vol, pos, crop=True):
+    """Everything one row shows, for the viewer AND the figure -- one function,
+    so what you place in the viewer is exactly what the figure prints.
+
+    `cols` is every column in config order; `methods` the subset that is a
+    network's output (not the reference, not the zero-filled adjoint).
+    `stored` holds each method's per-slice metrics as dumped. Images are
+    cropped to the shared FOV box when `crop`, and `vmax` is the one display
+    ceiling the whole row uses.
+    """
+    cols, methods, stack_n = {}, {}, None
+    for lab, spec in COLUMNS:
+        v = load(spec, vol)
+        stack_n = len(v) if stack_n is None else min(stack_n, len(v))
+        cols[lab] = v
+        if col_spec(spec)[0] is not None:
+            methods[lab] = v
+    pos = int(np.clip(pos, 0, stack_n - 1))
+
+    first = next(iter(cols.values()))
+    sl = int(first.slice_index[pos])
+    ref_s = first.ref[pos]
+    organ = first.organ[pos] if first.organ is not None else anatomy_mask(ref_s)
+
+    vmax = window(ref_s, organ)
+    if crop:
+        c0, r0, W = fov_box(ref_s)
+        cut = lambda a: a[r0:r0 + W, c0:c0 + W]
+    else:
+        W, cut = min(ref_s.shape), (lambda a: a)
+
+    return dict(
+        vol=vol, pos=pos, sl=sl, W=W, vmax=vmax,
+        ref=cut(ref_s), organ=cut(organ),
+        cols={k: cut(v.img[pos]) for k, v in cols.items()},
+        methods={k: cut(v.img[pos]) for k, v in methods.items()},
+        stored={k: {m: vals[pos] for m, vals in v.metrics.items()}
+                for k, v in methods.items()},
+        masked={k: bool(v.attrs.get("use_organ_mask", False)) for k, v in methods.items()},
+        n=stack_n,
+    )
+
+
+def zoom_window(a, zoom):
+    """The ZOOM_W x ZOOM_H source window at `zoom` = (c0, r0)."""
+    c0, r0 = zoom
+    return a[r0:r0 + ZOOM_H, c0:c0 + ZOOM_W]
+
+
+def zoom_pair(view, lab, zoom):
+    """(magnified image, |residual|) for column `lab` inside the zoom box, as
+    RGB uint8 arrays at SOURCE resolution -- the two insets that sit under
+    each panel of the figure. The image uses the row's window and gamma; the
+    residual |ref - x| is linear, windowed at vmax / RESID_GAIN and colour
+    mapped, exactly as the full residual panels are.
+    """
+    img = zoom_window(view["cols"][lab], zoom)
+    ref = zoom_window(view["ref"], zoom)
+    g = to8(img, view["vmax"])
+    left = np.repeat(g[..., None], 3, axis=2)
+    a = np.clip(np.abs(ref - img) / max(view["vmax"] / RESID_GAIN, 1e-12), 0, 1)
+    right = (apply_cmap(a, RESID_CMAP) if RESID_CMAP
+             else np.repeat((a * 255 + 0.5).astype(np.uint8)[..., None], 3, axis=2))
+    return left, right
+
+
 def pretty(name):
     """`file_brain_AXT2_201_2010294` -> something that fits a status line."""
     return re.sub(r"^file_", "", name)
+
+
+# ---------------------------------------------------------------------------
+# Switching configs at run time (figures/webviewer.py's dataset menu)
+# ---------------------------------------------------------------------------
+# Every option a config may set, as this module defines it. A switch restores
+# these before applying the next config, so nothing one config set (a knee
+# BRIGHTNESS, say) leaks into the next.
+_DEFAULTS = {k: globals()[k] for k in CONFIGURABLE}
+_DEFAULTS["VARIANT"] = None
+
+
+def reset():
+    """Every configurable option back to its default, and the dump cache dropped.
+
+    The cache is keyed by (column spec, volume), and the same run name exists
+    under several DUMP_ROOTs (lpdsnet_R8 for brain AND knee), so it must not
+    outlive the config that filled it.
+    """
+    import copy
+    for k, v in _DEFAULTS.items():
+        globals()[k] = copy.deepcopy(v)
+    _CACHE.clear()
+
+
+def list_configs(config_dir=None):
+    """Every config under `config_dir` (default figures/configs), with what it can show.
+
+    Returns dicts: path, name (its VARIANT), n_volumes, columns (labels whose
+    dumps exist), error (why it cannot be opened, else None). Leaves the module
+    reset -- the caller applies whichever it wants.
+    """
+    import contextlib
+    import glob
+    import io
+
+    config_dir = config_dir or os.path.join(HERE, "configs")
+    out = []
+    for path in sorted(glob.glob(os.path.join(config_dir, "*.py"))):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        entry = dict(path=path, name=stem, n_volumes=0, columns=[], error=None)
+        reset()
+        try:
+            # Configs name the runs they are missing on stderr; that is noise here.
+            with contextlib.redirect_stderr(io.StringIO()):
+                apply_config(path)
+            entry["name"] = variant()
+            entry["n_volumes"] = len(volumes())
+            entry["columns"] = [lab for lab, _ in COLUMNS]
+            if not entry["n_volumes"]:
+                entry["error"] = "no volume is dumped for every column"
+        except SystemExit as e:
+            entry["error"] = str(e).splitlines()[0]
+        except Exception as e:                     # noqa: BLE001 -- report, keep listing
+            entry["error"] = f"{type(e).__name__}: {e}"
+        out.append(entry)
+    reset()
+    return out
