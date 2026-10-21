@@ -39,8 +39,8 @@ Output
 ------
 `<run_dir>/eval_dump/<volume>.h5` by default, or mirrored under `--out`:
 
-    reference       (n, H, W) complex64   ground truth
-    recon           (n, H, W) complex64   network output
+    reference       (n, H, W) complex64   ground truth          } all three x organ_mask
+    recon           (n, H, W) complex64   network output        } (attr images_masked)
     zero_filled     (n, H, W) complex64   E^H y -- the artifact to be removed
     organ_mask      (n, H, W) uint8       coil-support anatomy mask
     sampling_mask   (n, H, W) uint8       k-space pattern
@@ -254,6 +254,7 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         "seed": int(args.seed),
         "scale_fac": float(val.get("scale_fac", 1.0) or 1.0),
         "use_organ_mask": bool(cfg.get("training", {}).get("use_organ_mask", False)),
+        "images_masked": bool(cfg["task"] == "recon"),
         "n_params": int(n_params),
         "step": int(step or 0),
         "metrics": list(metrics),
@@ -282,22 +283,28 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         gt, recon, metric_mask = adapter(model, batch, cfg, device, sigma, gen,
                                          extras=extras)
 
-        buf.setdefault("reference", []).append(_np(gt).astype(np.complex64))
-        buf.setdefault("recon", []).append(_np(recon).astype(np.complex64))
-        if "zero_filled" in extras:
-            buf.setdefault("zero_filled", []).append(
-                _np(extras["zero_filled"]).astype(np.complex64))
-        if "sampling_mask" in extras:
-            buf.setdefault("sampling_mask", []).append(
-                (np.abs(_np(extras["sampling_mask"])) > 0).astype(np.uint8))
         # The ANATOMY mask is taken from the batch, not from the adapter: the
         # adapter returns None for it whenever the run did not train with it,
         # but the viewer still wants it to crop the FOV and to window the
         # display. Whether it entered the metrics is a separate question, and
         # `use_organ_mask` in the attrs is what answers it.
+        organ = None
         if cfg["task"] == "recon" and len(batch) >= 4:
-            buf.setdefault("organ_mask", []).append(
-                (np.abs(_np(batch[3])) > 0).astype(np.uint8))
+            organ = (np.abs(_np(batch[3])) > 0).astype(np.uint8)
+            buf.setdefault("organ_mask", []).append(organ)
+        # Every stored IMAGE is masked to the anatomy (`images_masked` attr):
+        # what a network leaves in the background is not part of the problem,
+        # and the metrics below never see it. They are computed from the
+        # unmasked tensors with the metric mask, so this changes no number.
+        keep = (lambda a: a) if organ is None else (lambda a: a * organ)
+        buf.setdefault("reference", []).append(keep(_np(gt)).astype(np.complex64))
+        buf.setdefault("recon", []).append(keep(_np(recon)).astype(np.complex64))
+        if "zero_filled" in extras:
+            buf.setdefault("zero_filled", []).append(
+                keep(_np(extras["zero_filled"])).astype(np.complex64))
+        if "sampling_mask" in extras:
+            buf.setdefault("sampling_mask", []).append(
+                (np.abs(_np(extras["sampling_mask"])) > 0).astype(np.uint8))
         buf.setdefault("slice_index", []).append(np.int32(sl))
 
         for name, fn in metrics.items():

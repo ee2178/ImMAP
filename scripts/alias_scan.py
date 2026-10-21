@@ -96,12 +96,21 @@ def shifted(x, s, axis=1):
     return np.fft.ifft(np.fft.fft(x, axis=axis) * ph.reshape(shape), axis=axis).real
 
 
+_MASKED_WARNED = set()
+
+
 def scan_volume(dumps, vol, methods, target):
     """One row per (slice, method)."""
     rec = {}
     for m in methods:
         with h5py.File(os.path.join(dumps[m], vol + ".h5"), "r") as h:
             rec[m] = (np.abs(h["recon"][:]), h["nrmse_slice"][:])
+            if h.attrs.get("images_masked", False) and not _MASKED_WARNED:
+                _MASKED_WARNED.add(m)
+                print(f"warning: {dumps[m]}/{vol}.h5 stores organ-masked images "
+                      f"(dump_eval since 2026-10-21): `bg` is 0 by construction "
+                      f"and ghosts folding outside the mask are not seen",
+                      file=sys.stderr)
             if m == target:
                 ref = np.abs(h["reference"][:])
                 organ = h["organ_mask"][:] > 0

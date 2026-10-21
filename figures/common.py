@@ -75,13 +75,13 @@ RESID_CMAP = "inferno"    # residual colour scheme; None = grayscale
 CROP_FOV = True           # crop every column to one identical square FOV box
 CROP_PAD = 6              # padding around the foreground bounding box, px
 MASK_THRESH = 0.0         # anatomy mask is reference > THRESH * peak
-MASK_DISPLAY = "auto"     # draw every image multiplied by the organ mask?
-                          # "auto": when the dumps' metrics are organ-masked
-                          # (attr use_organ_mask; dump_eval --mask organ, the
-                          # default since 2026-10-20), so the picture shows the
-                          # pixels the numbers score. True / False force it.
-                          # Display only: the dumps keep the full image, which
-                          # the aliasing scan's background measures need.
+MASK_DISPLAY = True       # draw every image multiplied by the organ mask?
+                          # True (default since 2026-10-21): always, so older
+                          # dumps look like new ones, whose stored images are
+                          # already masked (attr images_masked). "auto": only
+                          # when the dumps' metrics are organ-masked (attr
+                          # use_organ_mask). False: never -- for a pre-10-21
+                          # dump this shows the background a net left behind.
 STATUS_METRIC = "psnr"    # which stored per-slice metric the viewer reports
 NAME = "default"          # output identity
 VARIANT = None            # input identity for rows/ and zooms/; None follows NAME

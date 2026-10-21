@@ -63,8 +63,10 @@ def build_trees(root):
             # astype: under NumPy 2, complex64 / np.float64 scalar is complex128,
             # which the loader passes through and upcasts the whole pipeline.
             # The real maps are complex64 (scripts/make_espirit_smaps.py).
-            f["smaps"] = (np.ones((n, NC, H, W), np.complex64)
-                          / np.sqrt(NC)).astype(np.complex64)
+            s = (np.ones((n, NC, H, W), np.complex64)
+                 / np.sqrt(NC)).astype(np.complex64)
+            s[:, :, :4, :] = s[:, :, -4:, :] = 0       # the organ mask's support
+            f["smaps"] = s
             img = rng.normal(0, 1, (n, H, W)).astype(np.float32)
             img[:, :4, :] = img[:, -4:, :] = 0.0       # a support to mask on
             f["image"] = (img + 0j).astype(np.complex64)
@@ -84,6 +86,17 @@ class StubNet(torch.nn.Module):
 
     def forward(self, y, E=None, sigma=None):
         return E.adjoint(y) * self.g, None
+
+
+class LeakyNet(StubNet):
+    """StubNet plus a constant in the background (the rows build_trees zeroes
+    in the maps), the anatomy untouched."""
+
+    def forward(self, y, E=None, sigma=None):
+        x, _ = super().forward(y, E, sigma)
+        leak = torch.zeros_like(x)
+        leak[..., :4, :] = leak[..., -4:, :] = 0.5
+        return x + leak, None
 
 
 def base_cfg(ks, sm):
@@ -229,6 +242,29 @@ def test_dump_run(ks, sm, tmp):
               and f.attrs["volume"] == "volA" and f.attrs["seed"] == 1234
               and bool(f.attrs["use_organ_mask"])
               and f.attrs["dump_version"] == de.DUMP_VERSION)
+        organ = f["organ_mask"][:] > 0
+        check("the fixture's organ mask has a background to mask",
+              organ.any() and not organ.all(), f"{organ.mean():.2f} inside")
+        stored_psnr = f["psnr_slice"][:]
+
+    # A net that leaves something in the background (E2E-VarNet, trained on a
+    # masked loss, does): the stored images must not keep it, the metrics --
+    # organ-masked -- must not see it either way.
+    dest4 = os.path.join(tmp, "dumped_leaky", "stub", "eval_dump")
+    de.dump_run("trained_nets/stub", cfg, LeakyNet(), 1, 10, args,
+                ["volA", "volC"], metrics, 0.05, dest4)
+    with h5py.File(os.path.join(dest4, "volA.h5")) as f:
+        organ = f["organ_mask"][:] > 0
+        check("every stored image is zero outside the organ mask",
+              bool(f.attrs["images_masked"])
+              and all(not np.abs(f[k][:][~organ]).any()
+                      for k in ("reference", "recon", "zero_filled")))
+        check("... and not blanked inside it",
+              all(np.abs(f[k][:][organ]).mean() > 0
+                  for k in ("reference", "recon", "zero_filled")))
+        check("a background leak changes no stored metric",
+              np.allclose(f["psnr_slice"][:], stored_psnr),
+              f"{f['psnr_slice'][:]} vs {stored_psnr}")
 
     # Same seed, same noise: this is the property that lets two runs be
     # compared pixel for pixel rather than just on average.
