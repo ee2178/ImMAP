@@ -181,9 +181,14 @@ def mg_levels(tr, out_e, gt, organ, kws):
         npz[f"mg/gt/l{l}"] = g[0, 0].cpu().numpy().astype(np.complex64)
         npz[f"mg/organ/l{l}"] = m[0, 0].real.cpu().numpy().astype(np.float32)
         for o in tr.outers:
-            x = _as_complex(tr.get(o, l, "x_out"))
-            if x is not None:
-                npz[f"mg/x/o{o}/l{l}"] = (x + dc)[0, 0].cpu().numpy().astype(np.complex64)
+            # x_out -> mg/x (the decoder side); the other V-cycle stages as
+            # mg/xin (entering the level), mg/xpre (pre-smoothed, restricted
+            # next), mg/xcorr (coarse-corrected, post-smoothed next)
+            for key, name in (("x_out", "x"), ("x", "xin"), ("x_pre", "xpre"),
+                              ("x_corr", "xcorr")):
+                x = _as_complex(tr.get(o, l, key))
+                if x is not None:
+                    npz[f"mg/{name}/o{o}/l{l}"] = (x + dc)[0, 0].cpu().numpy().astype(np.complex64)
             d = _as_complex(tr.get(o, l, "coarse_delta_x"))
             if d is not None:      # a difference: no DC; lives on level l+1's grid
                 npz[f"mg/delta/o{o}/l{l + 1}"] = d[0, 0].cpu().numpy().astype(np.complex64)
@@ -264,6 +269,12 @@ def load_npz(path):
 # ---------------------------------------------------------------------------
 # figures (numpy + matplotlib only) -- each returns its Figure
 # ---------------------------------------------------------------------------
+# "nearest" shows raw pixels but ALIASES whenever a panel has fewer screen pixels
+# than the image (a 640x372 slice in a 3-inch panel): edges turn jagged and
+# blocky. "antialiased" filters when shrinking and stays sharp when enlarging.
+INTERP = "antialiased"
+
+
 def _flip(a, how):
     return a[::-1 if how in ("ud", "both") else 1, ::-1 if how in ("lr", "both") else 1]
 
@@ -329,7 +340,7 @@ def fig_levels(z, meta, outer=-1, flip=None, resid_gain=5.0, panel=3.2):
                        color="0.5", transform=a.transAxes)
                 a.set_frame_on(False)
                 continue
-            a.imshow(F(im), cmap=cmap, vmin=0, vmax=vm, interpolation="nearest")
+            a.imshow(F(im), cmap=cmap, vmin=0, vmax=vm, interpolation=INTERP)
         ax[0][j].set_title(f"level {l}  {g.shape[0]}x{g.shape[1]}\n"
                            f"NRMSE vs R^l(gt) {100 * nrmse(x, g):.1f}%", fontsize=10)
     for i, r in enumerate(rows):
@@ -358,7 +369,7 @@ def fig_outers(z, meta, flip=None, panel=2.4):
             k = f"mg/x/o{o}/l{l}"
             if k not in z:
                 continue
-            a.imshow(F(np.abs(z[k])), cmap="gray", vmin=0, vmax=vmax, interpolation="nearest")
+            a.imshow(F(np.abs(z[k])), cmap="gray", vmin=0, vmax=vmax, interpolation=INTERP)
             a.set_title(f"{100 * nrmse(z[k], g):.1f}%", fontsize=9)
         ax[i][0].set_ylabel(f"level {l}", fontsize=11)
     for j, o in enumerate(outers):
@@ -387,11 +398,11 @@ def fig_unet(z, meta, flip=None, panel=3.2):
         pc, var = pc1(f)
         a = ax[0][j]; a.set_xticks([]); a.set_yticks([])
         a.imshow(F(rms), cmap="gray", vmin=0, vmax=float(np.percentile(rms, 99.5)) or 1.0,
-                 interpolation="nearest")
+                 interpolation=INTERP)
         a.set_title(f"{f.shape[0]} channels  {f.shape[1]}x{f.shape[2]}", fontsize=10)
         v = float(np.percentile(np.abs(pc), 99.5)) or 1.0
         a = ax[1][j]; a.set_xticks([]); a.set_yticks([])
-        a.imshow(F(pc), cmap="RdBu_r", vmin=-v, vmax=v, interpolation="nearest")
+        a.imshow(F(pc), cmap="RdBu_r", vmin=-v, vmax=v, interpolation=INTERP)
         a.set_xlabel(f"PC1 explains {100 * var:.0f}% of channel variance", fontsize=9)
     ax[0][0].set_ylabel("channel RMS", fontsize=11)
     ax[1][0].set_ylabel("1st principal comp.", fontsize=11)
@@ -399,6 +410,92 @@ def fig_unet(z, meta, flip=None, panel=3.2):
                  f"of cascade {meta['cascade'] + 1}/{meta['n_cascades']}, coarse -> fine "
                  f"-- feature channels, not images", fontsize=10)
     fig.tight_layout()
+    return fig
+
+
+def crop_box(z, meta, flip=None, pad=8):
+    """(r0, r1, c0, c1) on the finest DISPLAYED grid around the anatomy (the
+    organ mask), padded and snapped to whole coarsest-grid pixels, so
+    `a[r0 // 2**l : r1 // 2**l, ...]` is the same region at every level."""
+    flip = default_flip(meta) if flip is None else flip
+    m = _flip(z["mg/organ/l0"], flip) > 0.5 if flip else z["mg/organ/l0"] > 0.5
+    H, W = m.shape
+    top = 2 ** max(meta["levels"])
+    if not m.any():
+        return 0, H, 0, W
+    rr, cc = np.where(m.any(1))[0], np.where(m.any(0))[0]
+    snap_lo = lambda v: max(v - pad, 0) // top * top
+    snap_hi = lambda v, n: min(-(-(v + 1 + pad) // top) * top, n)
+    return snap_lo(rr[0]), snap_hi(rr[-1], H), snap_lo(cc[0]), snap_hi(cc[-1], W)
+
+
+def vcycle_stages(meta):
+    """The V-cycle in time order as (level, key, label): down the left arm,
+    the coarsest solve, back up the right arm."""
+    L = max(meta["levels"])
+    seq = []
+    for l in range(L):
+        seq += [(l, "xin", "enters" if l == 0 else "restricted down"),
+                (l, "xpre", "pre-smoothed")]
+    seq += [(L, "xin", "restricted down"), (L, "x", "coarsest solve")]
+    for l in range(L - 1, -1, -1):
+        seq += [(l, "xcorr", "+ coarse correction"), (l, "x", "post-smoothed")]
+    return seq
+
+
+def fig_vcycle(z, meta, outer=-1, show="x", flip=None, crop=True, pad=8,
+               panel=2.0, resid_gain=5.0, dpi=None):
+    """One V-cycle drawn as a V: a row per level (finest on top), time left to
+    right -- enter, pre-smooth, restrict down, ..., coarsest solve, ..., coarse
+    correction, post-smooth. `show` = "x" (the iterate) or "resid"
+    (|x - R^l gt|). Yellow: NRMSE vs R^l(gt), whole frame. Windows are per
+    level, shared along the row."""
+    import matplotlib.pyplot as plt
+    flip = default_flip(meta) if flip is None else flip
+    F = (lambda a: _flip(a, flip)) if flip else (lambda a: a)
+    r0, r1, c0, c1 = crop_box(z, meta, flip, pad) if crop else (0, None, 0, None)
+    cut = lambda a, l: F(a)[r0 // 2 ** l:(None if r1 is None else r1 // 2 ** l),
+                            c0 // 2 ** l:(None if c1 is None else c1 // 2 ** l)]
+    o = meta["outers"][outer]
+    levels = sorted(meta["levels"])
+    seq = vcycle_stages(meta)
+    g0 = cut(z["mg/gt/l0"], 0)
+    aspect = g0.shape[0] / g0.shape[1]
+    fig, ax = plt.subplots(len(levels), len(seq), squeeze=False, dpi=dpi,
+                           figsize=(panel * len(seq) + 0.8, panel * aspect * len(levels) + 1.0),
+                           gridspec_kw=dict(wspace=0.04, hspace=0.18))
+    for a in ax.ravel():
+        a.set_axis_off()
+    vmax = {l: float(np.percentile(np.abs(cut(z[f"mg/gt/l{l}"], l)), 99.5)) or 1.0
+            for l in levels}
+    for j, (l, key, label) in enumerate(seq):
+        a = ax[levels.index(l)][j]
+        a.set_axis_on(); a.set_xticks([]); a.set_yticks([])
+        k = f"mg/{key}/o{o}/l{l}"
+        if k not in z:                      # the cold start: x = y~ is set inside
+            a.text(.5, .5, "cold start\n(x = y~)", ha="center", va="center",
+                   color="0.5", transform=a.transAxes, fontsize=8)
+        else:
+            x, g = z[k], z[f"mg/gt/l{l}"]
+            if show == "resid":
+                im = np.abs(np.abs(x) - np.abs(g))
+                a.imshow(cut(im, l), cmap="inferno", vmin=0, vmax=vmax[l] / resid_gain,
+                         interpolation=INTERP)
+            else:
+                a.imshow(cut(np.abs(x), l), cmap="gray", vmin=0, vmax=vmax[l],
+                         interpolation=INTERP)
+            a.text(0.03, 0.97, f"{100 * nrmse(x, g):.1f}%", transform=a.transAxes,
+                   ha="left", va="top", fontsize=7, color="yellow")
+        a.set_title(f"{j + 1}. {label}", fontsize=8)
+    for i, l in enumerate(levels):
+        g = z[f"mg/gt/l{l}"]
+        ax[i][0].set_axis_on(); ax[i][0].set_xticks([]); ax[i][0].set_yticks([])
+        ax[i][0].set_frame_on(False)
+        ax[i][0].set_ylabel(f"level {l}\n{g.shape[0]}x{g.shape[1]}", fontsize=9)
+    fig.suptitle(f"{meta['run']}  {meta['volume']} slice {meta['slice']}: V-cycle "
+                 f"{o + 1}/{len(meta['outers'])}, every branch "
+                 f"({'|x - R^l gt|' if show == 'resid' else 'x_l'}"
+                 f"{', cropped' if crop else ''}; yellow = NRMSE vs R^l(gt))", fontsize=10)
     return fig
 
 

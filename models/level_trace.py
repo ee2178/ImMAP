@@ -30,6 +30,9 @@ Per (outer, level), whichever of these exist for that family:
 
     x, z                incoming iterate at that level     (None on the cold
                         start, where the layer sets x = y~ itself)
+    x_pre, z_pre        after the PRE-smoother: what is restricted down
+    x_corr, z_corr      after the coarse correction: what the POST-smoother
+                        starts from              (these two: MGLPDSNet only)
     x_out, z_out        outgoing iterate at that level
     x_c, z_c            what the level BELOW receives (= R x, widen_z R z)
     pi_x, pi_z          the FAS correction formed for the level below
@@ -195,6 +198,30 @@ def trace_forward(net, *args, **kwargs):
                 if i < len(out) and torch.is_tensor(out[i]):
                     d[name] = out[i].detach()
 
+    # The two states INSIDE a level that the V-cycle's own in/out hooks miss:
+    # after the pre-smoother (what gets restricted down) and after the coarse
+    # correction (what the post-smoother starts from). Primal-dual family only:
+    # its smoothers are the `lpdsA` / `lpdsB` stacks.
+    def smoothed(level):
+        def hook(mod, args_, out):
+            x, z = _as_state(out[0] if isinstance(out, tuple) else out)
+            d = slot(level)
+            if x is not None:
+                d["x_pre"] = x.detach()
+            if z is not None:
+                d["z_pre"] = z.detach()
+        return hook
+
+    def corrected(level):
+        def hook(mod, args_):
+            x, z = _as_state(args_[0])
+            d = slot(level)
+            if x is not None:
+                d["x_corr"] = x.detach()
+            if z is not None:
+                d["z_corr"] = z.detach()
+        return hook
+
     def leaf_pre(mod, args_):
         x, z = _as_state(args_[0])
         d = slot(maxd + 1)
@@ -215,6 +242,9 @@ def trace_forward(net, *args, **kwargs):
         for v in vcs:
             handles.append(v.register_forward_pre_hook(pre))
             handles.append(v.register_forward_hook(post))
+            if hasattr(v, "lpdsA") and hasattr(v, "lpdsB"):
+                handles.append(v.lpdsA.register_forward_hook(smoothed(lvl[id(v)])))
+                handles.append(v.lpdsB.register_forward_pre_hook(corrected(lvl[id(v)])))
             df = getattr(v, "dF", None)
             if isinstance(df, df_cls):
                 df._trace_level = lvl[id(v)]
