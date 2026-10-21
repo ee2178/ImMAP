@@ -360,7 +360,10 @@ def load(spec, volume):
 # written before then lack them and are skipped by the `k in both` test -- but
 # they record acs_lines=20, which a measured dump (-1) still contradicts.
 COMPARABLE = ("sigma", "R", "seed", "anatomy", "acs_lines", "mask_dist",
-              "center_frac", "adjust_accel", "kspace_type", "online_smaps")
+              "center_frac", "adjust_accel", "kspace_type", "online_smaps",
+              # NYUMets (scripts/dump_eval_nyumets.py): which intensity units the images and
+              # metrics are in, and which way the stored slices are turned
+              "intensity_units", "display_orient")
 
 
 def check_comparable(volume):

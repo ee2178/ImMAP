@@ -56,9 +56,9 @@ ANATOMIES=(brain knee)
 
 # Substring filters on the run path, passed to --only. The trailing underscore
 # keeps `lpdsnet_` from also selecting a future cell whose name contains it.
-# `mglpds_` is brain's MGLPDS-Big stopgap until a full-length brain mg169v6
-# exists (see torch/main_eval.sbatch); knee has no such run, so it matches nothing.
-ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ mglpds_ varnetmaps_}"
+# MGLPDS-Big is mg169v6 for both anatomies (brain's `mglpds` stopgap retired
+# 2026-10-21); ONLY="... mglpds_" still dumps it.
+ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ varnetmaps_}"
 # EXACT=1: the ONLY entries are run directory NAMES, matched exactly, so a cell
 # is dumped without its tagged probes (<cell>_500ep, <cell>_prof, ...):
 #   EXACT=1 ONLY="varnetmaps_R12 lpdsnet_R12 mg81v6_R12" sbatch --array=0 ...

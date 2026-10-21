@@ -19,18 +19,17 @@
 # PSNR, SSIM, NRMSE, LPIPS on every val volume, for the significance tests in
 # scripts/wilcoxon_main.py. One array task per RUN:
 #
-#    0- 3  brain R8   varnetmaps lpdsnet mg81v6 mglpds
-#    4- 7  brain R12  varnetmaps lpdsnet mg81v6 mglpds
+#    0- 3  brain R8   varnetmaps lpdsnet mg81v6 mg169v6
+#    4- 7  brain R12  varnetmaps lpdsnet mg81v6 mg169v6
 #    8-11  knee  R8   varnetmaps lpdsnet mg81v6 mg169v6
 #   12-15  knee  R12  varnetmaps lpdsnet mg81v6 mg169v6
 #
-# BRAIN'S MGLPDS-Big IS A STOPGAP: the saved `mglpds` run, until a full-length
-# brain mg169v6 has trained. Same width (M=169) and the same V-cycle; it differs
-# only in computational choices (Galerkin coarse Gram, Gauss complex conv) that
-# do not change what the net can represent. Knee's is `mg169v6`. The run is
-# found under either name -- `mglpds_R<r>`, or `mg169v6_R<r>` carrying
-# RENAMED_FROM_mglpds.txt (the rename of 2026-10-16) -- and a task whose run
-# cannot be found FAILS rather than exiting clean with nothing scored. Slices: each run's training range (brain 0:8, knee 12:25).
+# MGLPDS-Big is `mg169v6` for both anatomies (brain's full-length runs finished
+# 2026-10-21; until then brain used the `mglpds` run as a stopgap). A directory
+# carrying RENAMED_FROM_mglpds.txt is that stopgap renamed, NOT a trained
+# mg169v6, and is refused (STOPGAP_OK=1 scores it anyway). A task whose run
+# cannot be found FAILS rather than exiting clean with nothing scored.
+# Slices: each run's training range (brain 0:8, knee 12:25).
 #
 # BEFORE THE FIRST SUBMIT, on a LOGIN node (compute nodes have no route out, and
 # LPIPS needs pretrained AlexNet weights in ~/.cache/torch):
@@ -70,18 +69,21 @@
 # all the plots and tests read) and:
 #   python figures/plot_main_bars.py
 #   python scripts/wilcoxon_main.py --ref MGLPDS-Big
+#
+# NEW RUNS ONLY (e.g. brain MGLPDS-Big, 2026-10-21) -- the others resume as done:
+#   VAL_KSPACE=measurement_awgn sbatch --array=3,7 torch/main_eval.sbatch
 
 RUNS=(
-    brain/varnetmaps_R8  brain/lpdsnet_R8  brain/mg81v6_R8  brain/mglpds_R8
-    brain/varnetmaps_R12 brain/lpdsnet_R12 brain/mg81v6_R12 brain/mglpds_R12
+    brain/varnetmaps_R8  brain/lpdsnet_R8  brain/mg81v6_R8  brain/mg169v6_R8
+    brain/varnetmaps_R12 brain/lpdsnet_R12 brain/mg81v6_R12 brain/mg169v6_R12
     knee/varnetmaps_R8   knee/lpdsnet_R8   knee/mg81v6_R8   knee/mg169v6_R8
     knee/varnetmaps_R12  knee/lpdsnet_R12  knee/mg81v6_R12  knee/mg169v6_R12
 )
 # Rediscretized multigrid runs LAUNCHED BEFORE 2026-10-07 trained with the
 # Galerkin coarse operator on slice sizes that do not divide by the stride
 # (operators/coarse.py); they must be evaluated the same way. Of the runs above
-# that is brain mg81v6_R12 (exp9, 2026-10-02). `mglpds` is Galerkin throughout;
-# the knee runs and brain mg81v6_R8 were launched after the change.
+# that is brain mg81v6_R12 (exp9, 2026-10-02). The knee runs, brain mg81v6_R8
+# and brain mg169v6 were launched after the change.
 EMBEDDED_OFF="${EMBEDDED_OFF:-brain/mg81v6_R12}"
 
 METRICS="${METRICS:-psnr ssim nrmse lpips}"
@@ -122,14 +124,11 @@ ENTRY="${RUNS[${SLURM_ARRAY_TASK_ID}]}"
 ANATOMY="${ENTRY%%/*}"
 RUN="${ENTRY#*/}"
 
-# The brain stopgap under its renamed directory (see BRAIN'S MGLPDS-Big above).
 RUNS_ROOT="trained_nets/mg_recon"
-if [ ! -d "${RUNS_ROOT}/${ANATOMY}/${RUN}" ] && [ "${RUN%_R*}" = "mglpds" ]; then
-    _alt="mg169v6_R${RUN##*_R}"
-    if [ -f "${RUNS_ROOT}/${ANATOMY}/${_alt}/RENAMED_FROM_mglpds.txt" ]; then
-        echo "[eval] ${ENTRY}: using ${ANATOMY}/${_alt}, the renamed mglpds run (stopgap)"
-        RUN="${_alt}"
-    fi
+# The renamed brain stopgap (see MGLPDS-Big above) must not pass for the real run.
+if [ -f "${RUNS_ROOT}/${ANATOMY}/${RUN}/RENAMED_FROM_mglpds.txt" ] && [ "${STOPGAP_OK:-0}" != "1" ]; then
+    echo "[eval] ${RUNS_ROOT}/${ANATOMY}/${RUN} is the renamed mglpds stopgap"          "(RENAMED_FROM_mglpds.txt), not a trained mg169v6 -- move it aside, or"          "STOPGAP_OK=1 to score it anyway" >&2
+    exit 1
 fi
 if [ ! -f "${RUNS_ROOT}/${ANATOMY}/${RUN}/config.json" ] \
         || [ ! -f "${RUNS_ROOT}/${ANATOMY}/${RUN}/net.ckpt" ]; then

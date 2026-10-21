@@ -79,8 +79,9 @@ from evaluation.tasks import (build_adapter, default_sigma, force_organ_mask,  #
                               metric_mask_source, val_kspace_type)
 
 # Display names of the main comparison. Keyed by CELL (the run name without
-# its _R<r> suffix). Brain's MGLPDS-Big is the full-length `mglpds` run (Galerkin
-# coarse Gram); knee's is `mg169v6`. A run not listed keeps its cell name.
+# its _R<r> suffix). MGLPDS-Big is `mg169v6`; `mglpds` was brain's stopgap until
+# 2026-10-21, and where both are present the plots keep mg169v6
+# (wilcoxon_main.PREFERRED_CELLS). A run not listed keeps its cell name.
 LABELS = {
     "varnetmaps": "E2E-VarNet",
     "lpdsnet": "LPDSNet",
