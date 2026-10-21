@@ -55,8 +55,11 @@ _pb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pb)
 load, holm, HIGHER_IS_BETTER, ORDER = _pb.load, _pb.holm, _pb.HIGHER_IS_BETTER, _pb.ORDER
 
-HEAD = {"psnr": ("PSNR (dB)", 2), "ssim": ("SSIM", 4), "nrmse": ("NRMSE", 4),
-        "lpips": ("LPIPS", 4)}
+# metric -> (column label, decimals, display scale). SSIM and NRMSE are shown as
+# PERCENTAGES (x100, 2 decimals): 0.8661 +- 0.0014 reads as 86.61 +- 0.14, the
+# same digits without the leading zeros. The CSV keeps the raw values.
+HEAD = {"psnr": ("PSNR (dB)", 2, 1), "ssim": ("SSIM (%)", 2, 100),
+        "nrmse": ("NRMSE (%)", 2, 100), "lpips": ("LPIPS", 4, 1)}
 DEFAULT_NETS = ["E2E-VarNet", "LPDSNet", "MGLPDS-Small"]
 DEFAULT_RENAME = ["MGLPDS-Small=MGLPDS"]
 
@@ -125,8 +128,8 @@ def main():
         blocks.append((g, nets, cells, ns))
 
     def entry(c, m, tex):
-        dec = HEAD[m][1]
-        mu, se = f"{c['mean']:.{dec}f}", f"{c['se']:.{dec}f}"
+        _, dec, k = HEAD[m]
+        mu, se = f"{k * c['mean']:.{dec}f}", f"{k * c['se']:.{dec}f}"
         star = c["p_holm"] is not None and c["p_holm"] < a.alpha
         if tex:
             mu = f"\\mathbf{{{mu}}}" if c["best"] else mu
@@ -145,7 +148,8 @@ def main():
          "% Needs \\usepackage{booktabs}.",
          f"% Caption text: {note}",
          "\\begin{tabular}{l" + "c" * len(metrics) + "}", "\\toprule",
-         "Method & " + " & ".join(f"{HEAD[m][0]} {tarrow[m]}" for m in metrics) + " \\\\"]
+         "Method & " + " & ".join(f"{HEAD[m][0].replace('%', chr(92) + '%')} {tarrow[m]}"
+                                 for m in metrics) + " \\\\"]
     for g, nets, cells, ns in blocks:
         nlab = "/".join(str(n) for n in sorted(ns))
         L += ["\\midrule",

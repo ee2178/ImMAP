@@ -73,12 +73,23 @@
 # NEW RUNS ONLY (e.g. brain MGLPDS-Big, 2026-10-21) -- the others resume as done:
 #   VAL_KSPACE=measurement_awgn sbatch --array=3,7 torch/main_eval.sbatch
 
+# OTHER RUN SETS (e.g. the exp14 knee ablations): RUNS="<anatomy>/<run> ..."
+# replaces the list below -- one array task per entry, in the order given -- and
+# OUT keeps their results out of the main table's tree:
+#   RUNS="knee/mg81v6_R8 knee/mg100v6_R8 knee/mg121v6_R8 knee/mg144v6_R8 knee/mg169v6_R8 knee/mg81v2_R8 knee/mg81v4_R8" \
+#   OUT=results/ablation_knee_R8 VAL_KSPACE=measurement_awgn sbatch --array=0-6 torch/main_eval.sbatch
+# Runs already scored in another tree are scored again here (same seed, same
+# numbers), so the ablation tree is complete on its own.
+_RUNS_GIVEN="${RUNS:-}"
 RUNS=(
     brain/varnetmaps_R8  brain/lpdsnet_R8  brain/mg81v6_R8  brain/mg169v6_R8
     brain/varnetmaps_R12 brain/lpdsnet_R12 brain/mg81v6_R12 brain/mg169v6_R12
     knee/varnetmaps_R8   knee/lpdsnet_R8   knee/mg81v6_R8   knee/mg169v6_R8
     knee/varnetmaps_R12  knee/lpdsnet_R12  knee/mg81v6_R12  knee/mg169v6_R12
 )
+if [ -n "${_RUNS_GIVEN}" ]; then
+    read -r -a RUNS <<< "${_RUNS_GIVEN}"
+fi
 # Rediscretized multigrid runs LAUNCHED BEFORE 2026-10-07 trained with the
 # Galerkin coarse operator on slice sizes that do not divide by the stride
 # (operators/coarse.py); they must be evaluated the same way. Of the runs above

@@ -603,6 +603,23 @@ MODELS.update({
 EXP9_CELLS = tuple(f"mg{m}v6" for m in EXP9_M)
 
 # ---------------------------------------------------------------------------
+#  EXP14: knee R=8 ablations, full length (2026-10-21)
+#
+#  Width: M = 81, 100, 121, 144, 169 at K=[6,[4,4,6]] (81 and 169 are exp11's
+#  MGLPDS-Small / -Big). Depth: V = 2, 4, 6 at M=81. Every cell but mg144v6 is
+#  already defined above (exp8 / exp9); M=144 (12^2) fills the 121-169 gap.
+#  Identical to the exp8 cells otherwise. Launcher: torch/exp14_knee_ablation.sbatch.
+# ---------------------------------------------------------------------------
+EXP14_M = (144,)
+MODELS.update({
+    f"mg{m}v6": dict(type="MGLPDSNet",
+                     params=dict(LPDS_COMMON, M=m, K=[6, list(EXP8_ITERS)], **_EXP8),
+                     training=dict(_EXP8_TRAINING))
+    for m in EXP14_M
+})
+EXP14_CELLS = tuple(f"mg{m}v6" for m in EXP14_M)
+
+# ---------------------------------------------------------------------------
 #  EXP12: the GROUP twins of the main comparison's two multigrid cells
 #  (2026-10-08).
 #
@@ -694,7 +711,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
-          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP12_CELLS + ("ram", "ramdrunet")
+          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet")
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.

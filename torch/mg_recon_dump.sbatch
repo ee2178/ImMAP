@@ -58,6 +58,7 @@ ANATOMIES=(brain knee)
 # keeps `lpdsnet_` from also selecting a future cell whose name contains it.
 # MGLPDS-Big is mg169v6 for both anatomies (brain's `mglpds` stopgap retired
 # 2026-10-21); ONLY="... mglpds_" still dumps it.
+_ONLY_GIVEN="${ONLY:+1}"
 ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ varnetmaps_}"
 # EXACT=1: the ONLY entries are run directory NAMES, matched exactly, so a cell
 # is dumped without its tagged probes (<cell>_500ep, <cell>_prof, ...):
@@ -77,6 +78,20 @@ SLICES=("0:8" "12:25")
 # so 40 knee volumes is about the same number of slices. N_VOLUMES=<n>
 # overrides both; N_VOLUMES=0 dumps EVERY volume in the val split.
 NVOLS=(60 40)
+# VOLUMES: explicit volume names (no .h5), dumped INSTEAD of the first N --
+# e.g. the picks of scripts/rank_slices.py. Run one anatomy per submit:
+#   VOLUMES="file1001506 file1001122" EXACT=1 ONLY="..." sbatch --array=1 ...
+VOLUMES="${VOLUMES:-}"
+# PICKS_DIR: dump the volumes listed in <PICKS_DIR>/<anatomy>.txt (one name per
+# line, as scripts/rank_slices.py --pick writes them) -- the interesting ones,
+# APPENDED to the existing dumps: each volume is its own <volume>.h5, so the
+# first-N files already in eval_dump/ are left alone (a listed volume that is
+# already there is rewritten). Unless ONLY is given, this dumps exactly the
+# main comparison's eight runs (EXACT), not the cells' tagged probes:
+#   PICKS_DIR=results/picks sbatch torch/mg_recon_dump.sbatch
+# The picked volumes get their own noise draw (the generator restarts per run
+# over the listed volumes), the same for every run, so columns stay comparable.
+PICKS_DIR="${PICKS_DIR:-}"
 
 # LPIPS is IN by default since 2026-10-20 (organ-masked like the rest: the
 # background is zeroed in both images, evaluation/metrics.py::lpips). It needs
@@ -144,6 +159,21 @@ SLICE_RANGE="${SLICES[${SLURM_ARRAY_TASK_ID}]}"
 N_VOLUMES="${N_VOLUMES:-${NVOLS[${SLURM_ARRAY_TASK_ID}]}}"
 RUNS_ROOT="trained_nets/mg_recon/${ANATOMY}"
 
+if [ -n "${PICKS_DIR}" ]; then
+    _picks="${PICKS_DIR}/${ANATOMY}.txt"
+    if [ ! -s "${_picks}" ]; then
+        echo "[dump] PICKS_DIR=${PICKS_DIR}: no ${_picks} -- run" \
+             "scripts/rank_slices.py --from-csv results/main/slices.csv --pick ${PICKS_DIR}" >&2
+        exit 1
+    fi
+    VOLUMES="$(grep -v '^[[:space:]]*\(#\|$\)' "${_picks}" | tr -d '\r' | tr '\n' ' ')"
+    if [ -z "${_ONLY_GIVEN}" ]; then
+        ONLY="varnetmaps_R8 lpdsnet_R8 mg81v6_R8 mg169v6_R8 varnetmaps_R12 lpdsnet_R12 mg81v6_R12 mg169v6_R12"
+        EXACT=1
+    fi
+    echo "[dump] ${ANATOMY}: $(wc -w <<< "${VOLUMES}") picked volumes from ${_picks}"
+fi
+
 if [ ! -d "${RUNS_ROOT}" ]; then
     echo "[dump] ${RUNS_ROOT} does not exist -- nothing has been trained for" \
          "${ANATOMY} yet, or the repo root is wrong (IMMAP_ROOT=${IMMAP_ROOT})." >&2
@@ -151,7 +181,7 @@ if [ ! -d "${RUNS_ROOT}" ]; then
 fi
 
 echo "[dump] ${ANATOMY}: runs=${RUNS_ROOT} only='${ONLY}' slices=${SLICE_RANGE}" \
-     "volumes=${N_VOLUMES} metrics='${METRICS}' seed=${SEED}"
+     "volumes=${VOLUMES:-first ${N_VOLUMES}} metrics='${METRICS}' seed=${SEED}"
 echo "[dump] $(date '+%F %T')  node=$(hostname)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
@@ -160,6 +190,7 @@ python scripts/dump_eval.py \
     --only ${ONLY} ${EXACT:+--exact} \
     --slices "${SLICE_RANGE}" \
     --n-volumes "${N_VOLUMES}" \
+    ${VOLUMES:+--volumes ${VOLUMES}} \
     --metrics ${METRICS} \
     --seed "${SEED}" \
     --workers "${WORKERS}" \
