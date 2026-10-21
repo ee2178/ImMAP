@@ -20,6 +20,9 @@
 #   sbatch torch/mg_recon_dump.sbatch                 # brain and knee
 #   sbatch --array=0 torch/mg_recon_dump.sbatch       # brain only
 #
+# LPIPS is computed by default: download its weights once on a login node
+# first (see METRICS below).
+#
 # One array task per ANATOMY; each dumps every run matching ONLY, so a single
 # task covers that anatomy's R=4 and R=8 cells (R comes from each run's own
 # config, not from here). Output lands in
@@ -75,9 +78,16 @@ SLICES=("0:8" "12:25")
 # overrides both; N_VOLUMES=0 dumps EVERY volume in the val split.
 NVOLS=(60 40)
 
-METRICS="${METRICS:-psnr ssim nrmse}"   # lpips is deliberately absent: it
-                                        # downloads weights on first use, and a
-                                        # compute node has no route out
+# LPIPS is IN by default since 2026-10-20 (organ-masked like the rest: the
+# background is zeroed in both images, evaluation/metrics.py::lpips). It needs
+# pretrained AlexNet weights, and a compute node has no route out, so download
+# them ONCE on a LOGIN node (they cache under ~/.cache/torch, which compute
+# nodes share):
+#     conda activate gcdl
+#     python -c "from evaluation.metrics import warm_up; warm_up(['lpips'], 'cpu')"
+# Without that, dump_eval stops in its first second with the reason (it warms
+# LPIPS up before the sweep). METRICS="psnr ssim nrmse" skips it.
+METRICS="${METRICS:-psnr ssim nrmse lpips}"
 SEED="${SEED:-1234}"
 SIGMA="${SIGMA:-}"                      # empty = each run's own val_noise_std
 # How the measurement is made (2026-10-20): simulated k-space -- the SENSE ground

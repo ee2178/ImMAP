@@ -75,6 +75,13 @@ RESID_CMAP = "inferno"    # residual colour scheme; None = grayscale
 CROP_FOV = True           # crop every column to one identical square FOV box
 CROP_PAD = 6              # padding around the foreground bounding box, px
 MASK_THRESH = 0.0         # anatomy mask is reference > THRESH * peak
+MASK_DISPLAY = "auto"     # draw every image multiplied by the organ mask?
+                          # "auto": when the dumps' metrics are organ-masked
+                          # (attr use_organ_mask; dump_eval --mask organ, the
+                          # default since 2026-10-20), so the picture shows the
+                          # pixels the numbers score. True / False force it.
+                          # Display only: the dumps keep the full image, which
+                          # the aliasing scan's background measures need.
 STATUS_METRIC = "psnr"    # which stored per-slice metric the viewer reports
 NAME = "default"          # output identity
 VARIANT = None            # input identity for rows/ and zooms/; None follows NAME
@@ -92,7 +99,7 @@ FLIP = ""                 # display orientation: "" as stored, "ud" upside down,
 CONFIGURABLE = (
     "NAME", "DUMP_ROOT", "COLUMNS", "ROWS", "ZOOM_W", "ZOOM_H", "ZOOM_UP",
     "WINDOW_PCT", "WINDOW_SCALE", "BRIGHTNESS", "GAMMA", "RESID_GAIN",
-    "RESID_CMAP", "CROP_FOV", "CROP_PAD", "MASK_THRESH", "STATUS_METRIC",
+    "RESID_CMAP", "CROP_FOV", "CROP_PAD", "MASK_THRESH", "MASK_DISPLAY", "STATUS_METRIC",
     "FIG_METRICS", "FIG_TITLE", "IMG_WIDTH", "FLIP",
 )
 
@@ -541,7 +548,17 @@ def _flipper():
     return lambda a: a[::-1 if ud else 1, ::-1 if lr else 1]
 
 
-def slice_view(vol, pos, crop=True):
+def display_mask(masked):
+    """Whether a row is drawn masked to the organ, per MASK_DISPLAY. `masked`
+    maps each method column to its dump's `use_organ_mask`."""
+    if MASK_DISPLAY == "auto":
+        return any(masked.values())
+    if MASK_DISPLAY in (True, False):
+        return MASK_DISPLAY
+    raise SystemExit(f"MASK_DISPLAY={MASK_DISPLAY!r}: use 'auto', True or False")
+
+
+def slice_view(vol, pos, crop=True, mask=None):
     """Everything one row shows, for the viewer AND the figure -- one function,
     so what you place in the viewer is exactly what the figure prints.
 
@@ -550,6 +567,13 @@ def slice_view(vol, pos, crop=True):
     `stored` holds each method's per-slice metrics as dumped. Images are
     cropped to the shared FOV box when `crop`, and `vmax` is the one display
     ceiling the whole row uses.
+
+    MASKING. With `mask` True -- or None and MASK_DISPLAY saying so -- every
+    image (each column and the reference) is multiplied by the organ mask, so
+    residuals, the disagreement overlay and the automatic zoom placement, all
+    computed from these images, are masked too. `display_masked` says which.
+    The mask is the dump's `organ_mask` (the stored coil maps' support under
+    `dump_eval --mask organ`), the same pixels the stored metrics average over.
     """
     cols, methods, stack_n = {}, {}, None
     for lab, spec in COLUMNS:
@@ -573,14 +597,20 @@ def slice_view(vol, pos, crop=True):
     else:
         W, cut = min(ref_s.shape), (lambda a: a)
 
+    masked = {k: bool(v.attrs.get("use_organ_mask", False)) for k, v in methods.items()}
+    show = display_mask(masked) if mask is None else bool(mask)
+    organ_c = cut(organ)
+    keep = organ_c.astype(np.float32)
+    ap = (lambda a: a * keep) if show else (lambda a: a)
+
     return dict(
         vol=vol, pos=pos, sl=sl, W=W, vmax=vmax,
-        ref=cut(ref_s), organ=cut(organ),
-        cols={k: cut(fl(v.img[pos])) for k, v in cols.items()},
-        methods={k: cut(fl(v.img[pos])) for k, v in methods.items()},
+        ref=ap(cut(ref_s)), organ=organ_c,
+        cols={k: ap(cut(fl(v.img[pos]))) for k, v in cols.items()},
+        methods={k: ap(cut(fl(v.img[pos]))) for k, v in methods.items()},
         stored={k: {m: vals[pos] for m, vals in v.metrics.items()}
                 for k, v in methods.items()},
-        masked={k: bool(v.attrs.get("use_organ_mask", False)) for k, v in methods.items()},
+        masked=masked, display_masked=show,
         n=stack_n,
     )
 

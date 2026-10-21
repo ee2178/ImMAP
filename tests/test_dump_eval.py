@@ -60,7 +60,11 @@ def build_trees(root):
             f.attrs["acquisition"] = "AXT2"
             f["kspace"] = np.zeros((n, NC, H, W), np.complex64)
         with h5py.File(os.path.join(sm, fn), "w") as f:
-            f["smaps"] = np.ones((n, NC, H, W), np.complex64) / np.sqrt(NC)
+            # astype: under NumPy 2, complex64 / np.float64 scalar is complex128,
+            # which the loader passes through and upcasts the whole pipeline.
+            # The real maps are complex64 (scripts/make_espirit_smaps.py).
+            f["smaps"] = (np.ones((n, NC, H, W), np.complex64)
+                          / np.sqrt(NC)).astype(np.complex64)
             img = rng.normal(0, 1, (n, H, W)).astype(np.float32)
             img[:, :4, :] = img[:, -4:, :] = 0.0       # a support to mask on
             f["image"] = (img + 0j).astype(np.complex64)

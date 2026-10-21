@@ -26,6 +26,8 @@ BROWSE -- scrub the set and mark the rows you want:
     x                toggle the residual of each column (|ref - col|)
     d                toggle the inter-method disagreement overlay
     c                toggle the FOV crop
+    k                toggle masking every image to the organ (default: on when
+                     the dumps' metrics are masked -- MASK_DISPLAY in common.py)
     - / =            dimmer / brighter          (session only; the value is
                                                  printed so you can pin it)
     space            mark or unmark this volume+slice
@@ -102,6 +104,9 @@ class PickerCore:
         self.vi, self.pos, self.si = 0, 0, 0
         self.mode, self.dis, self.view, self.resid = "browse", False, 0, False
         self.crop = fc.CROP_FOV
+        # None = follow fc.MASK_DISPLAY ("auto": masked when the dumps' metrics
+        # are); `k` pins it on or off for the session.
+        self.mask_view = None
         self.flash = ""
         # Every column side by side (the default), or one at a time (`g`).
         self.grid = True
@@ -217,7 +222,14 @@ class PickerCore:
                else self.sel[self.si]["volume"])
         pos = (self.pos if self.mode == "browse"
                else self._pos_of(vol, self.sel[self.si]["slice"]))
-        return fc.slice_view(vol, pos, crop=self.crop)
+        return fc.slice_view(vol, pos, crop=self.crop, mask=self.mask_view)
+
+    def toggle_mask(self):
+        """`k`: flip whether the images are drawn masked to the organ."""
+        self.mask_view = not self.current()["display_masked"]
+        self.flash = ("images masked to the organ" if self.mask_view
+                      else "images unmasked (full field of view)")
+        self.render()
 
     def snapshot(self, c=None):
         """The current view as one image: every panel on screen in a row, its
@@ -468,13 +480,14 @@ class PickerCore:
                 f"ZOOM [{self.si + 1}/{len(self.sel)}] {pretty(c['vol'])} "
                 f"slice {c['sl']}")
         keys = ("<-/-> slice (shift 5) | up/dn volume | o open | g all/one | e column | "
-                "1-9 column on/off | x residual | d overlay | c crop | -/= gain | "
+                "1-9 column on/off | x residual | d overlay | c crop | k mask | -/= gain | "
                 "s snapshot | space mark | m next | enter zoom | q save+quit | esc abort"
                 if self.mode == "browse" else
                 "click/drag place (any panel) | arrows nudge | n/p next row | r auto | "
                 "b browse | q save+quit | esc abort")
         note = self.flash
         self.flash = ""
+        head += "   [masked to organ]" if c.get("display_masked") else "   [unmasked]"
         return (f"{head}   selected {len(self.sel)}/{self.target}   {note}\n"
                 f"{m}: {'  '.join(parts)}\n{keys}")
 
@@ -519,6 +532,7 @@ class Picker(PickerCore):
             b(f"<Key-{i}>", lambda e, i=i: self.toggle_column(
                 ([l for l, _ in fc.COLUMNS] + [None] * 9)[i - 1]))
         b("<Key-c>", lambda e: self.set(crop=not self.crop))
+        b("<Key-k>", lambda e: self.toggle_mask())
         b("<Key-g>", lambda e: self.set(grid=not self.grid))
         # In the grid `e` drops to one column at a time; there it cycles.
         b("<Key-e>", lambda e: (self.set(grid=False) if self.grid else

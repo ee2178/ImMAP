@@ -93,7 +93,7 @@ class WebPicker(PickerCore):
         """Everything the PANEL IMAGES depend on -- not the zoom box, which the
         page draws itself, so dragging it never re-encodes an image."""
         raw = repr((fc.variant(), fc.DUMP_ROOT, c["vol"], c["pos"],
-                    self.resid, self.dis, self.crop,
+                    self.resid, self.dis, self.crop, c["display_masked"],
                     fc.BRIGHTNESS, tuple(self.shown_labels())))
         return hashlib.md5(raw.encode()).hexdigest()[:16]
 
@@ -135,6 +135,7 @@ class WebPicker(PickerCore):
             hidden=sorted(self.hidden),
             grid=self.grid, view=self.view % len(fc.COLUMNS),
             resid=self.resid, dis=self.dis, crop=self.crop,
+            display_masked=bool(c["display_masked"]),
             brightness=fc.BRIGHTNESS, key=key,
             panel_text=[self.panel_text(c, lab, i)
                         for i, lab in enumerate(self.shown_labels())],
@@ -161,6 +162,8 @@ class WebPicker(PickerCore):
         elif op == "goto" and browse:
             sl = a.get("sl")
             self.goto(int(a["vi"]), None if sl in (None, "") else int(sl))
+        elif op == "toggle" and a.get("name") == "mask":
+            self.toggle_mask()
         elif op == "toggle" and a.get("name") in ("resid", "dis", "crop", "grid"):
             self.set(**{a["name"]: not getattr(self, a["name"])})
         elif op == "hide":
@@ -726,6 +729,7 @@ td.k{color:var(--muted);font-size:11px}
     <label class="chk"><input type="checkbox" id="t_resid"> Residual |ref &minus; x|</label>
     <label class="chk"><input type="checkbox" id="t_dis"> Disagreement overlay</label>
     <label class="chk"><input type="checkbox" id="t_crop"> Crop to anatomy</label>
+    <label class="chk" title="Multiply every image by the organ mask -- the pixels the stored metrics score. On by default when the dumps' metrics are masked."><input type="checkbox" id="t_mask"> Mask to organ (as scored)</label>
     <label class="chk"><input type="checkbox" id="t_pix"> Hard pixels (no smoothing)</label>
     <div class="row"><span class="hint" style="width:70px">Columns</span>
       <select id="viewsel" style="flex:1"></select></div>
@@ -826,6 +830,7 @@ function apply(s) {
   const sld = $("slider"); sld.max = s.n - 1; if (!sld.matches(":active")) sld.value = s.pos;
   // display
   $("t_resid").checked = s.resid; $("t_dis").checked = s.dis; $("t_crop").checked = s.crop;
+  $("t_mask").checked = s.display_masked;
   const vs = $("viewsel"), colKey = s.all_columns.join("|");
   if (vs.dataset.key !== colKey) {       // labels, not count: datasets differ
     vs.dataset.key = colKey;
@@ -990,7 +995,7 @@ $("s1m").onclick = () => send("slice", {d: -1});
 $("s1p").onclick = () => send("slice", {d: 1});
 $("s5p").onclick = () => send("slice", {d: 5});
 $("slider").addEventListener("input", e => send("slice_to", {pos: +e.target.value}));
-for (const n of ["resid", "dis", "crop"]) $("t_" + n).onchange = () => send("toggle", {name: n});
+for (const n of ["resid", "dis", "crop", "mask"]) $("t_" + n).onchange = () => send("toggle", {name: n});
 $("t_pix").onchange = () => panels.forEach(d => d.classList.toggle("pix", $("t_pix").checked));
 $("viewsel").onchange = e => send("view", {i: +e.target.value});
 // Models: every dumped run of this dataset; checking one adds it to the comparison.
@@ -1057,6 +1062,7 @@ document.addEventListener("keydown", e => {
     n: () => send("row", {d: 1}), p: () => send("row", {d: -1}), m: () => send("next_marked"),
     x: () => send("toggle", {name: "resid"}), d: () => send("toggle", {name: "dis"}),
     c: () => send("toggle", {name: "crop"}), g: () => send("toggle", {name: "grid"}),
+    k: () => send("toggle", {name: "mask"}),
     r: () => send("auto"), "-": () => send("gain", {f: 1 / 1.15}), "=": () => send("gain", {f: 1.15}),
     o: () => { $("vfilter").focus(); $("vfilter").select(); },
   };
