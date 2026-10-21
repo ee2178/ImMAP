@@ -49,8 +49,13 @@ def _call_net(net, x, E, sigma):
 
 
 # ---------------------------------------------------------------------------
-def recon(net, batch, cfg, device, sigma, generator=None, extras=None):
+def recon(net, batch, cfg, device, sigma, generator=None, extras=None, call=None):
     """CS-MRI reconstruction. Mirrors the val block of `training/recon.py`.
+
+    `call(net, y, E, sigma) -> image` replaces the plain forward -- how
+    scripts/level_figure.py runs `forward_levels` on exactly this measurement
+    and operator. It receives the EMBEDDED operator; the result is truncated
+    back here as usual.
 
     Returns `(gt, recon, organ_mask)`. The mask is None unless the config asks
     for it, so the sweep restricts its metrics to exactly the region the run
@@ -98,7 +103,7 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None):
     # different operator here than the val loop built, and the sweep would stop
     # reproducing the curves it is meant to summarise.
     E, T = embed_for_net(net, E, image, pad_hw)
-    out = T.forward(_call_net(net, y, E, sigma_n))
+    out = T.forward((call or _call_net)(net, y, E, sigma_n))
 
     if mri.get("whiten_kspace", False) and "Zinv" in extra:
         out = extra["Zinv"] * out
