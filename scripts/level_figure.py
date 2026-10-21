@@ -8,7 +8,7 @@ next to what a U-Net decoder holds at the same scales.
         --compare trained_nets/mg_recon/knee/varnetmaps_R8 --out figures/out/levels
 
     # re-render without torch / data / GPU (e.g. after copying the .npz down):
-    python scripts/level_figure.py --from-npz figures/out/levels/knee_file1000108_22.npz
+    python scripts/level_figure.py --from-npz figures/out/levels/mg169v6_R8_knee_1000108_22.npz
 
 THE ARGUMENT IT IS BUILT FOR. In MGLPDS every level of the V-cycle carries a
 primal IMAGE x_l that solves a coarse version of the SAME reconstruction
@@ -129,6 +129,16 @@ def _run_one(run_dir, vol, sl, args, device, call_for):
     from evaluation.tasks import build_adapter, default_sigma, force_organ_mask
 
     cfg, model, n_params, step = de.load_run(run_dir, device)
+    if getattr(args, "coarse_op", None):
+        # Inference-time swap of the coarse forward model (no parameter depends
+        # on it): e.g. a rediscretize-trained net run with the Galerkin Gram.
+        from models.mg_lpds import PDObjectiveDownsample
+        n = 0
+        for m in model.modules():
+            if isinstance(m, PDObjectiveDownsample):
+                m.coarse_op, n = args.coarse_op, n + 1
+        if n:
+            print(f"[{os.path.basename(run_dir)}] coarse_op -> {args.coarse_op} ({n} levels)")
     force_organ_mask(cfg)
     if args.val_kspace_type:
         cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
@@ -197,7 +207,7 @@ def mg_levels(tr, out_e, gt, organ, kws):
 
 
 def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1234,
-                val_kspace_type="measurement_awgn", device=None):
+                val_kspace_type="measurement_awgn", device=None, coarse_op=None):
     """Run `run` (a multigrid net) -- and optionally `compare` (a VarNet) -- on
     one val slice, exactly as eval_per_volume measures it.
 
@@ -205,6 +215,8 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
         z     {name: numpy array}, the layout `save_npz` writes (mg/x/o<o>/l<l>,
               mg/gt/l<l>, mg/delta/o<o>/l<l>, mg/organ/l<l>, vn/feat/<k>, gt, recon)
         meta  plain dict: volume, slice, run, M, K, levels, outers, sigma, ...
+        coarse_op  None: as trained; "galerkin" / "rediscretize" swaps the
+              coarse forward model of `run` at inference (the trace records it)
         live  the objects, for poking at further in a notebook: live["mg"] has
               model, cfg, trace (a LevelTrace), gt, recon, organ, out_embedded;
               live["vn"] the same for the comparison plus `features`
@@ -215,7 +227,8 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
 
     device = torch.device(device) if device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu")
-    args = types.SimpleNamespace(sigma=sigma, seed=seed, val_kspace_type=val_kspace_type)
+    args = types.SimpleNamespace(sigma=sigma, seed=seed, val_kspace_type=val_kspace_type,
+                                 coarse_op=coarse_op)
     with open(os.path.join(run, "config.json")) as f:
         vol = _resolve_volume(json.load(f), volume)
     sl = int(slice)
@@ -231,10 +244,15 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
                 dc=[float(mu.real), float(mu.imag)], scale_misfit=fit,
                 R=R["cfg"]["mri"].get("R"),
                 kspace_type=R["cfg"].get("training", {}).get("val_kspace_type"),
-                run_path=run)
+                run_path=run,
+                coarse_op=coarse_op or R["cfg"]["model"]["params"].get("coarse_op", "galerkin"),
+                coarse_op_trained=R["cfg"]["model"]["params"].get("coarse_op", "galerkin"),
+                coarse_op_swapped=coarse_op if coarse_op and coarse_op != R["cfg"][
+                    "model"]["params"].get("coarse_op", "galerkin") else None)
     live = {"mg": dict(R, trace=tr, out_embedded=out_e)}
 
     if compare:
+        args.coarse_op = None            # the swap is for the multigrid net only
         V = _run_one(compare, vol, sl, args, device, lambda st: _unet_call(st, cascade))
         feats = V["store"]["features"]
         for k, f in enumerate(feats):          # coarse -> fine
@@ -250,9 +268,12 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
 
 
 def save_npz(z, meta, out_dir):
-    """-> the path written: <out_dir>/<anatomy>_<volume tail>_<slice>.npz"""
+    """-> the path written:
+    <out_dir>/<run>[_<coarse_op swap>]_<anatomy>_<volume tail>_<slice>.npz"""
     os.makedirs(out_dir, exist_ok=True)
-    stem = f"{meta['anatomy'] or 'slice'}_{meta['volume'].split('_')[-1]}_{meta['slice']}"
+    swap = meta.get("coarse_op_swapped")
+    stem = (f"{meta['run']}{'_' + swap if swap else ''}_{meta['anatomy'] or 'slice'}_"
+            f"{meta['volume'].split('_')[-1]}_{meta['slice']}")
     path = os.path.join(out_dir, stem + ".npz")
     np.savez_compressed(path, meta=np.array(json.dumps(meta)), **z)
     return path
