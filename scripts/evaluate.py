@@ -64,7 +64,8 @@ def load_run(run_dir, device):
     with open(os.path.join(run_dir, "config.json")) as f:
         cfg = json.load(f)
 
-    model = build_model(cfg).to(device)
+    from scripts.dump_eval import for_checkpoint
+    model = build_model(for_checkpoint(cfg)).to(device)
     ckpt = torch.load(os.path.join(run_dir, "net.ckpt"), map_location=device,
                       weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])

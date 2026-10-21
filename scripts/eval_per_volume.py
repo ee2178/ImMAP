@@ -88,6 +88,8 @@ LABELS = {
     "mg81v6": "MGLPDS-Small",
     "mg169v6": "MGLPDS-Big",
     "mglpds": "MGLPDS-Big",
+    "ramdrunet": "RAM",          # exp13: DRUNet-initialised trunk, our protocol
+    "ram": "RAM-scratch",        # the same net from a random init
 }
 
 DEFAULT_METRICS = ["psnr", "ssim", "nrmse", "lpips"]

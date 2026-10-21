@@ -41,6 +41,7 @@ _CANDIDATES = [
     ("LPDSNet",       "lpdsnet_R12"),
     ("MGLPDS-Small",  "mg81v6_R12"),
     ("MGLPDS-Big",    "mg169v6_R12"),
+    ("RAM",           "ramdrunet_R12"),     # exp13; left out until dumped
 ]
 
 

@@ -103,6 +103,18 @@ def find_runs(root, only=None, exact=False):
     return out
 
 
+def for_checkpoint(cfg):
+    """The config to BUILD a net whose weights a checkpoint will then replace:
+    an initialisation that fetches pretrained weights (RAM's `init_from`, the
+    DRUNet trunk) is dropped -- the checkpoint overwrites every one of those
+    weights, and building it would need the download cache on the node."""
+    params = cfg.get("model", {}).get("params", {})
+    if params.get("init_from") is None:
+        return cfg
+    out = dict(cfg, model=dict(cfg["model"], params=dict(params, init_from=None)))
+    return out
+
+
 def load_run(run_dir, device):
     from models import build_model            # imported late: pulls in CUDA bits
 
@@ -114,7 +126,7 @@ def load_run(run_dir, device):
     from models.mg_lpds import set_planar_state
     set_planar_state(bool(cfg.get("training", {}).get("planar_state", False)))
 
-    model = build_model(cfg).to(device)
+    model = build_model(for_checkpoint(cfg)).to(device)
     ckpt = torch.load(os.path.join(run_dir, "net.ckpt"), map_location=device,
                       weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
