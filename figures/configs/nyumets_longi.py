@@ -12,8 +12,10 @@
 # prior study's CT1 at the matched slice -- the study the w2 net was shown (attr prior_volume).
 # Only multi-study patients are dumped, so both nets are compared on the same population.
 #
-# Dump on BigPurple (60 val volumes, original slices 80-99):
+# Dump on BigPurple (default: 60 val volumes, original slices 80-99; any range works -- the viewer
+# scrubs whatever slices a volume's dump holds and keys picks by ORIGINAL slice number):
 #   sbatch bigpurple/nyumets_dump.sbatch
+#   N_VOLUMES=0 SLICES=70:110 BATCH=20 sbatch --time=08:00:00 bigpurple/nyumets_dump.sbatch
 # Bring the dumps down (from the repo root on the cluster, then on the laptop):
 #   tar czf nyumets_longi.tgz trained_nets/nyumets/I2SB_Unet_NYUMets_CT1_from_all{,_plus_otherT1CT1_w2}_bs64/eval_dump
 #   scp <cluster>:<ImMAP>/nyumets_longi.tgz . && tar xzf nyumets_longi.tgz
