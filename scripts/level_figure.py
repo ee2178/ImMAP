@@ -470,9 +470,13 @@ def trace_layers(run, volume, slice, sigma=None, seed=1234,
     from operators.truncate import Truncate
     g = Truncate(tuple(out_e.shape[-2:]), tuple(R["gt"].shape[-2:])).adjoint(R["gt"])
     gts = {tuple(g.shape[-2:]): g[0, 0].cpu().numpy().astype(np.complex64)}
+    # One R^l(gt) per grid the net actually ran on -- not "until it is small":
+    # a grid that is even only down to the coarsest level (e.g. 768 x 400 ->
+    # 96 x 50 at four levels) cannot be restricted once more.
+    need = {tuple(x.shape[-2:]) for x in xs}
     try:
         kws = _transfer_kws(R["model"])
-        while min(g.shape[-2:]) > 8 and len(gts) < 6:
+        while not need <= set(gts) and all(n % 2 == 0 for n in g.shape[-2:]):
             g = restrict(g, **kws)
             gts[tuple(g.shape[-2:])] = g[0, 0].cpu().numpy().astype(np.complex64)
     except TypeError:                       # a flat net: no transfers, one grid

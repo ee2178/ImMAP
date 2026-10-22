@@ -30,8 +30,9 @@ independent samples (scripts/wilcoxon_main.py explains).
 
 GROUPS. The fastMRI scripts group experiments by (anatomy, R); NYUMets has no R, so the `anatomy`
 column carries a slice-range group and R is 0, which the table and the chart print as the group
-name alone. By default: the whole dumped range, and -- when it crosses --trained-hi, the end of
-the training slice range (90) -- the trained part and the unseen part separately, since slices
+name alone. By default ONE group, the whole dumped range. `--trained-hi Z` (the end of the
+training slice range) also splits it into the part below Z and the part from Z on, and shades the
+latter in the profile -- for when slices the nets never saw should be read separately. Slices
 the nets never saw are a different question. `--groups 80:90 90:100` sets them by hand.
 
 PROFILE. Also draws <--profile>.png/.pdf: every net's mean PSNR per ORIGINAL slice index (mean
@@ -89,8 +90,9 @@ def main(argv=None):
     p.add_argument("--groups", nargs="*", metavar="LO:HI",
                    help="slice-range groups (ORIGINAL indices, hi exclusive); default: the "
                         "dumped range, plus its trained and unseen parts")
-    p.add_argument("--trained-hi", type=int, default=90,
-                   help="end of the slice range the nets trained on (default 90)")
+    p.add_argument("--trained-hi", type=int, default=None,
+                   help="end of the slice range the nets trained on: splits the groups there and "
+                        "shades the profile from it (default: no split)")
     p.add_argument("--out", default=os.path.join(HERE, "results", "nyumets_eval"),
                    help="directory for slices.csv and volumes.csv")
     p.add_argument("--profile", default=os.path.join(HERE, "figures", "out", "nyumets_profile"),
@@ -137,14 +139,16 @@ def main(argv=None):
         groups = [tuple(int(x) for x in g.split(":")) for g in a.groups]
     else:
         groups = [(lo, hi)]
-        if lo < a.trained_hi < hi:
+        if a.trained_hi is not None and lo < a.trained_hi < hi:
             groups += [(lo, a.trained_hi), (a.trained_hi, hi)]
 
     def gname(g):
         # ", <tag>" is where the bar chart breaks the tick label (plot_main_bars.group_label)
-        tag = (", all" if (g[0], g[1]) == (lo, hi) and len(groups) > 1 and lo < a.trained_hi < hi
-               else ", unseen" if g[0] >= a.trained_hi
-               else ", trained" if g[1] <= a.trained_hi else "")
+        th = a.trained_hi
+        tag = ("" if th is None
+               else ", all" if (g[0], g[1]) == (lo, hi) and len(groups) > 1
+               else ", unseen" if g[0] >= th
+               else ", trained" if g[1] <= th else "")
         return f"slices {g[0]}-{g[1] - 1}{tag}"
 
     os.makedirs(a.out, exist_ok=True)
@@ -226,7 +230,7 @@ def profile(data, labels, vols, trained_hi, out):
             ax[1].fill_between(zz, g - gs, g + gs, color=c, alpha=0.2, lw=0)
     ax[1].axhline(0, color=MUTED, lw=0.8)
     for x in ax:
-        if zs[0] < trained_hi <= zs[-1]:
+        if trained_hi is not None and zs[0] < trained_hi <= zs[-1]:
             x.axvspan(trained_hi - 0.5, zs[-1] + 0.5, color=GRID, alpha=0.6, lw=0, zorder=0)
         x.grid(axis="y", color=GRID, lw=0.6)
         for sp in ("top", "right"):
@@ -235,7 +239,8 @@ def profile(data, labels, vols, trained_hi, out):
     ax[0].set_ylabel("PSNR (dB) ↑")
     ax[1].set_ylabel("paired gain (dB)")
     ax[1].set_xlabel("original slice index" + (f"  (shaded: >= {trained_hi}, unseen in training)"
-                                                 if zs[0] < trained_hi <= zs[-1] else ""))
+                                                 if trained_hi is not None
+                                                 and zs[0] < trained_hi <= zs[-1] else ""))
     ax[0].legend(frameon=False, loc="lower left")
     ax[1].legend(frameon=False, loc="lower left", fontsize=8)
     fig.text(0.5, 0.005, f"mean ± s.e.m. over {len(vols)} volumes", ha="center", va="bottom",

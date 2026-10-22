@@ -131,8 +131,11 @@ def main():
               lm["n_layers"] == n_want and lm["dc_misfit"] < 1e-5
               and (zr is None or np.allclose(last["x"], zr["recon"], atol=1e-5)),
               f"{lm['n_layers']} layers, DC misfit {lm['dc_misfit']:.1e}")
-    sh = set(L["shape"] for L in lf.trace_layers(A, "volA", 2, **kw)[0])
+    layers_A, gts_A, _ = lf.trace_layers(A, "volA", 2, **kw)
+    sh = set(L["shape"] for L in layers_A)
     check("multigrid layers run on every level's grid", len(sh) == 3, str(sorted(sh)))
+    check("trace_layers: one R^l(gt) per grid the net ran on, no more", set(gts_A) == sh,
+          f"{sorted(gts_A)} vs {sorted(sh)}")
     rows = np.tile(np.array([1.0, -1.0])[:, None], (16, 32)) + 3.0    # alternates down axis 0
     r, c = lf.nyquist_share(rows)
     check("nyquist_share: horizontal stripes are all 'rows'", r > 0.99 and c < 0.01,
