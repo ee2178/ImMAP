@@ -95,7 +95,8 @@ LABELS = {
 DEFAULT_METRICS = ["psnr", "ssim", "nrmse", "lpips"]
 META_KEYS = ("run", "anatomy", "R", "step", "sigma", "seed", "slices", "val_kspace_type",
              "mask_source",
-             "metrics", "n_volumes", "use_organ_mask", "rediscretize_embedded")
+             "metrics", "n_volumes", "use_organ_mask", "rediscretize_embedded",
+             "transfer_filter")
 
 
 def cell_of(run):
@@ -148,11 +149,26 @@ def _setup(run_dir, anatomy, args, metric_names, device):
     os.makedirs(dest, exist_ok=True)
 
     cfg, model, n_params, step = de.load_run(run_dir, device)
+    # --transfer-filter: the grid-transfer filter of a multigrid net swapped at
+    # inference (same weights; operators/resample.py::set_transfer_filter), e.g.
+    # "none" = the sinc off. Nets without grid transfers are scored as they are.
+    from operators.resample import set_transfer_filter, transfer_filter_of
+    filt_trained = transfer_filter_of(model) or ""
+    filt = filt_trained
+    if getattr(args, "transfer_filter", None):
+        if filt_trained:
+            set_transfer_filter(model, args.transfer_filter)
+            filt = args.transfer_filter
+            print(f"  [{run}] transfer filter {filt_trained} -> {filt} (inference swap)")
+        else:
+            print(f"  [{run}] no grid transfers: --transfer-filter does not apply")
     # Rows written before `val_kspace_type` was recorded were measured the
     # training way -- what the run's config said then (it had no val key).
     legacy = {"val_kspace_type": cfg.get("mri", {}).get("kspace_type", "simulated"),
               # ...and scored on whatever mask the run itself used
-              "mask_source": metric_mask_source(cfg)}
+              "mask_source": metric_mask_source(cfg),
+              # ...and with the transfer the net was built with
+              "transfer_filter": filt_trained}
     if getattr(args, "mask", "organ") == "organ":
         force_organ_mask(cfg)
     if args.val_kspace_type:
@@ -172,6 +188,7 @@ def _setup(run_dir, anatomy, args, metric_names, device):
                             ("name", "anatomy", "kspace_root", "smap_root", "scale_fac")},
                 rediscretize_embedded=os.environ.get("IMMAP_REDISCRETIZE_EMBEDDED", "1"),
                 val_kspace_type=val_kspace_type(cfg),
+                transfer_filter=filt,
                 metric_versions={m: metric_version(m) for m in metric_names})
 
     val = dict(cfg["data"]["val"])
@@ -238,6 +255,12 @@ def eval_run(run_dir, anatomy, args, metric_names, device):
         with open(meta_path) as f:
             old = json.load(f)
         changed = [k for k in META_KEYS if _was(old, k, S) != meta[k]]
+        if "transfer_filter" in changed:
+            # Starting over would DELETE the other filter's results for this run.
+            raise SystemExit(
+                f"[{run}] {meta_path} was scored with transfer filter "
+                f"{_was(old, 'transfer_filter', S)!r}, this pass uses {meta['transfer_filter']!r}. "
+                f"Give a filter swap its own --out (main_eval.sbatch's TRANSFER_FILTER does).")
         if changed:
             print(f"  [{run}] settings changed ({', '.join(changed)}) -- starting over")
             if os.path.exists(csv_path):
@@ -460,6 +483,10 @@ def main():
                         "training.val_kspace_type, else its training kspace_type. "
                         "'simulated': the SENSE ground truth through the stored maps, "
                         "mask and AWGN, so the noise is exactly sigma"),
+    p.add_argument("--transfer-filter",
+                   help="swap the grid-transfer filter of multigrid runs at inference "
+                        "(same weights): box, bilinear, ..., or none = the sinc off; "
+                        "default: as trained. Use its own --out.")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)

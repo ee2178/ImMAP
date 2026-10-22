@@ -104,7 +104,13 @@ SIGMA="${SIGMA:-}"                     # empty = each run's own val_noise_std
 # measurement results/main has always used. VAL_KSPACE=simulated -> results/main_simulated.
 VAL_KSPACE="${VAL_KSPACE:-measurement_awgn}"
 if [ "${VAL_KSPACE}" = "measurement_awgn" ]; then _out="results/main"; else _out="results/main_${VAL_KSPACE}"; fi
-OUT="${OUT:-${_out}${SIGMA:+_s${SIGMA}}}"
+# TRANSFER_FILTER: swap the multigrid nets' grid-transfer filter at inference
+# (same weights): "none" = the sinc off, or "box", "bilinear", ... VarNet /
+# LPDSNet have no transfers and are scored as they are, so the tree is complete.
+# Its own tree, e.g. results/main_filtnone:
+#   TRANSFER_FILTER=none VAL_KSPACE=measurement_awgn sbatch torch/main_eval.sbatch
+TRANSFER_FILTER="${TRANSFER_FILTER:-}"
+OUT="${OUT:-${_out}${SIGMA:+_s${SIGMA}}${TRANSFER_FILTER:+_filt${TRANSFER_FILTER}}}"
 WORKERS="${WORKERS:-6}"
 RECOMPUTE="${RECOMPUTE:-}"             # e.g. RECOMPUTE=nrmse: re-score that column only
 EXTRA="${EXTRA:-}"                     # e.g. EXTRA="--n-volumes 3" for a probe
@@ -169,6 +175,7 @@ python scripts/eval_per_volume.py \
     --out "${OUT}" \
     ${SIGMA:+--sigma "${SIGMA}"} \
     --val-kspace-type "${VAL_KSPACE}" \
+    ${TRANSFER_FILTER:+--transfer-filter "${TRANSFER_FILTER}"} \
     ${RECOMPUTE:+--recompute ${RECOMPUTE}} \
     ${EXTRA}
 

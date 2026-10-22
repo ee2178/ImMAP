@@ -388,6 +388,59 @@ def use_filter_length(name, taps, factor=DEFAULT_FACTOR):
         _KERNEL_CACHE.clear()
 
 
+def set_transfer_filter(model, name):
+    """Point every FIXED grid transfer of a BUILT `model` at filter `name`.
+
+    A multigrid net resolves its filter once, at construction (`use_filter`
+    only reaches models built inside it), and keeps it as `transfer_filter` on
+    each V-cycle and objective-downsample module; every restriction,
+    prolongation, coarse coil map (operators/coarse.py) and coarse noise level
+    reads it from there on each call. Changing those attributes therefore
+    changes the transfer of a TRAINED net -- the weights stay as they were (no
+    parameter depends on the filter), so it is a diagnostic, not a retraining.
+
+    -> `[(module, previous filter)]`, for `swap_transfer_filter` to restore.
+    Refused for nets that LEARN their transfer (`learn_transfer=True`): those
+    hold their own kernel in a `GridTransfer`, which this would not reach.
+    """
+    name = _check_filter(name)
+    mods = [m for m in model.modules() if hasattr(m, "transfer_filter")]
+    if not mods:
+        raise ValueError(f"{type(model).__name__} has no grid transfer to swap")
+    learned = [type(m).__name__ for m in mods if getattr(m, "transfer", None) is not None]
+    if learned:
+        raise ValueError(f"{type(model).__name__} learns its transfer ({learned[0]} holds a "
+                         f"GridTransfer); swapping the filter name would not reach it")
+    prev = [(m, m.transfer_filter) for m in mods]
+    for m in mods:
+        m.transfer_filter = name
+    return prev
+
+
+@contextlib.contextmanager
+def swap_transfer_filter(model, name):
+    """`set_transfer_filter` inside a block, restored on exit.
+
+        with swap_transfer_filter(net, "box"):      # or "none": no filter at all
+            out = net(y, E=E, sigma=sigma)
+    """
+    prev = set_transfer_filter(model, name)
+    try:
+        yield name
+    finally:
+        for m, f in prev:
+            m.transfer_filter = f
+
+
+def transfer_filter_of(model):
+    """The filter a built model's grid transfers use; None if it has none."""
+    for m in model.modules():
+        if hasattr(m, "transfer_filter"):
+            f = m.transfer_filter
+            return "tensor" if torch.is_tensor(f) else f
+    return None
+
+
 def filter_length(filter=None, factor=DEFAULT_FACTOR, length=None):
     """Kernel length a given filter uses at this factor."""
     filter, _ = split_normalisation(_check_filter(filter))

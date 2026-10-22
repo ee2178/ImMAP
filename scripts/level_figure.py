@@ -140,6 +140,14 @@ def _run_one(run_dir, vol, sl, args, device, call_for):
                 m.coarse_op, n = args.coarse_op, n + 1
         if n:
             print(f"[{os.path.basename(run_dir)}] coarse_op -> {args.coarse_op} ({n} levels)")
+    from operators.resample import set_transfer_filter, transfer_filter_of
+    filter_trained = transfer_filter_of(model)
+    if getattr(args, "transfer_filter", None):
+        # Inference-time swap of the grid-transfer filter (no parameter depends
+        # on it): e.g. "box" or "none" -- the sinc switched off.
+        n = len(set_transfer_filter(model, args.transfer_filter))
+        print(f"[{os.path.basename(run_dir)}] transfer filter {filter_trained} -> "
+              f"{args.transfer_filter} ({n} modules)")
     force_organ_mask(cfg)
     if args.val_kspace_type:
         cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
@@ -156,7 +164,8 @@ def _run_one(run_dir, vol, sl, args, device, call_for):
         organ = batch[3].to(device)
     return dict(cfg=cfg, model=model, gt=gt, recon=recon, organ=organ, store=store,
                 sigma=float(sigma), n_params=int(n_params), step=int(step or 0),
-                run=os.path.basename(os.path.normpath(run_dir)))
+                run=os.path.basename(os.path.normpath(run_dir)),
+                filter_trained=filter_trained)
 
 
 def mg_levels(tr, out_e, gt, organ, kws):
@@ -209,7 +218,7 @@ def mg_levels(tr, out_e, gt, organ, kws):
 
 def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1234,
                 val_kspace_type="measurement_awgn", device=None, coarse_op=None,
-                transfer_taps=None):
+                transfer_taps=None, transfer_filter=None):
     """Run `run` (a multigrid net) -- and optionally `compare` (a VarNet) -- on
     one val slice, exactly as eval_per_volume measures it.
 
@@ -224,6 +233,12 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
               inference -- restriction, prolongation, the coarse maps, and the
               R^l(gt) the levels are scored against -- same weights
               (operators.resample.use_filter_length; the trace records it)
+        transfer_filter  None: as trained (the sinc); "box", "bilinear", ...
+              or "none" (no filter at all: plain decimation down, one-sample
+              scatter up) swaps the FILTER of every transfer of `run` at
+              inference -- same weights (operators.resample.set_transfer_filter;
+              the trace records it). R^l(gt) follows the net's transfer, so
+              coarse-level NRMSEs are only comparable at equal transfers.
         live  the objects, for poking at further in a notebook: live["mg"] has
               model, cfg, trace (a LevelTrace), gt, recon, organ, out_embedded;
               live["vn"] the same for the comparison plus `features`
@@ -235,7 +250,7 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
     device = torch.device(device) if device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu")
     args = types.SimpleNamespace(sigma=sigma, seed=seed, val_kspace_type=val_kspace_type,
-                                 coarse_op=coarse_op)
+                                 coarse_op=coarse_op, transfer_filter=transfer_filter)
     with open(os.path.join(run, "config.json")) as f:
         vol = _resolve_volume(json.load(f), volume)
     sl = int(slice)
@@ -267,11 +282,16 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
                 transfer_taps=int(transfer_taps or taps_trained),
                 transfer_taps_trained=int(taps_trained),
                 transfer_taps_swapped=(int(transfer_taps) if transfer_taps
-                                       and int(transfer_taps) != taps_trained else None))
+                                       and int(transfer_taps) != taps_trained else None),
+                transfer_filter=str(transfer_filter or R["filter_trained"]),
+                transfer_filter_trained=str(R["filter_trained"]),
+                transfer_filter_swapped=(transfer_filter if transfer_filter
+                                         and transfer_filter != R["filter_trained"] else None))
     live = {"mg": dict(R, trace=tr, out_embedded=out_e)}
 
     if compare:
-        args.coarse_op = None            # the swap is for the multigrid net only
+        args.coarse_op = None            # the swaps are for the multigrid net only
+        args.transfer_filter = None
         V = _run_one(compare, vol, sl, args, device, lambda st: _unet_call(st, cascade))
         feats = V["store"]["features"]
         for k, f in enumerate(feats):          # coarse -> fine
@@ -288,11 +308,13 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
 
 def save_npz(z, meta, out_dir):
     """-> the path written:
-    <out_dir>/<run>[_<coarse_op swap>][_taps<n>]_<anatomy>_<volume tail>_<slice>.npz"""
+    <out_dir>/<run>[_<coarse_op swap>][_taps<n>][_filt<name>]_<anatomy>_<volume tail>_<slice>.npz"""
     os.makedirs(out_dir, exist_ok=True)
     swap = meta.get("coarse_op_swapped")
     taps = meta.get("transfer_taps_swapped")
-    stem = (f"{meta['run']}{'_' + swap if swap else ''}{f'_taps{taps}' if taps else ''}_"
+    filt = meta.get("transfer_filter_swapped")
+    stem = (f"{meta['run']}{'_' + swap if swap else ''}{f'_taps{taps}' if taps else ''}"
+            f"{f'_filt{filt}' if filt else ''}_"
             f"{meta['anatomy'] or 'slice'}_"
             f"{meta['volume'].split('_')[-1]}_{meta['slice']}")
     path = os.path.join(out_dir, stem + ".npz")
@@ -584,6 +606,9 @@ def main(argv=None):
     p.add_argument("--transfer-taps", type=int,
                    help="implant a longer sinc (e.g. 12, 16) into every transfer of "
                         "--run at inference; default: as trained (8)")
+    p.add_argument("--transfer-filter",
+                   help="swap the grid-transfer filter of --run at inference: box, "
+                        "bilinear, ..., or none (the sinc off); default: as trained")
     p.add_argument("--out", default=os.path.join(ROOT, "figures", "out", "levels"))
     p.add_argument("--from-npz", help="only re-render this .npz (no torch, no data)")
     p.add_argument("--flip", choices=["", "ud", "lr", "both"],
@@ -595,7 +620,7 @@ def main(argv=None):
         p.error("--run, --volume and --slice are required (or --from-npz)")
     z, meta, _ = trace_slice(a.run, a.volume, a.slice, compare=a.compare, cascade=a.cascade,
                              sigma=a.sigma, seed=a.seed, val_kspace_type=a.val_kspace_type,
-                             transfer_taps=a.transfer_taps)
+                             transfer_taps=a.transfer_taps, transfer_filter=a.transfer_filter)
     path = save_npz(z, meta, a.out)
     print(f"wrote {path}")
     render(path, a.flip)
