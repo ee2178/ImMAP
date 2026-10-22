@@ -409,6 +409,100 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
     return z, meta, live
 
 
+def _layers_call(store):
+    """Record the primal iterate after EVERY `LPDSLayer`, in execution order --
+    the flat LPDSNet's K layers, or every smoother layer of a V-cycle (each on
+    its own level's grid)."""
+    def call(net, y, E, sigma):
+        import torch
+        from models.lpds import LPDSLayer
+        xs, hs = [], []
+
+        def hook(mod, args_, out):
+            st = out[0] if isinstance(out, tuple) else out
+            x = st[0] if isinstance(st, tuple) else st
+            xs.append(_as_complex(x.detach()))
+
+        for m in net.modules():
+            if isinstance(m, LPDSLayer):
+                hs.append(m.register_forward_hook(hook))
+        try:
+            with torch.no_grad():
+                out = net(y, E=E, sigma=sigma)
+        finally:
+            for h in hs:
+                h.remove()
+        out = out[0] if isinstance(out, tuple) else out
+        store.update(xs=xs, out_embedded=out.detach())
+        return out
+    return call
+
+
+def trace_layers(run, volume, slice, sigma=None, seed=1234,
+                 val_kspace_type="measurement_awgn", device=None, coarse_op=None,
+                 transfer_filter=None):
+    """The iterate after every LPDS layer of `run` on one val slice (same
+    measurement as `trace_slice`; cached nets, same knobs).
+
+    -> `(layers, gts, meta)`: `layers` a list of {"k", "shape", "x"} in
+    execution order, x complex in IMAGE units (the DC the net removes added
+    back -- under the "dc" transfer normalisation a constant restricts to
+    itself, so it is the same constant on every level); `gts` {shape: R^l(gt)}
+    for every grid size that occurs, via the net's own restriction.
+    """
+    import types
+
+    import torch
+    from operators.resample import restrict
+
+    device = torch.device(device) if device else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu")
+    args = types.SimpleNamespace(sigma=sigma, seed=seed, val_kspace_type=val_kspace_type,
+                                 coarse_op=coarse_op, transfer_filter=transfer_filter)
+    with open(os.path.join(run, "config.json")) as f:
+        vol = _resolve_volume(json.load(f), volume)
+    R = _run_one(run, vol, int(slice), args, device, _layers_call)
+    xs, out_e = R["store"]["xs"], R["store"]["out_embedded"]
+    last = next(x for x in reversed(xs) if x.shape == out_e.shape)
+    diff = out_e - last
+    mu = diff.mean()
+    fit = float((diff - mu).norm() / out_e.norm())
+    from operators.truncate import Truncate
+    g = Truncate(tuple(out_e.shape[-2:]), tuple(R["gt"].shape[-2:])).adjoint(R["gt"])
+    gts = {tuple(g.shape[-2:]): g[0, 0].cpu().numpy().astype(np.complex64)}
+    try:
+        kws = _transfer_kws(R["model"])
+        while min(g.shape[-2:]) > 8 and len(gts) < 6:
+            g = restrict(g, **kws)
+            gts[tuple(g.shape[-2:])] = g[0, 0].cpu().numpy().astype(np.complex64)
+    except TypeError:                       # a flat net: no transfers, one grid
+        pass
+    layers = [dict(k=i, shape=tuple(x.shape[-2:]),
+                   x=(x + mu)[0, 0].cpu().numpy().astype(np.complex64))
+              for i, x in enumerate(xs)]
+    meta = dict(run=R["run"], volume=vol, slice=int(slice), n_layers=len(xs),
+                dc=[float(mu.real), float(mu.imag)], dc_misfit=fit,
+                anatomy=R["cfg"]["data"]["val"].get("anatomy", ""), run_path=run)
+    if fit > 1e-3:
+        print(f"WARNING: output minus last finest iterate is not a constant "
+              f"(rel. misfit {fit:.1e}); per-layer images are approximate", file=sys.stderr)
+    return layers, gts, meta
+
+
+def nyquist_share(a, frac=0.8):
+    """`(rows, cols)`: the share of |a|'s energy (mean removed) at or above
+    `frac` of the Nyquist frequency along axis 0 / axis 1 of a's own grid. A
+    period-2 pattern along an axis (stripes ACROSS it) puts its energy there;
+    natural images put very little."""
+    m = np.abs(a).astype(np.float64)
+    m = m - m.mean()
+    P = np.abs(np.fft.fft2(m)) ** 2
+    fy = np.abs(np.fft.fftfreq(m.shape[0])) * 2       # 0 .. 1 = Nyquist
+    fx = np.abs(np.fft.fftfreq(m.shape[1])) * 2
+    tot = P.sum() or 1.0
+    return float(P[fy >= frac, :].sum() / tot), float(P[:, fx >= frac].sum() / tot)
+
+
 def save_npz(z, meta, out_dir):
     """-> the path written:
     <out_dir>/<run>[_<coarse_op swap>][_taps<n>][_filt<name>]_<anatomy>_<volume tail>_<slice>.npz"""

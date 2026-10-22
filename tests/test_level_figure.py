@@ -43,14 +43,14 @@ def check(name, ok, detail=""):
         FAIL.append(name)
 
 
-def make_run(root, name, ks, sm, coarse_op, planar):
+def make_run(root, name, ks, sm, coarse_op, planar, flat=False):
     from models import build_model
     from models.components import set_complex_mode
     from models.mg_lpds import set_planar_state
     cfg = base_cfg(ks, sm)
     cfg["data"]["val"]["pad_multiple"] = 8
     cfg["model"] = {"type": "MGLPDSNet", "params": dict(
-        K=[2, [2, 2, 2]], M=8, C=1, P=3, s=2, degrees=1, lam0=1e-3, tau0=0.5,
+        K=4 if flat else [2, [2, 2, 2]], M=8, C=1, P=3, s=2, degrees=1, lam0=1e-3, tau0=0.5,
         theta0=0.0, alpha0=0.3, is_complex=True, preproc="kspace",
         resize_noise=True, coarse_op=coarse_op)}
     if planar:
@@ -120,11 +120,30 @@ def main():
         state = [m.transfer_filter for m in model.modules() if hasattr(m, "transfer_filter")]
     check("as_traced restores the state a trace ran with", set(state) == {"sinc"}, str(set(state)))
 
+    # 5: every LPDS layer, multigrid and flat -----------------------------------
+    import numpy as np
+    flat = make_run(tmp, "lpdsflat_R4", ks, sm, "rediscretize", planar=True, flat=True)
+    for run, n_want in ((A, 12), (flat, 4)):        # K=[2,[2,2,2]]: (1+1 + 1+1 + 2) x 2
+        layers, gts, lm = lf.trace_layers(run, "volA", 2, **kw)
+        last = [L for L in layers if L["shape"] == layers[0]["shape"]][-1]
+        zr, _, _ = lf.trace_slice(run, "volA", 2, **kw) if run == A else (None, None, None)
+        check(f"{os.path.basename(run)}: one iterate per LPDS layer, last + DC = output",
+              lm["n_layers"] == n_want and lm["dc_misfit"] < 1e-5
+              and (zr is None or np.allclose(last["x"], zr["recon"], atol=1e-5)),
+              f"{lm['n_layers']} layers, DC misfit {lm['dc_misfit']:.1e}")
+    sh = set(L["shape"] for L in lf.trace_layers(A, "volA", 2, **kw)[0])
+    check("multigrid layers run on every level's grid", len(sh) == 3, str(sorted(sh)))
+    rows = np.tile(np.array([1.0, -1.0])[:, None], (16, 32)) + 3.0    # alternates down axis 0
+    r, c = lf.nyquist_share(rows)
+    check("nyquist_share: horizontal stripes are all 'rows'", r > 0.99 and c < 0.01,
+          f"rows {r:.3f} cols {c:.3f}")
+
     # 1b: a new checkpoint is picked up ---------------------------------------
     time.sleep(1.1)
     os.utime(os.path.join(A, "net.ckpt"))
     lf.trace_slice(A, "volA", 2, **kw)
-    check("a changed net.ckpt is reloaded", loads == ["mgA_R4", "mgB_R4", "mgA_R4"], str(loads))
+    check("a changed net.ckpt is reloaded",
+          loads == ["mgA_R4", "mgB_R4", "lpdsflat_R4", "mgA_R4"], str(loads))
     print("\n" + lf.cache_info())
 
     de.load_run = real
