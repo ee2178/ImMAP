@@ -316,11 +316,107 @@ def test_vertex_net_end_to_end():
               and len(grads) > 0 and all(bool(torch.isfinite(g_).all()) for g_ in grads))
 
 
+_COPIES = ("analysis", "synthesis", "prox")
+
+
+def _drift_(layer, scale=0.3, seed=0):
+    """Move a layer's convs the way training moves them after construction."""
+    from models.base import set_weight
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for conv in (layer.analysis, layer.synthesis):
+            w = conv.weight
+            set_weight(conv, w + scale * w.abs().mean() * torch.randn(w.shape, generator=g).to(w.dtype))
+
+
+def test_tied_copies():
+    """`fas_copies="tied"`: the downsampler uses F_1's / C_1's own modules, so
+    the FAS correction stays coherent however far training moves them."""
+    from models.mg_lpds import PDObjectiveDownsample
+    tied, untied = _net(fas_copies="tied"), _net(fas_copies="untied")
+    same = []
+    for V in (m for m in tied.modules() if isinstance(m, PDVCycle)):
+        F1, C1 = V.lpdsA.first, first_pd_layer(V.mglayer)
+        same += [getattr(V.dF, f"{n}_fine") is getattr(F1, n) for n in _COPIES]
+        same += [getattr(V.dF, f"{n}_coarse") is getattr(C1, n) for n in _COPIES]
+    check("tied: every downsampler holds F_1's / C_1's own modules, in every outer V-cycle",
+          len(same) == 2 * 3 * 2 * 2 and all(same), f"{sum(same)}/{len(same)}")
+    copies = sum(p.numel() for d in untied.modules() if isinstance(d, PDObjectiveDownsample)
+                 for n in _COPIES for s in ("fine", "coarse")
+                 for p in getattr(d, f"{n}_{s}").parameters())
+    n_t, n_u = (sum(p.numel() for p in m.parameters()) for m in (tied, untied))
+    check("tied drops exactly the copies' parameters", n_u - n_t == copies,
+          f"{n_u:,} -> {n_t:,} ({copies:,} in copies)")
+    y = torch.randn(1, 1, 32, 32)
+    with torch.no_grad():
+        check("tied and untied nets agree before any training (copies == layers)",
+              torch.equal(tied(y, sigma=torch.tensor(0.015))[0],
+                          untied(y, sigma=torch.tensor(0.015))[0]))
+
+    # after "training": F_1 and C_1 move, an untied dF's copies do not
+    sigma = torch.tensor(0.015)
+    for copies_mode, mode, filt, want in (("untied", "fixed_point", "sinc_vertex", False),
+                                          ("tied", "fixed_point", "sinc_vertex", True),
+                                          ("tied", "gradient", "box", True)):
+        torch.manual_seed(2)
+        V = PDVCycle([2, 2], C=1, M=4, P=5, stride=2, is_complex=False, lam0=0.05,
+                     transfer_filter=filt, fas_dual=mode, fas_copies=copies_mode)
+        F1, C1 = V.lpdsA.first, first_pd_layer(V.mglayer)
+        _drift_(F1, seed=1)
+        _drift_(C1, seed=2)
+        with torch.no_grad():
+            x = torch.randn(1, 1, 16, 16)
+            Ax = F1.analysis(x)
+            z = F1.prox.prox.threshold(Ax, sigma) * torch.sign(Ax)     # z = clip(z + Ax)
+            y = x + F1.synthesis(z)                                     # fine residual 0
+            (x_c, z_c, pi_x, pi_z, y_c, E_c, sigma_c, _) = V.dF(x, z, y, Identity(), sigma, {}, {})
+            (xn, zn), _ = C1((x_c, z_c), y_c, E=E_c, sigma=sigma_c, pi=(pi_x, pi_z))
+            dx, dz = rel(xn, x_c), rel(zn, z_c)
+        check(f"after drift, {copies_mode:6s} copies + {mode:11s}: coarse sweep "
+              f"{'stays put' if want else 'MOVES'}", (dx < 1e-5 and dz < 1e-5) == want,
+              f"dx={dx:.1e} dz={dz:.1e}")
+
+    # checkpoints: untied (drifted) -> tied refused; tied -> tied and tied -> untied load
+    drifted = _net(fas_copies="untied")
+    for V in (m for m in drifted.modules() if isinstance(m, PDVCycle)):
+        _drift_(V.lpdsA.first, seed=3)
+    try:
+        _net(fas_copies="tied").load_state_dict(drifted.state_dict())
+        check("an untied checkpoint with drifted copies is refused by a tied net", False)
+    except ValueError:
+        check("an untied checkpoint with drifted copies is refused by a tied net", True)
+    a = _net(fas_copies="tied")
+    for V in (m for m in a.modules() if isinstance(m, PDVCycle)):
+        _drift_(V.lpdsA.first, seed=4)
+    b, c = _net(fas_copies="tied"), _net(fas_copies="untied")
+    b.load_state_dict(a.state_dict())
+    c.load_state_dict(a.state_dict())
+    with torch.no_grad():
+        oa, ob, oc = (m(y, sigma=sigma)[0] for m in (a, b, c))
+    check("tied checkpoint round-trips (tied -> tied bit-identical, -> untied equal)",
+          torch.equal(oa, ob) and rel(oc, oa) < 1e-6, f"untied rel {rel(oc, oa):.1e}")
+
+    # training mechanics on the tied net
+    t = _net(fas_copies="tied")
+    out = t(y, sigma=sigma)[0]
+    out.pow(2).mean().backward()
+    C1 = first_pd_layer(next(m for m in t.modules() if isinstance(m, PDVCycle)).mglayer)
+    g = C1.synthesis.conv_real.weight.grad
+    t.project()
+    check("tied net: gradients reach the shared modules; project() runs",
+          g is not None and bool(torch.isfinite(g).all()) and float(g.abs().sum()) > 0)
+    try:
+        _net(fas_copies="shared")
+        check("unknown fas_copies refused", False)
+    except ValueError:
+        check("unknown fas_copies refused", True)
+
+
 def main():
     for t in (test_vertex_pair, test_vertex_response, test_lattice_alignment,
               test_vertex_length_and_learned, test_sweep_coherence,
               test_coherence_through_dF, test_dF_formula, test_net,
-              test_vertex_net_end_to_end):
+              test_vertex_net_end_to_end, test_tied_copies):
         print(f"\n== {t.__name__}")
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

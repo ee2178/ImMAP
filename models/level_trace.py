@@ -277,6 +277,57 @@ def trace_forward(net, *args, **kwargs):
     return out, LevelTrace(rec, maxd + 2, family)
 
 
+def _transfer_kws(net):
+    """The fixed (image-grid) transfer of `net`'s V-cycles, as `restrict` kwargs."""
+    from models.mg_lpds import PDObjectiveDownsample
+    for m in net.modules():
+        if isinstance(m, PDObjectiveDownsample):
+            return dict(julia_compat=m.julia_compat, filter=m.transfer_filter)
+    return None
+
+
+def level_images(net, trace, out, outer=-1, tol=1e-3):
+    """The image each grid level holds once V-cycle `outer` has come back up
+    through it (`x_out`, the decoder side), finest first, in IMAGE units.
+
+    -> `[x_0, x_1, ...]`, each `(B, C, H / 2^l, W / 2^l)` complex on the
+    EMBEDDED grid (crop with the training loop's `T`), or None when there is no
+    primal image per level (the CDLNet family carries only a code) or the net's
+    output is not on the finest iterate's grid.
+
+    DC. MGLPDSNet works on the DC-removed image (kspace_pre_process subtracts
+    mu E^H E 1, kspace_post_process adds mu back), so level l holds
+    R^l(x - mu). mu is recovered per image as output minus the finest iterate
+    (a constant -- a larger misfit than `tol` returns None rather than a wrong
+    picture) and R^l(mu) is added back with the net's own transfer.
+    """
+    from models.components import to_complex
+    from operators.resample import restrict
+
+    kws = _transfer_kws(net)
+    if trace.family != "MGLPDSNet" or kws is None:
+        return None
+    o = trace.outers[outer]
+    xs = []
+    for l in trace.levels:
+        x = trace.get(o, l, "x_out")
+        if x is None:
+            break
+        xs.append(to_complex(x) if torch.is_complex(out) else x)
+    if not xs or xs[0].shape != out.shape:
+        return None
+    diff = out - xs[0]
+    mu = diff.mean(dim=(-2, -1), keepdim=True)
+    if float((diff - mu).norm()) > tol * float(out.norm()) + 1e-12:
+        return None
+    dc = mu.expand_as(xs[0]).contiguous()
+    images = []
+    for x in xs:
+        images.append(x + dc)
+        dc = restrict(dc, **kws)
+    return images
+
+
 class LevelTraceMixin:
     """Adds `forward_levels` to a multigrid container."""
 
@@ -287,3 +338,12 @@ class LevelTraceMixin:
         returns. Runs under `no_grad`; for training, call `forward`.
         """
         return trace_forward(self, *args, **kwargs)
+
+    def forward_level_images(self, *args, outer=-1, **kwargs):
+        """One traced forward -> `(output, level_images(...))`: what `forward`
+        returns, and the image every grid level holds after V-cycle `outer`
+        (finest first, image units, embedded grid; None when not available).
+        Runs under `no_grad` (training/recon.py's `log_levels` panel)."""
+        out, trace = trace_forward(self, *args, **kwargs)
+        x_hat = out[0] if isinstance(out, tuple) else out
+        return out, level_images(self, trace, x_hat, outer=outer)

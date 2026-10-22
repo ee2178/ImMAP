@@ -39,13 +39,13 @@
 # SENSE ground truth, organ mask from the stored maps, rediscretized coarse
 # Gram, planar convs, PLANAR_STATE on, 6000 epochs x 50 steps.
 #
-# ONE DIFFERENCE YOU WILL SEE IN wandb, not in the paper numbers: configs
-# generated since 2026-10-20 validate on SIMULATED k-space at sigma 0.015
-# (training.val_kspace_type), while exp11's runs were launched before and
-# validate on measured k-space. So the val curves of the two sets are on
-# slightly different measurements (and best-checkpoint selection follows each
-# run's own val). Compare the sweeps with torch/main_eval.sbatch instead, which
-# scores every run on the SAME measurement:
+# ONE DIFFERENCE YOU MAY SEE IN wandb, not in the paper numbers: these cells
+# were generated 2026-10-21, when configs validated on SIMULATED k-space
+# (training.val_kspace_type), while exp11's runs validate on measured k-space.
+# Between slots, with no job on the run, `python scripts/set_val_kspace.py`
+# switches them to measured validation (the val curve steps at the switch).
+# Compare the sweeps with torch/main_eval.sbatch, which scores every run on the
+# SAME measurement (measured k-space + AWGN):
 #     RUNS="knee/mg81v6_R8 knee/mg100v6_R8 knee/mg121v6_R8 knee/mg144v6_R8 knee/mg169v6_R8 knee/mg81v2_R8 knee/mg81v4_R8" \
 #     OUT=results/ablation_knee_R8 VAL_KSPACE=measurement_awgn sbatch --array=0-6 torch/main_eval.sbatch
 #

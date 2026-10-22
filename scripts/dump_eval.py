@@ -73,7 +73,8 @@ import datasets                              # noqa: F401  registers the loaders
 from datasets.registry import build_loader
 from evaluation.metrics import DEFAULT_METRICS, REGISTRY as METRIC_REGISTRY
 from evaluation.metrics import build_metrics, warm_up
-from evaluation.tasks import build_adapter, default_sigma, force_organ_mask, val_kspace_type
+from evaluation.tasks import (EVAL_KSPACE_TYPE, build_adapter, default_sigma,
+                              force_organ_mask, val_kspace_type)
 
 DUMP_VERSION = 1
 
@@ -360,8 +361,10 @@ def main():
                         "organ mask from the stored coil maps for every run; 'run': "
                         "each run's own setting")
     p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
-                   help="how the measurement is made; default = the run's "
-                        "training.val_kspace_type, else its training kspace_type")
+                   default=EVAL_KSPACE_TYPE,
+                   help=f"how the measurement is made (default {EVAL_KSPACE_TYPE}: "
+                        f"measured k-space + AWGN, as the nets train, whatever the "
+                        f"run's config says)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)

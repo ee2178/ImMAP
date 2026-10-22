@@ -26,7 +26,7 @@ from training.common import (
 from training.common import backtrack as do_backtrack, resync_schedule
 from training.step_profile import StepProfiler
 from visualization.filters import get_filter_grids
-from visualization.image import recon_panel
+from visualization.image import levels_panel, recon_panel, upsample_repeat
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
 
@@ -116,6 +116,31 @@ def _ckpt_field(path, key):
     return ck.get(key)
 
 
+@torch.no_grad()
+def _levels_log(net, y, E, sigma, T, zinv, mask, gt):
+    """The `log_levels` strip -> `(panel, [(h, w) per level, finest first])`,
+    or None when `net` has no per-level images.
+
+    Every level's image is brought to the embedded grid by pixel repetition,
+    then treated exactly like the recon in the panel beside it: cropped by `T`,
+    un-whitened by `zinv`, masked by `mask` -- so the finest tile IS the recon
+    tile of val/recon_example."""
+    fn = getattr(net, "forward_level_images", None)
+    if fn is None or getattr(net, "levels", 1) < 2:
+        return None
+    _, imgs = fn(y, E=E, sigma=sigma)
+    if not imgs:
+        return None
+    full = imgs[0].shape[-2:]
+    out = []
+    for x in imgs:
+        x = T.forward(upsample_repeat(x, full))
+        if zinv is not None:
+            x = zinv * x
+        out.append(x if mask is None else x * mask)
+    return levels_panel(out, gt), [tuple(x.shape[-2:]) for x in imgs]
+
+
 def train_recon(
     net,
     opt,
@@ -150,14 +175,14 @@ def train_recon(
     # move because the model moved, not because the noise did.
     val_noise_std=None,
     val_seed=None,
-    # How the VALIDATION measurement is made; None = the training `kspace_type`.
-    # "simulated" (the measured-protocol default since 2026-10-20) pushes the
-    # SENSE ground truth through the STORED maps, mask and AWGN, so the noise
-    # in y is exactly `val_noise_std` -- measured k-space already carries the
-    # scanner's own noise on top of what is added -- and sigma can be set
-    # outside the training range to test noise adaptivity. The operator still
-    # gets its maps the training way (online ESPIRiT from the measurement's
-    # ACS), so the forward model is not handed the maps that made the data.
+    # How the VALIDATION measurement is made; None = the training `kspace_type`,
+    # which is what the generator writes since 2026-10-22 (configs generated
+    # 2026-10-20 .. 2026-10-22 carry "simulated"; scripts/set_val_kspace.py
+    # removes it from a run). "simulated" pushes the SENSE ground truth through
+    # the STORED maps, mask and AWGN, so the noise in y is exactly
+    # `val_noise_std` -- measured k-space already carries the scanner's own
+    # noise on top of what is added. The operator still gets its maps the
+    # training way (online ESPIRiT from the measurement's ACS).
     val_kspace_type=None,
     ### Loss
     loss_type="complex-mse",
@@ -181,6 +206,12 @@ def train_recon(
     # is shrinking over training looks identical to one that is not. Raise it
     # to inspect a residual that has become faint.
     residual_gain=4.0,
+    # Multigrid nets only: also log `val/levels`, the image every grid level
+    # holds after the LAST V-cycle (coarsest -> finest, then the ground truth),
+    # coarse levels pixel-repeated up to full size, on val/recon_example's
+    # greyscale and mask. One extra traced forward per validation, on the slice
+    # the recon panel shows. Ignored (with one notice) by nets without levels.
+    log_levels=False,
     start_epoch=0,            # was: start_step
     save_dir=None,
     ckpt=None,
@@ -267,6 +298,7 @@ def train_recon(
     # (training/step_profile.py). Off by default, and then every `prof.*` call
     # below returns at once.
     prof = StepProfiler(device)
+    levels_off = False        # set once a net turns out to have no level images
 
     for epoch in range(start_epoch, num_epochs):
         net.train()
@@ -620,6 +652,26 @@ def train_recon(
                         {"val/recon_example": wandb_image(panel, caption=caption)},
                         step=global_step,
                     )
+
+                    if log_levels and not levels_off:
+                        lp = _levels_log(net, y_v, E_v, sigma_v, T_v,
+                                         extra_v.get("Zinv") if whiten_kspace else None,
+                                         p_mask, img_p)
+                        if lp is None:
+                            levels_off = True
+                            print("log_levels: this net has no per-level images "
+                                  "(not an MGLPDS V-cycle) -- val/levels is not logged")
+                        else:
+                            lpanel, sizes = lp
+                            wandb.log({"val/levels": wandb_image(
+                                lpanel,
+                                caption=(f"epoch {epoch} | last V-cycle, each grid level: "
+                                         + " | ".join(f"L{l} {h}x{w}" for l, (h, w)
+                                                      in reversed(list(enumerate(sizes))))
+                                         + " | ground truth\ncoarse levels pixel-repeated "
+                                         "to full size; same greyscale as recon_example"
+                                         + (" [organ mask]" if p_mask is not None else "")))},
+                                step=global_step)
 
             mean_metrics = {
                 k: (v.detach() / num_val_batches).item()

@@ -3,7 +3,7 @@
 Noise-level generalization: each net's metric against the TEST noise level, with
 the training range shaded -- the CDLNet / LPDSNet figure.
 
-    python figures/plot_noise_sweep.py                                  # results/noise_sweep_simulated
+    python figures/plot_noise_sweep.py                                  # results/noise_sweep_measurement_awgn
     python figures/plot_noise_sweep.py --metrics psnr ssim --ref MGLPDS-Big
     python figures/plot_noise_sweep.py --nets E2E-VarNet LPDSNet MGLPDS-Small \\
         --rename MGLPDS-Small=MGLPDS --ref MGLPDS
@@ -180,7 +180,7 @@ def plot(curves, keys, metrics, ref, out, scale):
     fig.legend([handles[n] for n in order], order, loc="upper center", ncol=len(order),
                frameon=False, bbox_to_anchor=(0.5, 1.0))
     fig.text(0.5, 0.0, "Shaded: training range. Bands: ± SEM over volumes "
-             "(paired across nets at each σ). Every net is told the true σ.",
+             "(paired across nets at each σ). Every net is told σ of the added noise.",
              ha="center", va="bottom", fontsize=7.5, color=MUTED)
     fig.tight_layout(rect=(0, 0.02, 1, 0.96))
     for ext in ("png", "pdf"):
@@ -191,7 +191,7 @@ def plot(curves, keys, metrics, ref, out, scale):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--root", default=os.path.join(ROOT, "results", "noise_sweep_simulated"))
+    p.add_argument("--root", default=os.path.join(ROOT, "results", "noise_sweep_measurement_awgn"))
     p.add_argument("--metrics", nargs="*", default=["psnr"],
                    help="psnr ssim nrmse lpips (default psnr)")
     p.add_argument("--nets", nargs="*", help="keep only these (labels before --rename)")

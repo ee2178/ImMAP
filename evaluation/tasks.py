@@ -180,13 +180,22 @@ def force_organ_mask(cfg):
     return cfg
 
 
+#: What every evaluation script measures on unless told otherwise (their
+#: --val-kspace-type default): MEASURED k-space + AWGN, how the nets train and
+#: how results/main has always been scored. Set explicitly rather than read from
+#: the run, because configs generated 2026-10-20 .. 2026-10-22 carry
+#: `training.val_kspace_type: "simulated"` and would otherwise be scored on the
+#: easier measurement. "simulated" stays available per call (noise sweeps).
+EVAL_KSPACE_TYPE = "measurement_awgn"
+
+
 def val_kspace_type(cfg):
     """How a validation / evaluation measurement is made for this run.
 
-    `training.val_kspace_type` when set -- "simulated" for every measured-
-    protocol config generated since 2026-10-20, and what the eval scripts'
-    --val-kspace-type overrides -- otherwise the run's training `kspace_type`,
-    which is what runs generated before then validated on.
+    `training.val_kspace_type` when set -- the eval scripts write their
+    --val-kspace-type there (default EVAL_KSPACE_TYPE); configs generated
+    2026-10-20 .. 2026-10-22 carry "simulated" -- otherwise the run's training
+    `kspace_type`, which is what training validation follows since 2026-10-22.
     """
     return (cfg.get("training", {}).get("val_kspace_type")
             or cfg.get("mri", {}).get("kspace_type", "simulated"))

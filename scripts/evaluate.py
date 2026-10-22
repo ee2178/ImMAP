@@ -47,7 +47,7 @@ import datasets                              # noqa: F401  registers the loaders
 from datasets.registry import build_loader
 from evaluation.metrics import DEFAULT_METRICS, REGISTRY as METRIC_REGISTRY
 from evaluation.metrics import build_metrics, warm_up
-from evaluation.tasks import build_adapter, default_sigma
+from evaluation.tasks import EVAL_KSPACE_TYPE, build_adapter, default_sigma
 from models import build_model
 
 
@@ -114,8 +114,9 @@ def main():
                    help="noise levels; default is each run's val_noise_std")
     p.add_argument("--seed", type=int)
     p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
-                   help="how the measurement is made; default = each run's "
-                        "training.val_kspace_type, else its training kspace_type")
+                   help=f"how the measurement is made (default {EVAL_KSPACE_TYPE}: "
+                        f"measured k-space + AWGN, as the nets train, whatever each "
+                        f"run's config says); an --eval-config may set it too")
     p.add_argument("--device")
     p.add_argument("--limit", type=int, help="stop after N batches (smoke test)")
     args = p.parse_args()
@@ -134,7 +135,7 @@ def main():
     metric_names = opt("metrics", DEFAULT_METRICS)
     sigmas = opt("sigmas", None)
     seed = opt("seed", 1234)
-    val_kspace = opt("val_kspace_type", None)
+    val_kspace = opt("val_kspace_type", EVAL_KSPACE_TYPE)
     device = torch.device(opt("device",
                               "cuda" if torch.cuda.is_available() else "cpu"))
     limit = opt("limit", None)

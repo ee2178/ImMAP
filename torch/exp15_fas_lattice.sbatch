@@ -17,21 +17,28 @@
 #
 # EXPERIMENT 15 -- V-CYCLE CORRECTNESS FIXES vs mg81v6, KNEE R=8, FULL LENGTH.
 #
-#   0   knee  R8   mg81v6vtx    lattice fix,  legacy dual FAS
-#   1   knee  R8   mg81v6vtxA   lattice fix + FAS option A   (fas_dual=fixed_point)
-#   2   knee  R8   mg81v6vtxB   lattice fix + FAS option B   (fas_dual=gradient)
+#   0   knee  R8   mg81v6vtx    lattice fix,  legacy dual FAS, untied FAS copies
+#   1   knee  R8   mg81v6vtxA   lattice fix + FAS option A   (fas_dual=fixed_point, fas_copies=tied)
+#   2   knee  R8   mg81v6vtxB   lattice fix + FAS option B   (fas_dual=gradient,    fas_copies=tied)
+#
+# The FAS cells TIE the downsampler's operators to the first fine / coarse
+# layers' (fas_copies=tied): with its own trained copies the FAS correction
+# carries their drift into the coarse level and no dual placement stays
+# coherent after training (models/mg_lpds.py::FAS_COPIES). Tied, mg81v6 loses
+# the copies' 22% of its parameters (1.73M -> 1.35M).
 #
 # The lattice fix (transfer_filter=sinc_vertex) is ON in every cell: it is a
 # correctness fix, the standard for every multigrid cell from now on
 # (make_mg_recon_configs.py::MG_TRANSFER_FILTER), not an ablation arm. So
 #     mg81v6 -> mg81v6vtx            what the lattice fix is worth
-#     mg81v6vtx -> vtxA / vtxB        what each FAS fix is worth on top of it
+#     mg81v6vtx -> vtxA / vtxB        what a coherent FAS (tied copies + option
+#                                     A or B) is worth on top of it
 #
 # (Index order is the generator's MODELS order, not the order of ONLY.)
 #
 # BASELINE: exp11's knee/mg81v6_R8 (MGLPDS-Small), NOT retrained here. Every
-# cell is mg81v6 with only `model.params.transfer_filter` and/or
-# `model.params.fas_dual` changed (checked config-for-config against the
+# cell is mg81v6 with only `model.params.transfer_filter`, `.fas_dual` and
+# `.fas_copies` changed (checked config-for-config against the
 # regenerated mg81v6_R8 on 2026-10-22: those keys, the run dir and the wandb
 # name differ, nothing else).
 #

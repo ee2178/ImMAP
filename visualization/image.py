@@ -910,6 +910,38 @@ def recon_panel(gt, recon, zero_filled=None, gain=4.0, eps=1e-12):
     return torch.cat(strip, dim=-1)[0], stats
 
 
+def upsample_repeat(x, shape):
+    """`x` (..., h, w) brought to `shape` = (H, W) by repeating each pixel
+    (H/h) x (W/w) times -- nearest neighbour, so a coarse level keeps its own
+    resolution on screen instead of being smoothed into looking finer. Complex
+    safe. The factors must be whole numbers (multigrid levels are 2^l)."""
+    H, W = int(shape[-2]), int(shape[-1])
+    h, w = x.shape[-2:]
+    if H % h or W % w:
+        raise ValueError(f"cannot repeat a {h}x{w} grid onto {H}x{W}: not a whole factor")
+    return x.repeat_interleave(H // h, dim=-2).repeat_interleave(W // w, dim=-1)
+
+
+def levels_panel(levels, gt, eps=1e-12):
+    """[coarsest level | ... | finest level | ground truth], one strip.
+
+    `levels` finest first, every one ALREADY at the ground truth's size (see
+    `upsample_repeat`). All tiles share `recon_panel`'s intensity scale -- the
+    ground truth's max -- so this strip and val/recon_example read on one
+    greyscale, and a coarse level that over- or under-shoots shows as such.
+    First image of the batch, like `recon_panel`.
+    """
+    gt_m = _to_mag(gt)
+    ref = gt_m.max().clamp_min(eps)
+    tiles = [(_to_mag(x) / ref).clamp(0, 1) for x in reversed(list(levels))]
+    tiles.append((gt_m / ref).clamp(0, 1))
+    pad = torch.ones(1, 1, tiles[0].shape[-2], 2)
+    strip = [tiles[0]]
+    for t in tiles[1:]:
+        strip += [pad, t]
+    return torch.cat(strip, dim=-1)[0]
+
+
 def residual_kspace(gt, recon, eps=1e-12):
     """log-magnitude spectrum of the residual -- what kind of artifact is this?
 

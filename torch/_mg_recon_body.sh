@@ -356,8 +356,10 @@ if os.path.exists(out) and not force:
     # `val_kspace_type` (2026-10-20) changes only how VALIDATION is measured,
     # never the trained net; a run launched before it existed resumes from its
     # own config.json and keeps validating the way it always did.
+    # `log_levels` (2026-10-22) adds the val/levels wandb panel and nothing
+    # else; run dirs launched before it resume without it.
     _EXEC_KEYS = ("training.planar_state", "model.params.flex_block_size",
-                  "training.val_kspace_type")
+                  "training.val_kspace_type", "training.log_levels")
     a, b = _flat(old), _flat(cfg)
     diff = sorted(k for k in set(a) | set(b)
                   if a.get(k) != b.get(k) and k not in _EXEC_KEYS)

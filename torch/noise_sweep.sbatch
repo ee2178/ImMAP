@@ -21,19 +21,22 @@
 # Every net here trained at sigma ~ U[0.01, 0.02] (both anatomies). The unrolled
 # nets are noise-ADAPTIVE: every threshold and step is affine in sigma
 # (`degrees=1`, models/prox.py::Polynomial). E2E-VarNet never sees sigma. RAM
-# is conditioned on it. Each net is told the TRUE test sigma (oracle sigma).
+# is conditioned on it. Each net is told the test sigma of the ADDED noise, as
+# in training (oracle sigma).
 #
 #    0- 3  brain R8   varnetmaps lpdsnet mg81v6 mg169v6
 #    4- 7  knee  R8   varnetmaps lpdsnet mg81v6 mg169v6
 #    RAM, or another R, through RUNS (one task per entry, in order):
 #      RUNS="brain/ramdrunet_R8 knee/ramdrunet_R8" sbatch --array=0-1 torch/noise_sweep.sbatch
 #
-# THE MEASUREMENT is SIMULATED k-space by default: the SENSE ground truth through
-# the stored maps, the mask and AWGN at exactly sigma. Measured k-space already
-# carries the scanner's own noise, so with it the true noise level is unknown and
-# cannot go BELOW the scanner's -- a sweep needs a known sigma. The nets trained
-# on measured k-space + AWGN, so simulated test data is a (small, fixed) domain
-# shift, the same at every sigma. VAL_KSPACE=measurement_awgn for the other view.
+# THE MEASUREMENT is MEASURED k-space + AWGN at sigma (VAL_KSPACE, default
+# measurement_awgn), as the nets train and as every other evaluation scores them.
+# sigma is then the ADDED noise: the scanner's own noise rides on top, so the
+# total level is not exactly sigma, and the lowest sigmas sit at or under the
+# scanner floor (the curve flattens there rather than reading as "less noise").
+# VAL_KSPACE=simulated for an exact sigma (the SENSE ground truth through the
+# stored maps, the mask and AWGN at exactly sigma) -- a small, fixed domain shift
+# from training, written to its own tree.
 #
 # NOISE IS PAIRED ACROSS SIGMA: eval_per_volume seeds each slice's noise by
 # (seed, volume, slice), so every sigma scales the same draw, and every net sees
@@ -47,7 +50,7 @@
 # OUTPUT, one tree per sigma, merged as each task finishes:
 #     results/noise_sweep_<VAL_KSPACE>/s<sigma>/{<anatomy>/<run>.slices.csv, volumes.csv}
 # then the figure (copy the tree down first):
-#     python figures/plot_noise_sweep.py --root results/noise_sweep_simulated
+#     python figures/plot_noise_sweep.py --root results/noise_sweep_measurement_awgn
 #
 # RESUMABLE per (net, sigma): resubmitting finishes what is missing.
 #
@@ -65,7 +68,7 @@ if [ -n "${_RUNS_GIVEN}" ]; then
 fi
 # Training range is [0.01, 0.02]; 0.01 / 0.015 / 0.02 sit inside it.
 SIGMAS="${SIGMAS:-0.0025 0.005 0.01 0.015 0.02 0.03 0.04 0.05}"
-VAL_KSPACE="${VAL_KSPACE:-simulated}"
+VAL_KSPACE="${VAL_KSPACE:-measurement_awgn}"
 METRICS="${METRICS:-psnr ssim nrmse}"   # + lpips if wanted (weights cached on a login node)
 SEED="${SEED:-1234}"
 SAMPLE_BRAIN="${SAMPLE_BRAIN:-100}"    # volumes drawn per brain run; 0 = all 815

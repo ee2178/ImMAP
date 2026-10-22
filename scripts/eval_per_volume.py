@@ -75,8 +75,8 @@ import datasets                              # noqa: F401,E402  registers the lo
 from datasets.registry import build_loader   # noqa: E402
 from evaluation.metrics import REGISTRY as METRIC_REGISTRY  # noqa: E402
 from evaluation.metrics import build_metrics, metric_version, warm_up  # noqa: E402
-from evaluation.tasks import (build_adapter, default_sigma, force_organ_mask,  # noqa: E402
-                              metric_mask_source, val_kspace_type)
+from evaluation.tasks import (EVAL_KSPACE_TYPE, build_adapter, default_sigma,  # noqa: E402
+                              force_organ_mask, metric_mask_source, val_kspace_type)
 
 # Display names of the main comparison. Keyed by CELL (the run name without
 # its _R<r> suffix). MGLPDS-Big is `mg169v6`; `mglpds` was brain's stopgap until
@@ -508,10 +508,12 @@ def main():
                         "LPIPS compares with the background zeroed). 'run': the mask "
                         "setting each run trained with")
     p.add_argument("--val-kspace-type", choices=["simulated", "measurement_awgn"],
-                   help="how the evaluation measurement is made; default = the run's "
-                        "training.val_kspace_type, else its training kspace_type. "
-                        "'simulated': the SENSE ground truth through the stored maps, "
-                        "mask and AWGN, so the noise is exactly sigma"),
+                   default=EVAL_KSPACE_TYPE,
+                   help=f"how the evaluation measurement is made (default "
+                        f"{EVAL_KSPACE_TYPE}: measured k-space + AWGN, as the nets train, "
+                        f"whatever the run's config says). 'simulated': the SENSE ground "
+                        f"truth through the stored maps, mask and AWGN, so the noise is "
+                        f"exactly sigma"),
     p.add_argument("--transfer-filter",
                    help="swap the grid-transfer filter of multigrid runs at inference "
                         "(same weights): box, bilinear, ..., or none = the sinc off; "

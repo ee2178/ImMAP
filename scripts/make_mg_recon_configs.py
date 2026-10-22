@@ -641,12 +641,18 @@ EXP14_CELLS = tuple(f"mg{m}v6" for m in EXP14_M)
 #  defined before stay cell-centred -- their configs carry no transfer_filter
 #  key and so resolve to the module default "sinc", which must NOT change, or
 #  every trained checkpoint would load with a different transfer.
+#
+#  The FAS options A / B come with fas_copies="tied": with the downsampler's
+#  own trained copies of F_1 / C_1 ("untied") no dual placement stays coherent
+#  after training -- the copies drift and that drift enters the coarse level as
+#  if it were fine residual (12d on mglpds_R8: 71% of the first coarse step).
 # ---------------------------------------------------------------------------
 MG_TRANSFER_FILTER = "sinc_vertex"
+_FAS_FIX = dict(fas_copies="tied")
 EXP15 = {
     "mg81v6vtx":  dict(transfer_filter=MG_TRANSFER_FILTER),
-    "mg81v6vtxA": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point"),
-    "mg81v6vtxB": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient"),
+    "mg81v6vtxA": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX),
+    "mg81v6vtxB": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient", **_FAS_FIX),
 }
 MODELS.update({
     name: dict(type="MGLPDSNet",
@@ -981,6 +987,19 @@ def supports_planar_state(spec):
             and not p.get("learn_transfer"))
 
 
+def supports_level_panel(spec):
+    """Does this cell have per-level images for `training.log_levels`? A
+    primal-dual V-cycle (`MGLPDSNet` / `MGGroupLPDS` with K = [K_outer,
+    [i0, i1, ...]]): every grid level carries an image. Written ON for those,
+    absent for every other cell (their configs stay byte-identical); the key is
+    logging-only, so the launch guard treats it as execution-only and existing
+    run dirs still resume (torch/_mg_recon_body.sh::_EXEC_KEYS)."""
+    K = spec["params"].get("K")
+    return (spec["type"] in ("MGLPDSNet", "MGLPDS", "MGGroupLPDS")
+            and isinstance(K, (list, tuple)) and len(K) == 2
+            and isinstance(K[1], (list, tuple)) and len(K[1]) > 1)
+
+
 def _opt_mri(args):
     """The optional `mri` keys, present ONLY when switched on.
 
@@ -1129,6 +1148,8 @@ def _display_name(spec_type, params):
             tag += "_" + str(params["transfer_filter"])
         if params.get("fas_dual", "legacy") != "legacy":
             tag += "_fas" + params["fas_dual"]
+        if params.get("fas_copies", "untied") != "untied":
+            tag += "_" + params["fas_copies"]
         return "%s_%s" % (spec_type, tag)
     if spec_type == "RAM":
         # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.
@@ -1362,6 +1383,9 @@ def make_config(anatomy, r, model, args):
             **({"planar_state": True}
                if getattr(args, "planar_state", False) and supports_planar_state(spec)
                else {}),
+            # val/levels: each grid level's image after the last V-cycle
+            # (training/recon.py). On for every multigrid cell; logging only.
+            **({"log_levels": True} if supports_level_panel(spec) else {}),
         },
         "mri": {
             "R": r,

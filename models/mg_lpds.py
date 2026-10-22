@@ -153,6 +153,35 @@ def _check_fas_dual(mode):
     return mode
 
 
+#: Which operators `PDObjectiveDownsample` forms the FAS residuals with
+#: (`fas_copies`):
+#:
+#:   "untied"  its own copies of the first fine layer's (F_1) and the first
+#:             coarse layer's (C_1) analysis / synthesis / prox -- equal at
+#:             construction, trained apart after (this port and
+#:             `mg_lpds.jl:164-165` have always done this). The first coarse
+#:             sweep then steps by R r_fine + (D_{C_1} - D^dF_c) z_c: the drift
+#:             between the copy and C_1 enters the coarse level as if it were
+#:             fine-level residual, and no dual placement is coherent after
+#:             training (12d on mglpds_R8: 71% of that step, 99.7% of its
+#:             near-Nyquist part).
+#:   "tied"    F_1's and C_1's own modules: the drift is zero by construction
+#:             and the first coarse step is -tau R r_fine. Fine and coarse
+#:             filters stay independent; only the downsampler's private copies
+#:             go (22% of mg81v6's parameters). The fine tie to F_1 is a
+#:             convention -- every fine sweep has its own weights.
+#:
+#: Not interchangeable on a checkpoint: an "untied" one cannot load "tied"
+#: (`MGLPDSNet.load_state_dict` refuses), a "tied" one loads "untied".
+FAS_COPIES = ("untied", "tied")
+
+
+def _check_fas_copies(mode):
+    if mode not in FAS_COPIES:
+        raise ValueError(f"fas_copies must be one of {FAS_COPIES}, got {mode!r}")
+    return mode
+
+
 class PDObjectiveDownsample(nn.Module):
     """Restrict `(x, z, y, E, sigma)` and form `(pi_x, pi_z)`.
 
@@ -164,12 +193,13 @@ class PDObjectiveDownsample(nn.Module):
 
     def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False,
                  transfer_filter=None, transfer=None, coarse_op="galerkin",
-                 fas_dual="legacy"):
+                 fas_dual="legacy", fas_copies="untied"):
         super().__init__()
         self.widen = int(widen)
         self.julia_compat = bool(julia_compat)
         self.coarse_op = coarse_op
         self.fas_dual = _check_fas_dual(fas_dual)
+        self.fas_copies = _check_fas_copies(fas_copies)
         self.is_complex = bool(getattr(fine_layer, "is_complex", True))
         self.transfer_filter = _check_filter(transfer_filter)
         # LATENT-grid transfer, shared with the enclosing V-cycle. Only the
@@ -177,12 +207,17 @@ class PDObjectiveDownsample(nn.Module):
         # keeps the fixed filter, alongside y / E / sigma.
         self.transfer = transfer
 
-        self.analysis_fine = copy.deepcopy(fine_layer.analysis)
-        self.synthesis_fine = copy.deepcopy(fine_layer.synthesis)
-        self.prox_fine = copy.deepcopy(fine_layer.prox)
-        self.analysis_coarse = copy.deepcopy(coarse_layer.analysis)
-        self.synthesis_coarse = copy.deepcopy(coarse_layer.synthesis)
-        self.prox_coarse = copy.deepcopy(coarse_layer.prox)
+        # "untied": private copies, equal to the layers' at construction and
+        # trained on their own after. "tied": the layers' OWN modules, so the
+        # coarse residual inside pi_x / pi_z is computed with exactly the
+        # operators the coarse level's first sweep applies (see FAS_COPIES).
+        own = (lambda m: m) if self.fas_copies == "tied" else copy.deepcopy
+        self.analysis_fine = own(fine_layer.analysis)
+        self.synthesis_fine = own(fine_layer.synthesis)
+        self.prox_fine = own(fine_layer.prox)
+        self.analysis_coarse = own(coarse_layer.analysis)
+        self.synthesis_coarse = own(coarse_layer.synthesis)
+        self.prox_coarse = own(coarse_layer.prox)
 
         M_fine, M_coarse = fine_layer.M, coarse_layer.M
         if M_coarse == M_fine:
@@ -345,13 +380,14 @@ class PDVCycle(nn.Module):
     def __init__(self, iters, C, M, widen=1, alpha0=1e-1, julia_compat=False,
                  spectral_init=True, transfer_filter=None,
                  learn_transfer=False, coarse_op="galerkin", fas_dual="legacy",
-                 **layer_kws):
+                 fas_copies="untied", **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
         if coarse_op not in COARSE_OPS:
             raise ValueError(f"coarse_op must be one of {COARSE_OPS}, got {coarse_op!r}")
         self.coarse_op = coarse_op
         self.fas_dual = _check_fas_dual(fas_dual)
+        self.fas_copies = _check_fas_copies(fas_copies)
         assert iters[0] % 2 == 0, \
             f"non-coarsest level iters must be even, got {iters[0]}"
         self.widen = int(widen)
@@ -407,7 +443,7 @@ class PDVCycle(nn.Module):
                                     transfer_filter=self.transfer_filter,
                                     learn_transfer=learn_transfer,
                                     coarse_op=coarse_op, fas_dual=fas_dual,
-                                    **coarse_kws)
+                                    fas_copies=fas_copies, **coarse_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
                 C, M_c, spectral_init=False, **coarse_kws))
@@ -420,7 +456,8 @@ class PDVCycle(nn.Module):
                                         julia_compat=julia_compat,
                                         transfer_filter=self.transfer_filter,
                                         transfer=self.transfer,
-                                        coarse_op=coarse_op, fas_dual=fas_dual)
+                                        coarse_op=coarse_op, fas_dual=fas_dual,
+                                        fas_copies=fas_copies)
         # The coarse sweeps apply pi_z; their placement follows the mode.
         _set_layer_fas_dual(self.mglayer, fas_dual)
 
@@ -438,6 +475,8 @@ class PDVCycle(nn.Module):
     # -- construction-time weight tying -------------------------------------
     @torch.no_grad()
     def retie_dF(self):
+        if self.dF.fas_copies == "tied":         # dF holds the layers' own modules
+            return
         fine, coarse = self.lpdsA.first, first_pd_layer(self.mglayer)
         self.dF.analysis_fine.load_state_dict(fine.analysis.state_dict())
         self.dF.synthesis_fine.load_state_dict(fine.synthesis.state_dict())
@@ -501,7 +540,8 @@ class PDVCycle(nn.Module):
     def extra_repr(self):
         return (f"depth={self.depth}, iters_per_level={self.iters_per_level}, "
                 f"M={self.M} x widen^l (widen={self.widen}), "
-                f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}")
+                f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}, "
+                f"fas_copies={self.fas_copies}")
 
 
 # ===========================================================================
@@ -548,12 +588,14 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  attn_backend="gather", flex_block_size=128,
                  preproc="kspace", resize_noise=False, julia_compat=False,
                  transfer_filter=None, learn_transfer=False,
-                 coarse_op="galerkin", fas_dual="legacy"):
+                 coarse_op="galerkin", fas_dual="legacy", fas_copies="untied"):
         super().__init__()
         K_outer, iters = _parse_K(K)
-        # How the coarse levels apply the DUAL FAS correction (see FAS_DUAL).
-        # "legacy" is what every net before 2026-10-22 trained with.
+        # How the coarse levels apply the DUAL FAS correction (see FAS_DUAL),
+        # and which operators the corrections are formed with (FAS_COPIES).
+        # "legacy" / "untied" is what every net before 2026-10-22 trained with.
         self.fas_dual = _check_fas_dual(fas_dual)
+        self.fas_copies = _check_fas_copies(fas_copies)
         # The coarse levels' forward model -- "galerkin" (E . P: exact, but
         # every coarse Gram runs the full-resolution multicoil FFTs) or
         # "rediscretize" (SENSE posed on the coarse grid; see
@@ -595,7 +637,7 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 julia_compat=julia_compat,
                 transfer_filter=self.transfer_filter,
                 learn_transfer=self.learn_transfer, coarse_op=coarse_op,
-                fas_dual=fas_dual, **layer_kws))
+                fas_dual=fas_dual, fas_copies=fas_copies, **layer_kws))
             if fas_dual == "gradient":
                 _check_gradient_fas_proxes(self)
 
@@ -706,9 +748,31 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
         with batched_projection():
             walk(self)
 
+    def load_state_dict(self, state_dict, strict=True, **kw):
+        """`nn.Module.load_state_dict`, refusing a checkpoint that would split a
+        SHARED module. Under `fas_copies="tied"` the downsampler's modules are
+        F_1's / C_1's, so each of their tensors has two keys; an "untied"
+        checkpoint carries different values under them, and loading it would
+        silently overwrite the layers' weights with the copies'."""
+        groups = {}
+        for k, v in self.state_dict(keep_vars=True).items():
+            groups.setdefault(id(v), []).append(k)
+        for keys in groups.values():
+            present = [k for k in keys if k in state_dict]
+            for k in present[1:]:
+                a, b = state_dict[present[0]], state_dict[k]
+                if a.shape != b.shape or not torch.equal(a, b.to(a.device)):
+                    raise ValueError(
+                        f"checkpoint has different values under {present[0]!r} and {k!r}, "
+                        f"which are ONE tensor in this net (fas_copies={self.fas_copies!r}): "
+                        f"it was trained with untied FAS copies -- build the net with "
+                        f"fas_copies='untied' to load it")
+        return super().load_state_dict(state_dict, strict=strict, **kw)
+
     def extra_repr(self):
         return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "
-                f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}")
+                f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}, "
+                f"fas_copies={self.fas_copies}")
 
 
 PLANAR_STATE_ENV = "IMMAP_PLANAR_STATE"
