@@ -96,7 +96,7 @@ DEFAULT_METRICS = ["psnr", "ssim", "nrmse", "lpips"]
 META_KEYS = ("run", "anatomy", "R", "step", "sigma", "seed", "slices", "val_kspace_type",
              "mask_source",
              "metrics", "n_volumes", "use_organ_mask", "rediscretize_embedded",
-             "transfer_filter")
+             "transfer_filter", "volume_select")
 
 
 def cell_of(run):
@@ -112,6 +112,19 @@ def label_of(run):
 def slice_seed(seed, volume, sl):
     """A per-slice seed: identical for every run, independent of visiting order."""
     return (int(seed) * 1_000_003 + zlib.crc32(f"{volume}:{sl}".encode())) % (2 ** 63)
+
+
+def sample_volumes(names, n, seed=0):
+    """`n` volumes drawn uniformly at random (fixed `seed`) from `names`, in
+    sorted order -- the same draw for every run. The default first-N of a
+    sorted list is one acquisition site for brain (file_brain_AXT2_200_*);
+    a sweep that means to say something about the val set wants a spread."""
+    names = sorted(names)
+    if not n or n >= len(names):
+        return names
+    import numpy as np
+    pick = np.random.default_rng(int(seed)).choice(len(names), int(n), replace=False)
+    return [names[i] for i in sorted(pick)]
 
 
 def train_slices(cfg):
@@ -168,7 +181,9 @@ def _setup(run_dir, anatomy, args, metric_names, device):
               # ...and scored on whatever mask the run itself used
               "mask_source": metric_mask_source(cfg),
               # ...and with the transfer the net was built with
-              "transfer_filter": filt_trained}
+              "transfer_filter": filt_trained,
+              # ...on the first N (or all) volumes
+              "volume_select": "first"}
     if getattr(args, "mask", "organ") == "organ":
         force_organ_mask(cfg)
     if args.val_kspace_type:
@@ -176,7 +191,15 @@ def _setup(run_dir, anatomy, args, metric_names, device):
     sigma = args.sigma if args.sigma is not None else default_sigma(cfg)
     slices = args.slices if args.slices is not None else train_slices(cfg)
     lo, hi = de.parse_slices(slices)
-    volumes = de.resolve_volumes(cfg["data"]["val"], args.volumes, args.n_volumes)
+    if getattr(args, "sample_volumes", None):
+        if args.volumes or args.n_volumes:
+            raise SystemExit("--sample-volumes picks the volumes itself; drop --volumes / --n-volumes")
+        volumes = sample_volumes(de.resolve_volumes(cfg["data"]["val"], None, None),
+                                 args.sample_volumes, args.sample_seed)
+        volume_select = f"sample{args.sample_volumes}@{args.sample_seed}"
+    else:
+        volumes = de.resolve_volumes(cfg["data"]["val"], args.volumes, args.n_volumes)
+        volume_select = "first"
 
     meta = dict(run=run, anatomy=anatomy, R=cfg.get("mri", {}).get("R"),
                 step=int(step or 0), sigma=float(sigma), seed=int(args.seed),
@@ -189,6 +212,7 @@ def _setup(run_dir, anatomy, args, metric_names, device):
                 rediscretize_embedded=os.environ.get("IMMAP_REDISCRETIZE_EMBEDDED", "1"),
                 val_kspace_type=val_kspace_type(cfg),
                 transfer_filter=filt,
+                volume_select=volume_select,
                 metric_versions={m: metric_version(m) for m in metric_names})
 
     val = dict(cfg["data"]["val"])
@@ -472,6 +496,11 @@ def main():
     p.add_argument("--volumes", nargs="*", help="explicit volume names (smoke tests)")
     p.add_argument("--n-volumes", type=int, default=None,
                    help="first N volumes only (smoke tests); default all")
+    p.add_argument("--sample-volumes", type=int, metavar="N",
+                   help="N volumes drawn at random (fixed --sample-seed) from the whole "
+                        "val split, the same for every run -- for sweeps that score a "
+                        "subset; the first N of brain is one acquisition site")
+    p.add_argument("--sample-seed", type=int, default=0)
     p.add_argument("--sigma", type=float)
     p.add_argument("--mask", choices=["organ", "run"], default="organ",
                    help="'organ' (default): score every run inside the organ mask "

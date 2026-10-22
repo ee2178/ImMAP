@@ -283,6 +283,37 @@ def test_force_mask(tmp, ks, sm):
               "use_organ_mask" in str(e) or "mask_source" in str(e), str(e)[:90])
 
 
+def test_sample_and_sigma(tmp, ks, sm):
+    """--sample-volumes draws a fixed random subset; --sigma moves the scores
+    the way more noise should (the noise sweep, scripts/noise_sweep)."""
+    names = [f"v{i:02d}" for i in range(20)]
+    a, b = epv.sample_volumes(names, 5, 0), epv.sample_volumes(names[::-1], 5, 0)
+    check("sample_volumes: fixed draw, sorted, independent of input order",
+          a == b and a == sorted(a) and len(set(a)) == 5 and set(a) <= set(names), str(a))
+    check("sample_volumes: not simply the first N", a != names[:5])
+    check("sample_volumes: n >= len -> everything", epv.sample_volumes(names, 99) == names)
+
+    cfg = base_cfg(ks, sm)
+    cfg["data"]["train"] = dict(cfg["data"]["val"], start_slice=1, end_slice=3)
+    runs_root, dev = os.path.join(tmp, "runs_ss"), torch.device("cpu")
+    run_dir = make_run(runs_root, "knee", "lpdsnet_R4", cfg)
+    psnr = {}
+    for s in (0.01, 3.0):           # the stub is poor: noise must rival its error
+        out = os.path.join(tmp, f"res_ss_{s}")
+        epv.eval_run(run_dir, "knee", args_for(runs_root, out, sigma=s, sample_volumes=2,
+                                               sample_seed=0), METRICS, dev)
+        meta = json.load(open(os.path.join(out, "knee", "lpdsnet_R4.meta.json")))
+        rows = read(os.path.join(out, "knee", "lpdsnet_R4.slices.csv"))
+        vols = sorted({r["volume"] for r in rows})
+        psnr[s] = np.mean([float(r["psnr"]) for r in rows])
+    check("--sample-volumes: the drawn volumes, recorded in the meta",
+          vols == epv.sample_volumes(["volA", "volB", "volC"], 2, 0)
+          and meta["volume_select"] == "sample2@0" and meta["n_volumes"] == 2,
+          f"{vols} {meta.get('volume_select')}")
+    check("--sigma: far more noise, lower PSNR", psnr[3.0] < psnr[0.01] - 1,
+          f"{psnr[0.01]:.2f} -> {psnr[3.0]:.2f} dB")
+
+
 def test_wilcoxon(tmp):
     rng = np.random.default_rng(1)
     n = 30
@@ -330,6 +361,7 @@ def main():
         test_recompute(tmp, ks, sm)
         test_val_kspace(tmp, ks, sm)
         test_force_mask(tmp, ks, sm)
+        test_sample_and_sigma(tmp, ks, sm)
         test_wilcoxon(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
