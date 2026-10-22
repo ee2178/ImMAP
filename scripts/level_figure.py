@@ -530,14 +530,43 @@ def cached_model(run, device=None):
     return _net(run, device)["model"]
 
 
+def _vcycle_walk(model):
+    """Every LPDS layer and FAS downsampler of `model` in execution order, as
+    `(kind, level, where, outer, module)`: kind "layer" (an `LPDSLayer`) or
+    "dF" (a `PDObjectiveDownsample`, between `level` and `level + 1`); `outer`
+    the outer V-cycle (None for a flat stack, whose layers are all level 0)."""
+    from models.lpds import LPDSLayer
+    from models.mg_lpds import PDVCycle
+
+    def cycle(V, level, k):
+        for i, L in enumerate(V.lpdsA.layers):
+            yield "layer", level, f"V{k} L{level} pre{i}", k, L
+        yield "dF", level, f"V{k} L{level}->L{level + 1} dF", k, V.dF
+        if isinstance(V.mglayer, PDVCycle):
+            yield from cycle(V.mglayer, level + 1, k)
+        else:
+            for i, L in enumerate(V.mglayer.layers):
+                yield "layer", level + 1, f"V{k} L{level + 1} solve{i}", k, L
+        for i, L in enumerate(V.lpdsB.layers):
+            yield "layer", level, f"V{k} L{level} post{i}", k, L
+
+    cycles = [m for m in model.modules() if isinstance(m, PDVCycle)]
+    inner = {id(c.mglayer) for c in cycles}
+    seen = set()
+    for k, V in enumerate(c for c in cycles if id(c) not in inner):
+        for item in cycle(V, 0, k):
+            seen.add(id(item[-1]))
+            yield item
+    flat = [m for m in model.modules() if isinstance(m, LPDSLayer) and id(m) not in seen]
+    for i, L in enumerate(flat):
+        yield "layer", 0, f"layer{i}", None, L
+
+
 def conv_sites(model):
     """Every analysis / synthesis conv of an LPDS-family net with its grid level:
     [{"level", "where", "conv": "analysis" | "synthesis", "module"}], V-cycle by
     V-cycle (pre-smoother, the FAS downsampler's copies, the coarser levels,
     post-smoother); a flat stack is all level 0."""
-    from models.lpds import LPDSLayer
-    from models.mg_lpds import PDVCycle
-
     sites, seen = [], set()
 
     def add(level, where, conv, module):
@@ -545,32 +574,15 @@ def conv_sites(model):
             seen.add(id(module))
             sites.append(dict(level=level, where=where, conv=conv, module=module))
 
-    def layer(level, where, L):
-        add(level, where, "analysis", L.analysis)
-        add(level, where, "synthesis", L.synthesis)
-
-    def cycle(V, level, tag):
-        for i, L in enumerate(V.lpdsA.layers):
-            layer(level, f"{tag} pre{i}", L)
-        dF = V.dF
-        add(level, f"{tag} dF", "analysis", dF.analysis_fine)
-        add(level, f"{tag} dF", "synthesis", dF.synthesis_fine)
-        add(level + 1, f"{tag} dF", "analysis", dF.analysis_coarse)
-        add(level + 1, f"{tag} dF", "synthesis", dF.synthesis_coarse)
-        if isinstance(V.mglayer, PDVCycle):
-            cycle(V.mglayer, level + 1, tag)
+    for kind, level, where, _, m in _vcycle_walk(model):
+        if kind == "layer":
+            add(level, where, "analysis", m.analysis)
+            add(level, where, "synthesis", m.synthesis)
         else:
-            for i, L in enumerate(V.mglayer.layers):
-                layer(level + 1, f"{tag} solve{i}", L)
-        for i, L in enumerate(V.lpdsB.layers):
-            layer(level, f"{tag} post{i}", L)
-
-    cycles = [m for m in model.modules() if isinstance(m, PDVCycle)]
-    inner = {id(c.mglayer) for c in cycles}
-    for k, V in enumerate(c for c in cycles if id(c) not in inner):
-        cycle(V, 0, f"V{k}")
-    for i, L in enumerate(m for m in model.modules() if isinstance(m, LPDSLayer)):
-        layer(0, f"layer{i}", L)                  # a flat stack; seen ones are skipped
+            add(level, where, "analysis", m.analysis_fine)
+            add(level, where, "synthesis", m.synthesis_fine)
+            add(level + 1, where, "analysis", m.analysis_coarse)
+            add(level + 1, where, "synthesis", m.synthesis_coarse)
     if not sites:
         raise TypeError(f"{type(model).__name__} has no LPDS layers")
     return sites
@@ -673,6 +685,189 @@ def equalized_convs(model, convs=("analysis", "synthesis"), levels=None, axes="b
         with torch.no_grad():
             for m, w in saved:
                 set_weight(m, w)
+
+
+# ---------------------------------------------------------------------------
+# which term of a sweep injects the period-2 energy (notebook section 12d)
+#
+# One LPDS sweep is
+#     x+ = x - tau r,    r = (E^H E x - y~) + D z - pi_x
+#     z+ = prox(u),      u = z + A xbar - pi_z     (pi_z after the prox under
+#                                                    fas_dual="fixed_point")
+# Every term of r is linear, so the near-Nyquist part of the STEP splits
+# exactly into theirs. On a coarse level pi_x = r_c(entry) - R r_fine is split
+# too: minus the level's own residual where it entered, plus the restricted
+# fine residual. The image's Nyquist band is reached from the latent code only
+# through D's W(pi) (latent near-DC -> image period 2), so the DUAL side is
+# reported as D(each piece of u): which piece carries the latent DC that D
+# leaks (before the clip, which is the one nonlinearity).
+# ---------------------------------------------------------------------------
+def _c2d(t):
+    """A traced tensor as one complex (H, W) numpy image (planar-safe)."""
+    return _as_complex(t.detach())[0, 0].cpu().numpy().astype(np.complex64)
+
+
+def _terms_call(store, select):
+    def call(net, y, E, sigma):
+        import torch
+        from models.lpds import _per_channel
+        from models.mg_lpds import gram_or_x
+        from operators.resample import restrict
+
+        recs, rrx, patched = [], {}, []
+
+        def wrap_dF(m):
+            orig = m.forward
+
+            def fwd(x, z, y_t, E_, sig, cache, static=None):
+                out = orig(x, z, y_t, E_, sig, cache, static)
+                planar = getattr(m, "is_complex", True) and not x.is_complex()
+                r_f = gram_or_x(E_, x, planar) - y_t + m.synthesis_fine(z)
+                # keep pi_x alive with its R r_fine, so the id cannot be reused
+                rrx[id(out[2])] = (out[2], restrict(r_f, julia_compat=m.julia_compat,
+                                                    filter=m.transfer_filter))
+                return out
+            m.forward = fwd
+            patched.append(m)
+
+        def wrap_layer(L, level, where, outer):
+            orig = L.forward
+
+            def fwd(state, y_tilde, E=None, sigma=None, pi=None, cache=None):
+                if state is None:
+                    return orig(state, y_tilde, E=E, sigma=sigma, pi=pi, cache=cache)
+                x, z = state
+                planar = L.is_complex and not x.is_complex()
+                pi_x, pi_z = (None, None) if pi is None else pi
+                T = {"data  E^H E x - y~": gram_or_x(E, x, planar) - y_tilde,
+                     "synth D z": L.synthesis(z)}
+                if pi_x is not None:
+                    hit = rrx.get(id(pi_x))
+                    if hit is not None and hit[0] is pi_x:
+                        T["FAS   -r_c(entry)"] = -(pi_x + hit[1])
+                        T["FAS   +R r_fine"] = hit[1]
+                    else:
+                        T["FAS   -pi_x"] = -pi_x
+                out = orig(state, y_tilde, E=E, sigma=sigma, pi=pi, cache=cache)
+                x_new = out[0][0]
+                theta = L.theta(sigma, ref=x)
+                theta = _per_channel(theta, x) if planar else theta
+                x_bar = x_new + theta * (x_new - x)
+                U = {"D z": L.synthesis(z), "D A xbar": L.synthesis(L.analysis(x_bar))}
+                if pi_z is not None:
+                    sign = 1.0 if getattr(L, "fas_dual", "legacy") == "fixed_point" else -1.0
+                    U[f"D ({'+' if sign > 0 else '-'}pi_z)"] = L.synthesis(sign * pi_z)
+                recs.append(dict(level=level, where=where, outer=outer,
+                                 x_before=_c2d(x), x_after=_c2d(x_new),
+                                 terms={k: _c2d(v) for k, v in T.items()},
+                                 dual={k: _c2d(v) for k, v in U.items()},
+                                 fas_dual=getattr(L, "fas_dual", "legacy")))
+                return out
+            L.forward = fwd
+            patched.append(L)
+
+        for kind, level, where, outer, m in _vcycle_walk(net):
+            if kind == "dF":
+                wrap_dF(m)
+            elif select(level, outer):
+                wrap_layer(m, level, where, outer)
+        try:
+            with torch.no_grad():
+                out = net(y, E=E, sigma=sigma)
+        finally:
+            for m in patched:
+                del m.forward                    # back to the class method
+        store.update(recs=recs)
+        return out[0] if isinstance(out, tuple) else out
+    return call
+
+
+def trace_terms(run, volume, slice, levels=(1,), outers=None, sigma=None, seed=1234,
+                val_kspace_type="measurement_awgn", device=None, coarse_op=None,
+                transfer_filter=None):
+    """Every sweep of `run` on `levels` (0 = finest) in V-cycles `outers` (None:
+    the LAST; a flat net: ignored), split into its terms -- same measurement
+    as `trace_slice`, cached net, no weight changed.
+
+    -> `(recs, meta)`, one record per sweep in execution order: level, where,
+    outer, x_before / x_after (complex (H, W)), `terms` {name: (H, W)} summing
+    to the primal residual r (the step is -tau r), `dual` {name: D(piece of
+    the dual argument u)}, fas_dual."""
+    import types
+
+    import torch
+
+    device = torch.device(device) if device else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu")
+    model = cached_model(run, device)
+    tops = sorted({o for kind, _, _, o, _ in _vcycle_walk(model) if o is not None})
+    want = None if not tops else (
+        {tops[-1]} if outers is None else {tops[o] for o in outers})
+    levels = set(levels)
+
+    def select(level, outer):
+        return level in levels and (outer is None or want is None or outer in want)
+
+    args = types.SimpleNamespace(sigma=sigma, seed=seed, val_kspace_type=val_kspace_type,
+                                 coarse_op=coarse_op, transfer_filter=transfer_filter)
+    with open(os.path.join(run, "config.json")) as f:
+        vol = _resolve_volume(json.load(f), volume)
+    R = _run_one(run, vol, int(slice), args, device, lambda st: _terms_call(st, select))
+    recs = R["store"]["recs"]
+    meta = dict(run=R["run"], volume=vol, slice=int(slice), levels=sorted(levels),
+                outers=sorted(want) if want else None, n_sweeps=len(recs))
+    if not recs:
+        print(f"WARNING: no sweep of {R['run']} matched levels={sorted(levels)}, "
+              f"outers={outers}", file=sys.stderr)
+    return recs, meta
+
+
+def _nyq_mask(shape, frac, axis):
+    fy = np.abs(np.fft.fftfreq(shape[0])) * 2
+    fx = np.abs(np.fft.fftfreq(shape[1])) * 2
+    if axis == "rows":
+        return np.broadcast_to((fy >= frac)[:, None], shape)
+    if axis == "cols":
+        return np.broadcast_to((fx >= frac)[None, :], shape)
+    raise ValueError(f"axis must be 'rows' or 'cols', got {axis!r}")
+
+
+def nyquist_part(a, frac=0.8, axis="rows"):
+    """The part of the complex image `a` at or above `frac` of Nyquist along
+    `axis` -- what `nyquist_share` counts, as an image."""
+    A = np.fft.fft2(a)
+    return np.fft.ifft2(np.where(_nyq_mask(a.shape, frac, axis), A, 0))
+
+
+def field_share(a, frac=0.8):
+    """`nyquist_share` of the complex FIELD (mean removed) rather than its
+    magnitude: linear, so the shares of a sum's terms are comparable."""
+    a = np.asarray(a, np.complex128)
+    P = np.abs(np.fft.fft2(a - a.mean())) ** 2
+    tot = P.sum() or 1.0
+    return tuple(float(P[_nyq_mask(a.shape, frac, ax)].sum() / tot) for ax in ("rows", "cols"))
+
+
+def term_attribution(parts, frac=0.8):
+    """How the near-Nyquist part of `sum(parts.values())` splits over `parts`.
+
+    -> {"rows" | "cols": [(name, share, size)]}: `share` = the term's projection
+    onto the sum's near-Nyquist part over that part's energy -- the shares add
+    to 1, a term can be negative (it cancels others); `size` = |term's
+    near-Nyquist part| / |the sum's| (two big terms of opposite share cancel)."""
+    total = sum(parts.values())
+    out = {}
+    for ax in ("rows", "cols"):
+        m = _nyq_mask(total.shape, frac, ax)
+        S = np.fft.fft2(total)[m]
+        den = float((np.abs(S) ** 2).sum()) or 1e-30
+        rows = []
+        for name, t in parts.items():
+            Tf = np.fft.fft2(t)[m]
+            rows.append((name, float((np.conj(S) * Tf).real.sum() / den),
+                         float(np.sqrt((np.abs(Tf) ** 2).sum() / den))))
+        out[ax] = rows
+    return out
 
 
 def save_npz(z, meta, out_dir):

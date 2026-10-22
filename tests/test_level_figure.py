@@ -197,6 +197,61 @@ def main():
           [(s[0], s[1]) for s in summ] == [(l, c) for l in (0, 1, 2) for c in ("analysis", "synthesis")],
           str([(s[0], s[1], s[2]) for s in summ]))
 
+    # 7: term attribution (notebook section 12d) ---------------------------------
+    recs, tm = lf.trace_terms(A, "volA", 2, levels=[1], **kw)
+    tops = {r["outer"] for r in recs}
+    check("trace_terms: level-1 sweeps of the last V-cycle only",
+          len(recs) > 0 and all(r["level"] == 1 for r in recs) and tops == {1},
+          f"{len(recs)} sweeps, outers {sorted(tops)}")
+    # d = x - x+ = tau * residual. The iterates are float32 and these toy nets are
+    # near converged (|d| ~ 1e-4 |x|), so the subtraction alone costs ~eps |x| / |d|:
+    # the tolerance scales with that, and tau must come back as the config's 0.5.
+    exact = []
+    for r in recs:
+        s = sum(r["terms"].values()).astype(np.complex128)
+        d = r["x_before"].astype(np.complex128) - r["x_after"]
+        c = (np.vdot(s, d) / np.vdot(s, s)).real
+        floor = 10 * np.finfo(np.float32).eps * np.linalg.norm(r["x_before"]) / np.linalg.norm(d)
+        exact.append((float(np.linalg.norm(d - c * s) / np.linalg.norm(d)), float(floor), float(c)))
+    check("the terms sum to the residual: step = -tau * sum(terms), tau = 0.5",
+          all(m < f and abs(c - 0.5) < 1e-3 for m, f, c in exact),
+          "  ".join(f"misfit {m:.1e} (fp floor {f:.1e}) tau {c:.4f}" for m, f, c in exact))
+    check("coarse sweeps split pi_x into -r_c(entry) and +R r_fine",
+          all({"FAS   -r_c(entry)", "FAS   +R r_fine"} <= set(r["terms"]) for r in recs))
+    # At a level's FIRST sweep the state IS (Rx, Rz), so the level's own residual
+    # equals r_c(entry) up to the dF copies' drift from the smoother -- none in an
+    # untrained net: data + synth - r_c(entry) = 0 and the step is R r_fine alone.
+    first = [r for r in recs if r["where"].endswith("pre0")]
+    own = [float(np.linalg.norm(r["terms"]["data  E^H E x - y~"] + r["terms"]["synth D z"]
+                                + r["terms"]["FAS   -r_c(entry)"])
+                 / np.linalg.norm(r["terms"]["FAS   -r_c(entry)"])) for r in first]
+    check("first coarse sweep: own residual cancels -r_c(entry) (tied weights)",
+          len(first) == 1 and max(own) < 1e-5, f"{own}")
+    att = lf.term_attribution(recs[0]["terms"])
+    check("attribution shares add to 1 on each axis",
+          all(abs(sum(s for _, s, _ in att[ax]) - 1) < 1e-6 for ax in ("rows", "cols")),
+          str({ax: round(sum(s for _, s, _ in att[ax]), 6) for ax in att}))
+    z_tt, _, _ = lf.trace_slice(A, "volA", 2, **kw)
+    check("trace_terms leaves the net untouched (bit-identical trace after)",
+          all((z_tt[k] == z0[k]).all() for k in z0)
+          and not any("forward" in vars(m) for m in lf.cached_model(A, "cpu").modules()))
+    frecs, _ = lf.trace_terms(flat, "volA", 2, levels=[0], **kw)
+    check("flat net: every sweep, data + synthesis terms only",
+          len(frecs) == 3 and all(set(r["terms"]) == {"data  E^H E x - y~", "synth D z"}
+                                  for r in frecs), f"{len(frecs)} sweeps (4 layers, 1 cold start)")
+    from models.mg_lpds import set_fas_dual
+    prev = set_fas_dual(lf.cached_model(A, "cpu"), "fixed_point")
+    try:
+        precs, _ = lf.trace_terms(A, "volA", 2, levels=[1], **kw)
+    finally:
+        set_fas_dual(lf.cached_model(A, "cpu"), prev)
+    check("dual pieces follow the FAS placement (+pi_z after the prox under fixed_point)",
+          all("D (+pi_z)" in r["dual"] for r in precs) and all("D (-pi_z)" in r["dual"] for r in recs))
+    stripes = np.tile(np.array([1.0, -1.0])[:, None], (16, 32)).astype(np.complex64) + 3.0
+    check("nyquist_part / field_share see a horizontal stripe",
+          np.allclose(lf.nyquist_part(stripes), stripes - 3.0, atol=1e-5)
+          and lf.field_share(stripes)[0] > 0.99)
+
     # 1b: a new checkpoint is picked up ---------------------------------------
     time.sleep(1.1)
     os.utime(os.path.join(A, "net.ckpt"))
