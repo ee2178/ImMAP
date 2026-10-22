@@ -503,6 +503,174 @@ def nyquist_share(a, frac=0.8):
     return float(P[fy >= frac, :].sum() / tot), float(P[:, fx >= frac].sum() / tot)
 
 
+# ---------------------------------------------------------------------------
+# the stride-2 convs' polyphase leak (notebook section 12)
+#
+# A stride-2 conv with an odd kernel is FOUR filters, one per output parity
+# (row, col): with P = 7, an even output row gets taps {1, 3, 5}, an odd one
+# {0, 2, 4, 6}. The synthesis (ConvTranspose2d) therefore maps a latent DC to
+#     W(0, 0)  on every pixel, plus   W(pi, 0) (-1)^row + W(0, pi) (-1)^col
+#                                     + W(pi, pi) (-1)^(row + col)
+# where W(pi, 0) = sum_ij (-1)^i w_ij is (even-row taps - odd-row taps): a
+# period-2 pattern along axis 0 (horizontal stripes, `nyquist_share`'s "rows")
+# with that gain. The analysis conv is its adjoint: image content at those
+# frequencies ALIASES onto the latent DC with the same gains. Nothing in
+# training pins them to zero; a random (init) kernel has them ~ W(0, 0).
+# ---------------------------------------------------------------------------
+def cached_model(run, device=None):
+    """The cached net of `run` -- the SAME object `trace_slice` / `trace_layers`
+    run -- for inspecting or (temporarily) editing its weights."""
+    import torch
+    device = torch.device(device) if device else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu")
+    return _net(run, device)["model"]
+
+
+def conv_sites(model):
+    """Every analysis / synthesis conv of an LPDS-family net with its grid level:
+    [{"level", "where", "conv": "analysis" | "synthesis", "module"}], V-cycle by
+    V-cycle (pre-smoother, the FAS downsampler's copies, the coarser levels,
+    post-smoother); a flat stack is all level 0."""
+    from models.lpds import LPDSLayer
+    from models.mg_lpds import PDVCycle
+
+    sites, seen = [], set()
+
+    def add(level, where, conv, module):
+        if id(module) not in seen:
+            seen.add(id(module))
+            sites.append(dict(level=level, where=where, conv=conv, module=module))
+
+    def layer(level, where, L):
+        add(level, where, "analysis", L.analysis)
+        add(level, where, "synthesis", L.synthesis)
+
+    def cycle(V, level, tag):
+        for i, L in enumerate(V.lpdsA.layers):
+            layer(level, f"{tag} pre{i}", L)
+        dF = V.dF
+        add(level, f"{tag} dF", "analysis", dF.analysis_fine)
+        add(level, f"{tag} dF", "synthesis", dF.synthesis_fine)
+        add(level + 1, f"{tag} dF", "analysis", dF.analysis_coarse)
+        add(level + 1, f"{tag} dF", "synthesis", dF.synthesis_coarse)
+        if isinstance(V.mglayer, PDVCycle):
+            cycle(V.mglayer, level + 1, tag)
+        else:
+            for i, L in enumerate(V.mglayer.layers):
+                layer(level + 1, f"{tag} solve{i}", L)
+        for i, L in enumerate(V.lpdsB.layers):
+            layer(level, f"{tag} post{i}", L)
+
+    cycles = [m for m in model.modules() if isinstance(m, PDVCycle)]
+    inner = {id(c.mglayer) for c in cycles}
+    for k, V in enumerate(c for c in cycles if id(c) not in inner):
+        cycle(V, 0, f"V{k}")
+    for i, L in enumerate(m for m in model.modules() if isinstance(m, LPDSLayer)):
+        layer(0, f"layer{i}", L)                  # a flat stack; seen ones are skipped
+    if not sites:
+        raise TypeError(f"{type(model).__name__} has no LPDS layers")
+    return sites
+
+
+def _parity_signs(w):
+    import torch
+    P0, P1 = w.shape[-2:]
+    sr = (1 - 2 * (torch.arange(P0, device=w.device) % 2)).to(w.real.dtype)[:, None]
+    sc = (1 - 2 * (torch.arange(P1, device=w.device) % 2)).to(w.real.dtype)[None, :]
+    return sr, sc
+
+
+def phase_leak(w):
+    """`(rows, cols, diag)` for one conv weight (..., P, P), stride 2:
+    ||W(pi, 0)|| / ||W(0, 0)||, ||W(0, pi)|| / ||W(0, 0)||, ||W(pi, pi)|| / ||W(0, 0)||,
+    each W(.) the (out x in) matrix of kernel sums at that frequency, Frobenius
+    norms. 0 = no period-2 leak; ~1 = a random kernel's."""
+    sr, sc = _parity_signs(w)
+    W00 = w.sum((-2, -1))
+    den = float(W00.abs().pow(2).sum().sqrt()) or 1e-30
+    return tuple(float((w * s).sum((-2, -1)).abs().pow(2).sum().sqrt()) / den
+                 for s in (sr, sc, sr * sc))
+
+
+def leak_table(model):
+    """`phase_leak` of every conv of `model` -> [{level, where, conv, rows,
+    cols, diag}], in `conv_sites` order."""
+    import torch
+    out = []
+    with torch.no_grad():
+        for s in conv_sites(model):
+            r, c, d = phase_leak(s["module"].weight)
+            out.append(dict(level=s["level"], where=s["where"], conv=s["conv"],
+                            rows=r, cols=c, diag=d))
+    return out
+
+
+def leak_summary(rows):
+    """Mean / max of the leak per (level, conv), coarse levels last ->
+    [(level, conv, n, mean (rows, cols, diag), max (rows, cols, diag))]."""
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["level"], r["conv"]), []).append(r)
+    out = []
+    for (level, conv), rs in sorted(groups.items()):
+        a = np.array([[r["rows"], r["cols"], r["diag"]] for r in rs])
+        out.append((level, conv, len(rs), tuple(a.mean(0)), tuple(a.max(0))))
+    return out
+
+
+def equalize_phases(w, axes="both"):
+    """`w` (..., P, P) with its stride-2 parity classes balanced -- the
+    smallest (L2) change, spread evenly over each class's taps -- so that
+      "both"  W(pi, 0) = W(0, pi) = W(pi, pi) = 0     (all four classes equal)
+      "rows"  W(pi, 0) = W(pi, pi) = 0                (row parities equal)
+      "cols"  W(0, pi) = W(pi, pi) = 0                (col parities equal)
+    while W(0, 0) -- the kernel's DC gain, per (out, in) pair -- is unchanged."""
+    import torch
+    if axes not in ("both", "rows", "cols"):
+        raise ValueError(f"axes must be 'both', 'rows' or 'cols', got {axes!r}")
+    P0, P1 = w.shape[-2:]
+    pr = (torch.arange(P0, device=w.device) % 2)[:, None]
+    pc = (torch.arange(P1, device=w.device) % 2)[None, :]
+    masks = {(a, b): ((pr == a) & (pc == b)).to(w.real.dtype) for a in (0, 1) for b in (0, 1)}
+    sums = {k: (w * m).sum((-2, -1), keepdim=True) for k, m in masks.items()}
+    out = w.clone()
+    for (a, b), m in masks.items():
+        if axes == "both":
+            target = sum(sums.values()) / 4
+        elif axes == "rows":
+            target = (sums[(0, b)] + sums[(1, b)]) / 2
+        else:
+            target = (sums[(a, 0)] + sums[(a, 1)]) / 2
+        out = out + m * (target - sums[(a, b)]) / m.sum()
+    return out
+
+
+@contextlib.contextmanager
+def equalized_convs(model, convs=("analysis", "synthesis"), levels=None, axes="both"):
+    """Inside the block, every selected conv of `model` has its polyphase leak
+    removed (`equalize_phases`); the trained weights come back on exit, even on
+    an error. `levels`: None = all, else an iterable of grid levels (0 = finest).
+    Yields the number of convs changed. Same weights otherwise -- a diagnostic,
+    like a transfer swap."""
+    import torch
+    from models.base import set_weight
+
+    sel = [s for s in conv_sites(model) if s["conv"] in convs
+           and (levels is None or s["level"] in set(levels))]
+    saved = []
+    try:
+        with torch.no_grad():
+            for s in sel:
+                w = s["module"].weight
+                saved.append((s["module"], w.clone()))
+                set_weight(s["module"], equalize_phases(w, axes))
+        yield len(saved)
+    finally:
+        with torch.no_grad():
+            for m, w in saved:
+                set_weight(m, w)
+
+
 def save_npz(z, meta, out_dir):
     """-> the path written:
     <out_dir>/<run>[_<coarse_op swap>][_taps<n>][_filt<name>]_<anatomy>_<volume tail>_<slice>.npz"""
