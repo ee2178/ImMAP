@@ -64,6 +64,14 @@ DEFAULT_NETS = ["E2E-VarNet", "LPDSNet", "MGLPDS-Small"]
 DEFAULT_RENAME = ["MGLPDS-Small=MGLPDS"]
 
 
+def block_title(g, tex):
+    """"Brain, R=8" for an (anatomy, R) experiment; the first field as written when R <= 0
+    (NYUMets' slice-range groups, which have no acceleration and their own capitalisation)."""
+    if int(g[1]) <= 0:
+        return str(g[0])
+    return f"{g[0].capitalize()}, " + (f"$R{{=}}{g[1]}$" if tex else f"R={g[1]}")
+
+
 def sem(x):
     """Standard error of the mean: sample std / sqrt(n)."""
     return 0.0 if len(x) < 2 else float(np.std(x, ddof=1) / np.sqrt(len(x)))
@@ -153,8 +161,8 @@ def main():
     for g, nets, cells, ns in blocks:
         nlab = "/".join(str(n) for n in sorted(ns))
         L += ["\\midrule",
-              f"\\multicolumn{{{len(metrics) + 1}}}{{l}}{{\\textit{{{g[0].capitalize()}, "
-              f"$R{{=}}{g[1]}$ ($n{{=}}{nlab}$ volumes)}}}} \\\\"]
+              f"\\multicolumn{{{len(metrics) + 1}}}{{l}}{{\\textit{{{block_title(g, True)} "
+              f"($n{{=}}{nlab}$ volumes)}}}} \\\\"]
         for n in nets:
             L.append(f"{n} & " + " & ".join(entry(cells[(n, m)], m, True)
                                             if (n, m) in cells else "--" for m in metrics)
@@ -172,7 +180,7 @@ def main():
     M = []
     for g, nets, cells, ns in blocks:
         nlab = "/".join(str(n) for n in sorted(ns))
-        M += [f"**{g[0].capitalize()}, R={g[1]}** (n={nlab} volumes)", "",
+        M += [f"**{block_title(g, False)}** (n={nlab} volumes)", "",
               "| Method | " + " | ".join(f"{HEAD[m][0]} {arrow[m]}" for m in metrics) + " |",
               "|---|" + "---|" * len(metrics)]
         M += [f"| {n} | " + " | ".join(entry(cells[(n, m)], m, False)

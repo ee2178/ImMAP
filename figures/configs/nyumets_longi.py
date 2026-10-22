@@ -56,5 +56,7 @@ ROWS = []
 
 STATUS_METRIC = "psnr"
 FIG_METRICS = ("psnr", "ssim")
+FIG_INPUT_METRICS = False       # T1 and prior CT1 are inputs of another contrast: no PSNR on them
+FIG_TITLE = r"NYUMets, T1 $\rightarrow$ CT1"
 ZOOM_W = ZOOM_H = 40
 CROP_PAD = 4

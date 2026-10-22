@@ -90,6 +90,10 @@ VARIANT = None            # input identity for rows/ and zooms/; None follows NA
 FIG_METRICS = ("psnr", "ssim")  # printed top-right of each panel, in this order;
                           # any of psnr, ssim, nrmse
 FIG_TITLE = None          # a line above the column headers, e.g. r"Knee, $R{=}8$"
+FIG_INPUT_METRICS = True  # print live metrics on columns that are not a method's output (the
+                          # zero-filled adjoint, ...)? False leaves those panels unlabelled --
+                          # for inputs of another contrast (NYUMets' T1, prior CT1) a PSNR
+                          # against the target says nothing
 IMG_WIDTH = "3cm"         # displayed width of one panel in the PDF
 FLIP = ""                 # display orientation: "" as stored, "ud" upside down,
                           # "lr" mirrored, "both". Display only -- metrics and
@@ -100,7 +104,7 @@ CONFIGURABLE = (
     "NAME", "DUMP_ROOT", "COLUMNS", "ROWS", "ZOOM_W", "ZOOM_H", "ZOOM_UP",
     "WINDOW_PCT", "WINDOW_SCALE", "BRIGHTNESS", "GAMMA", "RESID_GAIN",
     "RESID_CMAP", "CROP_FOV", "CROP_PAD", "MASK_THRESH", "MASK_DISPLAY", "STATUS_METRIC",
-    "FIG_METRICS", "FIG_TITLE", "IMG_WIDTH", "FLIP",
+    "FIG_METRICS", "FIG_TITLE", "FIG_INPUT_METRICS", "IMG_WIDTH", "FLIP",
 )
 
 

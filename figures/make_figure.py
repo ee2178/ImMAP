@@ -73,11 +73,12 @@ def short_id(volume):
     return m.group(1) if m else fc.pretty(volume)
 
 
-def live_psnr(ref, x, mask):
-    """training.metrics.psnr's definition (data_range 1, masked mean)."""
+def live_psnr(ref, x, mask, data_range=1.0):
+    """training.metrics.psnr's definition (masked mean). `data_range` is the dump's attr when it
+    has one (NYUMets: the run's data_range, 2.0), else 1 -- what the stored values used."""
     se = (ref - x) ** 2
     mse = se[mask].mean() if mask is not None and mask.any() else se.mean()
-    return float(10 * np.log10(1.0 / max(mse, 1e-30)))
+    return float(10 * np.log10(data_range ** 2 / max(mse, 1e-30)))
 
 
 def save_gray(path, a, vmax):
@@ -240,6 +241,8 @@ def main():
         how = "row" if row.get("zoom") else "picked" if tag in zooms else "auto"
         masked = any(v["masked"].values())
         mask = v["organ"] if masked else None
+        first = next(spec for _, spec in fc.COLUMNS if col_spec(spec)[0] is not None)
+        data_range = float(fc.load(first, vol).attrs.get("data_range", 1.0))
 
         cells = []
         for lab in headers:
@@ -252,6 +255,8 @@ def main():
             vals = {}
             if is_ref[lab]:
                 text = r"\\".join(NAMES[m] for m in fc.FIG_METRICS)
+            elif lab not in v["methods"] and not fc.FIG_INPUT_METRICS:
+                text = ""                       # an input column: no metrics printed
             else:
                 x, stored = v["cols"][lab], v["stored"].get(lab, {})
                 for m in fc.FIG_METRICS:
@@ -260,7 +265,7 @@ def main():
                     elif m in stored:
                         vals[m] = float(stored[m])
                     elif m == "psnr":
-                        vals[m] = live_psnr(v["ref"], x, mask)
+                        vals[m] = live_psnr(v["ref"], x, mask, data_range)
                 text = r"\\".join(FMT[m].format(vals[m]) if m in vals else "--"
                                   for m in fc.FIG_METRICS)
                 table.append(dict(row=ri, volume=vol, slice=sl, column=lab,
