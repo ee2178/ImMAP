@@ -353,6 +353,41 @@ _FILTER_SPECS = {
 }
 
 
+@contextlib.contextmanager
+def use_filter_length(name, taps, factor=DEFAULT_FACTOR):
+    """Give filter `name` a different kernel LENGTH inside a block -- everywhere.
+
+        with use_filter_length("sinc", 12):     # 12 taps instead of 8 at factor 2
+            out = model(y, E=E, sigma=sigma)
+
+    Every transfer resolves its kernel by name on each call (`restrict`,
+    `prolong`, the coarse coil maps in operators/coarse.py, the noise scaling),
+    so this reaches all of them at once, including inside a TRAINED model: the
+    weights stay as they were and only the kernel changes. A diagnostic, then,
+    not a retraining -- the net learned its coarse levels against the original
+    length. Models with `learn_transfer=True` hold their own kernel
+    (`GridTransfer`) and are NOT affected.
+
+    `taps` must be a multiple of `factor` (the table stores length / factor)
+    with `taps - factor` even (see `transfer_padding`). The kernel cache is
+    cleared on entry and exit, so no kernel of the other length survives.
+    """
+    if name not in _FILTER_SPECS:
+        raise ValueError(f"no kernel table entry for {name!r}; one of {sorted(_FILTER_SPECS)}")
+    taps, factor = int(taps), int(factor)
+    if taps < factor or taps % factor or (taps - factor) % 2:
+        raise ValueError(f"taps={taps} at factor={factor}: need a multiple of the factor, "
+                         f">= it, with taps - factor even (e.g. 8, 12, 16 at factor 2)")
+    prev = _FILTER_SPECS[name]
+    _FILTER_SPECS[name] = (prev[0], taps // factor)
+    _KERNEL_CACHE.clear()
+    try:
+        yield taps
+    finally:
+        _FILTER_SPECS[name] = prev
+        _KERNEL_CACHE.clear()
+
+
 def filter_length(filter=None, factor=DEFAULT_FACTOR, length=None):
     """Kernel length a given filter uses at this factor."""
     filter, _ = split_normalisation(_check_filter(filter))

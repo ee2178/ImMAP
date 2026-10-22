@@ -100,7 +100,9 @@ EMBEDDED_OFF="${EMBEDDED_OFF:-brain/mg81v6_R12}"
 METRICS="${METRICS:-psnr ssim nrmse lpips}"
 SEED="${SEED:-1234}"
 SIGMA="${SIGMA:-}"                     # empty = each run's own val_noise_std
-VAL_KSPACE="${VAL_KSPACE:-simulated}"  # or measurement_awgn (how the nets trained)
+# Measured k-space + AWGN by default (2026-10-22), how the nets train and the
+# measurement results/main has always used. VAL_KSPACE=simulated -> results/main_simulated.
+VAL_KSPACE="${VAL_KSPACE:-measurement_awgn}"
 if [ "${VAL_KSPACE}" = "measurement_awgn" ]; then _out="results/main"; else _out="results/main_${VAL_KSPACE}"; fi
 OUT="${OUT:-${_out}${SIGMA:+_s${SIGMA}}}"
 WORKERS="${WORKERS:-6}"

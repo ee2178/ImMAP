@@ -1291,16 +1291,13 @@ def make_config(anatomy, r, model, args):
             "noise_dist": "uniform",
             "val_noise_std": val_noise_std(anatomy),
             "val_seed": VAL_SEED,
-            # VALIDATE ON SIMULATED k-space (2026-10-20), while training stays on
-            # measured k-space + AWGN: the SENSE ground truth through the stored
-            # maps, mask and AWGN, so the noise in y is exactly val_noise_std
-            # (measured data carry the scanner's own noise as well) and sigma can
-            # later be set outside the training range. The operator still uses
-            # online ESPIRiT maps. Legacy configs are simulated throughout and
-            # get no key. Ignored by the launch guard (validation only), so runs
-            # launched before it resume unchanged.
-            **({"val_kspace_type": "simulated"}
-               if getattr(args, "kspace_type", "simulated") == "measurement_awgn" else {}),
+            # VALIDATION IS MEASURED, like training (2026-10-22): no
+            # `val_kspace_type` key, so validation uses the training kspace_type.
+            # From 2026-10-20 to 2026-10-22 this wrote "simulated" for measured
+            # configs; runs launched then carry it in their config.json --
+            # scripts/set_val_kspace.py switches them back. The key is still
+            # honoured when present (evaluation/tasks.py::val_kspace_type), and
+            # the launch guard ignores it (validation only).
             "loss_type": "magnitude-nl1-nl2",
             "clip_grad": float(getattr(args, "clip_grad", CLIP_GRAD)),
             # Loss AND metrics AND the wandb panel -- see training/recon.py.

@@ -44,6 +44,7 @@ images shown are exactly what the V-cycle holds, in image units.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -207,7 +208,8 @@ def mg_levels(tr, out_e, gt, organ, kws):
 
 
 def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1234,
-                val_kspace_type="measurement_awgn", device=None, coarse_op=None):
+                val_kspace_type="measurement_awgn", device=None, coarse_op=None,
+                transfer_taps=None):
     """Run `run` (a multigrid net) -- and optionally `compare` (a VarNet) -- on
     one val slice, exactly as eval_per_volume measures it.
 
@@ -217,6 +219,11 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
         meta  plain dict: volume, slice, run, M, K, levels, outers, sigma, ...
         coarse_op  None: as trained; "galerkin" / "rediscretize" swaps the
               coarse forward model of `run` at inference (the trace records it)
+        transfer_taps  None: as trained (the 8-tap sinc at factor 2); e.g. 12 or
+              16 implants a LONGER sinc into every transfer of `run` at
+              inference -- restriction, prolongation, the coarse maps, and the
+              R^l(gt) the levels are scored against -- same weights
+              (operators.resample.use_filter_length; the trace records it)
         live  the objects, for poking at further in a notebook: live["mg"] has
               model, cfg, trace (a LevelTrace), gt, recon, organ, out_embedded;
               live["vn"] the same for the comparison plus `features`
@@ -233,10 +240,18 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
         vol = _resolve_volume(json.load(f), volume)
     sl = int(slice)
 
-    R = _run_one(run, vol, sl, args, device, _mg_call)
-    tr, out_e = R["store"]["trace"], R["store"]["out_embedded"]
-    gt, organ = R["gt"], R["organ"]
-    z, mu, fit = mg_levels(tr, out_e, gt, organ, _transfer_kws(R["model"]))
+    from operators.resample import filter_length, use_filter_length
+    taps_trained = filter_length("sinc")
+    with (use_filter_length("sinc", transfer_taps) if transfer_taps
+          else contextlib.nullcontext()):
+        R = _run_one(run, vol, sl, args, device, _mg_call)
+        tkw = _transfer_kws(R["model"])
+        if transfer_taps and tkw.get("filter") != "sinc":
+            raise ValueError(f"{run} uses transfer filter {tkw.get('filter')!r}; "
+                             f"transfer_taps only lengthens the 'sinc'")
+        tr, out_e = R["store"]["trace"], R["store"]["out_embedded"]
+        gt, organ = R["gt"], R["organ"]
+        z, mu, fit = mg_levels(tr, out_e, gt, organ, tkw)
     meta = dict(volume=vol, slice=sl, anatomy=R["cfg"]["data"]["val"].get("anatomy", ""),
                 run=R["run"], n_params=R["n_params"], sigma=R["sigma"], step=R["step"],
                 K=R["cfg"]["model"]["params"].get("K"), M=R["cfg"]["model"]["params"].get("M"),
@@ -248,7 +263,11 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
                 coarse_op=coarse_op or R["cfg"]["model"]["params"].get("coarse_op", "galerkin"),
                 coarse_op_trained=R["cfg"]["model"]["params"].get("coarse_op", "galerkin"),
                 coarse_op_swapped=coarse_op if coarse_op and coarse_op != R["cfg"][
-                    "model"]["params"].get("coarse_op", "galerkin") else None)
+                    "model"]["params"].get("coarse_op", "galerkin") else None,
+                transfer_taps=int(transfer_taps or taps_trained),
+                transfer_taps_trained=int(taps_trained),
+                transfer_taps_swapped=(int(transfer_taps) if transfer_taps
+                                       and int(transfer_taps) != taps_trained else None))
     live = {"mg": dict(R, trace=tr, out_embedded=out_e)}
 
     if compare:
@@ -269,10 +288,12 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
 
 def save_npz(z, meta, out_dir):
     """-> the path written:
-    <out_dir>/<run>[_<coarse_op swap>]_<anatomy>_<volume tail>_<slice>.npz"""
+    <out_dir>/<run>[_<coarse_op swap>][_taps<n>]_<anatomy>_<volume tail>_<slice>.npz"""
     os.makedirs(out_dir, exist_ok=True)
     swap = meta.get("coarse_op_swapped")
-    stem = (f"{meta['run']}{'_' + swap if swap else ''}_{meta['anatomy'] or 'slice'}_"
+    taps = meta.get("transfer_taps_swapped")
+    stem = (f"{meta['run']}{'_' + swap if swap else ''}{f'_taps{taps}' if taps else ''}_"
+            f"{meta['anatomy'] or 'slice'}_"
             f"{meta['volume'].split('_')[-1]}_{meta['slice']}")
     path = os.path.join(out_dir, stem + ".npz")
     np.savez_compressed(path, meta=np.array(json.dumps(meta)), **z)
@@ -560,6 +581,9 @@ def main(argv=None):
     p.add_argument("--val-kspace-type", default="measurement_awgn",
                    help="as the main table (results/main); 'simulated' for the "
                         "simulated-k-space tree")
+    p.add_argument("--transfer-taps", type=int,
+                   help="implant a longer sinc (e.g. 12, 16) into every transfer of "
+                        "--run at inference; default: as trained (8)")
     p.add_argument("--out", default=os.path.join(ROOT, "figures", "out", "levels"))
     p.add_argument("--from-npz", help="only re-render this .npz (no torch, no data)")
     p.add_argument("--flip", choices=["", "ud", "lr", "both"],
@@ -570,7 +594,8 @@ def main(argv=None):
     if not (a.run and a.volume and a.slice is not None):
         p.error("--run, --volume and --slice are required (or --from-npz)")
     z, meta, _ = trace_slice(a.run, a.volume, a.slice, compare=a.compare, cascade=a.cascade,
-                             sigma=a.sigma, seed=a.seed, val_kspace_type=a.val_kspace_type)
+                             sigma=a.sigma, seed=a.seed, val_kspace_type=a.val_kspace_type,
+                             transfer_taps=a.transfer_taps)
     path = save_npz(z, meta, a.out)
     print(f"wrote {path}")
     render(path, a.flip)

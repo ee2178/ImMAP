@@ -105,12 +105,12 @@ PICKS_DIR="${PICKS_DIR:-}"
 METRICS="${METRICS:-psnr ssim nrmse lpips}"
 SEED="${SEED:-1234}"
 SIGMA="${SIGMA:-}"                      # empty = each run's own val_noise_std
-# How the measurement is made (2026-10-20): simulated k-space -- the SENSE ground
-# truth through the stored maps, mask and AWGN -- as the evaluation tables use
-# (torch/main_eval.sbatch). VAL_KSPACE=measurement_awgn reproduces the earlier
-# dumps. The dump records it, and the viewer warns when dumps made both ways
-# are put side by side.
-VAL_KSPACE="${VAL_KSPACE:-simulated}"
+# How the measurement is made: measured k-space + AWGN by default (2026-10-22),
+# as the nets train and as torch/main_eval.sbatch scores them. VAL_KSPACE=simulated
+# (the SENSE ground truth through the stored maps, mask and AWGN) is the
+# alternative. The dump records it, and the viewer warns when dumps made both
+# ways are put side by side.
+VAL_KSPACE="${VAL_KSPACE:-measurement_awgn}"
 OUT="${OUT:-}"                          # empty = <run>/eval_dump/
 WORKERS="${WORKERS:-4}"
 SCAN="${SCAN:-1}"                       # 0 = dump only, no aliasing scan

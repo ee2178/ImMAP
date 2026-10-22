@@ -235,19 +235,24 @@ def test_launch_guard(tmp, off, on):
               isinstance(r3, str) and "training.clip_grad" in r3
               and "planar_state" not in r3, str(r3)[:110])
 
-    # training.val_kspace_type (2026-10-20) is validation-only: a run launched
-    # before the generator wrote it is the same launch, resumed, not refused.
+    # training.val_kspace_type is validation-only. The generator wrote
+    # "simulated" for measured configs 2026-10-20 .. 2026-10-22 and writes no
+    # key since (validation follows training: measured). A run launched in that
+    # window carries the key; regenerating without it must be the same launch,
+    # resumed, not refused (scripts/set_val_kspace.py switches its validation).
     new = copy.deepcopy(on["lpdsnet_R12"])
-    check("the generator writes val_kspace_type=simulated for measured configs",
-          new["training"].get("val_kspace_type") == "simulated")
+    check("the generator writes no val_kspace_type: measured configs validate as they train",
+          "val_kspace_type" not in new["training"]
+          and new["mri"].get("kspace_type") == "measurement_awgn",
+          str(new["training"].get("val_kspace_type")))
     old = copy.deepcopy(new)
-    old["training"].pop("val_kspace_type", None)
+    old["training"]["val_kspace_type"] = "simulated"
     run_dir = tempfile.mkdtemp(dir=tmp)
     gen = os.path.join(run_dir, "config.gen.json")
     r0 = guard(write("old_val.json", old), gen, run_dir)
     r1 = guard(write("new_val.json", new), gen, run_dir)
-    check("launched before val_kspace_type existed: same launch, not refused",
-          r0 is None and r1 == 3, f"first {r0!r}, with the key {r1!r}")
+    check("launched with val_kspace_type=simulated: same launch without it, not refused",
+          r0 is None and r1 == 3, f"first {r0!r}, without the key {r1!r}")
 
 
 def main():
