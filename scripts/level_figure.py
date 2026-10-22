@@ -112,7 +112,10 @@ def _transfer_kws(net):
 
 def _resolve_volume(cfg, name):
     import dump_eval as de
-    names = de.resolve_volumes(cfg["data"]["val"], None, 0)
+    key = json.dumps(cfg["data"]["val"], sort_keys=True, default=str)
+    if key not in _VOLUMES:
+        _VOLUMES[key] = de.resolve_volumes(cfg["data"]["val"], None, 0)
+    names = _VOLUMES[key]
     if name in names:
         return name
     hits = [n for n in names if name in n]
@@ -122,40 +125,135 @@ def _resolve_volume(cfg, name):
     return hits[0]
 
 
-def _run_one(run_dir, vol, sl, args, device, call_for):
-    import torch
+# ---------------------------------------------------------------------------
+# cache: each checkpoint, slice batch and volume list is loaded ONCE per process,
+# so a notebook can re-trace with other knobs without reloading the nets
+# ---------------------------------------------------------------------------
+_NETS, _BATCHES, _VOLUMES = {}, {}, {}
+
+
+def clear_cache():
+    """Drop every cached net, batch and volume list (frees GPU memory)."""
+    _NETS.clear(); _BATCHES.clear(); _VOLUMES.clear()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:                                              # noqa: BLE001
+        pass
+
+
+def cache_info():
+    """One line per cached net: run, device, the knobs it is currently set to."""
+    if not _NETS:
+        return "no nets cached"
+    return "\n".join(f"  {os.path.basename(k[0])} on {k[1]}  (knobs now: {v['knobs']})"
+                     for k, v in _NETS.items())
+
+
+def _net(run_dir, device):
+    """`dump_eval.load_run`, once per (run, device) -- reloaded only if net.ckpt
+    changed on disk. Remembers what the net was BUILT with (coarse operator,
+    transfer filter) so every trace starts from that, whatever an earlier one set."""
     import dump_eval as de
-    from datasets.registry import build_loader
+    from models.mg_lpds import PDObjectiveDownsample
+
+    key = (os.path.abspath(run_dir), str(device))
+    stamp = os.path.getmtime(os.path.join(run_dir, "net.ckpt"))
+    hit = _NETS.get(key)
+    if hit is None or hit["stamp"] != stamp:
+        cfg, model, n_params, step = de.load_run(run_dir, device)
+        hit = _NETS[key] = dict(
+            cfg=cfg, model=model, n_params=n_params, step=step, stamp=stamp, knobs=None,
+            coarse=[(m, m.coarse_op) for m in model.modules()
+                    if isinstance(m, PDObjectiveDownsample)],
+            filters=[(m, m.transfer_filter) for m in model.modules()
+                     if hasattr(m, "transfer_filter")])
+        print(f"[{os.path.basename(os.path.normpath(run_dir))}] loaded "
+              f"({n_params:,} params, step {step})")
+    return hit
+
+
+def _modes(cfg):
+    """The process-wide switches `load_run` sets, for THIS net: another cached
+    net may have set them since (they change no parameter, ~1e-7 in the output,
+    but each net should run the way it is evaluated)."""
+    from models.components import set_complex_mode
+    from models.mg_lpds import set_planar_state
+    t = cfg.get("training", {})
+    set_complex_mode(t.get("complex_conv") or "gauss")      # "gauss": the class default
+    set_planar_state(bool(t.get("planar_state", False)))
+
+
+def _set_knobs(entry, coarse_op=None, transfer_filter=None):
+    """Back to the BUILT coarse operator / transfer filter, then these swaps."""
+    from operators.resample import set_transfer_filter
+    for m, op in entry["coarse"]:
+        m.coarse_op = op
+    for m, f in entry["filters"]:
+        m.transfer_filter = f
+    if coarse_op:
+        for m, _ in entry["coarse"]:
+            m.coarse_op = coarse_op
+    if transfer_filter:
+        set_transfer_filter(entry["model"], transfer_filter)
+    entry["knobs"] = dict(coarse_op=coarse_op, transfer_filter=transfer_filter)
+
+
+@contextlib.contextmanager
+def as_traced(live, which="mg"):
+    """Put a cached net back in the state trace `live` ran it with -- coarse
+    operator, transfer filter, sinc length, conv/planar modes -- for working
+    with `live[which]["model"]` after other traces have re-used that net."""
+    from operators.resample import use_filter_length
+    L = live[which]
+    k = L.get("knobs", {})
+    _modes(L["cfg"])
+    _set_knobs(L["entry"], k.get("coarse_op"), k.get("transfer_filter"))
+    with (use_filter_length("sinc", k["transfer_taps"]) if k.get("transfer_taps")
+          else contextlib.nullcontext()):
+        yield L["model"]
+
+
+def _batch(cfg, vol, sl):
+    key = (json.dumps(cfg["data"]["val"], sort_keys=True, default=str), vol, int(sl))
+    if key not in _BATCHES:
+        from datasets.registry import build_loader
+        val = dict(cfg["data"]["val"])
+        val.update(enumerate_slices=True, start_slice=sl, end_slice=sl + 1,
+                   volumes=[vol], batch_size=1, num_workers=0)
+        _BATCHES[key] = next(iter(build_loader(val, shuffle=False, drop_last=False)))
+    return _BATCHES[key]
+
+
+def _run_one(run_dir, vol, sl, args, device, call_for):
+    import copy
+
+    import torch
     from eval_per_volume import slice_seed
     from evaluation.tasks import build_adapter, default_sigma, force_organ_mask
+    from operators.resample import transfer_filter_of
 
-    cfg, model, n_params, step = de.load_run(run_dir, device)
-    if getattr(args, "coarse_op", None):
-        # Inference-time swap of the coarse forward model (no parameter depends
-        # on it): e.g. a rediscretize-trained net run with the Galerkin Gram.
-        from models.mg_lpds import PDObjectiveDownsample
-        n = 0
-        for m in model.modules():
-            if isinstance(m, PDObjectiveDownsample):
-                m.coarse_op, n = args.coarse_op, n + 1
-        if n:
-            print(f"[{os.path.basename(run_dir)}] coarse_op -> {args.coarse_op} ({n} levels)")
-    from operators.resample import set_transfer_filter, transfer_filter_of
+    entry = _net(run_dir, device)          # cached: loaded once per process
+    cfg, model = copy.deepcopy(entry["cfg"]), entry["model"]
+    n_params, step = entry["n_params"], entry["step"]
+    _modes(cfg)
+    # Inference-time swaps (no parameter depends on either), applied from the
+    # net's BUILT state so nothing an earlier trace set survives: the coarse
+    # forward model (e.g. a rediscretize-trained net with the Galerkin Gram) and
+    # the grid-transfer filter (e.g. "box", or "none" -- the sinc off).
+    _set_knobs(entry)
     filter_trained = transfer_filter_of(model)
+    _set_knobs(entry, getattr(args, "coarse_op", None), getattr(args, "transfer_filter", None))
+    name = os.path.basename(os.path.normpath(run_dir))
+    if getattr(args, "coarse_op", None) and entry["coarse"]:
+        print(f"[{name}] coarse_op -> {args.coarse_op} ({len(entry['coarse'])} levels)")
     if getattr(args, "transfer_filter", None):
-        # Inference-time swap of the grid-transfer filter (no parameter depends
-        # on it): e.g. "box" or "none" -- the sinc switched off.
-        n = len(set_transfer_filter(model, args.transfer_filter))
-        print(f"[{os.path.basename(run_dir)}] transfer filter {filter_trained} -> "
-              f"{args.transfer_filter} ({n} modules)")
+        print(f"[{name}] transfer filter {filter_trained} -> {args.transfer_filter}")
     force_organ_mask(cfg)
     if args.val_kspace_type:
         cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
     sigma = args.sigma if args.sigma is not None else default_sigma(cfg)
-    val = dict(cfg["data"]["val"])
-    val.update(enumerate_slices=True, start_slice=sl, end_slice=sl + 1,
-               volumes=[vol], batch_size=1, num_workers=0)
-    batch = next(iter(build_loader(val, shuffle=False, drop_last=False)))
+    batch = _batch(cfg, vol, sl)          # cached: same slice, same tensors
     gen = torch.Generator(device=device).manual_seed(slice_seed(args.seed, vol, sl))
     store = {}
     gt, recon, organ = build_adapter(cfg["task"])(
@@ -165,7 +263,7 @@ def _run_one(run_dir, vol, sl, args, device, call_for):
     return dict(cfg=cfg, model=model, gt=gt, recon=recon, organ=organ, store=store,
                 sigma=float(sigma), n_params=int(n_params), step=int(step or 0),
                 run=os.path.basename(os.path.normpath(run_dir)),
-                filter_trained=filter_trained)
+                filter_trained=filter_trained, entry=entry)
 
 
 def mg_levels(tr, out_e, gt, organ, kws):
@@ -240,8 +338,11 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
               the trace records it). R^l(gt) follows the net's transfer, so
               coarse-level NRMSEs are only comparable at equal transfers.
         live  the objects, for poking at further in a notebook: live["mg"] has
-              model, cfg, trace (a LevelTrace), gt, recon, organ, out_embedded;
-              live["vn"] the same for the comparison plus `features`
+              model, cfg, trace (a LevelTrace), gt, recon, organ, out_embedded,
+              knobs; live["vn"] the same for the comparison plus `features`.
+              The nets are CACHED (loaded once per process; `clear_cache`), so a
+              later trace may re-set the same net's knobs: wrap work on
+              live["mg"]["model"] in `with as_traced(live):`
     """
     import types
 
@@ -287,7 +388,9 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
                 transfer_filter_trained=str(R["filter_trained"]),
                 transfer_filter_swapped=(transfer_filter if transfer_filter
                                          and transfer_filter != R["filter_trained"] else None))
-    live = {"mg": dict(R, trace=tr, out_embedded=out_e)}
+    live = {"mg": dict(R, trace=tr, out_embedded=out_e,
+                       knobs=dict(coarse_op=coarse_op, transfer_filter=transfer_filter,
+                                  transfer_taps=transfer_taps))}
 
     if compare:
         args.coarse_op = None            # the swaps are for the multigrid net only
@@ -300,7 +403,7 @@ def trace_slice(run, volume, slice, compare=None, cascade=-1, sigma=None, seed=1
         meta.update(compare=V["run"], compare_n_params=V["n_params"],
                     cascade=V["store"]["cascade"], n_cascades=V["store"]["n_cascades"],
                     compare_path=compare)
-        live["vn"] = dict(V, features=feats)
+        live["vn"] = dict(V, features=feats, knobs={})
     z["gt"] = gt[0, 0].cpu().numpy().astype(np.complex64)
     z["recon"] = R["recon"][0, 0].cpu().numpy().astype(np.complex64)
     return z, meta, live
