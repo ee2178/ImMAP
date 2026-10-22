@@ -71,6 +71,10 @@ resulting coarse Gram comes out 14.5% non-Hermitian, which makes `dF_coarse`
 the subgradient of no objective at all.  Keep it only as the "what we had
 before" row of an ablation table; `Resample.is_adjoint` is False for it.
 
+`sinc_vertex` is `sinc` moved to the VERTEX lattice (coarse sample on a fine
+sample, 7 taps, same |H| to within 0.02): the lattice the stride-2, odd-P
+convs of LPDSLayer put the latent on. See `VERTEX_FILTERS`.
+
 Selecting one
 -------------
 Three ways, in increasing order of scope:
@@ -112,11 +116,28 @@ from operators.base import Operator
 from operators.identity import Identity
 
 DEFAULT_FACTOR = 2
+# FROZEN at "sinc": a trained net's config without a `transfer_filter` key
+# resolves to this, so changing it would silently swap the transfer of every
+# existing checkpoint. New multigrid cells set "sinc_vertex" explicitly
+# (scripts/make_mg_recon_configs.py::MG_TRANSFER_FILTER; see VERTEX_FILTERS).
 DEFAULT_FILTER = "sinc"
 
 #: Every selectable filter.  `legacy` is a code path, not a kernel.
 TRANSFER_FILTERS = ("sinc", "sinc_unwindowed", "bicubic", "bilinear",
-                    "gaussian", "box", "none", "legacy")
+                    "gaussian", "box", "none", "legacy", "sinc_vertex")
+
+#: Filters on the VERTEX-centred lattice: coarse sample `j` sits ON fine sample
+#: `factor * j` (odd length, centred on a sample) instead of at the centre of
+#: the cell `[factor * j, factor * j + factor)` like every other filter here.
+#:
+#: Why it exists: a strided analysis conv with odd `P` (LPDSLayer, P=7, s=2)
+#: puts latent sample `i` ON image pixel `s * i`. Restricting the image and the
+#: latent with a CELL-centred filter then lands the two coarse grids on
+#: different lattices -- the coarse `A_c R x` and `R z` are offset by
+#: (2^l - 1) / 2 fine pixels at level l (0.5, 1.5, 3.5), approaching half a
+#: coarse pixel. With vertex-centred transfers both paths land on fine pixel
+#: `2^(l+1) k` at every level (tests/test_fas_lattice.py).
+VERTEX_FILTERS = ("sinc_vertex",)
 
 _default_filter = DEFAULT_FILTER
 
@@ -292,6 +313,31 @@ def _sinc_rect1d(factor, length, dtype, device):
     return kaiser_sinc1d(factor, length, dtype, device, windowed=False)
 
 
+def _sinc_vertex1d(factor, length, dtype, device):
+    """The Kaiser sinc on the VERTEX lattice: odd length, centred on a sample.
+
+    At factor 2 this is a half-band filter -- `sinc(t/2)` vanishes at every
+    even `t != 0` -- and each polyphase component is normalised to sum
+    `1/factor`, so that `R(1) = 1` AND `P = factor^2 R^T` maps 1 to 1 exactly
+    (with a plain sum-to-one an odd kernel's phases differ, and `P` would
+    print a period-`factor` pattern on a constant). The centre tap is then
+    exactly 1/2 and `P` interpolates: a coarse sample passes through unchanged
+    onto its fine sample. 7 taps at factor 2 match the cell-centred 8-tap sinc
+    to within 0.02 of |H| at every frequency (0.94 / 0.72 / 0.50 / 0.28 / 0.06
+    at 0.25 / 0.4 / 0.5 / 0.6 / 0.75 pi, against 0.96 / 0.73 / 0.50 / 0.27 /
+    0.05), so switching the lattice does not also switch the anti-aliasing.
+    """
+    if length % 2 == 0:
+        raise ValueError(f"a vertex-centred kernel needs an odd length, got {length}")
+    h = kaiser_sinc1d(factor, length, dtype, device)
+    t = torch.arange(length, device=device) - (length - 1) // 2
+    out = torch.empty_like(h)
+    for p in range(int(factor)):
+        m = (t % factor) == p
+        out[m] = h[m] / (factor * h[m].sum())
+    return out
+
+
 def _bilinear1d(factor, length, dtype, device):
     """`deepinv.physics.functional.bilinear_filter`: `[1,3,3,1]/8` at factor 2.
 
@@ -343,7 +389,9 @@ def _delta1d(factor, length, dtype, device):
 
 _FILTER_SPECS = {
     #  name      -> (builder, length as a multiple of factor)
+    #  (a VERTEX_FILTERS entry is one tap shorter: `mult * factor - 1`)
     "sinc":            (kaiser_sinc1d, 4),
+    "sinc_vertex":     (_sinc_vertex1d, 4),
     "sinc_unwindowed": (_sinc_rect1d,  4),
     "bicubic":  (_bicubic1d,    4),
     "gaussian": (_gaussian1d,   4),
@@ -375,11 +423,19 @@ def use_filter_length(name, taps, factor=DEFAULT_FACTOR):
     if name not in _FILTER_SPECS:
         raise ValueError(f"no kernel table entry for {name!r}; one of {sorted(_FILTER_SPECS)}")
     taps, factor = int(taps), int(factor)
-    if taps < factor or taps % factor or (taps - factor) % 2:
+    if name in VERTEX_FILTERS:
+        if taps < factor + 1 or (taps + 1) % factor or taps % 2 == 0:
+            raise ValueError(f"taps={taps} at factor={factor} for the vertex-centred {name!r}: "
+                             f"need an odd count one short of a multiple of the factor "
+                             f"(e.g. 7, 11, 15 at factor 2)")
+        mult = (taps + 1) // factor
+    elif taps < factor or taps % factor or (taps - factor) % 2:
         raise ValueError(f"taps={taps} at factor={factor}: need a multiple of the factor, "
                          f">= it, with taps - factor even (e.g. 8, 12, 16 at factor 2)")
+    else:
+        mult = taps // factor
     prev = _FILTER_SPECS[name]
-    _FILTER_SPECS[name] = (prev[0], taps // factor)
+    _FILTER_SPECS[name] = (prev[0], mult)
     _KERNEL_CACHE.clear()
     try:
         yield taps
@@ -450,7 +506,13 @@ def filter_length(filter=None, factor=DEFAULT_FACTOR, length=None):
         return int(factor)
     if length is not None:
         return int(length)
-    return _FILTER_SPECS[filter][1] * int(factor)
+    return _FILTER_SPECS[filter][1] * int(factor) - (filter in VERTEX_FILTERS)
+
+
+def is_vertex_centred(filter=None):
+    """Whether `filter` puts coarse sample `j` ON fine sample `factor * j`."""
+    filter, _ = split_normalisation(_check_filter(filter))
+    return not torch.is_tensor(filter) and filter in VERTEX_FILTERS
 
 
 def transfer_kernel(filter=None, factor=DEFAULT_FACTOR, length=None,
@@ -482,7 +544,7 @@ def transfer_kernel(filter=None, factor=DEFAULT_FACTOR, length=None,
             "transpose of bilinear interpolation.")
 
     build, mult = _FILTER_SPECS[filter]
-    length = mult * int(factor) if length is None else int(length)
+    length = filter_length(filter, factor, length)
     h = build(factor, length, dtype, device)
     return gamma * torch.outer(h, h)[None, None]
 
@@ -493,8 +555,18 @@ def sinc_kernel2d(factor=2, length=None, dtype=torch.float32, device=None):
 
 
 def transfer_padding(filter=None, factor=DEFAULT_FACTOR, length=None):
-    """Left / right halo so `R` divides the grid exactly and `P` inverts it."""
+    """Left / right halo so `R` divides the grid exactly and `P` inverts it.
+
+    Cell-centred: `a + b = length - factor`. Vertex-centred: `a = b =
+    (length - 1) / 2`, which centres coarse sample `j` on fine sample
+    `factor * j`; the restriction then never reads the last padded sample,
+    and `prolong` restores it with `output_padding` (`_prolong_output_padding`).
+    """
     length = filter_length(filter, factor, length)
+    if is_vertex_centred(filter):
+        if length % 2 == 0:
+            raise ValueError(f"a vertex-centred transfer needs an odd length, got {length}")
+        return (length - 1) // 2, (length - 1) // 2
     span = length - int(factor)
     if span < 0:
         raise ValueError(
@@ -719,11 +791,21 @@ def prolong(x, scale=DEFAULT_FACTOR, length=None, filter=None):
     a, b = transfer_padding(filter, scale, length)
     groups = x.shape[1]
     w = _weight_for(x, filter, scale, length, groups) * adjoint_scale(filter, scale)
+    op = _prolong_output_padding(a, b, scale, w.shape[-1])
 
     def fn(t):
-        return circ_fold(F.conv_transpose2d(t, w, stride=scale, groups=groups), a, b)
+        return circ_fold(F.conv_transpose2d(t, w, stride=scale, groups=groups,
+                                            output_padding=op), a, b)
 
     return _apply_complex(fn, x)
+
+
+def _prolong_output_padding(a, b, factor, length):
+    """Trailing zeros `conv_transpose2d` must emit so its output is the padded
+    length `n * factor + a + b` the fold expects: 0 on the cell-centred lattice
+    (`a + b = length - factor`), `factor - 1` on the vertex one, where the
+    restriction's last padded sample is never read and so gets no adjoint."""
+    return int(a) + int(b) + int(factor) - int(length)
 
 
 def noise_scale(factor=DEFAULT_FACTOR, length=None, filter=None):
@@ -893,10 +975,12 @@ class GridTransfer(nn.Module):
         a, b = self.pad
         w, groups = self._w(z)
         w = w * self.adjoint_scale
+        op = _prolong_output_padding(a, b, self.factor, self.length)
 
         def fn(t):
             return circ_fold(
-                F.conv_transpose2d(t, w, stride=self.factor, groups=groups), a, b)
+                F.conv_transpose2d(t, w, stride=self.factor, groups=groups,
+                                   output_padding=op), a, b)
 
         return _apply_complex(fn, z)
 

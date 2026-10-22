@@ -318,6 +318,33 @@ class SoftThreshold(nn.Module):
         zt, cache = self.forward(z, sigma, cache)
         return z - zt, cache
 
+    def normal_cone(self, z, w, sigma=None, tol=1e-4):
+        """`Pi_{N_C(z)}(w)`: `w` projected onto the normal cone of the DUAL set
+        `C = {|z_k| <= t_k}` at `z` -- the element of `dg*(z)` closest to `w`.
+
+        Entries strictly inside (`|z| < (1 - tol) t`) have the cone `{0}`; on
+        (or past) the boundary it is the ray along `z / |z|`, so the projection
+        keeps the outward part of `w` along it: `relu(Re(conj(u) w)) u`. That
+        is the subgradient selection that makes the dual gradient
+        `Aw - v` vanish at a fixed point `z = clip(z + Aw)` on BOTH sides of
+        the boundary. Past the boundary `dg*` is empty; the ray is the natural
+        extension, and is where option B's coherence ends (models/mg_lpds.py).
+        Real, complex and planar codes; the modulus pairs `[re; im]` as the
+        clip does.
+        """
+        t = self.threshold(z, sigma)
+        eps = self.fenchel_eps
+        if self._is_planar_state(z):
+            B, C2, H, W = z.shape
+            zp, wp = z.reshape(B, 2, C2 // 2, H, W), w.reshape(B, 2, C2 // 2, H, W)
+            a = (zp * zp).sum(1).clamp_min(eps * eps).sqrt()
+            s = (zp * wp).sum(1) / a
+            k = ((a >= (1 - tol) * t).to(z.dtype) * F.relu(s) / a).unsqueeze(1)
+            return (zp * k).reshape(z.shape)
+        a = z.abs().clamp_min(eps)
+        s = ((z.conj() * w).real if torch.is_complex(z) else z * w) / a
+        return z * ((a >= (1 - tol) * t).to(a.dtype) * F.relu(s) / a)
+
     @torch.no_grad()
     def project_(self):
         self.tau.project_(lo=0.0)
@@ -843,6 +870,17 @@ class FenchelProx(nn.Module):
         # the inner prox IS the answer -- forming it via two subtractions cost
         # two full M-channel temporaries and bought nothing.
         return self.prox(z, sigma, cache)
+
+    def normal_cone(self, z, w, sigma=None):
+        """`Pi_{N(z)}(w)` for THIS map's set (see `SoftThreshold.normal_cone`).
+        Only the elementwise clip has one; the group clip's set is coupled
+        through the learned adjacency and is not implemented."""
+        nc = getattr(self.prox, "normal_cone", None)
+        if nc is None:
+            raise NotImplementedError(
+                f"{type(self.prox).__name__} has no normal-cone selection; the "
+                f"gradient-form dual FAS (fas_dual='gradient') needs one")
+        return nc(z, w, sigma)
 
     @torch.no_grad()
     def project_(self):

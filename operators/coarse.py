@@ -118,6 +118,10 @@ def coarse_truncate(T, factor=DEFAULT_FACTOR):
 
     A centred 376 -> 372 embedding (left = 2) coarsens to 188 -> 186 at offset
     1, and that one to 94 -> 93, also at offset 1 (phase 1).
+
+    The same phase serves a VERTEX-centred filter (`sinc_vertex`), whose coarse
+    pixel `j` sits on fine pixel `factor*j`: the window's first lattice point is
+    again `left + phase`.
     """
     big_c, small_c, off_c, phase = [], [], [], []
     for big, small, off in zip(T.big, T.small, (T.top, T.left)):

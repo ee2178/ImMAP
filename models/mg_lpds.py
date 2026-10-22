@@ -123,6 +123,36 @@ def preload_pd_with_widening(coarse, fine_layer, widen):
 # ===========================================================================
 #  Delta dF -- restriction + the two FAS corrections
 # ===========================================================================
+#: How the DUAL FAS correction is formed and applied (`fas_dual`). The primal
+#: is the same under all three: its step has no prox, so a gradient residual
+#: subtracted inside and a fixed-point residual added after coincide.
+#:
+#:   "legacy"       pi_z = r_c(Rz) - R r(z),  r(z) = z - prox_{g*}(z + A x),
+#:                  subtracted INSIDE the prox -- what this port and
+#:                  `mg_lpds.jl:127` have always done. Not coherent: with a
+#:                  zero fine residual the coarse dual still moves (in the
+#:                  linear regime by 2 A_c x_c).
+#:   "fixed_point"  option A -- FAS on the fixed-point equation. Same pi_z,
+#:                  ADDED after the prox: z+ = prox(z + A_c xbar) + pi_z. With
+#:                  the fine residual zero the coarse sweep stays put, always.
+#:   "gradient"     option B -- FAS on the optimality condition (a tilt of the
+#:                  coarse dual). pi_z = d_c(Rx, Rz) - R d(x, z), with the dual
+#:                  gradient d = A x - Pi_{N(z)}(A x) (the subgradient of g* at z
+#:                  nearest A x; `SoftThreshold.normal_cone`), subtracted
+#:                  INSIDE. Coherent while R z lies in the coarse dual set;
+#:                  local (elementwise) prox only.
+#:
+#: Changes no parameter: any checkpoint loads under any of them (as a
+#: diagnostic -- a net trained under one has learned around it).
+FAS_DUAL = ("legacy", "fixed_point", "gradient")
+
+
+def _check_fas_dual(mode):
+    if mode not in FAS_DUAL:
+        raise ValueError(f"fas_dual must be one of {FAS_DUAL}, got {mode!r}")
+    return mode
+
+
 class PDObjectiveDownsample(nn.Module):
     """Restrict `(x, z, y, E, sigma)` and form `(pi_x, pi_z)`.
 
@@ -133,11 +163,13 @@ class PDObjectiveDownsample(nn.Module):
     """
 
     def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False,
-                 transfer_filter=None, transfer=None, coarse_op="galerkin"):
+                 transfer_filter=None, transfer=None, coarse_op="galerkin",
+                 fas_dual="legacy"):
         super().__init__()
         self.widen = int(widen)
         self.julia_compat = bool(julia_compat)
         self.coarse_op = coarse_op
+        self.fas_dual = _check_fas_dual(fas_dual)
         self.is_complex = bool(getattr(fine_layer, "is_complex", True))
         self.transfer_filter = _check_filter(transfer_filter)
         # LATENT-grid transfer, shared with the enclosing V-cycle. Only the
@@ -166,13 +198,20 @@ class PDObjectiveDownsample(nn.Module):
         # planar STATE: real tensors, [re; im] stacked (see LPDSLayer.forward)
         planar = getattr(self, "is_complex", True) and not x.is_complex()
 
+        gradient = self.fas_dual == "gradient"
+
         # ---- fine-level primal-dual residual --------------------------------
         # primal:  grad f(x) + A^T z
         rx_fine = gram_or_x(E, x, planar) - y + self.synthesis_fine(z)
-        # dual: the FIXED-POINT residual z - prox_{g*}(z + A x), not a gradient
-        zhat, cache["_dF_fine"] = self.prox_fine(
-            z + self.analysis_fine(x), sigma, cache.setdefault("_dF_fine", {}))
-        rz_fine = z - zhat
+        # dual: the FIXED-POINT residual z - prox_{g*}(z + A x) ("legacy",
+        # "fixed_point"), or the dual GRADIENT A x - Pi_{N(z)}(A x) ("gradient")
+        Ax = self.analysis_fine(x)
+        if gradient:
+            rz_fine = Ax - self.prox_fine.normal_cone(z, Ax, sigma)
+        else:
+            zhat, cache["_dF_fine"] = self.prox_fine(
+                z + Ax, sigma, cache.setdefault("_dF_fine", {}))
+            rz_fine = z - zhat
 
         # ---- restriction: x and y on the image grid, z on the latent grid ----
         # IMAGE path -- the primal variable and its residual sit on the same
@@ -196,10 +235,13 @@ class PDObjectiveDownsample(nn.Module):
         # Handed on to the coarse level, whose first sweep needs the same Gram.
         gram_x_c = gram_or_x(E_c, x_c, planar)
         rx_coarse = gram_x_c - y_c + self.synthesis_coarse(z_c)
-        zhat_c, cache["_dF_coarse"] = self.prox_coarse(
-            z_c + self.analysis_coarse(x_c), sigma_c,
-            cache.setdefault("_dF_coarse", {}))
-        rz_coarse = z_c - zhat_c
+        Ax_c = self.analysis_coarse(x_c)
+        if gradient:
+            rz_coarse = Ax_c - self.prox_coarse.normal_cone(z_c, Ax_c, sigma_c)
+        else:
+            zhat_c, cache["_dF_coarse"] = self.prox_coarse(
+                z_c + Ax_c, sigma_c, cache.setdefault("_dF_coarse", {}))
+            rz_coarse = z_c - zhat_c
 
         return (x_c, z_c, rx_coarse - Rrx, rz_coarse - Rrz, y_c, E_c, sigma_c,
                 gram_x_c)
@@ -214,6 +256,38 @@ class PDObjectiveDownsample(nn.Module):
         for m in (self.prox_fine, self.prox_coarse):
             if hasattr(m, "project_"):
                 m.project_()
+
+
+def _set_layer_fas_dual(module, mode):
+    for m in module.modules():
+        if isinstance(m, LPDSLayer):
+            m.fas_dual = mode
+
+
+def set_fas_dual(model, mode):
+    """Point every dual FAS correction of a BUILT `model` at `mode` -> the
+    previous mode. Changes no parameter, so it is a diagnostic on a trained
+    net (which learned around its own mode), not a retraining."""
+    mode = _check_fas_dual(mode)
+    if mode == "gradient":
+        _check_gradient_fas_proxes(model)
+    owners = [m for m in model.modules()
+              if isinstance(m, (MGLPDSNet, PDVCycle, PDObjectiveDownsample))]
+    if not owners:
+        raise ValueError(f"{type(model).__name__} has no V-cycle")
+    prev = owners[0].fas_dual
+    for m in owners:
+        m.fas_dual = mode
+    _set_layer_fas_dual(model, mode)
+    return prev
+
+
+def _check_gradient_fas_proxes(model):
+    bad = {type(m.prox).__name__ for m in model.modules()
+           if isinstance(m, FenchelProx) and not hasattr(m.prox, "normal_cone")}
+    if bad:
+        raise ValueError(f"fas_dual='gradient' needs the dual set's normal cone, which "
+                         f"{sorted(bad)} does not provide (local prox only, window=1)")
 
 
 def gram_or_x(E, x, planar=False):
@@ -270,12 +344,14 @@ class PDVCycle(nn.Module):
 
     def __init__(self, iters, C, M, widen=1, alpha0=1e-1, julia_compat=False,
                  spectral_init=True, transfer_filter=None,
-                 learn_transfer=False, coarse_op="galerkin", **layer_kws):
+                 learn_transfer=False, coarse_op="galerkin", fas_dual="legacy",
+                 **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
         if coarse_op not in COARSE_OPS:
             raise ValueError(f"coarse_op must be one of {COARSE_OPS}, got {coarse_op!r}")
         self.coarse_op = coarse_op
+        self.fas_dual = _check_fas_dual(fas_dual)
         assert iters[0] % 2 == 0, \
             f"non-coarsest level iters must be even, got {iters[0]}"
         self.widen = int(widen)
@@ -330,7 +406,7 @@ class PDVCycle(nn.Module):
                                     spectral_init=False,
                                     transfer_filter=self.transfer_filter,
                                     learn_transfer=learn_transfer,
-                                    coarse_op=coarse_op,
+                                    coarse_op=coarse_op, fas_dual=fas_dual,
                                     **coarse_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
@@ -344,7 +420,9 @@ class PDVCycle(nn.Module):
                                         julia_compat=julia_compat,
                                         transfer_filter=self.transfer_filter,
                                         transfer=self.transfer,
-                                        coarse_op=coarse_op)
+                                        coarse_op=coarse_op, fas_dual=fas_dual)
+        # The coarse sweeps apply pi_z; their placement follows the mode.
+        _set_layer_fas_dual(self.mglayer, fas_dual)
 
         # Two coarse-correction steps. Left unclamped by `project_`: they are
         # signed step sizes, unlike tau / theta.
@@ -423,7 +501,7 @@ class PDVCycle(nn.Module):
     def extra_repr(self):
         return (f"depth={self.depth}, iters_per_level={self.iters_per_level}, "
                 f"M={self.M} x widen^l (widen={self.widen}), "
-                f"coarse_op={self.coarse_op}")
+                f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}")
 
 
 # ===========================================================================
@@ -470,9 +548,12 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  attn_backend="gather", flex_block_size=128,
                  preproc="kspace", resize_noise=False, julia_compat=False,
                  transfer_filter=None, learn_transfer=False,
-                 coarse_op="galerkin"):
+                 coarse_op="galerkin", fas_dual="legacy"):
         super().__init__()
         K_outer, iters = _parse_K(K)
+        # How the coarse levels apply the DUAL FAS correction (see FAS_DUAL).
+        # "legacy" is what every net before 2026-10-22 trained with.
+        self.fas_dual = _check_fas_dual(fas_dual)
         # The coarse levels' forward model -- "galerkin" (E . P: exact, but
         # every coarse Gram runs the full-resolution multicoil FFTs) or
         # "rediscretize" (SENSE posed on the coarse grid; see
@@ -514,7 +595,9 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 julia_compat=julia_compat,
                 transfer_filter=self.transfer_filter,
                 learn_transfer=self.learn_transfer, coarse_op=coarse_op,
-                **layer_kws))
+                fas_dual=fas_dual, **layer_kws))
+            if fas_dual == "gradient":
+                _check_gradient_fas_proxes(self)
 
     # ----------------------------------------------------------------------
     def forward(self, y, E=None, sigma=None, state=None):
@@ -625,7 +708,7 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
 
     def extra_repr(self):
         return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "
-                f"coarse_op={self.coarse_op}")
+                f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}")
 
 
 PLANAR_STATE_ENV = "IMMAP_PLANAR_STATE"

@@ -78,6 +78,13 @@ def _per_channel(t, x):
 class LPDSLayer(nn.Module):
     """One primal-dual sweep.  Port of `lpds.jl::LPDSLayer`."""
 
+    # Where a coarse level's dual FAS correction `pi_z` enters the sweep (see
+    # models/mg_lpds.py::FAS_DUAL). "fixed_point" ADDS it after the prox --
+    # FAS on the fixed-point equation; "legacy" and "gradient" subtract it
+    # inside, as a tilt of the dual. Set per instance by PDVCycle; a layer
+    # that never receives `pi` (any fine level, any flat LPDS) ignores it.
+    fas_dual = "legacy"
+
     def __init__(self, C, M, P=7, stride=1, lam0=1e-2, tau0=1e-1, theta0=1e-1,
                  degrees=0, is_complex=True, window=1, Mh=None, prox_kws=None):
         super().__init__()
@@ -144,9 +151,12 @@ class LPDSLayer(nn.Module):
         x_bar = x_new + theta * (x_new - x)          # over-relaxation
 
         u = z + self.analysis(x_bar)
-        if pi_z is not None:
+        outside = pi_z is not None and self.fas_dual == "fixed_point"
+        if pi_z is not None and not outside:
             u = u - pi_z
         z_new, cache = self.prox(u, sigma, cache)
+        if outside:
+            z_new = z_new + pi_z
 
         return (x_new, z_new), cache
 

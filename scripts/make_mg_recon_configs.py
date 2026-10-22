@@ -620,6 +620,43 @@ MODELS.update({
 EXP14_CELLS = tuple(f"mg{m}v6" for m in EXP14_M)
 
 # ---------------------------------------------------------------------------
+#  EXP15: V-cycle correctness fixes against mg81v6, knee R=8 (2026-10-22)
+#
+#  Two defects found in the transfers' USE, not in R / P themselves:
+#    LATTICE  the stride-2, P=7 analysis conv puts latent sample i ON image
+#             pixel 2i; the cell-centred sinc restriction puts coarse pixel j
+#             at 2j + 1/2. Image and latent then coarsen onto lattices offset
+#             by (2^l - 1)/2 fine px at level l. `sinc_vertex` (7 taps, same
+#             |H|) is the vertex-centred sinc: offset 0 at every level.
+#    FAS      the dual correction pi_z (a fixed-point residual) is subtracted
+#             inside the prox, which is not coherent. "fixed_point" (option A)
+#             adds it after the prox; "gradient" (option B) forms it from the
+#             dual gradient and keeps it inside. models/mg_lpds.py::FAS_DUAL.
+#  Each cell is mg81v6 (exp11's MGLPDS-Small) with only these keys changed,
+#  so mg81v6_R8 itself is the baseline and is not retrained.
+#  Launcher: torch/exp15_fas_lattice.sbatch.
+#
+#  The LATTICE fix is a correctness fix, not an ablation arm: every multigrid
+#  cell defined from here on sets transfer_filter=MG_TRANSFER_FILTER. Cells
+#  defined before stay cell-centred -- their configs carry no transfer_filter
+#  key and so resolve to the module default "sinc", which must NOT change, or
+#  every trained checkpoint would load with a different transfer.
+# ---------------------------------------------------------------------------
+MG_TRANSFER_FILTER = "sinc_vertex"
+EXP15 = {
+    "mg81v6vtx":  dict(transfer_filter=MG_TRANSFER_FILTER),
+    "mg81v6vtxA": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point"),
+    "mg81v6vtxB": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient"),
+}
+MODELS.update({
+    name: dict(type="MGLPDSNet",
+               params=dict(MODELS["mg81v6"]["params"], **extra),
+               training=dict(MODELS["mg81v6"]["training"]))
+    for name, extra in EXP15.items()
+})
+EXP15_CELLS = tuple(EXP15)
+
+# ---------------------------------------------------------------------------
 #  EXP12: the GROUP twins of the main comparison's two multigrid cells
 #  (2026-10-08).
 #
@@ -711,7 +748,8 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           # not renumber exp1-exp4, whose arrays index the default list.
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
-          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet")
+          "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet") \
+    + EXP15_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -1086,6 +1124,11 @@ def _display_name(spec_type, params):
                              "-".join(str(i) for i in iters))
         if params.get("coarse_op", "galerkin") != "galerkin":
             tag += "_rd"
+        # exp15: otherwise the fixes would share mg81v6's wandb name
+        if params.get("transfer_filter") not in (None, "sinc"):
+            tag += "_" + str(params["transfer_filter"])
+        if params.get("fas_dual", "legacy") != "legacy":
+            tag += "_fas" + params["fas_dual"]
         return "%s_%s" % (spec_type, tag)
     if spec_type == "RAM":
         # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.

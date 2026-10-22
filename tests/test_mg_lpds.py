@@ -8,7 +8,9 @@ Checks for the Multigrid Learned Primal-Dual Splitting port.
 The load-bearing test is `test_fas_consistency`. Everything else confirms the
 plumbing; only that one confirms the CORRECTION, and a wrong `pi_x` / `pi_z`
 passes every shape and gradient check while quietly making the coarse level
-solve a different problem.
+solve a different problem. It checks the residual IDENTITY only; whether the
+coarse SWEEP then stays put -- which the legacy dual placement fails -- is
+tests/test_fas_lattice.py.
 
 Run with:  python -m tests.test_mg_lpds
 """
