@@ -680,6 +680,12 @@ EXP15 = {
     "mg81v6vtxAnest": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX),
     "mg81v6vtxBnest": dict(transfer_filter=MG_TRANSFER_FILTER, **MG_FAS),
     "mg81v6vtxBnestsup": dict(transfer_filter=MG_TRANSFER_FILTER, **MG_FAS),
+    # The tie ablated with the parent-pi fix in (2026-10-23): vtxAnest / vtxBnest
+    # with the downsampler's own (untied) copies of F_1 / C_1.
+    "mg81v6vtxAnestU": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point",
+                            fas_copies="untied", fas_parent_pi=True),
+    "mg81v6vtxBnestU": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient",
+                            fas_copies="untied", fas_parent_pi=True),
 }
 # Cell-specific `training` keys (written only for these cells).
 EXP15_TRAINING = {
