@@ -75,7 +75,8 @@ def _mg_call(store):
     def call(net, y, E, sigma):
         out, trace = net.forward_levels(y, E=E, sigma=sigma)
         out = out[0] if isinstance(out, tuple) else out
-        store.update(trace=trace, out_embedded=out.detach())
+        # the call itself too: `coarse_solve_test` re-runs the net on it
+        store.update(trace=trace, out_embedded=out.detach(), inputs=(y, E, sigma))
         return out
     return call
 
@@ -1400,6 +1401,358 @@ def fig_correction_spectra(z, meta, outer=-1, flip=None, db_floor=-110.0, panel=
         A.set_xlim(-.5, .5); A.set_ylim(-60, 5); A.tick_params(labelsize=6)
         A.set_title(f"|H| of P ({meta['transfer_filter']}), dB", fontsize=8)
         A.set_xlabel("cycles / fine pixel", fontsize=7); A.grid(alpha=.25)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# is the coarse level solving its problem -- and is that the right problem?
+# ---------------------------------------------------------------------------
+# The learned coarse level steps on ITS OWN problem: its own analysis A_1,
+# synthesis B_1 and threshold lambda_1, tilted by the FAS correction pi. The
+# fine problem restricted to coarse images (Galerkin) is a different one:
+#     min_{x_c}  1/2 ||E P x_c - y||^2 + lambda_0 ||A_0 P x_c||_1   (x 1/4)
+# `coarse_solve_test` runs, from the SAME restricted start u_c and on the same
+# slice, several fixed coarse solvers to (near) convergence and scores every
+# iterate against R gt -- and what it would do to the fine level, x_pre + P(x_c - u_c):
+#   "C1"          the learned coarse level's FIRST layer, iterated with the net's
+#                 own pi: where the learned coarse problem's solution is
+#   "galerkin"    the fine first layer F_1 on P x_c (z on the FINE latent grid):
+#                 exactly the fine problem restricted to coarse images, FAS-tilted
+#                 with the correct nested pi
+#   "galerkin_R"  as "galerkin" with the coefficients restricted too,
+#                 A = R_z A_0 P, B = R B_0 P_z (z on the coarse latent grid):
+#                 what a Galerkin-prior coarse level would compute in the net
+#   "galerkin_untilted"  "galerkin" with pi = 0: the best coarse image under
+#                 the fine model, with no FAS correction at all
+# Every solver is an LPDS layer with fixed weights (the learned tau / theta of
+# the layer it came from), iterated `n_iter` times; `step` reports whether it
+# converged. Galerkin modes use the exact Galerkin data term R E^H(E P x - y),
+# whatever coarse operator the run was trained with.
+COARSE_SOLVERS = ("C1", "galerkin", "galerkin_R", "galerkin_untilted")
+
+
+def _vcycle_index(model):
+    """`{(outer, level): PDVCycle}`, level 0 finest."""
+    from models.mg_lpds import PDVCycle
+    cycles = [m for m in model.modules() if isinstance(m, PDVCycle)]
+    inner = {id(c.mglayer) for c in cycles}
+    out = {}
+    for k, V in enumerate(c for c in cycles if id(c) not in inner):
+        level = 0
+        while isinstance(V, PDVCycle):
+            out[(k, level)] = V
+            V, level = V.mglayer, level + 1
+    return out
+
+
+def _capture_vcycles(model, y, E, sigma):
+    """One forward; per (outer, level) what the FAS downsampler received and
+    returned, and what the coarse level handed back. -> `{(k, l): dict}`."""
+    import torch
+    index = _vcycle_index(model)
+    rec, patched = {}, []
+
+    def det(t):
+        return t.detach() if torch.is_tensor(t) else t
+
+    for key, V in index.items():
+        d = rec.setdefault(key, {})
+
+        def wrap_dF(m, d=d):
+            orig = m.forward
+
+            def fwd(x, z, y_t, E_, sig, cache, static=None, pi=None):
+                out = orig(x, z, y_t, E_, sig, cache, static, pi=pi)
+                d.update(x=det(x), z=det(z), y=det(y_t), E=E_, sigma=det(sig),
+                         pi=None if pi is None else tuple(det(p) for p in pi),
+                         x_c=det(out[0]), z_c=det(out[1]), pi_c=(det(out[2]), det(out[3])),
+                         y_c=det(out[4]), E_c=out[5], sigma_c=det(out[6]))
+                return out
+            m.forward = fwd
+            patched.append(m)
+
+        def wrap_coarse(m, d=d):
+            orig = m.forward
+
+            def fwd(*a, **kw):
+                out = orig(*a, **kw)
+                state = out[0] if isinstance(out, tuple) else out
+                d.update(w_x=det(state[0]), w_z=det(state[1]))
+                return out
+            m.forward = fwd
+            patched.append(m)
+
+        wrap_dF(V.dF)
+        wrap_coarse(V.mglayer)
+    try:
+        with torch.no_grad():
+            model(y, E=E, sigma=sigma)
+    finally:
+        for m in patched:
+            del m.forward
+    return rec, index
+
+
+def _np_img(t, mu):
+    """A DC-removed traced image as complex numpy (H, W), DC added back."""
+    return (_as_complex(t)[0, 0].cpu().numpy() + mu).astype(np.complex64)
+
+
+def _pd_run(x, z, data_grad, A, B, prox, tau, theta, pi, mode, n_iter, every, score):
+    """`n_iter` LPDS steps with fixed operators (LPDSLayer.forward's update,
+    `mode` = where pi_z enters). -> (x, z, records)."""
+    pi_x, pi_z = (None, None) if pi is None else pi
+    out = (lambda zn: zn + pi_z) if (pi_z is not None and mode == "fixed_point") else None
+    recs = []
+    for t in range(1, n_iter + 1):
+        r = data_grad(x) + B(z)
+        if pi_x is not None:
+            r = r - pi_x
+        xn = x - tau * r
+        xb = xn + theta * (xn - x)
+        u = z + A(xb)
+        if pi_z is not None and out is None:
+            u = u - pi_z
+        zn = prox(u)
+        if out is not None:
+            zn = out(zn)
+        if t == 1 or t % every == 0 or t == n_iter:
+            step = float((xn - x).norm() / (x.norm() + 1e-12))
+            step_z = float((zn - z).norm() / (z.norm() + 1e-12))
+            recs.append(dict(it=t, step=step, step_z=step_z, **score(xn)))
+        x, z = xn, zn
+    return x, z, recs
+
+
+def _residual(x, z, data_grad, A, B, prox, normal_cone, mode, pi=None):
+    """The level's FAS residual (primal, dual) at (x, z) -- net of `pi` when
+    given, in the form that is zero at the fixed point of `mode`'s sweep
+    (models/mg_lpds.py::_check_fas_parent_pi)."""
+    pi_x, pi_z = (None, None) if pi is None else pi
+    rx = data_grad(x) + B(z)
+    if pi_x is not None:
+        rx = rx - pi_x
+    Ax = A(x)
+    if mode == "gradient":
+        w = Ax if pi_z is None else Ax - pi_z
+        rz = w - normal_cone(z, w)
+    elif mode == "fixed_point":
+        rz = z - prox(z + Ax)
+        if pi_z is not None:
+            rz = rz - pi_z
+    else:                                                        # legacy
+        rz = z - prox(z + Ax if pi_z is None else z + Ax - pi_z)
+    return rx, rz
+
+
+def coarse_solve_test(z, meta, live, outer=-1, level=0, n_iter=300, every=5,
+                      solvers=COARSE_SOLVERS):
+    """Fixed coarse solvers from the learned coarse level's own start, on the
+    transition `level` -> `level + 1` of V-cycle `outer` (live mode).
+
+    -> dict: `refs` (NRMSEs of u_c, the learned w_c, x_pre, x_corr), `own`
+    (the learned coarse level's one-step change under its first layer at its
+    start and at its end -- did the learned solve reduce its own residual?),
+    and `runs[solver]` = {"recs": per-iteration NRMSE / step, "x_c", "x_f"}.
+    """
+    import torch
+    from models.lpds import _per_channel
+    from models.mg_lpds import first_pd_layer, gram_or_x
+    from operators.resample import prolong, restrict
+
+    model = live["mg"]["model"]
+    y, E, sigma = live["mg"]["store"]["inputs"]
+    ctx = as_traced(live) if "entry" in live["mg"] else contextlib.nullcontext()
+    with ctx:
+        rec, index = _capture_vcycles(model, y, E, sigma)
+        k = sorted({kk for kk, _ in rec})[outer]
+        if (k, level) not in rec:
+            raise ValueError(f"no V-cycle at level {level} (levels "
+                             f"{sorted({l for _, l in rec})})")
+        d, V = rec[(k, level)], index[(k, level)]
+        if V.widen != 1:
+            raise NotImplementedError("widen > 1: the coarse code has more channels")
+        mode = V.fas_dual
+        filt = V.transfer_filter
+        Ri = lambda t: restrict(t, julia_compat=V.julia_compat, filter=filt)  # noqa: E731
+        Pi = lambda t: prolong(t, filter=filt)                                # noqa: E731
+        if V.transfer is not None:
+            Rz, Pz = V.transfer.restrict, V.transfer.prolong
+        else:
+            Rz, Pz = Ri, Pi
+        F1, C1 = V.lpdsA.first, first_pd_layer(V.mglayer)
+        x, zf, sig, sig_c = d["x"], d["z"], d["sigma"], d["sigma_c"]
+        planar = F1.is_complex and not x.is_complex()
+        mu = complex(*meta["dc"])
+        gt_c, gt_f = z[f"mg/gt/l{level + 1}"], z[f"mg/gt/l{level}"]
+
+        def steps(layer, s, ref):
+            tau, theta = layer.tau(s, ref=ref), layer.theta(s, ref=ref)
+            if planar:
+                tau, theta = _per_channel(tau, ref), _per_channel(theta, ref)
+            return tau, theta
+
+        def score_for(u_x):
+            def score(xc):
+                xf = x + Pi(xc - u_x)
+                return dict(coarse=nrmse(_np_img(xc, mu), gt_c),
+                            fine=nrmse(_np_img(xf, mu), gt_f))
+            return score
+
+        with torch.no_grad():
+            # ---- references: what the net did ------------------------------
+            u_x, u_z, w_x, w_z = d["x_c"], d["z_c"], d["w_x"], d["w_z"]
+            x_corr = x + V.alpha_x(Pi(w_x - u_x))
+            refs = dict(u_c=nrmse(_np_img(u_x, mu), gt_c),
+                        w_c=nrmse(_np_img(w_x, mu), gt_c),
+                        x_pre=nrmse(_np_img(x, mu), gt_f),
+                        x_corr=nrmse(_np_img(x_corr, mu), gt_f),
+                        x_pre_plus_P=nrmse(_np_img(x + Pi(w_x - u_x), mu), gt_f))
+
+            # ---- the learned coarse level's own residual (first layer) -------
+            def one_step(xs, zs):
+                (xn, zn), _ = C1((xs, zs), d["y_c"], E=d["E_c"], sigma=sig_c,
+                                 pi=d["pi_c"])
+                return (float((xn - xs).norm() / (xs.norm() + 1e-12)),
+                        float((zn - zs).norm() / (zs.norm() + 1e-12)))
+            own = dict(start=one_step(u_x, u_z), end=one_step(w_x, w_z))
+
+            # ---- the fine level's own residual, net of its own pi ------------
+            fprox = lambda u: F1.prox(u, sig, {})[0]                         # noqa: E731
+            fcone = lambda zz, w: F1.prox.normal_cone(zz, w, sig)            # noqa: E731
+            fdata = lambda xx: gram_or_x(d["E"], xx, planar) - d["y"]        # noqa: E731
+            s_x, s_z = _residual(x, zf, fdata, F1.analysis, F1.synthesis, fprox, fcone,
+                                 mode, pi=d["pi"])
+            # exact Galerkin data term on coarse images: R E^H (E P x - y)
+            gdata = lambda xc: Ri(gram_or_x(d["E"], Pi(xc), planar) - d["y"])  # noqa: E731
+
+            runs = {}
+            for name in solvers:
+                if name == "C1":
+                    cprox = lambda u: C1.prox(u, sig_c, {})[0]               # noqa: E731
+                    cdata = lambda xc: gram_or_x(d["E_c"], xc, planar) - d["y_c"]  # noqa: E731
+                    tau, theta = steps(C1, sig_c, u_x)
+                    xc, zc, recs = _pd_run(u_x, u_z, cdata, C1.analysis, C1.synthesis, cprox,
+                                           tau, theta, d["pi_c"], C1.fas_dual, n_iter, every,
+                                           score_for(u_x))
+                else:
+                    restricted = name == "galerkin_R"
+                    if restricted:       # z on the COARSE latent grid
+                        A = lambda xc: Rz(F1.analysis(Pi(xc)))                # noqa: E731
+                        B = lambda zc: Ri(F1.synthesis(Pz(zc)))               # noqa: E731
+                        z0, Rd = Rz(zf), Rz
+                    else:                # z stays on the FINE latent grid
+                        A = lambda xc: F1.analysis(Pi(xc))                    # noqa: E731
+                        B = lambda zc: Ri(F1.synthesis(zc))                   # noqa: E731
+                        z0, Rd = zf, (lambda t: t)
+                    if name == "galerkin_untilted":
+                        pi = None
+                    else:
+                        cone = lambda zz, w: F1.prox.normal_cone(zz, w, sig)  # noqa: E731
+                        r_x, r_z = _residual(u_x, z0, gdata, A, B, fprox, cone, mode)
+                        pi = (r_x - Ri(s_x), r_z - Rd(s_z))
+                    tau, theta = steps(F1, sig, u_x)
+                    xc, zc, recs = _pd_run(u_x, z0, gdata, A, B, fprox, tau, theta, pi,
+                                           mode, n_iter, every, score_for(u_x))
+                runs[name] = dict(recs=recs, x_c=_np_img(xc, mu),
+                                  x_f=_np_img(x + Pi(xc - u_x), mu))
+            imgs = dict(u_c=_np_img(u_x, mu), w_c=_np_img(w_x, mu), x_pre=_np_img(x, mu),
+                        x_corr=_np_img(x_corr, mu), gt_c=gt_c, gt_f=gt_f)
+    return dict(outer=k, level=level, mode=mode, n_iter=n_iter, refs=refs, own=own,
+                runs=runs, imgs=imgs, run=meta["run"],
+                fas_parent_pi=bool(getattr(V, "fas_parent_pi", False)))
+
+
+SOLVER_COLORS = {"C1": "#0072B2", "galerkin": "#D55E00", "galerkin_R": "#E69F00",
+                 "galerkin_untilted": "#009E73"}
+SOLVER_LABELS = {"C1": "learned coarse layer 1, iterated",
+                 "galerkin": "Galerkin (fine F1 on P x_c)",
+                 "galerkin_R": "Galerkin, restricted coeffs",
+                 "galerkin_untilted": "Galerkin, no FAS tilt"}
+
+
+def coarse_solve_table(res):
+    """Print the comparison; returns nothing."""
+    L, Lc = res["level"], res["level"] + 1
+    r = res["refs"]
+    print(f"{res['run']}  V-cycle {res['outer'] + 1}, L{Lc} -> L{L}  "
+          f"(fas_dual={res['mode']}, fas_parent_pi={res['fas_parent_pi']})")
+    print(f"  learned coarse solve: L{Lc} NRMSE {100 * r['u_c']:.2f}% at its start (R x_pre) "
+          f"-> {100 * r['w_c']:.2f}% at its end")
+    print(f"  L{L}: x_pre {100 * r['x_pre']:.2f}%  -> + alpha P(w - u) {100 * r['x_corr']:.2f}%"
+          f"   (with alpha = 1: {100 * r['x_pre_plus_P']:.2f}%)")
+    (sx0, sz0), (sx1, sz1) = res["own"]["start"], res["own"]["end"]
+    print(f"  its OWN residual (one step of its first layer, relative change x / z): "
+          f"start {sx0:.2e} / {sz0:.2e}  ->  end {sx1:.2e} / {sz1:.2e}")
+    print(f"\n  {'solver (n_iter=' + str(res['n_iter']) + ')':<36}{'L' + str(Lc) + ' best':>9}"
+          f"{'@it':>5}{'final':>8}{'L' + str(L) + ' (alpha=1)':>14}{'final step x/z':>18}")
+    for name, run in res["runs"].items():
+        recs = run["recs"]
+        best = min(recs, key=lambda q: q["coarse"])
+        last = recs[-1]
+        print(f"  {SOLVER_LABELS.get(name, name):<36}{100 * best['coarse']:>8.2f}%{best['it']:>5}"
+              f"{100 * last['coarse']:>7.2f}%{100 * last['fine']:>13.2f}%"
+              f"{last['step']:>10.1e}/{last['step_z']:.1e}")
+
+
+def fig_coarse_solve(res, z=None, meta=None, flip=None, crop=True, pad=8, panel=2.2,
+                     dpi=None):
+    """Curves (coarse NRMSE vs R gt, fine NRMSE with alpha = 1, step size) per
+    solver against the learned level's references, then the final images."""
+    import matplotlib.pyplot as plt
+    L, Lc = res["level"], res["level"] + 1
+    if z is not None and meta is not None:
+        flip = default_flip(meta) if flip is None else flip
+        cut = _crop_fn(z, meta, flip, crop, pad)
+    else:
+        cut = lambda a, l: a                                                 # noqa: E731
+    names = list(res["runs"])
+    ncol = 3 + len(names)
+    fig = plt.figure(figsize=(panel * ncol + 0.6, 3 * panel + 1.2), dpi=dpi)
+    gs = fig.add_gridspec(3, ncol, height_ratios=[1.15, 1, 1], hspace=0.35, wspace=0.08)
+    r = res["refs"]
+    for j, (key, ylabel, refs) in enumerate((
+            ("coarse", f"L{Lc} NRMSE vs R gt (%)",
+             [(r["u_c"], "start u_c = R x_pre", ":"), (r["w_c"], "learned w_c", "--")]),
+            ("fine", f"L{L} NRMSE, x_pre + P(x_c - u_c) (%)",
+             [(r["x_pre"], "x_pre", ":"), (r["x_corr"], "net: + alpha P(w - u)", "--")]),
+            ("step", "relative step |x+ - x| / |x|", []))):
+        A = fig.add_subplot(gs[0, j * ncol // 3:(j + 1) * ncol // 3])
+        for name in names:
+            recs = res["runs"][name]["recs"]
+            it = [q["it"] for q in recs]
+            v = [q[key] * (1 if key == "step" else 100) for q in recs]
+            A.plot(it, v, color=SOLVER_COLORS.get(name, "0.3"), lw=1.6,
+                   label=SOLVER_LABELS.get(name, name))
+        for val, lab, ls in refs:
+            A.axhline(100 * val, color="0.35", lw=1.0, ls=ls, label=lab)
+        if key == "step":
+            A.set_yscale("log")
+        A.set_xlabel("iteration", fontsize=8); A.set_title(ylabel, fontsize=9)
+        A.tick_params(labelsize=7); A.grid(alpha=.25)
+        A.legend(fontsize=6.5, frameon=False)
+    im = res["imgs"]
+    vmax = {l: float(np.percentile(np.abs(cut(im["gt_f" if l == L else "gt_c"], l)), 99.5)) or 1.0
+            for l in (L, Lc)}
+    rows = [(Lc, [("R gt", im["gt_c"]), ("start u_c", im["u_c"]), ("learned w_c", im["w_c"])]
+             + [(SOLVER_LABELS.get(n, n), res["runs"][n]["x_c"]) for n in names], im["gt_c"]),
+            (L, [("gt", im["gt_f"]), ("x_pre", im["x_pre"]), ("net: x_corr", im["x_corr"])]
+             + [("x_pre + P(.)", res["runs"][n]["x_f"]) for n in names], im["gt_f"])]
+    for i, (lev, cells, g) in enumerate(rows):
+        for j, (title, a) in enumerate(cells):
+            A = fig.add_subplot(gs[1 + i, j])
+            A.imshow(np.abs(cut(a, lev)), cmap="gray", vmin=0, vmax=vmax[lev],
+                     interpolation=INTERP)
+            A.set_xticks([]); A.set_yticks([])
+            if j > 0:
+                A.text(0.03, 0.97, f"{100 * nrmse(a, g):.1f}%", transform=A.transAxes,
+                       ha="left", va="top", fontsize=7, color="yellow")
+            A.set_title(title, fontsize=7)
+            if j == 0:
+                A.set_ylabel(f"L{lev}", fontsize=9)
+    fig.suptitle(f"{res['run']}: the coarse problem, V-cycle {res['outer'] + 1}, L{Lc} -> L{L}"
+                 f"  (fixed solvers from the learned level's start; images at the last "
+                 f"iteration, n={res['n_iter']})", fontsize=10)
     return fig
 
 
