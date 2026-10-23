@@ -653,8 +653,24 @@ EXP14_CELLS = tuple(f"mg{m}v6" for m in EXP14_M)
 #  R pi^1; the first vtxA / vtxB runs showed level 2 degrading over training.
 #  Those two cells are kept as they launched (_FAS_FIX_V1) so the running dirs
 #  still resume; the *nest cells are the same with the fix.
+#
+#  OPTION B IS THE DEFAULT FAS (user, 2026-10-23): option A trained to better
+#  numbers but B is the more accurate scheme (the gradient-form tilt of
+#  Guerra-Valkonen), so MG_FAS -- B, tied copies, the parent-pi fix -- is the
+#  FAS of every multigrid cell from here on, as MG_TRANSFER_FILTER is the
+#  transfer. exp15 keeps mg81v6vtxAnest (A with the same fixes) as the
+#  comparison.
+#
+#  PER-LEVEL SUPERVISION (2026-10-23): mg81v6vtxBnestsup is vtxBnest plus
+#  training.level_loss_weight = MG_LEVEL_LOSS -- each coarse level's final
+#  iterate scored against R^l(gt) with the output's loss (training/recon.py).
+#  The trained coarse levels end every V-cycle mid-oscillation because nothing
+#  but the output is supervised; this asks whether they can hold an image
+#  without costing the output. DEFINED, not in exp15's default launch.
 # ---------------------------------------------------------------------------
 MG_TRANSFER_FILTER = "sinc_vertex"
+MG_FAS = dict(fas_dual="gradient", fas_copies="tied", fas_parent_pi=True)
+MG_LEVEL_LOSS = 0.1
 _FAS_FIX_V1 = dict(fas_copies="tied")
 _FAS_FIX = dict(fas_copies="tied", fas_parent_pi=True)
 EXP15 = {
@@ -662,12 +678,17 @@ EXP15 = {
     "mg81v6vtxA": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX_V1),
     "mg81v6vtxB": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient", **_FAS_FIX_V1),
     "mg81v6vtxAnest": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX),
-    "mg81v6vtxBnest": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient", **_FAS_FIX),
+    "mg81v6vtxBnest": dict(transfer_filter=MG_TRANSFER_FILTER, **MG_FAS),
+    "mg81v6vtxBnestsup": dict(transfer_filter=MG_TRANSFER_FILTER, **MG_FAS),
+}
+# Cell-specific `training` keys (written only for these cells).
+EXP15_TRAINING = {
+    "mg81v6vtxBnestsup": dict(level_loss_weight=MG_LEVEL_LOSS),
 }
 MODELS.update({
     name: dict(type="MGLPDSNet",
                params=dict(MODELS["mg81v6"]["params"], **extra),
-               training=dict(MODELS["mg81v6"]["training"]))
+               training=dict(MODELS["mg81v6"]["training"], **EXP15_TRAINING.get(name, {})))
     for name, extra in EXP15.items()
 })
 EXP15_CELLS = tuple(EXP15)
@@ -995,6 +1016,22 @@ def supports_planar_state(spec):
     return (spec["type"] in ("MGLPDSNet", "MGLPDS", "MGGroupLPDS")
             and p.get("is_complex", True) and int(p.get("widen", 1)) == 1
             and not p.get("learn_transfer"))
+
+
+def _level_loss_tag(spec):
+    """`_lvlsup<w>` when the cell supervises its coarse levels: its params are
+    another cell's (vtxBnestsup = vtxBnest), so without this the two would
+    share one wandb name. Refuses the key on a cell with no per-level images --
+    training/recon.py would refuse it at launch, and a config is cheaper to
+    fix here."""
+    w = (spec.get("training") or {}).get("level_loss_weight")
+    if not w:
+        return ""
+    if not supports_level_panel(spec):
+        raise ValueError(f"level_loss_weight on a {spec['type']} cell without a "
+                         f"primal-dual V-cycle: per-level supervision is multigrid only")
+    ws = w if isinstance(w, (list, tuple)) else [w]
+    return "_lvlsup" + "-".join(f"{float(x):g}" for x in ws)
 
 
 def supports_level_panel(spec):
@@ -1343,7 +1380,8 @@ def make_config(anatomy, r, model, args):
         "experiment": {
             # Load-bearing, not decoration: the flat and multigrid arms share a
             # model class, so `spec["type"]` alone collides on one wandb run.
-            "name": f"{_display_name(spec['type'], params)}_{anatomy}_R{r}_synth",
+            "name": (f"{_display_name(spec['type'], params)}{_level_loss_tag(spec)}"
+                     f"_{anatomy}_R{r}_synth"),
         },
         "model": dict(
             {"type": spec["type"], "params": params},

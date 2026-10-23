@@ -26,6 +26,8 @@ from training.common import (
 from training.common import backtrack as do_backtrack, resync_schedule
 from training.step_profile import StepProfiler
 from visualization.filters import get_filter_grids
+from models.level_trace import (LEVEL_LOSS_OUTERS, _pd_chains, _transfer_kws,
+                                collect_level_outputs, supervised_level_images)
 from visualization.image import levels_panel, recon_panel, upsample_repeat
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
@@ -141,6 +143,59 @@ def _levels_log(net, y, E, sigma, T, zinv, mask, gt):
     return levels_panel(out, gt), [tuple(x.shape[-2:]) for x in imgs]
 
 
+def _level_loss_weights(net, weight, outers):
+    """`level_loss_weight` -> one weight per coarse level (L1 first), or [] when
+    off. Refuses a net with no primal-dual V-cycle: the option would silently
+    do nothing there."""
+    ws = list(weight) if isinstance(weight, (list, tuple)) else [weight]
+    if not any(float(w) for w in ws):
+        return []
+    if outers not in LEVEL_LOSS_OUTERS:
+        raise ValueError(f"level_loss_outers must be one of {LEVEL_LOSS_OUTERS}, got {outers!r}")
+    if not _pd_chains(net):
+        raise ValueError(f"level_loss_weight is set but {type(net).__name__} has no "
+                         f"primal-dual V-cycle: per-level supervision is for multigrid "
+                         f"MGLPDS nets only")
+    n = int(getattr(net, "levels", 1)) - 1
+    if len(ws) == 1:
+        ws = ws * n
+    if len(ws) != n:
+        raise ValueError(f"level_loss_weight has {len(ws)} weights for {n} coarse levels")
+    if any(float(w) < 0 for w in ws):
+        raise ValueError(f"level_loss_weight must be >= 0, got {ws}")
+    return [float(w) for w in ws]
+
+
+def _level_loss(net, levels, recon_e, x0, image, organ_mask, T, zinv, use_mask, weights,
+                loss_fn, sigma):
+    """sum_l w_l * mean over the collected V-cycles of loss_fn(R^l gt, x_l), on
+    the embedded grid, both sides weighted by R^l of the crop support (and of
+    the organ mask when it is on) -- the coarse grids cannot be cropped by T."""
+    from operators.resample import restrict
+
+    kws = _transfer_kws(net)
+    imgs = supervised_level_images(net, levels, recon_e, x0)
+    if zinv is not None and torch.is_tensor(zinv) and zinv.dim() == 4 and \
+            zinv.shape[-2:] != (1, 1):
+        raise NotImplementedError("per-level supervision with a spatial whitening map")
+    g = T.adjoint(image)
+    w = T.adjoint(torch.ones_like(image)).real
+    if use_mask:
+        w = w * T.adjoint(organ_mask.to(image.dtype)).real
+    total, level = 0.0, 0
+    for l in sorted(imgs):
+        while level < l:
+            g, w, level = restrict(g, **kws), restrict(w, **kws), level + 1
+        wl = w.clamp(0.0, 1.0)
+        terms = []
+        for x in imgs[l]:
+            if zinv is not None:
+                x = zinv * x
+            terms.append(loss_fn(g * wl, x * wl, sigma))
+        total = total + weights[l - 1] * (sum(terms) / len(terms))
+    return total
+
+
 def train_recon(
     net,
     opt,
@@ -212,6 +267,23 @@ def train_recon(
     # greyscale and mask. One extra traced forward per validation, on the slice
     # the recon panel shows. Ignored (with one notice) by nets without levels.
     log_levels=False,
+    # PER-LEVEL SUPERVISION, multigrid MGLPDS nets only (2026-10-23). Off at 0.
+    # Adds, to the output loss, `level_loss_weight` x the same loss between
+    # each COARSE level's final iterate (what it hands back up, in image units)
+    # and R^l(ground truth) -- restricted with the net's own transfer, on the
+    # embedded grid, weighted by the restricted crop support (and the
+    # restricted organ mask when `use_organ_mask`). Without it nothing asks a
+    # coarse level to hold an image: the loss sees only the output, and the
+    # trained coarse levels end each V-cycle mid-oscillation.
+    #   level_loss_weight  a number (every coarse level that weight) or a list,
+    #                      one weight per coarse level, L1 first
+    #   level_loss_outers  "last": the final V-cycle only; "all": every
+    #                      V-cycle, averaged per level
+    # The TRAINING loss (and so the training backtrack) includes the level
+    # terms; the VALIDATION loss stays the output's alone -- it picks the
+    # best-validation checkpoint, which must be about the reconstruction.
+    level_loss_weight=0.0,
+    level_loss_outers="last",
     start_epoch=0,            # was: start_step
     save_dir=None,
     ckpt=None,
@@ -299,6 +371,10 @@ def train_recon(
     # below returns at once.
     prof = StepProfiler(device)
     levels_off = False        # set once a net turns out to have no level images
+    level_weights = _level_loss_weights(net, level_loss_weight, level_loss_outers)
+    if level_weights:
+        print(f"per-level supervision: weights {level_weights} on levels "
+              f"{list(range(1, len(level_weights) + 1))}, V-cycles: {level_loss_outers}")
 
     for epoch in range(start_epoch, num_epochs):
         net.train()
@@ -362,18 +438,27 @@ def train_recon(
 
             opt.zero_grad(set_to_none=True)
 
-            recon, _ = net(y, E=E, sigma=sigma_n)
-            recon = T.forward(recon)
+            if level_weights:
+                with collect_level_outputs(net, level_loss_outers) as lv:
+                    recon_e, (x0, _) = net(y, E=E, sigma=sigma_n)
+            else:
+                recon_e, _ = net(y, E=E, sigma=sigma_n)
+            recon = T.forward(recon_e)
             prof.mark("forward")
 
-            if whiten_kspace and "Zinv" in extra:
-                recon = extra["Zinv"] * recon
+            zinv = extra.get("Zinv") if whiten_kspace else None
+            if zinv is not None:
+                recon = zinv * recon
 
             image_l, recon_l = apply_loss_mask(
                 image, recon, organ_mask, use_organ_mask,
             )
 
             loss = loss_fn(image_l, recon_l, sigma_n)
+            if level_weights:
+                loss = loss + _level_loss(net, lv.levels, recon_e, x0, image, organ_mask,
+                                          T, zinv, use_organ_mask, level_weights,
+                                          loss_fn, sigma_n)
             loss.backward()
             prof.mark("backward")
 

@@ -328,6 +328,96 @@ def level_images(net, trace, out, outer=-1, tol=1e-3):
     return images
 
 
+# ---------------------------------------------------------------------------
+# per-level SUPERVISION: the coarse levels' final iterates, WITH autograd
+# ---------------------------------------------------------------------------
+LEVEL_LOSS_OUTERS = ("last", "all")
+
+
+def _pd_chains(net):
+    """`{(outer, level): module}` for an MGLPDSNet: every `PDVCycle` and the
+    coarsest level's `LPDSStack`, level 0 finest, outer = V-cycle index."""
+    from models.mg_lpds import PDVCycle
+    cycles = [m for m in net.modules() if isinstance(m, PDVCycle)]
+    inner = {id(c.mglayer) for c in cycles}
+    out = {}
+    for k, V in enumerate(c for c in cycles if id(c) not in inner):
+        level = 0
+        while isinstance(V, PDVCycle):
+            out[(k, level)] = V
+            V, level = V.mglayer, level + 1
+        out[(k, level)] = V                       # the coarsest level's stack
+    return out
+
+
+class collect_level_outputs:
+    """Context manager: during a forward of `net`, keep each COARSE level's
+    final iterate x (after that level's last sweep -- what it hands back to
+    the level above), with its autograd graph.
+
+        with collect_level_outputs(net, "last") as rec:
+            x_hat, (x0, z0) = net(y, E=E, sigma=sigma)
+        rec.levels  ->  {level: [x per selected V-cycle, execution order]}
+
+    `outers` = "last" (the final V-cycle) or "all". Level 0 is not collected:
+    it IS the output. Hooks only -- nothing is detached, the forward is
+    unchanged, and they are removed on exit (also on an exception)."""
+
+    def __init__(self, net, outers="last"):
+        if outers not in LEVEL_LOSS_OUTERS:
+            raise ValueError(f"outers must be one of {LEVEL_LOSS_OUTERS}, got {outers!r}")
+        chains = _pd_chains(net)
+        if not chains:
+            raise TypeError(f"{type(net).__name__} has no primal-dual V-cycle: per-level "
+                            f"supervision is for multigrid MGLPDS nets only")
+        n_outer = 1 + max(k for k, _ in chains)
+        keep = {n_outer - 1} if outers == "last" else set(range(n_outer))
+        self._targets = [(l, m) for (k, l), m in sorted(chains.items()) if l > 0 and k in keep]
+        self.levels, self._handles = {}, []
+
+    def __enter__(self):
+        for level, m in self._targets:
+            def hook(mod, args, out, level=level):
+                state = out[0] if isinstance(out, tuple) else out
+                self.levels.setdefault(level, []).append(state[0])
+            self._handles.append(m.register_forward_hook(hook))
+        return self
+
+    def __exit__(self, *exc):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+        return False
+
+
+def supervised_level_images(net, levels, x_hat, x0):
+    """The collected coarse iterates in IMAGE units on the embedded grid ->
+    `{level: [image, ...]}`, differentiable.
+
+    `x_hat` is the net's output (before any crop) and `x0` the finest iterate
+    it returned; the net works DC-removed, so `x_hat - x0` is the constant mu
+    (as `level_images`), and level l holds R^l(x - mu): R^l(mu) is added back
+    with the net's own image-grid transfer. A planar iterate comes back complex."""
+    from models.components import to_complex
+    from operators.resample import restrict
+
+    kws = _transfer_kws(net)
+    if x0.shape != x_hat.shape:
+        raise ValueError(f"output {tuple(x_hat.shape)} and finest iterate {tuple(x0.shape)} "
+                         f"differ: the net padded beyond the embedding, which per-level "
+                         f"supervision does not handle")
+    mu = (x_hat - x0).detach().mean(dim=(-2, -1), keepdim=True)
+    dc = mu.expand_as(x0).contiguous()
+    out = {}
+    for level in sorted(levels):
+        for _ in range(level - (max(out) if out else 0)):
+            dc = restrict(dc, **kws)
+        xs = [to_complex(x) if (x_hat.is_complex() and not x.is_complex()) else x
+              for x in levels[level]]
+        out[level] = [x + dc for x in xs]
+    return out
+
+
 class LevelTraceMixin:
     """Adds `forward_levels` to a multigrid container."""
 

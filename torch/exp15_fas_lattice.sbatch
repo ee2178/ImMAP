@@ -20,18 +20,28 @@
 #   0   knee  R8   mg81v6vtx    lattice fix,  legacy dual FAS, untied FAS copies
 #   1   knee  R8   mg81v6vtxA   lattice fix + FAS option A   (fas_dual=fixed_point, fas_copies=tied)
 #   2   knee  R8   mg81v6vtxB   lattice fix + FAS option B   (fas_dual=gradient,    fas_copies=tied)
-#   3   knee  R8   mg81v6vtxAnest   = vtxA + fas_parent_pi=true   (added 2026-10-23)
-#   4   knee  R8   mg81v6vtxBnest   = vtxB + fas_parent_pi=true   (added 2026-10-23)
+#   3   knee  R8   mg81v6vtxAnest   = vtxA + fas_parent_pi=true   (option A, tied, parent fix)
+#   4   knee  R8   mg81v6vtxBnest   = vtxB + fas_parent_pi=true   (option B, tied, parent fix)
+#
+# OPTION B IS THE DEFAULT (2026-10-23) for new multigrid cells: A trained to
+# better numbers, but B is the more accurate scheme, so B + tied copies + the
+# parent-pi fix is the standard FAS (make_mg_recon_configs.py::MG_FAS). Cell 3
+# keeps A with the same fixes as the comparison.
+#
+# PER-LEVEL SUPERVISION is NOT in this array (2026-10-23). The cell is defined
+# (mg81v6vtxBnestsup = vtxBnest + training.level_loss_weight 0.1) and can be
+# launched on its own when wanted:
+#   ONLY="mg81v6vtxBnestsup" sbatch --array=0 torch/exp15_fas_lattice.sbatch
 #
 # NESTED FAS (cells 3, 4). Level 2's correction must restrict level 1's
 # residual NET OF level 1's own pi: pi^2 = r_2(R u_1) - R(r_1(u_1) - pi^1).
 # Cells 0-2 restrict r_1 alone (as mg81v6 and mg_lpds.jl always have), so a
 # SOLVED level 1 still moves level 2 by R pi^1 -- and pi^1 grows as the coarse
-# filters train away from the fine ones. vtxA showed level 2 degrading over
-# training. Cells 1, 2 are kept exactly as launched so their run dirs resume;
-# 3, 4 are the same cells with the fix (models/mg_lpds.py::_check_fas_parent_pi).
+# filters train away from the fine ones. Cells 1, 2 are kept exactly as
+# launched so their run dirs resume (models/mg_lpds.py::_check_fas_parent_pi).
 #
-# TO ADD 3, 4 WHILE 0-2 ARE RUNNING, submit only the new indices:
+# TO ADD 3, 4 WHILE 0-2 ARE RUNNING, submit only the new indices (a cell already
+# running or finished under its name is resumed or skipped by the launch guard):
 #   sbatch --array=3-4 torch/exp15_fas_lattice.sbatch
 #
 # The FAS cells TIE the downsampler's operators to the first fine / coarse
@@ -46,14 +56,16 @@
 #     mg81v6 -> mg81v6vtx            what the lattice fix is worth
 #     mg81v6vtx -> vtxA / vtxB        what a coherent FAS (tied copies + option
 #                                     A or B) is worth on top of it
+#     vtxA -> vtxAnest, vtxB -> vtxBnest   what the parent-pi fix is worth
+#     vtxAnest vs vtxBnest            A vs B with every fix in
 #
 # (Index order is the generator's MODELS order, not the order of ONLY.)
 #
 # BASELINE: exp11's knee/mg81v6_R8 (MGLPDS-Small), NOT retrained here. Every
-# cell is mg81v6 with only `model.params.transfer_filter`, `.fas_dual` and
-# `.fas_copies` changed (checked config-for-config against the
-# regenerated mg81v6_R8 on 2026-10-22: those keys, the run dir and the wandb
-# name differ, nothing else).
+# cell is mg81v6 with only `model.params.transfer_filter`, `.fas_dual`,
+# `.fas_copies` and `.fas_parent_pi` changed (checked config-for-config against
+# the regenerated mg81v6_R8 on 2026-10-22 for cells 0-2: those keys, the run dir
+# and the wandb name differ, nothing else).
 #
 # WHAT THE TWO FIXES ARE (scripts/make_mg_recon_configs.py, EXP15):
 #   LATTICE  the stride-2 P=7 conv puts latent sample i ON image pixel 2i, the
