@@ -23,10 +23,11 @@
 #
 #   0  brain R8    1  brain R12    2  knee R8    3  knee R12
 #
-# TWO CELLS. The default since 2026-10-20 is `ramdrunet`: the U-Net trunk
-# initialised from deepinv's pretrained grayscale DRUNet, as the paper starts
-# RAM, then trained exactly like the rest (run dirs ramdrunet_R<r>). `ram` is
-# the same network from a random init (ONLY=ram; run dirs ram_R<r>). Neither
+# TWO CELLS. The default is `ram` (again since 2026-10-23): random init, the
+# runs in trained_nets/mg_recon/<anatomy>/ram_R<r> that the results use, so a
+# plain resubmit RESUMES them. `ramdrunet` (ONLY=ramdrunet; run dirs
+# ramdrunet_R<r>) is the same network with the U-Net trunk initialised from
+# deepinv's pretrained grayscale DRUNet, as the paper starts RAM. Neither
 # loads the published RAM weights -- those carry the paper's multi-task
 # training, and no other cell gets pretraining it could be matched against.
 # ramdrunet needs the DRUNet weights cached (ONE-TIME SETUP below).
@@ -81,7 +82,7 @@
 #   sbatch torch/exp13_ram.sbatch
 
 ANATOMIES="${ANATOMIES:-brain knee}"
-ONLY="${ONLY:-ramdrunet}"
+ONLY="${ONLY:-ram}"
 ACCELS="${ACCELS:-8 12}"
 # PLANAR_STATE and ATTN do nothing to RAM (the generator writes neither for it).
 # They are set to what exp11/exp12 use because REGENERATE rewrites EVERY config
