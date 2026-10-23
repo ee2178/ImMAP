@@ -4,7 +4,12 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=l40s
+#SBATCH --constraint="l40s|h200|a100"
+# ^ was l40s only; widened 2026-10-23 (GPUs scarce): any ONE of the listed types.
+#   Feature names must match the cluster's exactly -- `sinfo -o "%f"` lists them
+#   -- or sbatch rejects the job at submission. Add types with `|`. A cell may
+#   resume on a different GPU type than it started on -- harmless (same weights,
+#   fp roundoff only), but step times, and so how far a 48 h slot gets, change.
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
 #SBATCH --time=48:00:00
