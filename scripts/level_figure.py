@@ -1787,8 +1787,10 @@ def _saturation_call(store, select, masks):
 
         recs, patched = [], []
         warned = set()
+        last_clip = {}           # (outer, level) -> the last sweep's clip output there
 
-        def stats(level, mod_out, mod_ax, mod_z, mod_pi, lam):
+        def stats(level, mod_out, mod_ax, mod_z, mod_pi, lam, dot=None, mod_prev=None,
+                  extra=None):
             out = {}
             m = masks.get(level) if masks else None
             for scope in ("all", "anatomy"):
@@ -1818,6 +1820,13 @@ def _saturation_call(store, select, masks):
                 if mod_pi is not None:
                     pr = mod_pi[sel] / lam_b
                     d.update(pi_over=float((pr > 1).float().mean()), pi_med=float(pr.median()))
+                if dot is not None:
+                    # phase reversals: saturated now AND in the previous sweep's
+                    # clip output at this level, with the phase turned > 90 deg
+                    both = on & (mod_prev[sel] >= 0.99 * lam_b)
+                    n = int(both.sum())
+                    d["flip"] = float((dot[sel][both] < 0).float().sum() / n) if n else float("nan")
+                d.update(extra or {})
                 out[scope] = d
             return out
 
@@ -1849,13 +1858,35 @@ def _saturation_call(store, select, masks):
                 inc = Ax if (pi_z is None or fixed) else Ax - pi_z
                 lam = soft.threshold(z, sigma)
                 M = L.M
+                key = (outer, level)
+                prev = last_clip.get(key)
+                if prev is not None and prev.shape != clip_out.shape:
+                    prev = None
+                dot = mod_prev = None
+                extra = dict(step=float((x_new - x).norm() / (x.norm() + 1e-12)))
+                if prev is not None:
+                    if clip_out.is_complex():
+                        dot = (prev.conj() * clip_out).real
+                    elif clip_out.shape[1] == 2 * M:
+                        dot = prev[:, :M] * clip_out[:, :M] + prev[:, M:] * clip_out[:, M:]
+                    else:
+                        dot = prev * clip_out
+                    mod_prev = _code_modulus(prev, M)
+                    # how hard the code CHANGE pushes on x (through this layer's
+                    # D and tau -- the next sweep applies its own, nearly equal)
+                    tau = L.tau(sigma, ref=x)
+                    tau = _per_channel(tau, x) if planar else tau
+                    extra["push"] = float((tau * L.synthesis(clip_out - prev)).norm()
+                                          / (x.norm() + 1e-12))
+                last_clip[key] = clip_out
                 recs.append(dict(
                     level=level, where=where, outer=outer,
                     fas_dual=getattr(L, "fas_dual", "legacy"),
                     lam=float(lam.float().median()),
                     **stats(level, _code_modulus(clip_out, M), _code_modulus(inc, M),
                             _code_modulus(z, M),
-                            None if pi_z is None else _code_modulus(pi_z, M), lam)))
+                            None if pi_z is None else _code_modulus(pi_z, M), lam,
+                            dot=dot, mod_prev=mod_prev, extra=extra)))
                 return out
             L.forward = fwd
             patched.append(L)
@@ -1893,6 +1924,13 @@ def trace_saturation(run, volume, slice, levels=(0, 1, 2), outers=None, z=None, 
         z_med   median |z| / lambda of the incoming code
         pi_over, pi_med  (coarse sweeps) fraction with |pi_z| > lambda, median
         hist    counts of log10(|inc| / lambda) over SAT_LOG_BINS
+        flip    of the coefficients saturated now AND in the previous sweep's
+                clip output at the same (V-cycle, level), the fraction whose
+                phase turned > 90 deg (a code move of ~2 lambda); NaN on a
+                level's first traced sweep
+        push    |tau D (clip output - previous clip output)| / |x|: how hard the
+                code's change pushes on x (this layer's D and tau)
+        step    |x+ - x| / |x|, the whole primal step
     Under fas_dual="fixed_point" the clip output is z+ - pi_z (pi_z is added
     after the clip). Local prox only; group-prox sweeps are skipped."""
     import types
@@ -1941,9 +1979,11 @@ def saturation_table(recs, meta, scope="anatomy", per_sweep=True):
     """Print every sweep (optional) and a per-(V-cycle, level) mean."""
     scope = scope if scope in meta["scopes"] else "all"
     print(f"{meta['run']}  {meta['volume']} slice {meta['slice']}  ({scope} coefficients; "
-          f"sat = on the clip boundary, reset = saturated whatever z was)")
+          f"sat = on the clip boundary, reset = saturated whatever z was;\n"
+          f"  flip = saturated codes whose phase turned > 90 deg since the previous sweep "
+          f"at this level; push = |tau D (code change)| / |x|; step = |x+ - x| / |x|)")
     hdr = (f"  {'sweep':<22}{'lambda':>9}{'sat':>7}{'reset':>7}{'|inc|/lam med':>14}"
-           f"{'p90':>7}{'|z|/lam':>8}{'|pi|>lam':>9}")
+           f"{'p90':>7}{'|z|/lam':>8}{'|pi|>lam':>9}{'flip':>7}{'push':>8}{'step':>8}")
     if per_sweep:
         print(hdr)
         bad = [r["where"] for r in recs
@@ -1953,11 +1993,14 @@ def saturation_table(recs, meta, scope="anatomy", per_sweep=True):
         for r in recs:
             d = r[scope]
             pi = f"{100 * d['pi_over']:8.1f}%" if "pi_over" in d else f"{'-':>9}"
+            fl = f"{100 * d['flip']:6.1f}%" if np.isfinite(d.get("flip", np.nan)) else f"{'-':>7}"
+            pu = f"{100 * d['push']:7.2f}%" if "push" in d else f"{'-':>8}"
             print(f"  {r['where']:<22}{r['lam']:>9.2e}{100 * d['sat']:6.1f}%{100 * d['reset']:6.1f}%"
-                  f"{d['a_med']:>14.2f}{d['a_p90']:>7.1f}{d['z_med']:>8.2f}{pi}")
+                  f"{d['a_med']:>14.2f}{d['a_p90']:>7.1f}{d['z_med']:>8.2f}{pi}{fl}{pu}"
+                  f"{100 * d['step']:7.2f}%")
     print(f"\n  mean over sweeps")
     print(f"  {'V-cycle, level':<22}{'lambda':>9}{'sat':>7}{'reset':>7}{'|inc|/lam med':>14}"
-          f"{'p90':>7}{'|z|/lam':>8}{'|pi|>lam':>9}")
+          f"{'p90':>7}{'|z|/lam':>8}{'|pi|>lam':>9}{'flip':>7}{'push':>8}{'step':>8}")
     groups = {}
     for r in recs:
         groups.setdefault((r["outer"], r["level"]), []).append(r)
@@ -1966,10 +2009,14 @@ def saturation_table(recs, meta, scope="anatomy", per_sweep=True):
         mean = lambda k: float(np.mean([d[k] for d in ds]))                   # noqa: E731
         pis = [d["pi_over"] for d in ds if "pi_over" in d]
         pi = f"{100 * np.mean(pis):8.1f}%" if pis else f"{'-':>9}"
+        fls = [d["flip"] for d in ds if np.isfinite(d.get("flip", np.nan))]
+        fl = f"{100 * np.mean(fls):6.1f}%" if fls else f"{'-':>7}"
+        pus = [d["push"] for d in ds if "push" in d]
+        pu = f"{100 * np.mean(pus):7.2f}%" if pus else f"{'-':>8}"
         label = f"V{(o or 0) + 1} L{l} ({len(rs)} sweeps)"
         print(f"  {label:<22}{np.median([r['lam'] for r in rs]):>9.2e}{100 * mean('sat'):6.1f}%"
               f"{100 * mean('reset'):6.1f}%{mean('a_med'):>14.2f}{mean('a_p90'):>7.1f}"
-              f"{mean('z_med'):>8.2f}{pi}")
+              f"{mean('z_med'):>8.2f}{pi}{fl}{pu}{100 * mean('step'):7.2f}%")
 
 
 SAT_RUN_COLORS = ("#0072B2", "#D55E00", "#009E73", "#E69F00")
