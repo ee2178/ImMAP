@@ -590,7 +590,9 @@ def _weighted_ncc(x, y, w):
 def fit_affine(a, ma, b, mb, t0, dof=9, levels=(4, 2), iters=(120, 60), dev="cpu"):
     """Affine of `b` onto `a` by maximising their masked correlation. -> (M 4x4 numpy, info).
 
-    a, ma   reference volume (D, H, W) and its bool mask;  b, mb  the moving one (own depth)
+    a, ma   reference volume (D, H, W) and its bool mask;  b, mb  the moving one (own depth).
+            a and b may also be (C, D, H, W), several co-registered contrasts: the score is then
+            the mean of the per-contrast correlations (masks stay (D, H, W))
     t0      (dz, dh, dw) starting translation, `translate`'s sign: out[i] = b[i + t0]
 
     WHAT IT IS. The standard intensity-based registration loop (what SimpleITK's and ANTs'
@@ -626,7 +628,16 @@ def fit_affine(a, ma, b, mb, t0, dof=9, levels=(4, 2), iters=(120, 60), dev="cpu
         v.requires_grad_(True)
 
     def pooled(x, f):
-        return F.avg_pool3d(x[None, None], f) if f > 1 else x[None, None]
+        x = x[None] if x.dim() == 4 else x[None, None]            # (1, C, D, H, W)
+        return F.avg_pool3d(x, f) if f > 1 else x
+
+    def ncc(x, y, w):
+        # several contrasts (datasets/NYUMets/inference_registration.py): the MEAN of the
+        # per-contrast correlations, so each contrast counts once whatever its intensity range
+        if x.shape[1] == 1:
+            return _weighted_ncc(x, y, w)
+        return torch.stack([_weighted_ncc(x[:, c:c + 1], y[:, c:c + 1], w)
+                            for c in range(x.shape[1])]).mean()
 
     def score(M, A, MA, B, MB, f):
         grid = _level_grid(M, tuple(A.shape[2:]), tuple(B.shape[2:]), f)
@@ -641,7 +652,7 @@ def fit_affine(a, ma, b, mb, t0, dof=9, levels=(4, 2), iters=(120, 60), dev="cpu
             wm = F.grid_sample(MB, grid.detach(), mode="bilinear", padding_mode="zeros",
                                align_corners=True)
             w = MA * (wm > 0.999).to(MA.dtype)
-        return _weighted_ncc(A, wb, w), w.sum() / MA.sum().clamp_min(1e-6)
+        return ncc(A, wb, w), w.sum() / MA.sum().clamp_min(1e-6)
 
     info = {}
     for f, n_it in zip(levels, iters):

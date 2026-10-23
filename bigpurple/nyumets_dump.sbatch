@@ -17,6 +17,16 @@
 # volume, on the per-volume intensity scale. The first is trained on the fixed scales, the second
 # on volume_scale; the script runs each on its own pixels and converts the outputs.
 #
+# REGISTRATION (REGISTER): by default every (current, prior) pair is re-registered at inference
+# from FLAIR, T1 and T2 only -- the build's alignment saw the current CT1 -- and the prior is
+# resampled onto the current study. One fit per pair, kept under REG_CACHE so a rerun skips it.
+# REGISTER=current_to_prior warps the current study onto the prior instead; REGISTER=none keeps
+# the stored alignment.
+#
+# MASK (MASK_SOURCE): the runs trained with the current T1 & CT1 support, but inference has no
+# current CT1. auto (default) masks with the current T1 support AND the registered prior CT1's
+# (t1_prior_ct1), or the current T1 alone without registration (t1); config keeps the runs' own.
+#
 # SLICES are ORIGINAL indices: 80:100 by default. The runs trained on [50, 90), so 90-99 are
 # slices they never saw.
 #
@@ -52,6 +62,9 @@ BATCH="${BATCH:-10}"
 NFE="${NFE:-}"                         # empty = each run's val_nfe
 CSV="${CSV:-results/nyumets_eval/per_slice_${SLURM_JOB_ID:-local}.csv}"
 OUT="${OUT:-}"                         # empty = <run>/eval_dump/
+REGISTER="${REGISTER:-prior_to_current}"     # prior_to_current | current_to_prior | none (stored)
+REG_CACHE="${REG_CACHE:-cache/nyumets_reg}"  # per-pair transforms, reused by later jobs
+MASK_SOURCE="${MASK_SOURCE:-auto}"     # auto (t1_prior_ct1 registered / t1) | t1 | t1_prior_ct1 | config
 EXTRA="${EXTRA:-}"                     # anything else, e.g. EXTRA="--deterministic"
 
 # module load anaconda3/gpu/2023.09          # uncomment if conda is not already on PATH
@@ -77,6 +90,7 @@ done
 echo "host   : $(hostname)   $(date '+%F %T')"
 echo "runs   : $RUNS"
 echo "volumes: $N_VOLUMES   slices: $SLICES   units: $UNITS   weights: $WEIGHTS   seed: $SEED"
+echo "registration: $REGISTER (cache $REG_CACHE)   mask: $MASK_SOURCE"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 python scripts/dump_eval_nyumets.py \
@@ -88,6 +102,9 @@ python scripts/dump_eval_nyumets.py \
     --seed "$SEED" \
     --batch "$BATCH" \
     --csv "$CSV" \
+    --register "$REGISTER" \
+    --reg-cache "$REG_CACHE" \
+    --mask-source "$MASK_SOURCE" \
     ${NFE:+--nfe "$NFE"} \
     ${OUT:+--out "$OUT"} \
     $EXTRA

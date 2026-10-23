@@ -78,6 +78,10 @@ def build_nyumets_synth_loader(root=None,
                                guide_idx=None,
                                guide_window=0,
                                guide_enhancement=False,  # guide = the drawn slice's (CT1 - T1)_+ ; guide_idx ignored
+                               register=None,            # inference-time registration of each (current, prior)
+                                                         # pair from FLAIR/T1/T2 only: "prior_to_current" |
+                                                         # "current_to_prior" | dict -- datasets/NYUMets/
+                                                         # inference_registration.py
                                guide_contrasts=None,
                                n_guides=1,
                                min_slice_gap=5,
@@ -85,7 +89,7 @@ def build_nyumets_synth_loader(root=None,
                                deterministic=False,
                                slice_range=None,
                                # --- mask (see the dataset docstring) ---
-                               mask_source="h5",         # "h5" | "t1ct1" (support of T1 & CT1)
+                               mask_source="h5",         # "h5" | "t1ct1" (T1 & CT1 support) | "t1" | "t1_prior_ct1"
                                mask_apply=False,         # multiply the images by the mask
                                mask_guides="target",     # guides: "target" | "own" | "none"
                                mask_eps=0.0,             # nonzero means |value| > mask_eps
@@ -113,6 +117,7 @@ def build_nyumets_synth_loader(root=None,
         n_guides=n_guides, min_slice_gap=min_slice_gap, guide_slice=guide_slice,
         guide_window=guide_window,
         guide_enhancement=guide_enhancement,
+        register=register,
         deterministic=deterministic,
         guide_as_cond=False,                   # the adapter concatenates; see _SynthView
         center_crop=center_crop, crop_size=crop_size, random_flips=random_flips,

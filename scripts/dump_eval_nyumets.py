@@ -45,6 +45,18 @@ What is held fixed, and why
   factor between the two loaders' targets, exact since both are the stored image over a constant;
   a slice one factor does not explain stops the dump. Metrics are computed in those units with the
   run's `data_range`.
+* REGISTRATION WITHOUT THE TARGET (`--register`, default prior_to_current). The build aligned the
+  studies with masks that saw the current CT1, which inference cannot. By default each (current,
+  prior) pair is re-registered from the FLAIR, T1 and T2 of both studies only, and the prior --
+  all four contrasts -- resampled onto the current study (`current_to_prior` warps the current
+  study onto the prior instead; `none` keeps the stored alignment). One fit per pair, shared by
+  every run and scaling, kept in --reg-cache for reruns. Each file records `registration` and the
+  fit's correlation before / after (`reg_ncc_init`, `reg_ncc`, `reg_fit_ok`).
+* A MASK INFERENCE COULD MAKE (`--mask-source`, default auto). The runs' own `t1ct1` mask is the
+  support of the current T1 AND the current CT1 -- the scan being predicted. By default the dump
+  masks with the current T1 support AND the registered prior CT1's (`t1_prior_ct1`), or the
+  current T1 alone without registration (`t1`). It multiplies every stored image and bounds every
+  metric, so dumps with different masks are not comparable (the viewer checks `mask_source`).
 * PAIRED NOISE. The torch RNG is reset to the same value per (volume, chunk) before every run, so
   bridge runs draw identical noise; what separates them is the net.
 
@@ -71,6 +83,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import datasets                                    # noqa: F401  registers the loaders
 from datasets.registry import build_loader
+from datasets.NYUMets.inference_registration import describe
 from visualization.image import orient_tensor
 
 DUMP_VERSION = 1
@@ -159,7 +172,7 @@ def load_run(run_dir, device, weights):
 class Shared:
     """One loader configuration for every run, at every scaling the runs need."""
 
-    def __init__(self, runs, base, slice_range, units):
+    def __init__(self, runs, base, slice_range, units, register=None, mask_source=None):
         self.cond = []
         for r in runs:
             for c in r["cond_idx"]:
@@ -180,7 +193,14 @@ class Shared:
                     guide_as_cond=False, n_guides=1, guide_slice="index",
                     guide_enhancement=False, x1_source="contrast", deterministic=True,
                     random_flips=False, crop_size=None, center_crop=None,
-                    slice_range=list(slice_range))
+                    slice_range=list(slice_range),
+                    # the SAME registration for every run and scaling: one fit per volume pair,
+                    # shared in-process (and on disk with a cache_dir)
+                    register=register)
+        if mask_source is not None:
+            # the mask every image is multiplied by and every metric averages over -- one for all
+            # runs; mask_idx goes back to that source's default (t1 / t1_prior_ct1: [T1])
+            vcfg.update(mask_source=mask_source, mask_idx=None)
         self.vcfg = vcfg
         self.units = (units,) if units == "volume_scale" else ("none", tuple(base.get("scales")))
         self.ds = {}
@@ -351,6 +371,10 @@ def dump(runs, sh, vols, args, device):
                         buf.setdefault(k + "_slice", []).append(np.float32([vals[k]]))
                     rows.append(dict(run=r["name"], volume=vol, slice=int(z[j]), **vals))
         prior = volume_name(ref_ds.img_paths[prior_fi]) if prior_fi is not None else ""
+        reg = ref_ds.registration_info(fi, prior_fi) if prior_fi is not None else None
+        reg_attrs = {} if reg is None else dict(
+            reg_fit_ok=bool(reg["fit_ok"]), reg_ncc_init=float(reg["ncc_init"]),
+            reg_ncc=float(reg["ncc"]), reg_note=str(reg.get("why", "")))
         for r in runs:
             attrs = dict(
                 dump_version=DUMP_VERSION, run=r["name"], run_dir=r["dir"], task=r["task"],
@@ -365,12 +389,15 @@ def dump(runs, sh, vols, args, device):
                 weights=r["weights"], step=int(r["step"]), n_params=int(r["n_params"]),
                 use_organ_mask=True, images_masked=True, display_orient=args.orient or "",
                 mask_source=str(sh.vcfg.get("mask_source") or ""), metrics=list(METRICS),
+                registration=describe(ref_ds.register), **reg_attrs,
                 created=datetime.datetime.now().isoformat(timespec="seconds"))
             write_volume(os.path.join(dest_dir(r, args), vol + ".h5"), bufs[r["name"]], attrs)
         line = "  ".join("%s %.2f" % (r["name"][-14:], np.nanmean(
             [x["psnr"] for x in rows if x["run"] == r["name"] and x["volume"] == vol]))
             for r in runs)
-        print(f"[{vi + 1}/{len(vols)}] {vol}: {len(idx)} slices, prior {prior}  "
+        regl = ("" if reg is None else
+                f"reg ncc {reg['ncc_init']:.3f}->{reg['ncc']:.3f}{'' if reg['fit_ok'] else ' (kept identity)'}  ")
+        print(f"[{vi + 1}/{len(vols)}] {vol}: {len(idx)} slices, prior {prior}  {regl}"
               f"psnr {line}  ({time.time() - t0:.1f} s)", flush=True)
     return rows
 
@@ -426,6 +453,21 @@ def main():
     p.add_argument("--slices", default="80:100",
                    help="ORIGINAL slice indices lo:hi (hi exclusive)")
     p.add_argument("--split-root", help="val h5 root; default = the first run's val root")
+    p.add_argument("--register", choices=["prior_to_current", "current_to_prior", "none"],
+                   default="prior_to_current",
+                   help="inference-time registration of each (current, prior) pair from FLAIR, "
+                        "T1, T2 only (datasets/NYUMets/inference_registration.py); 'none' = the "
+                        "build's stored alignment, which saw the current CT1")
+    p.add_argument("--reg-cache", default="cache/nyumets_reg",
+                   help="directory the per-pair transforms are kept in, so a rerun does not refit "
+                        "('' = this process only)")
+    p.add_argument("--reg-device", help="device for the registration fits (default: --device)")
+    p.add_argument("--mask-source", choices=["auto", "config", "t1", "t1_prior_ct1", "t1ct1"],
+                   default="auto",
+                   help="the mask images are multiplied by and metrics averaged over. auto "
+                        "(default): what inference has -- t1_prior_ct1 (current T1 support AND "
+                        "the registered prior CT1's) with --register, t1 without; config: the "
+                        "runs' own setting (t1ct1 uses the current CT1)")
     p.add_argument("--units", choices=["volume_scale", "none"], default="volume_scale",
                    help="the intensity units every stored image and metric is in")
     p.add_argument("--weights", choices=["ema", "live"], default="ema",
@@ -485,7 +527,12 @@ def main():
     if len(set(roots.values())) > 1:
         print(f"NOTE: runs trained on different roots; all are scored on {base['root']}: {roots}")
 
-    sh = Shared(runs, base, args.slices, args.units)
+    register = None if args.register == "none" else dict(
+        direction=args.register, device=str(args.reg_device or device),
+        cache_dir=args.reg_cache or None)
+    mask_source = {"auto": "t1_prior_ct1" if register else "t1",
+                   "config": None}.get(args.mask_source, args.mask_source)
+    sh = Shared(runs, base, args.slices, args.units, register, mask_source)
     for r in runs:
         sh.check_channels(r)
     vols = sh.volumes()
@@ -498,7 +545,8 @@ def main():
     elif args.n_volumes:
         vols = dict(list(vols.items())[:args.n_volumes])
     print(f"\n{len(runs)} run(s) | {len(vols)} volume(s) of {n_all} multi-study | "
-          f"slices {args.slices[0]}:{args.slices[1]} | units {sh.units[0]} | device {device}")
+          f"slices {args.slices[0]}:{args.slices[1]} | units {sh.units[0]} | device {device} | "
+          f"registration {describe(sh.ds[sh.units].register)} | mask {sh.vcfg.get('mask_source')}")
 
     rows = dump(runs, sh, vols, args, device)
     for r in runs:

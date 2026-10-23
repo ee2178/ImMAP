@@ -98,6 +98,13 @@ THE MASK. `mask_source` picks what comes back as `mask`:
             both are nonzero (|value| > mask_eps; contrasts `mask_idx`, default [x1_idx, x0_idx]).
             Only those two define it -- NOT the intersection of every contrast's support, so a
             FLAIR or T2 with a smaller field of view does not shrink it.
+    t1      the support of this session's T1 alone (mask_idx default [x1_idx]). For inference:
+            the current CT1 is what is being predicted, so its support is not available either.
+    t1_prior_ct1
+            this session's T1 support AND the prior study's CT1 support at the matched slice
+            (the first other_study guide's study, offset 0) -- read from the REGISTERED prior
+            when `register` is on, so "post registration" is what it means there. Both are
+            available at inference. Needs guide_mode other_study.
 
 `mask_apply=True` also MULTIPLIES the images by that mask (either source): x0, x1, cond and y by
 this session's mask, and the guide planes according to `mask_guides`:
@@ -111,6 +118,16 @@ this session's mask, and the guide planes according to `mask_guides`:
 A bridge start taken from another study (x1_source="other_study") follows `mask_guides` as well.
 Masking happens before the crop/flip, so the mask and the images always move together. With
 mask_apply=False nothing is multiplied and only the returned `mask` changes.
+
+INFERENCE-TIME REGISTRATION (`register`, default None = the stored alignment). The build aligned a
+patient's studies with masks that saw the CT1 being predicted. `register: "prior_to_current"` (or
+a dict, datasets/NYUMets/inference_registration.py) re-aligns each (current, prior) pair from the
+FLAIR, T1 and T2 of both studies alone and resamples all four contrasts of the prior onto the
+current study's grid; the other_study guide planes are then read from that warped prior at the
+current slice's ORIGINAL index + offset. `"current_to_prior"` instead warps the CURRENT study
+(target, inputs, mask) onto the prior's grid and reads the guides from the stored prior. One fit
+per pair, cached (in-process and optionally on disk). Needs guide_slice "index"; current_to_prior
+also needs one other_study guide (n_guides 1) and x1_source "contrast".
 """
 
 import os
@@ -126,7 +143,7 @@ from datasets.slice_filter import filter_by_slice_range
 
 GUIDE_MODES = ("none", "same_session", "other_study", "far_slice", "central_slice", "same_slice")
 GUIDE_SLICES = ("matched", "index", "central", "random")
-MASK_SOURCES = ("h5", "t1ct1")
+MASK_SOURCES = ("h5", "t1ct1", "t1", "t1_prior_ct1")
 MASK_GUIDES = ("target", "own", "none")
 X1_SOURCES = ("contrast", "other_study")
 
@@ -236,9 +253,16 @@ class NYUMetsGuidedDataset(Dataset):
             raise ValueError(f"mask_guides must be one of {MASK_GUIDES}, got {self.mask_guides!r}")
         self.mask_eps = float(getattr(cfg, "mask_eps", 0.0) or 0.0)
         mi = getattr(cfg, "mask_idx", None)
-        self.mask_idx = [self.x1_idx, self.x0_idx] if mi is None else [int(c) for c in mi]
+        if mi is not None:
+            self.mask_idx = [int(c) for c in mi]
+        elif self.mask_source in ("t1", "t1_prior_ct1"):
+            self.mask_idx = [self.x1_idx]                 # the current CT1 is not available
+        else:
+            self.mask_idx = [self.x1_idx, self.x0_idx]
         if not self.mask_idx:
             raise ValueError("mask_idx must name at least one stored contrast")
+        if self.mask_source == "t1_prior_ct1" and "other_study" not in self.modes:
+            raise ValueError("mask_source t1_prior_ct1 needs guide_mode other_study (a prior study)")
 
         scales = getattr(cfg, "scales", None)
         self.scales = None if scales is None else np.asarray(scales, dtype=np.float32)
@@ -256,6 +280,24 @@ class NYUMetsGuidedDataset(Dataset):
             raise ValueError(f"intensity_norm must be one of {INTENSITY_NORMS}, "
                              f"got {self.intensity_norm!r}")
         self._centre = {}                                 # per-file (C,) medians
+
+        # inference-time registration of each (current, prior) pair; see the module docstring
+        from datasets.NYUMets.inference_registration import WarpCache, parse_register
+        self.register = parse_register(getattr(cfg, "register", None), self.x0_idx)
+        if self.register is not None:
+            if "other_study" not in self.modes:
+                raise ValueError("register needs guide_mode other_study: it aligns the prior study")
+            if self.guide_slice != "index":
+                raise ValueError("register needs guide_slice 'index': the warped prior lives on "
+                                 "the current study's ORIGINAL slice axis")
+            if self.x1_source != "contrast":
+                raise ValueError("register needs x1_source 'contrast' (a bridge start read from "
+                                 "the other study is not registered)")
+            if self.register["direction"] == "current_to_prior" and (
+                    self.modes != ["other_study"] or self.n_guides != 1):
+                raise ValueError("register current_to_prior needs exactly one other_study guide "
+                                 "(guide_mode other_study, n_guides 1)")
+        self._warped = WarpCache(2)
 
         tfms = []
         if getattr(cfg, "center_crop", None) is not None:
@@ -345,23 +387,25 @@ class NYUMetsGuidedDataset(Dataset):
         return int(torch.randint(n, (1,)).item())
 
     def _guide_planes(self, fi, li, idx):
-        """-> list of (file_index, slice_index, stored_contrast), in guide order."""
+        """-> list of (file_index, slice_index, stored_contrast, offset), in guide order.
+        `offset` is the other_study window offset d (-w..+w), None for every other mode -- what
+        a registered read needs, since it reads the warped prior at the current index + d."""
         out = []
         for mi, mode in enumerate(self.modes):
             salt0 = 1000 * (mi + 1)
             if mode == "same_session":
-                out += [(fi, li, c) for c in self.guide_contrasts]
+                out += [(fi, li, c, None) for c in self.guide_contrasts]
                 continue
             for g in range(self.n_guides):
                 salt = salt0 + g
                 if mode == "same_slice":
-                    out += [(fi, li, c) for c in self.guide_idx]
+                    out += [(fi, li, c, None) for c in self.guide_idx]
                 elif mode == "central_slice":
-                    out += [(fi, self.n_slices[fi] // 2, c) for c in self.guide_idx]
+                    out += [(fi, self.n_slices[fi] // 2, c, None) for c in self.guide_idx]
                 elif mode == "far_slice":
                     far = [z for z in range(self.n_slices[fi]) if abs(z - li) >= self.min_slice_gap]
                     z = far[self._pick(len(far), idx, salt)]
-                    out += [(fi, z, c) for c in self.guide_idx]
+                    out += [(fi, z, c, None) for c in self.guide_idx]
                 elif mode == "other_study":
                     # ONE sibling and ONE matched slice per guide; the window and the contrast
                     # list are then read from that same study. Order: slice offset -w..+w
@@ -371,7 +415,7 @@ class NYUMetsGuidedDataset(Dataset):
                     last = self.n_slices[gf] - 1
                     for d in range(-self.guide_window, self.guide_window + 1):
                         z = min(max(gz + d, 0), last)
-                        out += [(gf, z, c) for c in self.guide_idx]
+                        out += [(gf, z, c, d) for c in self.guide_idx]
                 else:
                     raise AssertionError(mode)
         return out
@@ -438,19 +482,97 @@ class NYUMetsGuidedDataset(Dataset):
             self._centre[fi] = c
         return c
 
-    def _mask_of(self, img, h, li):
-        """(H, W, 1) float32 mask of one stored slice, by `mask_source`."""
+    # -- inference-time registration (`register`) ---------------------------------------------
+    def _full_volume(self, fi):
+        """Volume `fi` on its ORIGINAL slice axis, scaled as `_read` scales a slice.
+        -> (img (Z, H, W, C+1) float32 -- the last channel is the stored `mask` (ones when the
+        h5 has none) --, present (Z,) bool). Z = its largest original index + 1."""
+        h = self._handle(self.img_paths[fi])
+        img = np.asarray(h[self.image_key][:], dtype=np.float32)          # (n, H, W, C)
+        if self.intensity_norm == "volume_scale":
+            img = img / self._volume_centre(fi, h)[None, None, None, :]
+        elif self.scales is not None:
+            img = img / self.scales[None, None, None, :]
+        m = (np.asarray(h["mask"][:], dtype=np.float32) if "mask" in h
+             else np.ones(img.shape[:3] + (1,), np.float32))
+        z = self._slice_index(fi).astype(np.int64)
+        out = np.zeros((int(z.max()) + 1,) + img.shape[1:3] + (img.shape[3] + 1,), np.float32)
+        out[z, ..., :-1], out[z, ..., -1:] = img, m.reshape(img.shape[:3] + (1,))
+        present = np.zeros(out.shape[0], bool)
+        present[z] = True
+        return out, present
+
+    def _registered(self, fi, gf):
+        """The (current fi, prior gf) pair registered as `register` says. -> dict:
+        img (Z, H, W, C+1) the MOVING study warped onto the fixed one's original slice axis (last
+        channel its stored mask), info (the fit's report), moving (file index that moved)."""
+        from datasets.NYUMets.inference_registration import _key, fit_pair, warp
+        spec = self.register
+        fixed, moving = (fi, gf) if spec["direction"] == "prior_to_current" else (gf, fi)
+
+        def make():
+            A, pa = self._full_volume(fixed)
+            B, pb = self._full_volume(moving)
+            key = _key(self.img_paths[fixed], self.img_paths[moving], self.image_key, spec)
+            M, info = fit_pair(A, pa, B, pb, spec, key=key)
+            W = warp(B, M, A.shape[:3], spec["device"])
+            W[..., -1] = (W[..., -1] > 0.5).astype(np.float32)           # the mask stays binary
+            return dict(img=W, info=info, moving=moving)
+        return self._warped.get((fixed, moving), make)
+
+    def registration_info(self, fi, gf):
+        """The fit report for the pair (current fi, prior gf), or None when `register` is off."""
+        return None if self.register is None else self._registered(fi, gf)["info"]
+
+    def _warped_slice(self, R, o):
+        """Slice at ORIGINAL index o of a registered volume (clamped to its axis), and its mask."""
+        o = min(max(int(o), 0), R["img"].shape[0] - 1)
+        s = R["img"][o]
+        return s[..., :-1], s[..., -1:]
+
+    def _mask_of(self, img, h, li, prior_ct1=None):
+        """(H, W, 1) float32 mask of one stored slice, by `mask_source`. `prior_ct1` (H, W) is
+        the prior study's CT1 at this slice, for t1_prior_ct1 (without it, e.g. for a guide
+        plane's "own" mask, that source falls back to the T1 support)."""
         if self.mask_source == "h5":
             return np.asarray(h["mask"][li]).astype(np.float32)
         # the support shared by the mask contrasts; `img` may be scaled, which cannot move a zero
         m = np.all(np.abs(img[..., self.mask_idx]) > self.mask_eps, axis=-1, keepdims=True)
+        if self.mask_source == "t1_prior_ct1" and prior_ct1 is not None:
+            m = m & (np.abs(prior_ct1) > self.mask_eps)[..., None]
         return m.astype(np.float32)
+
+    def _prior_ct1(self, fi, li, idx, o_cur):
+        """(H, W) prior CT1 at this slice for mask_source t1_prior_ct1: the first other_study
+        guide's study (same salt as _guide_planes), offset 0 -- the REGISTERED prior under
+        prior_to_current, the stored one otherwise (under current_to_prior the prior is the
+        grid everything was moved onto)."""
+        salt = 1000 * (self.modes.index("other_study") + 1)
+        gf, gz = self._other_study_slice(fi, li, idx, salt)
+        if self.register is not None and self.register["direction"] == "prior_to_current":
+            g, _ = self._warped_slice(self._registered(fi, gf), o_cur)
+        else:
+            g, _ = self._read(gf, gz)
+        return g[..., self.x0_idx]
 
     def __getitem__(self, idx):
         fi = int(self.file_id[idx])
         li = int(self.local[idx])
-        img, h = self._read(fi, li)
-        mask = self._mask_of(img, h, li)                  # (H, W, 1)
+        reg = None if self.register is None else self.register["direction"]
+        o_cur = int(self._slice_index(fi)[li]) if reg else None      # ORIGINAL slice index
+        pct1 = (self._prior_ct1(fi, li, idx, o_cur) if self.mask_source == "t1_prior_ct1"
+                else None)
+        if reg == "current_to_prior":
+            # THIS study, warped onto its prior's grid: target, inputs and mask all move. The
+            # prior is the one other_study guide's sibling (salt as in _guide_planes: mode 0,
+            # guide 0), so the guides below are read unwarped from the grid everything is on.
+            gf0 = self._other_study_slice(fi, li, idx, 1000)[0]
+            img, wmask = self._warped_slice(self._registered(fi, gf0), o_cur)
+            h = None
+            mask = wmask if self.mask_source == "h5" else self._mask_of(img, None, li, pct1)
+        else:
+            img, h = self._read(fi, li)
+            mask = self._mask_of(img, h, li, pct1)        # (H, W, 1)
         mask_np = mask                                    # numpy copy: `mask` becomes a tensor below
         if self.mask_apply:
             img = img * mask                              # every contrast of THIS session's slice
@@ -479,14 +601,26 @@ class NYUMetsGuidedDataset(Dataset):
             # each (study, slice) is read once, all contrasts, and masked once. (fi, li) is this
             # session's own slice: already masked above, and its "own" mask IS the target mask.
             planes, slices = [], {(fi, li): img}
-            for gf, gz, gc in self._guide_planes(fi, li, idx):
-                if (gf, gz) not in slices:
-                    gimg, gh = self._read(gf, gz)
-                    if self.mask_apply and self.mask_guides != "none":
-                        gimg = gimg * (mask_np if self.mask_guides == "target"
-                                       else self._mask_of(gimg, gh, gz))
-                    slices[(gf, gz)] = gimg
-                g = slices[(gf, gz)]
+            for gf, gz, gc, d in self._guide_planes(fi, li, idx):
+                if reg == "prior_to_current" and d is not None and gf != fi:
+                    # the prior warped onto THIS study's grid, at this slice's original index + d
+                    key = ("registered", gf, d)
+                    if key not in slices:
+                        gimg, gm = self._warped_slice(self._registered(fi, gf), o_cur + d)
+                        if self.mask_apply and self.mask_guides != "none":
+                            gimg = gimg * (mask_np if self.mask_guides == "target"
+                                           else gm if self.mask_source == "h5"
+                                           else self._mask_of(gimg, None, gz))
+                        slices[key] = gimg
+                    g = slices[key]
+                else:
+                    if (gf, gz) not in slices:
+                        gimg, gh = self._read(gf, gz)
+                        if self.mask_apply and self.mask_guides != "none":
+                            gimg = gimg * (mask_np if self.mask_guides == "target"
+                                           else self._mask_of(gimg, gh, gz))
+                        slices[(gf, gz)] = gimg
+                    g = slices[(gf, gz)]
                 planes.append(np.clip(g[..., self.x0_idx] - g[..., self.x1_idx], 0.0, None)
                               if gc == ENHANCEMENT else g[..., gc])
             guide = chw(np.stack(planes, axis=-1))        # (G, H, W)

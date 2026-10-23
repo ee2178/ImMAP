@@ -367,7 +367,7 @@ COMPARABLE = ("sigma", "R", "seed", "anatomy", "acs_lines", "mask_dist",
               "center_frac", "adjust_accel", "kspace_type", "online_smaps",
               # NYUMets (scripts/dump_eval_nyumets.py): which intensity units the images and
               # metrics are in, and which way the stored slices are turned
-              "intensity_units", "display_orient")
+              "intensity_units", "display_orient", "registration", "mask_source")
 
 
 def check_comparable(volume):
