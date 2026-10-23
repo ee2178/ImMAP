@@ -13,13 +13,26 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-2
+#SBATCH --array=0-4
 #
 # EXPERIMENT 15 -- V-CYCLE CORRECTNESS FIXES vs mg81v6, KNEE R=8, FULL LENGTH.
 #
 #   0   knee  R8   mg81v6vtx    lattice fix,  legacy dual FAS, untied FAS copies
 #   1   knee  R8   mg81v6vtxA   lattice fix + FAS option A   (fas_dual=fixed_point, fas_copies=tied)
 #   2   knee  R8   mg81v6vtxB   lattice fix + FAS option B   (fas_dual=gradient,    fas_copies=tied)
+#   3   knee  R8   mg81v6vtxAnest   = vtxA + fas_parent_pi=true   (added 2026-10-23)
+#   4   knee  R8   mg81v6vtxBnest   = vtxB + fas_parent_pi=true   (added 2026-10-23)
+#
+# NESTED FAS (cells 3, 4). Level 2's correction must restrict level 1's
+# residual NET OF level 1's own pi: pi^2 = r_2(R u_1) - R(r_1(u_1) - pi^1).
+# Cells 0-2 restrict r_1 alone (as mg81v6 and mg_lpds.jl always have), so a
+# SOLVED level 1 still moves level 2 by R pi^1 -- and pi^1 grows as the coarse
+# filters train away from the fine ones. vtxA showed level 2 degrading over
+# training. Cells 1, 2 are kept exactly as launched so their run dirs resume;
+# 3, 4 are the same cells with the fix (models/mg_lpds.py::_check_fas_parent_pi).
+#
+# TO ADD 3, 4 WHILE 0-2 ARE RUNNING, submit only the new indices:
+#   sbatch --array=3-4 torch/exp15_fas_lattice.sbatch
 #
 # The FAS cells TIE the downsampler's operators to the first fine / coarse
 # layers' (fas_copies=tied): with its own trained copies the FAS correction
@@ -59,8 +72,8 @@
 # validates on measured k-space; configs generated now do too (the generator no
 # longer writes val_kspace_type), so the curves are comparable. Compare the
 # final nets with main_eval anyway -- the SAME measurement for every run:
-#     RUNS="knee/mg81v6_R8 knee/mg81v6vtx_R8 knee/mg81v6vtxA_R8 knee/mg81v6vtxB_R8" \
-#     OUT=results/exp15_knee_R8 VAL_KSPACE=measurement_awgn sbatch --array=0-3 torch/main_eval.sbatch
+#     RUNS="knee/mg81v6_R8 knee/mg81v6vtx_R8 knee/mg81v6vtxA_R8 knee/mg81v6vtxB_R8 knee/mg81v6vtxAnest_R8 knee/mg81v6vtxBnest_R8" \
+#     OUT=results/exp15_knee_R8 VAL_KSPACE=measurement_awgn sbatch --array=0-5 torch/main_eval.sbatch
 #
 # A quick look before they finish: notebooks/vcycle_levels_real.ipynb on any of
 # these run dirs (the level figures read transfer_filter / fas_dual from the
@@ -69,7 +82,7 @@
 # EXISTING RUN DIRS. LAUNCH-ONCE (torch/_mg_recon_body.sh) resumes an
 # unfinished trained_nets/mg_recon/knee/<cell>_R8 and skips a finished one.
 # These names are new, so nothing should be there:
-#     ls -d trained_nets/mg_recon/knee/mg81v6{vtx,vtxA,vtxB}_R8
+#     ls -d trained_nets/mg_recon/knee/mg81v6{vtx,vtxA,vtxB,vtxAnest,vtxBnest}_R8
 #
 # FULL LENGTH: 300k steps, as exp11 / exp14; a cell may need a second 48 h
 # slot. When a slot ends, RESUBMIT THIS FILE: unfinished cells resume from
@@ -82,10 +95,10 @@
 #
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
-#       --accels 8 --only mg81v6vtx mg81v6vtxA mg81v6vtxB
+#       --accels 8 --only mg81v6vtx mg81v6vtxA mg81v6vtxB mg81v6vtxAnest mg81v6vtxBnest
 
 ANATOMY=knee
-ONLY="${ONLY:-mg81v6vtx mg81v6vtxA mg81v6vtxB}"
+ONLY="${ONLY:-mg81v6vtx mg81v6vtxA mg81v6vtxB mg81v6vtxAnest mg81v6vtxBnest}"
 ACCELS="${ACCELS:-8}"
 PLANAR_STATE="${PLANAR_STATE-1}"     # as exp11; `-`, so an explicitly EMPTY value turns it off
 ATTN="flex"                          # matches the other knee launchers --

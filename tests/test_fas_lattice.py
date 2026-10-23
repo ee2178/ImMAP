@@ -25,6 +25,10 @@ FAS (`fas_dual`, models/mg_lpds.py::FAS_DUAL)
      carries the mode, `set_fas_dual` swaps and restores, the gradient form is
      refused for the group prox, and a vertex-lattice rediscretized net runs
      end to end with a gradient.
+  9. `fas_copies="tied"` keeps that coherence after the layers drift.
+ 10. NESTED (`fas_parent_pi`, 2026-10-23): from a fixed point of a TILTED
+     level, the next level's sweep stays put only when the level's own pi is
+     subtracted before restricting; two-level nets are unchanged.
 
 Run with `python -m tests.test_fas_lattice`.
 """
@@ -412,11 +416,87 @@ def test_tied_copies():
         check("unknown fas_copies refused", True)
 
 
+def _tilted_fixed_point(layer, sigma, seed):
+    """`(x, z, y, pi)` with `(x, z)` a fixed point of `layer` under the TILT
+    `pi`, as a nested level is: z feasible, half of it on the boundary, and the
+    dual tilt a GENERIC one, A x - pi_z = n for an n in N(z) that is not the one
+    nearest A x (so `d(x, z) - pi_z != 0`, and only the in-projection residual
+    vanishes). The primal tilt is the primal residual itself."""
+    g = torch.Generator().manual_seed(seed)
+    x, y = torch.randn(1, 1, 16, 16, generator=g), torch.randn(1, 1, 16, 16, generator=g)
+    Ax = layer.analysis(x)
+    t = layer.prox.prox.threshold(Ax, sigma)
+    sgn = torch.sign(torch.randn(Ax.shape, generator=g))
+    on = torch.rand(Ax.shape, generator=g) < 0.5
+    z = torch.where(on, t * sgn, 0.4 * t * sgn)
+    n = torch.where(on, 0.3 * torch.rand(Ax.shape, generator=g) * sgn, torch.zeros_like(z))
+    pi_x = x - y + layer.synthesis(z)                                    # E = I
+    pi_z = Ax - n
+    return x, z, y, (pi_x, pi_z)
+
+
+def test_nested_fas():
+    """`fas_parent_pi`: a nested level hands down its residual NET OF its own
+    pi, pi^{l+1} = r_{l+1}(R u) - R(r_l(u) - pi^l). From a fixed point of a
+    TILTED level, the next level's sweep must stay put -- and without the flag
+    it moves by R pi^l. Two-level nets (pi^0 = 0) are untouched."""
+    from models.mg_lpds import set_fas_parent_pi
+    sigma = torch.tensor(0.015)
+    for mode, filt in (("fixed_point", "sinc_vertex"), ("gradient", "box")):
+        for nest in (True, False):
+            torch.manual_seed(6)
+            V = PDVCycle([2, 2], C=1, M=4, P=5, stride=2, is_complex=False, lam0=0.05,
+                         transfer_filter=filt, fas_dual=mode, fas_copies="tied",
+                         fas_parent_pi=nest)
+            fine = V.lpdsA.first
+            fine.fas_dual = mode       # it stands in for a NESTED level, which carries the mode
+            with torch.no_grad():
+                x, z, y, pi = _tilted_fixed_point(fine, sigma, seed=7)
+                if mode == "fixed_point":         # its dual tilt is the fixed-point residual
+                    pi = (pi[0], z - fine.prox(z + fine.analysis(x), sigma, {})[0])
+                (xf, zf), _ = fine((x, z), y, E=Identity(), sigma=sigma, pi=pi)
+                fixed = rel(xf, x) < 1e-5 and rel(zf, z) < 1e-5
+                (x_c, z_c, pi_x, pi_z, y_c, E_c, sigma_c, _) = V.dF(
+                    x, z, y, Identity(), sigma, {}, {}, pi=pi)
+                C1 = first_pd_layer(V.mglayer)
+                (xn, zn), _ = C1((x_c, z_c), y_c, E=E_c, sigma=sigma_c, pi=(pi_x, pi_z))
+                dx, dz = rel(xn, x_c), rel(zn, z_c)
+            check(f"tilted fine fixed point is one ({mode})", fixed)
+            check(f"nested {mode:11s} fas_parent_pi={nest!s:5s}: next level "
+                  f"{'stays put' if nest else 'MOVES'}",
+                  (dx < 1e-5 and dz < 1e-5) == nest, f"dx={dx:.1e} dz={dz:.1e}")
+
+    y = torch.randn(1, 1, 32, 32)
+    with torch.no_grad():
+        two = [MGLPDSNet(K=[2, [2, 2]], M=4, C=1, P=5, s=2, is_complex=False,
+                         preproc="identity", lam0=0.05, fas_dual="fixed_point",
+                         fas_copies="tied", fas_parent_pi=f) for f in (False, True)]
+        for m in two[1:]:
+            m.load_state_dict(two[0].state_dict())
+        o2 = [m(y, sigma=sigma)[0] for m in two]
+        three = _net(fas_dual="fixed_point", fas_copies="tied")
+        base = three(y, sigma=sigma)[0]
+        prev = set_fas_parent_pi(three, True)
+        nested = three(y, sigma=sigma)[0]
+        set_fas_parent_pi(three, prev)
+        back = three(y, sigma=sigma)[0]
+        built = _net(fas_dual="fixed_point", fas_copies="tied", fas_parent_pi=True)(y, sigma=sigma)[0]
+    check("two levels: fas_parent_pi changes nothing (pi^0 = 0)", torch.equal(o2[0], o2[1]))
+    check("three levels: it changes the output; set_fas_parent_pi == built; restores",
+          rel(nested, base) > 1e-6 and torch.equal(nested, built) and torch.equal(back, base)
+          and prev is False, f"rel {rel(nested, base):.1e}")
+    try:
+        _net(fas_parent_pi="yes")
+        check("non-bool fas_parent_pi refused", False)
+    except ValueError:
+        check("non-bool fas_parent_pi refused", True)
+
+
 def main():
     for t in (test_vertex_pair, test_vertex_response, test_lattice_alignment,
               test_vertex_length_and_learned, test_sweep_coherence,
               test_coherence_through_dF, test_dF_formula, test_net,
-              test_vertex_net_end_to_end, test_tied_copies):
+              test_vertex_net_end_to_end, test_tied_copies, test_nested_fas):
         print(f"\n== {t.__name__}")
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

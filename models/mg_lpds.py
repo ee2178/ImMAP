@@ -182,6 +182,33 @@ def _check_fas_copies(mode):
     return mode
 
 
+#: Which fine residual a NESTED level restricts (`fas_parent_pi`). A level
+#: below the finest solves its own tilted problem, r(x, z) = pi, so what it
+#: hands down is the residual OF THAT PROBLEM, r - pi:
+#:
+#:     pi^{l+1} = r_{l+1}(R u_l) - R( r_l(u_l) - pi^l )       (MGProx line 6)
+#:
+#:   False  restrict r_l alone -- what this port and `mg_lpds.jl` have always
+#:          done. Exact at l = 0 (pi^0 = 0), so a two-level net is unaffected;
+#:          from level 2 down it adds a spurious R pi^l to the tilt, so a SOLVED
+#:          level 1 still moves level 2. pi^1 measures the fine / coarse
+#:          operator mismatch, which grows as the coarse filters train away
+#:          from their widened-fine init.
+#:   True   subtract pi^l first, in the residual the level's sweeps iterate:
+#:          primal r_x - pi_x for every mode; dual
+#:            "fixed_point"  (z - prox(z + A x)) - pi_z
+#:            "gradient"     w - Pi_{N(z)}(w),  w = A x - pi_z  (the tilt goes
+#:                           INSIDE the projection: zero exactly at the tilted
+#:                           saddle point, which d(x, z) - pi_z is not)
+#:            "legacy"       z - prox(z + A x - pi_z)
+#:
+#: Changes no parameter: any checkpoint loads under either value.
+def _check_fas_parent_pi(flag):
+    if not isinstance(flag, bool):
+        raise ValueError(f"fas_parent_pi must be true or false, got {flag!r}")
+    return flag
+
+
 class PDObjectiveDownsample(nn.Module):
     """Restrict `(x, z, y, E, sigma)` and form `(pi_x, pi_z)`.
 
@@ -193,13 +220,14 @@ class PDObjectiveDownsample(nn.Module):
 
     def __init__(self, fine_layer, coarse_layer, widen=1, julia_compat=False,
                  transfer_filter=None, transfer=None, coarse_op="galerkin",
-                 fas_dual="legacy", fas_copies="untied"):
+                 fas_dual="legacy", fas_copies="untied", fas_parent_pi=False):
         super().__init__()
         self.widen = int(widen)
         self.julia_compat = bool(julia_compat)
         self.coarse_op = coarse_op
         self.fas_dual = _check_fas_dual(fas_dual)
         self.fas_copies = _check_fas_copies(fas_copies)
+        self.fas_parent_pi = _check_fas_parent_pi(fas_parent_pi)
         self.is_complex = bool(getattr(fine_layer, "is_complex", True))
         self.transfer_filter = _check_filter(transfer_filter)
         # LATENT-grid transfer, shared with the enclosing V-cycle. Only the
@@ -228,25 +256,37 @@ class PDObjectiveDownsample(nn.Module):
                 self.widen_z.weight.copy_(
                     identity_widen_weight(M_coarse, M_fine, self.widen))
 
-    def forward(self, x, z, y, E, sigma, cache, static=None):
+    def forward(self, x, z, y, E, sigma, cache, static=None, pi=None):
+        """`pi` is the fine level's OWN tilt `(pi_x, pi_z)` from its parent
+        (None at the finest); used only under `fas_parent_pi` (see there)."""
         R = dict(julia_compat=self.julia_compat, filter=self.transfer_filter)
         # planar STATE: real tensors, [re; im] stacked (see LPDSLayer.forward)
         planar = getattr(self, "is_complex", True) and not x.is_complex()
 
         gradient = self.fas_dual == "gradient"
+        pi_x, pi_z = (None, None) if pi is None or not \
+            getattr(self, "fas_parent_pi", False) else pi
 
         # ---- fine-level primal-dual residual --------------------------------
-        # primal:  grad f(x) + A^T z
+        # primal:  grad f(x) + A^T z  [- pi_x]
         rx_fine = gram_or_x(E, x, planar) - y + self.synthesis_fine(z)
+        if pi_x is not None:
+            rx_fine = rx_fine - pi_x
         # dual: the FIXED-POINT residual z - prox_{g*}(z + A x) ("legacy",
-        # "fixed_point"), or the dual GRADIENT A x - Pi_{N(z)}(A x) ("gradient")
+        # "fixed_point"), or the dual GRADIENT A x - Pi_{N(z)}(A x) ("gradient");
+        # with a parent tilt, the residual of the map the sweeps iterate
         Ax = self.analysis_fine(x)
         if gradient:
-            rz_fine = Ax - self.prox_fine.normal_cone(z, Ax, sigma)
+            w = Ax if pi_z is None else Ax - pi_z
+            rz_fine = w - self.prox_fine.normal_cone(z, w, sigma)
         else:
+            inside = pi_z is not None and self.fas_dual == "legacy"
             zhat, cache["_dF_fine"] = self.prox_fine(
-                z + Ax, sigma, cache.setdefault("_dF_fine", {}))
+                z + Ax - pi_z if inside else z + Ax, sigma,
+                cache.setdefault("_dF_fine", {}))
             rz_fine = z - zhat
+            if pi_z is not None and not inside:
+                rz_fine = rz_fine - pi_z
 
         # ---- restriction: x and y on the image grid, z on the latent grid ----
         # IMAGE path -- the primal variable and its residual sit on the same
@@ -317,6 +357,20 @@ def set_fas_dual(model, mode):
     return prev
 
 
+def set_fas_parent_pi(model, flag):
+    """`set_fas_dual`'s sibling for `fas_parent_pi` -> the previous value. A
+    diagnostic on a trained net, like it."""
+    flag = _check_fas_parent_pi(flag)
+    owners = [m for m in model.modules()
+              if isinstance(m, (MGLPDSNet, PDVCycle, PDObjectiveDownsample))]
+    if not owners:
+        raise ValueError(f"{type(model).__name__} has no V-cycle")
+    prev = getattr(owners[0], "fas_parent_pi", False)
+    for m in owners:
+        m.fas_parent_pi = flag
+    return prev
+
+
 def _check_gradient_fas_proxes(model):
     bad = {type(m.prox).__name__ for m in model.modules()
            if isinstance(m, FenchelProx) and not hasattr(m.prox, "normal_cone")}
@@ -380,7 +434,7 @@ class PDVCycle(nn.Module):
     def __init__(self, iters, C, M, widen=1, alpha0=1e-1, julia_compat=False,
                  spectral_init=True, transfer_filter=None,
                  learn_transfer=False, coarse_op="galerkin", fas_dual="legacy",
-                 fas_copies="untied", **layer_kws):
+                 fas_copies="untied", fas_parent_pi=False, **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
         if coarse_op not in COARSE_OPS:
@@ -388,6 +442,7 @@ class PDVCycle(nn.Module):
         self.coarse_op = coarse_op
         self.fas_dual = _check_fas_dual(fas_dual)
         self.fas_copies = _check_fas_copies(fas_copies)
+        self.fas_parent_pi = _check_fas_parent_pi(fas_parent_pi)
         assert iters[0] % 2 == 0, \
             f"non-coarsest level iters must be even, got {iters[0]}"
         self.widen = int(widen)
@@ -443,7 +498,8 @@ class PDVCycle(nn.Module):
                                     transfer_filter=self.transfer_filter,
                                     learn_transfer=learn_transfer,
                                     coarse_op=coarse_op, fas_dual=fas_dual,
-                                    fas_copies=fas_copies, **coarse_kws)
+                                    fas_copies=fas_copies,
+                                    fas_parent_pi=fas_parent_pi, **coarse_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
                 C, M_c, spectral_init=False, **coarse_kws))
@@ -457,7 +513,8 @@ class PDVCycle(nn.Module):
                                         transfer_filter=self.transfer_filter,
                                         transfer=self.transfer,
                                         coarse_op=coarse_op, fas_dual=fas_dual,
-                                        fas_copies=fas_copies)
+                                        fas_copies=fas_copies,
+                                        fas_parent_pi=fas_parent_pi)
         # The coarse sweeps apply pi_z; their placement follows the mode.
         _set_layer_fas_dual(self.mglayer, fas_dual)
 
@@ -496,9 +553,10 @@ class PDVCycle(nn.Module):
                                   cache=cache)
         x, z = state
 
-        # restrict + the two FAS corrections
+        # restrict + the two FAS corrections (net of this level's own pi,
+        # under fas_parent_pi)
         (x_c, z_c, pi_x, pi_z, y_c, E_c, sigma_c,
-         gram_x_c) = self.dF(x, z, y_tilde, E, sigma, cache, static)
+         gram_x_c) = self.dF(x, z, y_tilde, E, sigma, cache, static, pi=pi)
 
         # recurse -- the coarse level keeps its own adjacency cache, and
         # inherits both the shared static slot and the Gram dF just formed at
@@ -541,7 +599,8 @@ class PDVCycle(nn.Module):
         return (f"depth={self.depth}, iters_per_level={self.iters_per_level}, "
                 f"M={self.M} x widen^l (widen={self.widen}), "
                 f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}, "
-                f"fas_copies={self.fas_copies}")
+                f"fas_copies={self.fas_copies}, "
+                f"fas_parent_pi={getattr(self, 'fas_parent_pi', False)}")
 
 
 # ===========================================================================
@@ -588,14 +647,19 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  attn_backend="gather", flex_block_size=128,
                  preproc="kspace", resize_noise=False, julia_compat=False,
                  transfer_filter=None, learn_transfer=False,
-                 coarse_op="galerkin", fas_dual="legacy", fas_copies="untied"):
+                 coarse_op="galerkin", fas_dual="legacy", fas_copies="untied",
+                 fas_parent_pi=False):
         super().__init__()
         K_outer, iters = _parse_K(K)
         # How the coarse levels apply the DUAL FAS correction (see FAS_DUAL),
-        # and which operators the corrections are formed with (FAS_COPIES).
-        # "legacy" / "untied" is what every net before 2026-10-22 trained with.
+        # which operators the corrections are formed with (FAS_COPIES), and
+        # whether a nested level restricts its residual net of its own pi
+        # (`_check_fas_parent_pi`). "legacy" / "untied" / False is what every
+        # net before 2026-10-22 trained with; False stays the default so their
+        # configs, which lack the key, keep building that net.
         self.fas_dual = _check_fas_dual(fas_dual)
         self.fas_copies = _check_fas_copies(fas_copies)
+        self.fas_parent_pi = _check_fas_parent_pi(fas_parent_pi)
         # The coarse levels' forward model -- "galerkin" (E . P: exact, but
         # every coarse Gram runs the full-resolution multicoil FFTs) or
         # "rediscretize" (SENSE posed on the coarse grid; see
@@ -637,7 +701,8 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 julia_compat=julia_compat,
                 transfer_filter=self.transfer_filter,
                 learn_transfer=self.learn_transfer, coarse_op=coarse_op,
-                fas_dual=fas_dual, fas_copies=fas_copies, **layer_kws))
+                fas_dual=fas_dual, fas_copies=fas_copies,
+                fas_parent_pi=fas_parent_pi, **layer_kws))
             if fas_dual == "gradient":
                 _check_gradient_fas_proxes(self)
 
@@ -772,7 +837,8 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
     def extra_repr(self):
         return (f"K={self.K}, iters={self.iters}, M={self.M}, s={self.s}, "
                 f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}, "
-                f"fas_copies={self.fas_copies}")
+                f"fas_copies={self.fas_copies}, "
+                f"fas_parent_pi={getattr(self, 'fas_parent_pi', False)}")
 
 
 PLANAR_STATE_ENV = "IMMAP_PLANAR_STATE"

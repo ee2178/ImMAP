@@ -719,10 +719,12 @@ def _terms_call(store, select):
         def wrap_dF(m):
             orig = m.forward
 
-            def fwd(x, z, y_t, E_, sig, cache, static=None):
-                out = orig(x, z, y_t, E_, sig, cache, static)
+            def fwd(x, z, y_t, E_, sig, cache, static=None, pi=None):
+                out = orig(x, z, y_t, E_, sig, cache, static, pi=pi)
                 planar = getattr(m, "is_complex", True) and not x.is_complex()
                 r_f = gram_or_x(E_, x, planar) - y_t + m.synthesis_fine(z)
+                if pi is not None and getattr(m, "fas_parent_pi", False):
+                    r_f = r_f - pi[0]            # the level's own residual
                 # keep pi_x alive with its R r_fine, so the id cannot be reused
                 rrx[id(out[2])] = (out[2], restrict(r_f, julia_compat=m.julia_compat,
                                                     filter=m.transfer_filter))
@@ -1124,6 +1126,273 @@ def fig_vcycle(z, meta, outer=-1, show="x", flip=None, crop=True, pad=8,
                  f"{o + 1}/{len(meta['outers'])}, every branch "
                  f"({'|x - R^l gt|' if show == 'resid' else 'x_l'}"
                  f"{', cropped' if crop else ''}; yellow = NRMSE vs R^l(gt))", fontsize=10)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# the coarse-correction step: what a finer level actually receives
+# ---------------------------------------------------------------------------
+# A finer level never sees the coarse recon w_c itself. PDVCycle adds
+#     x_corr = x_pre + alpha_x * P(w_c - u_c),     u_c = R x_pre,
+# so only the coarse CHANGE crosses, and only through P: whatever P does not
+# pass (the coarse grid's top band) or whatever w_c shares with its start u_c
+# is invisible to the level above -- and to the loss.
+CORR_COLORS = dict(coarse="#0072B2", prolonged="#E69F00", gt="#7F7F7F",
+                   err_c="#009E73", err_p="#D55E00")
+
+
+def _prolong_np(a, meta):
+    """`P` of one (h, w) numpy image, with the net's image-grid transfer."""
+    import torch
+    from operators.resample import prolong
+    t = torch.from_numpy(np.ascontiguousarray(a))[None, None]
+    return prolong(t, filter=meta["transfer_filter"])[0, 0].numpy()
+
+
+def _rms(a):
+    return float(np.sqrt(np.mean(np.abs(a) ** 2)))
+
+
+def correction_parts(z, meta, outer=-1):
+    """Every coarse -> fine transition of V-cycle `outer`, coarsest first.
+
+    -> list of dicts, one per fine level l (the level RECEIVING the correction):
+        l, lc            fine and coarse level indices (0 = finest)
+        w_c              coarse recon after its solve / post-smooth (mg/x, l+1)
+        u_c              what the coarse level started from, R x_pre (mg/xin, l+1)
+        gt_c, gt         R^{l+1} gt and R^l gt
+        delta            w_c - u_c, the only thing the coarse level hands up
+        P_w, P_delta     P(w_c), P(delta) on level l's grid
+        P_gt_c           P(R^{l+1} gt): P_w - P_gt_c is the coarse error P lets through
+        applied          x_corr - x_pre: what level l actually added (= alpha_x P(delta))
+        alpha            the scalar fit applied ~ alpha * P(delta), and `alpha_misfit`
+        x_pre, x_corr    level l before / after the correction
+        visible          RMS(P e_c) / RMS(e_c), e_c = w_c - gt_c: the share of the
+                         coarse error that survives P (P preserves RMS on its passband)
+    Live mode only for P (torch); the arrays come from `z` (image units, DC in).
+    """
+    o = meta["outers"][outer]
+    L = max(meta["levels"])
+    parts = []
+    for l in range(L - 1, -1, -1):
+        lc = l + 1
+        get = lambda name, lev: z.get(f"mg/{name}/o{o}/l{lev}")
+        w_c, u_c = get("x", lc), get("xin", lc)
+        x_pre, x_corr = get("xpre", l), get("xcorr", l)
+        if any(a is None for a in (w_c, u_c, x_pre, x_corr)):
+            continue
+        gt_c, gt = z[f"mg/gt/l{lc}"], z[f"mg/gt/l{l}"]
+        delta = w_c - u_c
+        P_w, P_delta, P_gt_c = (_prolong_np(a, meta) for a in (w_c, delta, gt_c))
+        applied = x_corr - x_pre
+        den = np.vdot(P_delta, P_delta).real
+        alpha = np.vdot(P_delta, applied) / den if den > 0 else np.nan
+        misfit = (np.linalg.norm(applied - alpha * P_delta) / (np.linalg.norm(applied) + 1e-12)
+                  if den > 0 else np.nan)
+        e_c = w_c - gt_c
+        parts.append(dict(l=l, lc=lc, w_c=w_c, u_c=u_c, gt_c=gt_c, gt=gt, delta=delta,
+                          P_w=P_w, P_delta=P_delta, P_gt_c=P_gt_c, applied=applied,
+                          alpha=complex(alpha), alpha_misfit=float(misfit),
+                          x_pre=x_pre, x_corr=x_corr,
+                          visible=_rms(_prolong_np(e_c, meta)) / (_rms(e_c) + 1e-12)))
+    return parts
+
+
+def correction_table(z, meta):
+    """One row per (V-cycle, transition): how wrong the coarse recon is, how much
+    of that P lets through, and how big the step the fine level takes is."""
+    rows = []
+    for k in range(len(meta["outers"])):
+        for p in correction_parts(z, meta, outer=k):
+            rows.append(dict(
+                outer=k + 1, transition=f"L{p['lc']}->L{p['l']}",
+                nrmse_w_c=nrmse(p["w_c"], p["gt_c"]),
+                nrmse_P_w=nrmse(p["P_w"], p["P_gt_c"]),
+                visible=p["visible"],
+                step_rel=_rms(p["applied"]) / (_rms(p["x_pre"]) + 1e-12),
+                alpha=p["alpha"], alpha_misfit=p["alpha_misfit"]))
+    return rows
+
+
+def _crop_fn(z, meta, flip, crop, pad):
+    F = (lambda a: _flip(a, flip)) if flip else (lambda a: a)
+    r0, r1, c0, c1 = crop_box(z, meta, flip, pad) if crop else (0, None, 0, None)
+    return lambda a, l: F(a)[r0 // 2 ** l:(None if r1 is None else r1 // 2 ** l),
+                             c0 // 2 ** l:(None if c1 is None else c1 // 2 ** l)]
+
+
+def fig_correction(z, meta, outer=-1, flip=None, crop=True, pad=8, panel=2.0,
+                   resid_gain=5.0, dpi=None):
+    """The coarse-correction step of V-cycle `outer`, one row per transition
+    (coarsest first). Columns: the coarse recon w_c, R gt, its error; P(w_c), the
+    part of that error P lets through; what the coarse level hands up, P(w_c - u_c);
+    what the fine level adds, alpha P(w_c - u_c); the fine level before and after.
+    Images on one window per row (|.|); error and step panels on vmax/resid_gain."""
+    import matplotlib.pyplot as plt
+    flip = default_flip(meta) if flip is None else flip
+    cut = _crop_fn(z, meta, flip, crop, pad)
+    parts = correction_parts(z, meta, outer)
+    cols = [("w_c", "coarse recon w_c", "img", "c"),
+            ("gt_c", "R gt (coarse)", "img", "c"),
+            ("err_c", "|w_c - R gt|", "res", "c"),
+            ("P_w", "P(w_c)  [% vs P(R gt)]", "img", "f"),
+            ("err_p", "|P(w_c - R gt)|", "res", "f"),
+            ("P_delta", "|P(w_c - u_c)|  handed up", "step", "f"),
+            ("applied", "|alpha P(.)|  added", "step", "f"),
+            ("x_pre", "fine, before", "img", "f"),
+            ("x_corr", "fine, after", "img", "f")]
+    g0 = cut(z["mg/gt/l0"], 0)
+    aspect = g0.shape[0] / g0.shape[1]
+    fig, ax = plt.subplots(len(parts), len(cols), squeeze=False, dpi=dpi,
+                           figsize=(panel * len(cols) + 0.8, panel * aspect * len(parts) + 1.0),
+                           gridspec_kw=dict(wspace=0.04, hspace=0.25))
+    for i, p in enumerate(parts):
+        p = dict(p, err_c=p["w_c"] - p["gt_c"], err_p=p["P_w"] - p["P_gt_c"])
+        vmax = float(np.percentile(np.abs(cut(p["gt"], p["l"])), 99.5)) or 1.0
+        # the two step panels share their OWN window: a step is far smaller
+        # than an error, and on the error window it reads as black
+        vstep = float(np.percentile(np.abs(cut(p["P_delta"], p["l"])), 99.5)) or 1.0
+        for j, (key, title, kind, grid) in enumerate(cols):
+            a = ax[i][j]
+            lev = p["lc"] if grid == "c" else p["l"]
+            im = np.abs(cut(p[key], lev))
+            if kind == "img":
+                a.imshow(im, cmap="gray", vmin=0, vmax=vmax, interpolation=INTERP)
+            elif kind == "res":
+                a.imshow(im, cmap="inferno", vmin=0, vmax=vmax / resid_gain,
+                         interpolation=INTERP)
+            else:
+                a.imshow(im, cmap="inferno", vmin=0, vmax=vstep, interpolation=INTERP)
+            a.set_xticks([]); a.set_yticks([])
+            if key in ("w_c", "P_w", "x_pre", "x_corr"):
+                # P(w_c) against P(R gt): the coarse error P lets through, not the
+                # fine band no coarse grid can hold
+                g = {"w_c": p["gt_c"], "P_w": p["P_gt_c"]}.get(key, p["gt"])
+                a.text(0.03, 0.97, f"{100 * nrmse(p[key], g):.1f}%", transform=a.transAxes,
+                       ha="left", va="top", fontsize=7, color="yellow")
+            elif kind == "step":         # RMS relative to the fine image, own window
+                a.text(0.03, 0.97, f"rms {100 * _rms(p[key]) / (_rms(p['x_pre']) + 1e-12):.2f}%"
+                       f" of x\nwindow 0-{vstep:.2g}", transform=a.transAxes,
+                       ha="left", va="top", fontsize=6, color="cyan")
+            if i == 0:
+                a.set_title(title, fontsize=8)
+        ax[i][0].set_ylabel(f"L{p['lc']} -> L{p['l']}\nvisible {100 * p['visible']:.0f}%\n"
+                            f"alpha {p['alpha'].real:+.3g}", fontsize=8)
+    o = meta["outers"][outer]
+    fig.suptitle(f"{meta['run']}  {meta['volume']} slice {meta['slice']}: coarse correction, "
+                 f"V-cycle {o + 1}/{len(meta['outers'])}  (L0 = finest; yellow = NRMSE vs "
+                 f"R^l gt; 'visible' = RMS of P(coarse error) / RMS of coarse error)",
+                 fontsize=10)
+    return fig
+
+
+def _spectrum2d(a):
+    return np.fft.fftshift(np.fft.fft2(a, norm="forward"))
+
+
+def _axis_power(a, axis):
+    """Power vs frequency along `axis` (summed over the other axis), with the
+    frequencies in cycles per pixel OF THIS GRID. `norm="forward"` and the sum
+    make an image and its interpolation P(.) agree on the passband."""
+    S = np.abs(_spectrum2d(a)) ** 2
+    pw = S.sum(axis=1 - axis)
+    f = np.fft.fftshift(np.fft.fftfreq(a.shape[axis]))
+    return f, pw
+
+
+def transfer_response(meta, n=64):
+    """|H(f)| of P along one axis, normalised to 1 at DC; f in cycles per
+    FINE pixel."""
+    d = np.zeros((n // 2, n // 2), np.complex64)
+    d[n // 4, n // 4] = 1.0
+    f, pw = _axis_power(_prolong_np(d, meta), axis=0)
+    h = np.sqrt(pw / pw[np.argmin(np.abs(f))])
+    return f, h
+
+
+def fig_correction_spectra(z, meta, outer=-1, flip=None, db_floor=-110.0, panel=3.0,
+                           dpi=None):
+    """Frequency content of the coarse recon and of what crosses the transfer.
+
+    Per transition (rows, coarsest first): log|F| of w_c (coarse grid) and of
+    P(w_c) (fine grid; dashed box = the coarse grid's band), the same for the
+    coarse ERROR w_c - R gt, then 1-D power along each axis on a common axis in
+    cycles per FINE pixel (coarse Nyquist at +-0.25), with |H| of P underneath.
+    `flip` only orients the 2-D panels."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    flip = default_flip(meta) if flip is None else flip
+    F = (lambda a: _flip(a, flip)) if flip else (lambda a: a)
+    parts = correction_parts(z, meta, outer)
+    n = len(parts)
+    fig, ax = plt.subplots(n + 1, 6, squeeze=False, dpi=dpi,
+                           figsize=(panel * 6 + 0.6, panel * n + 0.45 * panel + 1.6),
+                           gridspec_kw=dict(wspace=0.3, hspace=0.5,
+                                            height_ratios=[1] * n + [0.45]))
+    for A in ax[n]:
+        A.set_axis_off()
+    C = CORR_COLORS
+    fH, H = transfer_response(meta)
+    for i, p in enumerate(parts):
+        e_c = p["w_c"] - p["gt_c"]
+        e_p = p["P_w"] - p["P_gt_c"]
+        spec = [(p["w_c"], "w_c", "c"), (p["P_w"], "P(w_c)", "f"),
+                (e_c, "w_c - R gt", "c"), (e_p, "P(w_c - R gt)", "f")]
+        logs = [20 * np.log10(np.abs(_spectrum2d(F(a))) + 1e-12) for a, _, _ in spec]
+        vmax = max(float(np.percentile(s, 99.9)) for s in logs)
+        for j, ((a, title, grid), s) in enumerate(zip(spec, logs)):
+            h, w = a.shape
+            A = ax[i][j]
+            A.set_facecolor("black")
+            # every panel in cycles per FINE pixel: the coarse grid's spectrum
+            # covers +-0.25, the dashed box
+            e = .25 if grid == "c" else .5
+            A.imshow(s, cmap="magma", vmin=vmax - 80, vmax=vmax,
+                     extent=(-e, e, e, -e), interpolation="nearest")
+            A.add_patch(Rectangle((-.25, -.25), .5, .5, fill=False, ls="--",
+                                  lw=1.0, ec="white"))
+            A.set_xlim(-.5, .5); A.set_ylim(.5, -.5)
+            A.set_xticks([-.5, -.25, 0, .25, .5]); A.set_yticks([-.5, -.25, 0, .25, .5])
+            A.tick_params(labelsize=6)
+            A.set_title(f"{title}  ({h}x{w})", fontsize=8)
+            if j == 0:
+                A.set_ylabel(f"L{p['lc']} -> L{p['l']}\nky (cycles / fine px)", fontsize=8)
+        # 1-D: rows (axis 0) and columns (axis 1), cycles per FINE pixel
+        for j, axis in ((4, 0), (5, 1)):
+            A = ax[i][j]
+            for a, grid, label, color, ls in (
+                    (p["gt"], "f", "R gt (fine)", C["gt"], "-"),
+                    (p["w_c"], "c", "w_c", C["coarse"], "-"),
+                    (p["P_w"], "f", "P(w_c)", C["prolonged"], "-"),
+                    (e_c, "c", "w_c - R gt", C["err_c"], "--"),
+                    (e_p, "f", "P(w_c - R gt)", C["err_p"], "--")):
+                f, pw = _axis_power(a, axis)
+                f = f / 2 if grid == "c" else f
+                A.plot(f, 10 * np.log10(pw + 1e-30), color=color, lw=1.2, ls=ls, label=label)
+            A.axvline(-.25, color="0.6", lw=0.8, ls=":"); A.axvline(.25, color="0.6", lw=0.8, ls=":")
+            A.set_xlim(-.5, .5)
+            lo = max(db_floor, A.get_ylim()[0])
+            A.set_ylim(lo, A.get_ylim()[1])
+            A.tick_params(labelsize=6); A.grid(alpha=.25)
+            A.set_title(f"power along axis {axis} ({'rows' if axis == 0 else 'cols'})",
+                        fontsize=8)
+            A.set_xlabel("cycles / fine pixel", fontsize=7)
+            if j == 5 and i == 0:
+                A.legend(fontsize=6, frameon=False, loc="lower center")
+    o = meta["outers"][outer]
+    fig.suptitle(f"{meta['run']}: spectra at the coarse correction, V-cycle {o + 1}/"
+                 f"{len(meta['outers'])}  (2-D: 20 log10 |F|, 80 dB window per row, all in "
+                 f"cycles / fine px; dashed box / dotted lines = the coarse grid's band)",
+                 fontsize=10)
+    # the transfer itself, under the 1-D panels: what P does to each frequency
+    for j in (4, 5):
+        A = ax[n][j]
+        A.set_axis_on()
+        A.plot(fH, 20 * np.log10(H + 1e-12), color="0.2", lw=1.2)
+        A.axvline(-.25, color="0.6", lw=0.8, ls=":"); A.axvline(.25, color="0.6", lw=0.8, ls=":")
+        A.set_xlim(-.5, .5); A.set_ylim(-60, 5); A.tick_params(labelsize=6)
+        A.set_title(f"|H| of P ({meta['transfer_filter']}), dB", fontsize=8)
+        A.set_xlabel("cycles / fine pixel", fontsize=7); A.grid(alpha=.25)
     return fig
 
 

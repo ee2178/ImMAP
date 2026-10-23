@@ -646,13 +646,23 @@ EXP14_CELLS = tuple(f"mg{m}v6" for m in EXP14_M)
 #  own trained copies of F_1 / C_1 ("untied") no dual placement stays coherent
 #  after training -- the copies drift and that drift enters the coarse level as
 #  if it were fine residual (12d on mglpds_R8: 71% of the first coarse step).
+#
+#  2026-10-23: and with fas_parent_pi=True -- level 2's correction restricts
+#  level 1's residual NET OF level 1's own pi (models/mg_lpds.py::
+#  _check_fas_parent_pi). Without it a solved level 1 still moves level 2 by
+#  R pi^1; the first vtxA / vtxB runs showed level 2 degrading over training.
+#  Those two cells are kept as they launched (_FAS_FIX_V1) so the running dirs
+#  still resume; the *nest cells are the same with the fix.
 # ---------------------------------------------------------------------------
 MG_TRANSFER_FILTER = "sinc_vertex"
-_FAS_FIX = dict(fas_copies="tied")
+_FAS_FIX_V1 = dict(fas_copies="tied")
+_FAS_FIX = dict(fas_copies="tied", fas_parent_pi=True)
 EXP15 = {
     "mg81v6vtx":  dict(transfer_filter=MG_TRANSFER_FILTER),
-    "mg81v6vtxA": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX),
-    "mg81v6vtxB": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient", **_FAS_FIX),
+    "mg81v6vtxA": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX_V1),
+    "mg81v6vtxB": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient", **_FAS_FIX_V1),
+    "mg81v6vtxAnest": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX),
+    "mg81v6vtxBnest": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient", **_FAS_FIX),
 }
 MODELS.update({
     name: dict(type="MGLPDSNet",
@@ -1150,6 +1160,8 @@ def _display_name(spec_type, params):
             tag += "_fas" + params["fas_dual"]
         if params.get("fas_copies", "untied") != "untied":
             tag += "_" + params["fas_copies"]
+        if params.get("fas_parent_pi"):
+            tag += "_nest"
         return "%s_%s" % (spec_type, tag)
     if spec_type == "RAM":
         # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.

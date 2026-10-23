@@ -275,12 +275,71 @@ def test_widen_end_to_end():
           == 2 * V.dF.analysis_fine.weight.shape[0], "M -> M*widen")
 
 
+def test_data_term_is_the_data_gradient():
+    """The layers' data term `E^H E x - y~` IS `E^H (E x - y)`.
+
+    The layers get `y~ = E^H y - mu E^H E 1` (preprocessing/kspace.py), formed
+    once per forward instead of an `E^H y` per layer, and iterate on the
+    DC-removed image x (the estimate is x + mu). So on the finest level
+
+        E^H E x - y~  ==  E^H (E (x + mu 1) - y)            y = the k-space,
+
+    and on a Galerkin coarse level (E_c = E P, y~_c = R y~)
+
+        E_c^H E_c x_c - y~_c  ==  R E^H (E (P x_c + mu 1) - y).
+
+    Checked on the iterates of a real forward, at the first warm sweep of each.
+    """
+    from models.lpds import gram
+    from operators.resample import prolong, restrict
+    from preprocessing.kspace import kspace_pre_process
+
+    torch.manual_seed(11)
+    E = mri_operator(B=1, C=4, N=32, seed=3)
+    image = torch.randn(1, 1, 32, 32, dtype=torch.complex64) + 1.5
+    y = E(image) + 0.01 * torch.randn_like(E(image))
+    net = MGLPDSNet(K=[1, [4, 4, 2]], M=4, C=1, P=5, s=2, is_complex=True,
+                    preproc="kspace", coarse_op="galerkin").eval()
+    _, _, (mu, pad) = kspace_pre_process(y, E, net.pad_stride)
+    V = net.net.first
+    fine, coarse = V.lpdsA.layers[1], V.mglayer.lpdsA.layers[0]   # first WARM sweeps
+    seen = {}
+
+    def spy(layer, key):
+        orig = layer.forward
+
+        def fwd(state, y_tilde, E=None, sigma=None, pi=None, cache=None):
+            if state is not None and key not in seen:
+                seen[key] = (state[0], gram(E, state[0]) - y_tilde)
+            return orig(state, y_tilde, E=E, sigma=sigma, pi=pi, cache=cache)
+        layer.forward = fwd
+
+    spy(fine, "fine")
+    spy(coarse, "coarse")
+    try:
+        with torch.no_grad():
+            net(y, E=E, sigma=torch.full((1, 1, 1, 1), 0.01))
+    finally:
+        del fine.forward, coarse.forward
+
+    with torch.no_grad():
+        x, got = seen["fine"]
+        want = E.adjoint(E(x + mu) - y)
+        check("finest level: E^H E x - y~ == E^H(E(x + mu) - y)", not any(pad)
+              and rel(got, want) < 1e-5, f"rel={rel(got, want):.1e}")
+        xc, got_c = seen["coarse"]
+        want_c = restrict(E.adjoint(E(prolong(xc) + mu) - y))
+        check("Galerkin coarse level: == R E^H(E(P x_c + mu) - y)",
+              rel(got_c, want_c) < 1e-5, f"rel={rel(got_c, want_c):.1e}")
+
+
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     for fn in (test_layer_shapes, test_extrapolation_is_live,
                test_widening_preserves_synthesis, test_fas_consistency,
                test_vcycle_and_stack_are_interchangeable, test_K_parsing,
-               test_end_to_end_mri, test_widen_end_to_end):
+               test_end_to_end_mri, test_widen_end_to_end,
+               test_data_term_is_the_data_gradient):
         print(f"\n--- {fn.__name__} ---")
         try:
             fn()
