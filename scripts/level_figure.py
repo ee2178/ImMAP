@@ -1756,6 +1756,283 @@ def fig_coarse_solve(res, z=None, meta=None, flip=None, crop=True, pad=8, panel=
     return fig
 
 
+# ---------------------------------------------------------------------------
+# is the dual code saturated? (the clip boundary, per coefficient)
+# ---------------------------------------------------------------------------
+# The dual step z+ = clip(z + A xbar) is a sparsity mechanism only while the
+# per-sweep increments A xbar are small against lambda: a noise coefficient's
+# increments then average out and z stays INSIDE the box (= thresholded to
+# zero). Once |A xbar| > |z| + lambda the sum leaves the box whatever z was --
+# the clip returns lambda * phase(A xbar), the code's history is erased, and
+# D z becomes lambda * D sign(A xbar): a noise coefficient pushes on x as hard as
+# an edge. `trace_saturation` measures this per LPDS sweep, no weight changed.
+SAT_LOG_BINS = np.linspace(-4.0, 3.0, 141)        # log10(|inc| / lambda)
+
+
+def _code_modulus(t, channels):
+    """|t| per coefficient: complex, PLANAR ([re; im] on the channel axis) or real."""
+    import torch
+    if t.is_complex():
+        return t.abs()
+    if t.shape[1] == 2 * channels:
+        return torch.hypot(t[:, :channels], t[:, channels:])
+    return t.abs()
+
+
+def _saturation_call(store, select, masks):
+    def call(net, y, E, sigma):
+        import torch
+        import torch.nn.functional as F
+        from models.lpds import _per_channel
+
+        recs, patched = [], []
+        warned = set()
+
+        def stats(level, mod_out, mod_ax, mod_z, mod_pi, lam):
+            out = {}
+            m = masks.get(level) if masks else None
+            for scope in ("all", "anatomy"):
+                if scope == "anatomy":
+                    if m is None or m.shape[-2:] != mod_ax.shape[-2:]:
+                        continue
+                    sel = m.expand_as(mod_ax)
+                else:
+                    sel = torch.ones_like(mod_ax, dtype=torch.bool)
+                lam_b = lam.expand_as(mod_ax)[sel]
+                a = mod_ax[sel] / lam_b
+                zr = mod_z[sel] / lam_b
+                on = mod_out[sel] >= 0.99 * lam_b
+                reset = mod_ax[sel] > mod_z[sel] + lam_b
+                d = dict(sat=float(on.float().mean()),
+                         reset=float(reset.float().mean()),
+                         # self-checks, both 0 unless the clip input / output
+                         # were mis-identified: an output past the box, and a
+                         # reset coefficient (|inc| > |z| + lambda) not on it
+                         over=float((mod_out[sel] > 1.01 * lam_b).float().mean()),
+                         reset_off=float((reset & ~on).float().mean()),
+                         a_med=float(a.median()),
+                         a_p90=float(torch.quantile(a.float()[:2 ** 24 - 1], 0.9)),
+                         z_med=float(zr.median()),
+                         hist=np.histogram(np.log10(a.float().clamp_min(1e-30).cpu().numpy()),
+                                           SAT_LOG_BINS)[0])
+                if mod_pi is not None:
+                    pr = mod_pi[sel] / lam_b
+                    d.update(pi_over=float((pr > 1).float().mean()), pi_med=float(pr.median()))
+                out[scope] = d
+            return out
+
+        def wrap(L, level, where, outer):
+            orig = L.forward
+            soft = getattr(getattr(L, "prox", None), "prox", None)
+            if not hasattr(soft, "threshold"):
+                if type(soft).__name__ not in warned:
+                    warned.add(type(soft).__name__)
+                    print(f"trace_saturation: {type(soft).__name__} has no scalar threshold "
+                          f"(group prox?) -- its sweeps are skipped", file=sys.stderr)
+                return
+
+            def fwd(state, y_tilde, E=None, sigma=None, pi=None, cache=None):
+                out = orig(state, y_tilde, E=E, sigma=sigma, pi=pi, cache=cache)
+                if state is None:
+                    return out
+                x, z = state
+                x_new, z_new = out[0]
+                planar = L.is_complex and not x.is_complex()
+                theta = L.theta(sigma, ref=x)
+                theta = _per_channel(theta, x) if planar else theta
+                Ax = L.analysis(x_new + theta * (x_new - x))
+                pi_z = None if pi is None else pi[1]
+                fixed = pi_z is not None and getattr(L, "fas_dual", "legacy") == "fixed_point"
+                clip_out = z_new - pi_z if fixed else z_new          # option A adds pi_z AFTER
+                # the increment the clip adds to z: A xbar, minus pi_z where pi_z
+                # goes INSIDE the clip ("gradient", "legacy")
+                inc = Ax if (pi_z is None or fixed) else Ax - pi_z
+                lam = soft.threshold(z, sigma)
+                M = L.M
+                recs.append(dict(
+                    level=level, where=where, outer=outer,
+                    fas_dual=getattr(L, "fas_dual", "legacy"),
+                    lam=float(lam.float().median()),
+                    **stats(level, _code_modulus(clip_out, M), _code_modulus(inc, M),
+                            _code_modulus(z, M),
+                            None if pi_z is None else _code_modulus(pi_z, M), lam)))
+                return out
+            L.forward = fwd
+            patched.append(L)
+
+        for kind, level, where, outer, m in _vcycle_walk(net):
+            if kind == "layer" and select(level, outer):
+                wrap(m, level, where, outer)
+        try:
+            with torch.no_grad():
+                out = net(y, E=E, sigma=sigma)
+        finally:
+            for m in patched:
+                del m.forward
+        store.update(recs=recs)
+        return out[0] if isinstance(out, tuple) else out
+    return call
+
+
+def trace_saturation(run, volume, slice, levels=(0, 1, 2), outers=None, z=None, sigma=None,
+                     seed=1234, val_kspace_type="measurement_awgn", device=None,
+                     coarse_op=None, transfer_filter=None):
+    """Per LPDS sweep of `run` on `levels` in V-cycles `outers` (None: the last;
+    indices into the outer cycles, e.g. [0, -1]): how saturated the dual code is.
+
+    -> `(recs, meta)`, one record per sweep in execution order: level, where,
+    outer, fas_dual, `lam` (median threshold), and per scope "all" (every
+    coefficient) / "anatomy" (latent positions inside the organ mask; needs `z`
+    from `trace_slice` on the same slice -- the masks are `mg/organ/l<l>`):
+        sat     fraction with |clip output| >= 0.99 lambda  (on the boundary)
+        reset   fraction with |inc| > |z| + lambda: saturated WHATEVER z was --
+                the code's history erased this sweep. inc = what the clip adds
+                to z: A xbar, minus pi_z where pi_z goes inside the clip
+                ("gradient", "legacy"); A xbar under "fixed_point"
+        a_med, a_p90   median / 90th percentile of |inc| / lambda
+        z_med   median |z| / lambda of the incoming code
+        pi_over, pi_med  (coarse sweeps) fraction with |pi_z| > lambda, median
+        hist    counts of log10(|inc| / lambda) over SAT_LOG_BINS
+    Under fas_dual="fixed_point" the clip output is z+ - pi_z (pi_z is added
+    after the clip). Local prox only; group-prox sweeps are skipped."""
+    import types
+
+    import torch
+    import torch.nn.functional as F
+
+    device = torch.device(device) if device else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu")
+    model = cached_model(run, device)
+    tops = sorted({o for kind, _, _, o, _ in _vcycle_walk(model) if o is not None})
+    want = None if not tops else (
+        {tops[-1]} if outers is None else {tops[o] for o in outers})
+    levels = set(levels)
+
+    def select(level, outer):
+        return level in levels and (outer is None or want is None or outer in want)
+
+    # anatomy masks on each level's LATENT grid: the organ mask, averaged over
+    # the analysis stride (the latent sample i sits on image pixel s*i)
+    masks = {}
+    if z is not None:
+        stride = next((L.stride for kind, _, _, _, L in _vcycle_walk(model) if kind == "layer"), 2)
+        for l in levels:
+            o = z.get(f"mg/organ/l{l}")
+            if o is not None:
+                t = torch.from_numpy(np.ascontiguousarray(o, np.float32))[None, None].to(device)
+                masks[l] = F.avg_pool2d(t, stride) > 0.5
+    args = types.SimpleNamespace(sigma=sigma, seed=seed, val_kspace_type=val_kspace_type,
+                                 coarse_op=coarse_op, transfer_filter=transfer_filter)
+    with open(os.path.join(run, "config.json")) as f:
+        vol = _resolve_volume(json.load(f), volume)
+    R = _run_one(run, vol, int(slice), args, device,
+                 lambda st: _saturation_call(st, select, masks))
+    recs = R["store"]["recs"]
+    meta = dict(run=R["run"], volume=vol, slice=int(slice), levels=sorted(levels),
+                outers=sorted(want) if want else None, n_sweeps=len(recs),
+                scopes=sorted({s for r in recs for s in ("all", "anatomy") if s in r}))
+    if not recs:
+        print(f"WARNING: no sweep of {R['run']} matched levels={sorted(levels)}, "
+              f"outers={outers}", file=sys.stderr)
+    return recs, meta
+
+
+def saturation_table(recs, meta, scope="anatomy", per_sweep=True):
+    """Print every sweep (optional) and a per-(V-cycle, level) mean."""
+    scope = scope if scope in meta["scopes"] else "all"
+    print(f"{meta['run']}  {meta['volume']} slice {meta['slice']}  ({scope} coefficients; "
+          f"sat = on the clip boundary, reset = saturated whatever z was)")
+    hdr = (f"  {'sweep':<22}{'lambda':>9}{'sat':>7}{'reset':>7}{'|inc|/lam med':>14}"
+           f"{'p90':>7}{'|z|/lam':>8}{'|pi|>lam':>9}")
+    if per_sweep:
+        print(hdr)
+        bad = [r["where"] for r in recs
+               if r[scope].get("over", 0) > 0 or r[scope].get("reset_off", 0) > 0]
+        if bad:
+            print(f"  WARNING: self-check failed in {bad} (clip input/output mis-identified)")
+        for r in recs:
+            d = r[scope]
+            pi = f"{100 * d['pi_over']:8.1f}%" if "pi_over" in d else f"{'-':>9}"
+            print(f"  {r['where']:<22}{r['lam']:>9.2e}{100 * d['sat']:6.1f}%{100 * d['reset']:6.1f}%"
+                  f"{d['a_med']:>14.2f}{d['a_p90']:>7.1f}{d['z_med']:>8.2f}{pi}")
+    print(f"\n  mean over sweeps")
+    print(f"  {'V-cycle, level':<22}{'lambda':>9}{'sat':>7}{'reset':>7}{'|inc|/lam med':>14}"
+          f"{'p90':>7}{'|z|/lam':>8}{'|pi|>lam':>9}")
+    groups = {}
+    for r in recs:
+        groups.setdefault((r["outer"], r["level"]), []).append(r)
+    for (o, l), rs in sorted(groups.items(), key=lambda kv: (kv[0][0] or 0, kv[0][1])):
+        ds = [r[scope] for r in rs]
+        mean = lambda k: float(np.mean([d[k] for d in ds]))                   # noqa: E731
+        pis = [d["pi_over"] for d in ds if "pi_over" in d]
+        pi = f"{100 * np.mean(pis):8.1f}%" if pis else f"{'-':>9}"
+        label = f"V{(o or 0) + 1} L{l} ({len(rs)} sweeps)"
+        print(f"  {label:<22}{np.median([r['lam'] for r in rs]):>9.2e}{100 * mean('sat'):6.1f}%"
+              f"{100 * mean('reset'):6.1f}%{mean('a_med'):>14.2f}{mean('a_p90'):>7.1f}"
+              f"{mean('z_med'):>8.2f}{pi}")
+
+
+SAT_RUN_COLORS = ("#0072B2", "#D55E00", "#009E73", "#E69F00")
+
+
+def fig_saturation(results, scope="anatomy", panel=3.2, dpi=None):
+    """`results` = {label: (recs, meta)} from `trace_saturation` on the SAME
+    levels / outers (e.g. vtxA and vtxB). Top: saturated and reset fractions
+    per sweep, execution order (level spans shaded). Bottom: distribution of
+    log10(|inc| / lambda) per level (inc = what the clip adds to z), pooled
+    over the traced sweeps -- right of the dashed line (1) the clip is active
+    for a zero code; right of the dotted one (2) for ANY code in the box."""
+    import matplotlib.pyplot as plt
+    labels = list(results)
+    first = results[labels[0]][0]
+    levels = sorted({r["level"] for r in first})
+    fig = plt.figure(figsize=(panel * max(3, len(levels)) + 0.8, 2 * panel + 1.0), dpi=dpi)
+    ncol = max(2, len(levels))
+    gs = fig.add_gridspec(2, ncol, hspace=0.45, wspace=0.28)
+    top = gs[0, :].subgridspec(1, 2, wspace=0.2)
+    for j, (key, title) in enumerate((("sat", "on the clip boundary (sat)"),
+                                      ("reset", "saturated whatever z was (reset)"))):
+        A = fig.add_subplot(top[0, j])
+        for c, lab in enumerate(labels):
+            recs, meta = results[lab]
+            sc = scope if scope in meta["scopes"] else "all"
+            A.plot(range(len(recs)), [100 * r[sc][key] for r in recs], marker="o", ms=3,
+                   lw=1.4, color=SAT_RUN_COLORS[c % 4], label=lab)
+        start = 0
+        for i in range(1, len(first) + 1):     # shade runs of the same level
+            if i == len(first) or (first[i]["level"], first[i]["outer"]) != \
+                    (first[start]["level"], first[start]["outer"]):
+                lv = first[start]["level"]
+                A.axvspan(start - .5, i - .5, color="0.5", alpha=0.06 + 0.06 * lv, lw=0)
+                A.text((start + i - 1) / 2, 1.0, f"L{lv}", transform=A.get_xaxis_transform(),
+                       ha="center", va="bottom", fontsize=7, color="0.3")
+                start = i
+        A.set_ylim(0, 100); A.set_ylabel("% of coefficients", fontsize=8)
+        A.set_xlabel("LPDS sweep (execution order)", fontsize=8)
+        A.set_title(title, fontsize=9, pad=12); A.tick_params(labelsize=7); A.grid(alpha=.25)
+        A.legend(fontsize=7, frameon=False)
+    centers = (SAT_LOG_BINS[:-1] + SAT_LOG_BINS[1:]) / 2
+    for j, lv in enumerate(levels):
+        A = fig.add_subplot(gs[1, j])
+        for c, lab in enumerate(labels):
+            recs, meta = results[lab]
+            sc = scope if scope in meta["scopes"] else "all"
+            h = sum(r[sc]["hist"] for r in recs if r["level"] == lv)
+            if np.sum(h):
+                A.plot(centers, 100 * h / h.sum(), color=SAT_RUN_COLORS[c % 4], lw=1.4, label=lab)
+        A.axvline(0, color="0.4", ls="--", lw=0.9)
+        A.axvline(np.log10(2), color="0.4", ls=":", lw=0.9)
+        A.set_xlabel("log10(|increment| / lambda)", fontsize=8)
+        A.set_title(f"L{lv}", fontsize=9); A.tick_params(labelsize=7); A.grid(alpha=.25)
+        if j == 0:
+            A.set_ylabel("% of coefficients per bin", fontsize=8)
+            A.legend(fontsize=7, frameon=False)
+    m0 = results[labels[0]][1]
+    fig.suptitle(f"dual-code saturation, {m0['volume']} slice {m0['slice']}  ({scope} "
+                 f"coefficients; increment = what the clip adds to z; dashed: = lambda, dotted: 2 lambda)", fontsize=10)
+    return fig
+
+
 def render(npz_path, flip=None, out=None):
     """All three figures from a saved trace, to <stem>_{mg_levels,mg_outers,unet_decoder}.png."""
     import matplotlib
