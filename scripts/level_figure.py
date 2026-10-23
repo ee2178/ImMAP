@@ -1206,7 +1206,14 @@ def correction_table(z, meta):
         for p in correction_parts(z, meta, outer=k):
             rows.append(dict(
                 outer=k + 1, transition=f"L{p['lc']}->L{p['l']}",
+                # where the coarse level STARTED (R x_pre) vs where it ended: a
+                # solve that ends worse than its start moved away from the
+                # restricted fine iterate
+                nrmse_u_c=nrmse(p["u_c"], p["gt_c"]),
                 nrmse_w_c=nrmse(p["w_c"], p["gt_c"]),
+                # the fine level just before / after it adds the correction
+                nrmse_x_pre=nrmse(p["x_pre"], p["gt"]),
+                nrmse_x_corr=nrmse(p["x_corr"], p["gt"]),
                 nrmse_P_w=nrmse(p["P_w"], p["P_gt_c"]),
                 visible=p["visible"],
                 step_rel=_rms(p["applied"]) / (_rms(p["x_pre"]) + 1e-12),
