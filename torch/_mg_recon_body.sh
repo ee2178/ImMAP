@@ -60,6 +60,9 @@
 #                   run's config.json, so later resumes keep it). A run that
 #                   already has it keeps it whatever this is set to; to switch
 #                   one back, resume it with IMMAP_PLANAR_STATE=0 exported.
+#   PACK            cells per GPU (default 1). PACK=2 makes array task t train
+#                   cells 2t and 2t+1 together on its one GPU, under CUDA MPS;
+#                   the --array range shrinks to match. See "PACK" below.
 #   CLIP_GRAD       "" = the generator's default max gradient norm (0.05 since
 #                   2026-10-13). A cell launched before that carries 1.0, and
 #                   LAUNCH-ONCE refuses it under the new default; CLIP_GRAD=1.0
@@ -148,6 +151,125 @@ CELLS="$(python scripts/make_mg_recon_configs.py --list-cells \
     --anatomy "${ANATOMY}" ${ONLY:+--only ${ONLY}} ${ACCELS:+--accels ${ACCELS}})"
 N_TOTAL="$(echo "${CELLS}" | wc -l)"
 
+_regenerate() {
+    # PROTOCOL=legacy reproduces the old synthetic grid; unset = the
+    # generator's default (measured). See the generator's module docstring.
+    python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
+        --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} \
+        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"} \
+        ${PHASE_CORRECT:+--online-phase-correct} ${PLANAR_STATE:+--planar-state} \
+        ${CLIP_GRAD:+--clip-grad "${CLIP_GRAD}"} >/dev/null
+}
+
+# ---- PACK: several cells on one GPU -------------------------------------------------------
+# One batch-1 cell leaves the GPU idle between its many small kernels (~60% on
+# an H200), and the cluster cancels jobs whose average utilization stays low.
+# PACK=n makes array task t train cells t*n .. t*n+n-1 side by side on its one
+# GPU, so the other cells' kernels fill those gaps. The numbers are unchanged;
+# each cell steps somewhat slower, the GPU as a whole does more.
+#
+# This task becomes a dispatcher: it regenerates the configs ONCE (n children
+# rewriting the same files at once would race), starts CUDA MPS so the cells'
+# kernels actually overlap, and runs this body once per cell as a child with
+# its own SLURM_ARRAY_TASK_ID. Every child goes through LAUNCH-ONCE as usual,
+# so a cell already running elsewhere is skipped and the rest still train.
+# Each child logs to <PACK_LOG_DIR>/slurm_<job>_<task>_<model>_<R>.{out,err};
+# the task's own .out lists them.
+#
+# The --array range shrinks to 0..ceil(N/n)-1 (the bound is checked below).
+#   PACK_MPS   auto (default) = start MPS if nvidia-cuda-mps-control exists,
+#              1 = require it, 0 = never (the cells time-share the GPU, which
+#              fails outright when it is in Exclusive_Process mode).
+PACK="${PACK:-1}"
+if [ "${PACK}" -gt 1 ] && [ -z "${_PACK_CHILD:-}" ]; then
+    _first=$(( SLURM_ARRAY_TASK_ID * PACK ))
+    _ntasks=$(( (N_TOTAL + PACK - 1) / PACK ))
+    if [ -n "${SLURM_ARRAY_TASK_MAX:-}" ] \
+            && [ "${SLURM_ARRAY_TASK_MAX}" -lt "$((_ntasks - 1))" ] \
+            && [ "${SLURM_ARRAY_TASK_ID}" -eq "${SLURM_ARRAY_TASK_MAX}" ]; then
+        echo "[pack] NOTE: --array tops out at ${SLURM_ARRAY_TASK_MAX} but PACK=${PACK}" \
+             "needs 0-$((_ntasks - 1)) for ${N_TOTAL} ${ANATOMY} cells." \
+             "Cells $(( (SLURM_ARRAY_TASK_MAX + 1) * PACK ))..$((N_TOTAL - 1)) are NOT being run." >&2
+    fi
+    if [ "${_first}" -ge "${N_TOTAL}" ]; then
+        echo "[pack] task ${SLURM_ARRAY_TASK_ID} x PACK=${PACK} starts at cell ${_first}," \
+             "but there are ${N_TOTAL} ${ANATOMY} cells -- fix --array (should be 0-$((_ntasks - 1)))"
+        exit 1
+    fi
+
+    if [ "${REGENERATE}" = "1" ]; then
+        _regenerate
+    fi
+
+    case "${PACK_MPS:-auto}" in
+        0|off) _mps=0 ;;
+        *)     _mps=1 ;;
+    esac
+    if [ "${_mps}" = "1" ] && ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+        if [ "${PACK_MPS:-auto}" = "1" ]; then
+            echo "[pack] PACK_MPS=1 but nvidia-cuda-mps-control is not on PATH." >&2
+            exit 1
+        fi
+        echo "[pack] nvidia-cuda-mps-control not found: the cells will time-share the GPU." >&2
+        _mps=0
+    fi
+    if [ "${_mps}" = "1" ]; then
+        _mps_dir="${TMPDIR:-/tmp}/mps-${SLURM_JOB_ID:-$$}"
+        export CUDA_MPS_PIPE_DIRECTORY="${_mps_dir}/pipe"
+        export CUDA_MPS_LOG_DIRECTORY="${_mps_dir}/log"
+        mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
+        if nvidia-cuda-mps-control -d; then
+            trap 'echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true' EXIT
+            echo "[pack] CUDA MPS started (${_mps_dir})."
+        else
+            echo "[pack] could not start CUDA MPS: the cells will time-share the GPU." >&2
+            unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
+            _mps=0
+        fi
+    fi
+    # Without MPS an Exclusive_Process GPU admits one process: the second cell
+    # would die at its first CUDA call. Refuse up front instead.
+    if [ "${_mps}" = "0" ] && command -v nvidia-smi >/dev/null 2>&1 \
+            && nvidia-smi --query-gpu=compute_mode --format=csv,noheader 2>/dev/null \
+               | grep -qi exclusive; then
+        echo "[pack] the GPU is in Exclusive_Process mode and MPS is not running:" \
+             "only one process can use it. Run with PACK=1." >&2
+        exit 1
+    fi
+
+    # The launcher's settings are plain shell variables; the children are new
+    # shells, so hand them over. RUN_TAG is already resolved (maybe to ""),
+    # which the child's `${RUN_TAG-...}` keeps as is.
+    export ANATOMY IMMAP_ROOT CONFIG_ROOT SWEEP_EPOCHS RUN_TAG FORCE_RESTART \
+           ONLY ACCELS ATTN ORGAN_MASK PHASE_CORRECT PLANAR_STATE CLIP_GRAD \
+           PROTOCOL ONLINE_SMAPS_KWS VAL_EVERY
+    _log_dir="${PACK_LOG_DIR:-${IMMAP_ROOT}/torch/logs}"
+    mkdir -p "${_log_dir}"
+    # Split the task's CPUs between the cells (torch's intra-op pool defaults
+    # to every core, and n of those on one allocation oversubscribe it).
+    _threads=$(( ${SLURM_CPUS_PER_TASK:-16} / PACK ))
+    [ "${_threads}" -ge 1 ] || _threads=1
+
+    _pids=()
+    for (( _k = 0; _k < PACK; _k++ )); do
+        _i=$(( _first + _k ))
+        [ "${_i}" -lt "${N_TOTAL}" ] || break
+        _c="$(echo "${CELLS}" | awk -v i="${_i}" '$1 == i')"
+        _log="${_log_dir}/slurm_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}_${SLURM_ARRAY_TASK_ID}_$(echo "${_c}" | cut -f4)_$(echo "${_c}" | cut -f3)"
+        echo "[pack] cell ${_i}: $(echo "${_c}" | cut -f4) $(echo "${_c}" | cut -f3) -> ${_log}.{out,err}"
+        _PACK_CHILD=1 SLURM_ARRAY_TASK_ID="${_i}" SLURM_ARRAY_TASK_MAX= REGENERATE=0 \
+            OMP_NUM_THREADS="${_threads}" \
+            bash "${IMMAP_ROOT}/torch/_mg_recon_body.sh" > "${_log}.out" 2> "${_log}.err" &
+        _pids+=("$!")
+    done
+    _rc=0
+    for _p in "${_pids[@]}"; do
+        wait "${_p}" || _rc=$?
+    done
+    echo "[pack] all cells exited (status ${_rc})."
+    exit "${_rc}"
+fi
+
 # An array that is too SHORT is the quiet failure: every task succeeds and the
 # grid is simply missing cells, with nothing in any log to say so. Warn from the
 # task that would have been last. Not fatal -- `sbatch --array=0,6` to rerun two
@@ -179,12 +301,7 @@ echo "       config: ${BASE_CONFIG}"
 # ---- (re)generate the configs -------------------------------------------------------------
 # Cheap, and it keeps a stale hand-edited config from silently deciding a run.
 if [ "${REGENERATE}" = "1" ]; then
-    # PROTOCOL=legacy reproduces the old synthetic grid; unset = the
-    # generator's default (measured). See the generator's module docstring.
-    python scripts/make_mg_recon_configs.py --out "${CONFIG_ROOT}" \
-        --anatomy "${ANATOMY}" ${ATTN:+--attn "${ATTN}"} \
-        ${ORGAN_MASK:+--organ-mask} ${PROTOCOL:+--protocol "${PROTOCOL}"}         ${PHASE_CORRECT:+--online-phase-correct} ${PLANAR_STATE:+--planar-state} \
-        ${CLIP_GRAD:+--clip-grad "${CLIP_GRAD}"} >/dev/null
+    _regenerate
 fi
 
 if [ ! -f "${BASE_CONFIG}" ]; then

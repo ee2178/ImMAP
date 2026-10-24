@@ -4,21 +4,33 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint="l40s|h200|a100"
+#SBATCH --constraint="h200|b200"
+# ^ h200|b200 since 2026-10-23 (PACK=2: two cells per GPU want the big ones);
+#   before that l40s|h200|a100.
 # ^ was l40s only; widened 2026-10-23 (GPUs scarce): any ONE of the listed types.
 #   Feature names must match the cluster's exactly -- `sinfo -o "%f"` lists them
 #   -- or sbatch rejects the job at submission. Add types with `|`. A cell may
 #   resume on a different GPU type than it started on -- harmless (same weights,
 #   fp roundoff only), but step times, and so how far a 48 h slot gets, change.
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64GB
+#SBATCH --mem=96GB
+# ^ was 64GB; raised 2026-10-23 for PACK=2 (two training processes, each
+#   with its own data-loader workers).
 #SBATCH --time=48:00:00
 #SBATCH --job-name=Exp15-FASLat
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-6
+#SBATCH --array=0-3
+# ^ was 0-6; PACK=2 (2026-10-23) runs TWO cells per task on its one GPU, so
+#   task t trains cells 2t and 2t+1 and 7 cells need tasks 0-3. Alone, one
+#   batch-1 cell kept an H200 ~60% busy and jobs were cancelled for low GPU
+#   utilization; two cells fill each other's gaps (CUDA MPS, started by the
+#   body). Same numbers per cell, each one steps somewhat slower. Each cell
+#   logs to torch/logs/slurm_<job>_<task>_<model>_R8.{out,err}; the task's own
+#   .out names them. PACK=1 with --array=0-6 restores one cell per GPU:
+#     PACK=1 sbatch --array=0-6 torch/exp15_fas_lattice.sbatch
 #
 # EXPERIMENT 15 -- V-CYCLE CORRECTNESS FIXES vs mg81v6, KNEE R=8, FULL LENGTH.
 #
@@ -50,8 +62,10 @@
 # TO ADD NEW CELLS WHILE OTHERS ARE RUNNING, submit only their indices (a cell
 # already running or finished under its name is resumed or skipped by the
 # launch guard):
-#   sbatch --array=3-4 torch/exp15_fas_lattice.sbatch     # the parent-pi cells
-#   sbatch --array=5-6 torch/exp15_fas_lattice.sbatch     # their untied twins
+#   PACK=1 sbatch --array=3-4 torch/exp15_fas_lattice.sbatch     # the parent-pi cells
+#   PACK=1 sbatch --array=5-6 torch/exp15_fas_lattice.sbatch     # their untied twins
+# (PACK=1 because these are CELL indices; under the default PACK=2 the array
+# index is a task index -- task 1 is cells 2 and 3.)
 #
 # The FAS cells TIE the downsampler's operators to the first fine / coarse
 # layers' (fas_copies=tied): with its own trained copies the FAS correction
@@ -113,8 +127,9 @@
 #
 # SUBMIT FROM THE REPO ROOT.
 #   sbatch torch/exp15_fas_lattice.sbatch
-#   ONLY="mg81v6vtxA" sbatch --array=0 torch/exp15_fas_lattice.sbatch     # one cell
-#   SWEEP_EPOCHS=20 ONLY="mg81v6vtxB" sbatch --array=0 torch/exp15_fas_lattice.sbatch   # smoke probe
+#   ONLY="mg81v6vtxA mg81v6vtxB" sbatch --array=0 torch/exp15_fas_lattice.sbatch   # two cells, one GPU
+#   PACK=1 ONLY="mg81v6vtxA" sbatch --array=0 torch/exp15_fas_lattice.sbatch     # one cell alone
+#   PACK=1 SWEEP_EPOCHS=20 ONLY="mg81v6vtxB" sbatch --array=0 torch/exp15_fas_lattice.sbatch   # smoke probe
 #
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
@@ -131,6 +146,7 @@ ORGAN_MASK=1                         # regeneration rewrites every knee config,
 CONFIG_ROOT="config"
 SWEEP_EPOCHS="${SWEEP_EPOCHS:-}"     # empty = the config's num_epochs (full length)
 REGENERATE=1                         # 1 = regenerate configs before running
+PACK="${PACK:-2}"                    # cells per GPU; see --array above
 
 # sbatch runs a COPY of this file from the node's spool dir, so a
 # $BASH_SOURCE-relative path looks for the body next to that copy -- which was
