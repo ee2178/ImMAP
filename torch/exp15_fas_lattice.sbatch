@@ -28,7 +28,7 @@
 #   batch-1 cell kept an H200 ~60% busy and jobs were cancelled for low GPU
 #   utilization; two cells fill each other's gaps (CUDA MPS, started by the
 #   body). Same numbers per cell, each one steps somewhat slower. Each cell
-#   logs to torch/logs/slurm_<job>_<task>_<model>_R8.{out,err}; the task's own
+#   logs to torch/logs/slurm_<job>_<task>_knee_<model>_R8.{out,err}; the task's own
 #   .out names them. PACK=1 with --array=0-6 restores one cell per GPU:
 #     PACK=1 sbatch --array=0-6 torch/exp15_fas_lattice.sbatch
 #
@@ -46,6 +46,10 @@
 # better numbers, but B is the more accurate scheme, so B + tied copies + the
 # parent-pi fix is the standard FAS (make_mg_recon_configs.py::MG_FAS). Cell 3
 # keeps A with the same fixes as the comparison.
+#
+# SUPERSEDED 2026-10-25: cell 5 (mg81v6vtxAnestU -- A, UNTIED, parent fix)
+# trained best, so it is now MG_FAS, and torch/exp16_mg_retrain.sbatch retrains
+# every multigrid cell of the paper with it. Cells 3 and 4 keep their configs.
 #
 # PER-LEVEL SUPERVISION is NOT in this array (2026-10-23). The cell is defined
 # (mg81v6vtxBnestsup = vtxBnest + training.level_loss_weight 0.1) and can be

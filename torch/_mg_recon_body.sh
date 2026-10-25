@@ -173,8 +173,10 @@ _regenerate() {
 # kernels actually overlap, and runs this body once per cell as a child with
 # its own SLURM_ARRAY_TASK_ID. Every child goes through LAUNCH-ONCE as usual,
 # so a cell already running elsewhere is skipped and the rest still train.
-# Each child logs to <PACK_LOG_DIR>/slurm_<job>_<task>_<model>_<R>.{out,err};
-# the task's own .out lists them.
+# Each child logs to <PACK_LOG_DIR>/slurm_<job>_<task>_<anatomy>_<model>_<R>.{out,err};
+# the task's own .out lists them. <task> is PACK_LOG_TASK when the launcher
+# set it -- a launcher that remaps the array index (exp16 splits it over
+# anatomies) passes the original, so the name matches slurm_<job>_<task>.out.
 #
 # The --array range shrinks to 0..ceil(N/n)-1 (the bound is checked below).
 #   PACK_MPS   auto (default) = start MPS if nvidia-cuda-mps-control exists,
@@ -255,7 +257,7 @@ if [ "${PACK}" -gt 1 ] && [ -z "${_PACK_CHILD:-}" ]; then
         _i=$(( _first + _k ))
         [ "${_i}" -lt "${N_TOTAL}" ] || break
         _c="$(echo "${CELLS}" | awk -v i="${_i}" '$1 == i')"
-        _log="${_log_dir}/slurm_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}_${SLURM_ARRAY_TASK_ID}_$(echo "${_c}" | cut -f4)_$(echo "${_c}" | cut -f3)"
+        _log="${_log_dir}/slurm_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}_${PACK_LOG_TASK:-${SLURM_ARRAY_TASK_ID}}_${ANATOMY}_$(echo "${_c}" | cut -f4)_$(echo "${_c}" | cut -f3)"
         echo "[pack] cell ${_i}: $(echo "${_c}" | cut -f4) $(echo "${_c}" | cut -f3) -> ${_log}.{out,err}"
         _PACK_CHILD=1 SLURM_ARRAY_TASK_ID="${_i}" SLURM_ARRAY_TASK_MAX= REGENERATE=0 \
             OMP_NUM_THREADS="${_threads}" \

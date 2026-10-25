@@ -661,6 +661,12 @@ EXP14_CELLS = tuple(f"mg{m}v6" for m in EXP14_M)
 #  transfer. exp15 keeps mg81v6vtxAnest (A with the same fixes) as the
 #  comparison.
 #
+#  SUPERSEDED 2026-10-25 (user): mg81v6vtxAnestU -- option A, UNTIED copies,
+#  the parent-pi fix -- trained best of exp15, so MG_FAS is now that, and EXP16
+#  retrains every multigrid cell of the paper with it. vtxBnest / vtxBnestsup
+#  spell option B out (_FAS_B) so their configs, and their run dirs, are
+#  unchanged.
+#
 #  PER-LEVEL SUPERVISION (2026-10-23): mg81v6vtxBnestsup is vtxBnest plus
 #  training.level_loss_weight = MG_LEVEL_LOSS -- each coarse level's final
 #  iterate scored against R^l(gt) with the output's loss (training/recon.py).
@@ -669,7 +675,10 @@ EXP14_CELLS = tuple(f"mg{m}v6" for m in EXP14_M)
 #  without costing the output. DEFINED, not in exp15's default launch.
 # ---------------------------------------------------------------------------
 MG_TRANSFER_FILTER = "sinc_vertex"
-MG_FAS = dict(fas_dual="gradient", fas_copies="tied", fas_parent_pi=True)
+# What every multigrid cell from EXP16 on uses: exp15's mg81v6vtxAnestU.
+MG_FAS = dict(fas_dual="fixed_point", fas_copies="untied", fas_parent_pi=True)
+# Option B as exp15 launched it (MG_FAS until 2026-10-25).
+_FAS_B = dict(fas_dual="gradient", fas_copies="tied", fas_parent_pi=True)
 MG_LEVEL_LOSS = 0.1
 _FAS_FIX_V1 = dict(fas_copies="tied")
 _FAS_FIX = dict(fas_copies="tied", fas_parent_pi=True)
@@ -678,8 +687,8 @@ EXP15 = {
     "mg81v6vtxA": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX_V1),
     "mg81v6vtxB": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient", **_FAS_FIX_V1),
     "mg81v6vtxAnest": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX),
-    "mg81v6vtxBnest": dict(transfer_filter=MG_TRANSFER_FILTER, **MG_FAS),
-    "mg81v6vtxBnestsup": dict(transfer_filter=MG_TRANSFER_FILTER, **MG_FAS),
+    "mg81v6vtxBnest": dict(transfer_filter=MG_TRANSFER_FILTER, **_FAS_B),
+    "mg81v6vtxBnestsup": dict(transfer_filter=MG_TRANSFER_FILTER, **_FAS_B),
     # The tie ablated with the parent-pi fix in (2026-10-23): vtxAnest / vtxBnest
     # with the downsampler's own (untied) copies of F_1 / C_1.
     "mg81v6vtxAnestU": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point",
@@ -741,6 +750,48 @@ MODELS.update({
 })
 EXP12_CELLS = tuple(f"mggroup{m}v6" for m in EXP12_M)
 
+# ---------------------------------------------------------------------------
+#  EXP16: every multigrid cell of the paper retrained with exp15's best
+#  V-cycle (2026-10-25).
+#
+#  <base>vtxAnestU = <base> with the vertex-centred transfer and MG_FAS
+#  (option A, untied copies, parent-pi fix) -- exactly what mg81v6vtxAnestU is
+#  to mg81v6, nothing else changed. mg81v6vtxAnestU itself is exp15's cell (its
+#  knee R8 run dir is reused, not retrained); EXP16 only checks that it agrees.
+#  New NAMES, so every existing run dir stays as it is and the old nets remain
+#  the "before" of the comparison.
+#
+#    main     mg169v6 (MGLPDS-Big), mg81v6 (MGLPDS-Small)   exp11's cells
+#    group    mggroup169v6, mggroup81v6                      exp12's cells
+#    ablation mg100v6 mg121v6 mg144v6 (width), mg81v2 mg81v4 (depth)   exp14's
+#  Launcher: torch/exp16_mg_retrain.sbatch.
+# ---------------------------------------------------------------------------
+EXP16_BASES = ("mg169v6", "mg81v6", "mggroup169v6", "mggroup81v6",
+               "mg100v6", "mg121v6", "mg144v6", "mg81v2", "mg81v4")
+EXP16_SUFFIX = "vtxAnestU"
+
+
+def _exp16_cell(base):
+    spec = MODELS[base]
+    out = dict(type=spec["type"],
+               params=dict(spec["params"], transfer_filter=MG_TRANSFER_FILTER, **MG_FAS),
+               training=dict(spec.get("training") or {}))
+    if spec.get("note"):
+        out["note"] = (spec["note"] + " With exp15's V-cycle: vertex-centred "
+                       "transfer, FAS option A, untied copies, parent-pi fix.")
+    return out
+
+
+for _b in EXP16_BASES:
+    _name = _b + EXP16_SUFFIX
+    if _name in MODELS:
+        # exp15 defined it first; it must be the same cell, or the reused run
+        # dir would not be what EXP16 says it is.
+        assert MODELS[_name] == _exp16_cell(_b), f"{_name} differs from EXP16's definition"
+    else:
+        MODELS[_name] = _exp16_cell(_b)
+EXP16_CELLS = tuple(b + EXP16_SUFFIX for b in EXP16_BASES)
+
 # RAM (exp13): the Reconstruct Anything Model (Terris et al. 2025,
 # github.com/matthieutrs/ram), trained FROM SCRATCH under this grid's protocol --
 # same data, noise range, organ-masked loss, schedule and LR as every other cell.
@@ -792,7 +843,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
           "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet") \
-    + EXP15_CELLS
+    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS)
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
