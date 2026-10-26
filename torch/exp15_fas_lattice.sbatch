@@ -22,15 +22,15 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-3
-# ^ was 0-6; PACK=2 (2026-10-23) runs TWO cells per task on its one GPU, so
-#   task t trains cells 2t and 2t+1 and 7 cells need tasks 0-3. Alone, one
+#SBATCH --array=0-4
+# ^ 0-4 since 2026-10-26 (9 cells; was 0-3 for 7). PACK=2 (2026-10-23) runs TWO
+#   cells per task on its one GPU, so task t trains cells 2t and 2t+1. Alone, one
 #   batch-1 cell kept an H200 ~60% busy and jobs were cancelled for low GPU
 #   utilization; two cells fill each other's gaps (CUDA MPS, started by the
 #   body). Same numbers per cell, each one steps somewhat slower. Each cell
 #   logs to torch/logs/slurm_<job>_<task>_knee_<model>_R8.{out,err}; the task's own
-#   .out names them. PACK=1 with --array=0-6 restores one cell per GPU:
-#     PACK=1 sbatch --array=0-6 torch/exp15_fas_lattice.sbatch
+#   .out names them. PACK=1 with --array=0-8 restores one cell per GPU:
+#     PACK=1 sbatch --array=0-8 torch/exp15_fas_lattice.sbatch
 #
 # EXPERIMENT 15 -- V-CYCLE CORRECTNESS FIXES vs mg81v6, KNEE R=8, FULL LENGTH.
 #
@@ -41,6 +41,20 @@
 #   4   knee  R8   mg81v6vtxBnest   = vtxB + fas_parent_pi=true   (option B, tied, parent fix)
 #   5   knee  R8   mg81v6vtxAnestU  = vtxAnest with UNTIED copies  (option A, untied, parent fix)
 #   6   knee  R8   mg81v6vtxBnestU  = vtxBnest with UNTIED copies  (option B, untied, parent fix)
+#   7   knee  R8   mg81v6vtxBnestaclamp = vtxBnest, alpha in [0, 1]  (alpha_mode=clamp)   (2026-10-26)
+#   8   knee  R8   mg81v6vtxBnestafix   = vtxBnest, alpha = 1 fixed  (alpha_mode=fixed)   (2026-10-26)
+#
+# THE COARSE-CORRECTION STEP (cells 7, 8; models/mg_lpds.py::ALPHA_MODES). Every
+# other cell learns alpha_x / alpha_z free and signed. Trained nets drove the
+# L1 -> L0 alpha to ~0 -- the coarse levels become dead branches the loss no
+# longer constrains, hence corrupted coarse images -- and vtxBnest's L2 -> L1
+# alpha to ~5 (amplifying a timid coarse solve). Multigrid takes the correction
+# with a step >= 0: clamp keeps a learned step in [0, 1] (the line-search
+# reading; can still reach 0), fixed is the classical full step alpha = 1 (the
+# coarse change always reaches the output). Compare against cell 4.
+#   ONLY="mg81v6vtxBnestaclamp mg81v6vtxBnestafix" sbatch --array=0 torch/exp15_fas_lattice.sbatch
+# trains just these two, together on one GPU (PACK=2); under the default ONLY
+# they are task 4.
 #
 # OPTION B IS THE DEFAULT (2026-10-23) for new multigrid cells: A trained to
 # better numbers, but B is the more accurate scheme, so B + tied copies + the
@@ -87,6 +101,7 @@
 #     vtxAnest vs vtxBnest            A vs B with every fix in
 #     vtxAnestU -> vtxAnest, vtxBnestU -> vtxBnest   what the tie is worth
 #                                     with the parent-pi fix in
+#     vtxBnest -> vtxBnestaclamp / vtxBnestafix   what constraining alpha is worth
 #
 # (Index order is the generator's MODELS order, not the order of ONLY.)
 #
@@ -113,8 +128,8 @@
 # validates on measured k-space; configs generated now do too (the generator no
 # longer writes val_kspace_type), so the curves are comparable. Compare the
 # final nets with main_eval anyway -- the SAME measurement for every run:
-#     RUNS="knee/mg81v6_R8 knee/mg81v6vtx_R8 knee/mg81v6vtxA_R8 knee/mg81v6vtxB_R8 knee/mg81v6vtxAnest_R8 knee/mg81v6vtxBnest_R8 knee/mg81v6vtxAnestU_R8 knee/mg81v6vtxBnestU_R8" \
-#     OUT=results/exp15_knee_R8 VAL_KSPACE=measurement_awgn sbatch --array=0-7 torch/main_eval.sbatch
+#     RUNS="knee/mg81v6_R8 knee/mg81v6vtx_R8 knee/mg81v6vtxA_R8 knee/mg81v6vtxB_R8 knee/mg81v6vtxAnest_R8 knee/mg81v6vtxBnest_R8 knee/mg81v6vtxAnestU_R8 knee/mg81v6vtxBnestU_R8 knee/mg81v6vtxBnestaclamp_R8 knee/mg81v6vtxBnestafix_R8" \
+#     OUT=results/exp15_knee_R8 VAL_KSPACE=measurement_awgn sbatch --array=0-9 torch/main_eval.sbatch
 #
 # A quick look before they finish: notebooks/vcycle_levels_real.ipynb on any of
 # these run dirs (the level figures read transfer_filter / fas_dual from the
@@ -123,7 +138,7 @@
 # EXISTING RUN DIRS. LAUNCH-ONCE (torch/_mg_recon_body.sh) resumes an
 # unfinished trained_nets/mg_recon/knee/<cell>_R8 and skips a finished one.
 # These names are new, so nothing should be there:
-#     ls -d trained_nets/mg_recon/knee/mg81v6{vtx,vtxA,vtxB,vtxAnest,vtxBnest,vtxAnestU,vtxBnestU}_R8
+#     ls -d trained_nets/mg_recon/knee/mg81v6{vtx,vtxA,vtxB,vtxAnest,vtxBnest,vtxAnestU,vtxBnestU,vtxBnestaclamp,vtxBnestafix}_R8
 #
 # FULL LENGTH: 300k steps, as exp11 / exp14; a cell may need a second 48 h
 # slot. When a slot ends, RESUBMIT THIS FILE: unfinished cells resume from
@@ -138,10 +153,10 @@
 # Check the index map any time:
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee \
 #       --accels 8 --only mg81v6vtx mg81v6vtxA mg81v6vtxB mg81v6vtxAnest mg81v6vtxBnest \
-#       mg81v6vtxAnestU mg81v6vtxBnestU
+#       mg81v6vtxAnestU mg81v6vtxBnestU mg81v6vtxBnestaclamp mg81v6vtxBnestafix
 
 ANATOMY=knee
-ONLY="${ONLY:-mg81v6vtx mg81v6vtxA mg81v6vtxB mg81v6vtxAnest mg81v6vtxBnest mg81v6vtxAnestU mg81v6vtxBnestU}"
+ONLY="${ONLY:-mg81v6vtx mg81v6vtxA mg81v6vtxB mg81v6vtxAnest mg81v6vtxBnest mg81v6vtxAnestU mg81v6vtxBnestU mg81v6vtxBnestaclamp mg81v6vtxBnestafix}"
 ACCELS="${ACCELS:-8}"
 PLANAR_STATE="${PLANAR_STATE-1}"     # as exp11; `-`, so an explicitly EMPTY value turns it off
 ATTN="flex"                          # matches the other knee launchers --

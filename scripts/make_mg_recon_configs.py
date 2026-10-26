@@ -695,6 +695,16 @@ EXP15 = {
                             fas_copies="untied", fas_parent_pi=True),
     "mg81v6vtxBnestU": dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="gradient",
                             fas_copies="untied", fas_parent_pi=True),
+    # The coarse-correction step constrained (2026-10-26, models/mg_lpds.py::
+    # ALPHA_MODES): trained nets drove the L1 -> L0 alpha to ~0 (dead coarse
+    # branches the loss no longer constrains -- corrupted coarse images) and
+    # vtxBnest's L2 -> L1 alpha to ~5. vtxBnest with alpha in [0, 1] (the
+    # line-search reading) and with alpha = 1 fixed (the classical full step).
+    # LAST in this dict so the earlier cells keep their array indices.
+    "mg81v6vtxBnestaclamp": dict(transfer_filter=MG_TRANSFER_FILTER, **_FAS_B,
+                                 alpha_mode="clamp", alpha_range=[0.0, 1.0]),
+    "mg81v6vtxBnestafix": dict(transfer_filter=MG_TRANSFER_FILTER, **_FAS_B,
+                               alpha_mode="fixed"),
 }
 # Cell-specific `training` keys (written only for these cells).
 EXP15_TRAINING = {
@@ -1256,6 +1266,8 @@ def _display_name(spec_type, params):
             tag += "_" + params["fas_copies"]
         if params.get("fas_parent_pi"):
             tag += "_nest"
+        if params.get("alpha_mode", "free") != "free":
+            tag += "_alpha" + params["alpha_mode"]
         return "%s_%s" % (spec_type, tag)
     if spec_type == "RAM":
         # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.
