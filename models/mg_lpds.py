@@ -896,6 +896,38 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
         with batched_projection():
             walk(self)
 
+    def vcycles(self):
+        """`[(outer, level, PDVCycle)]` in construction order; level 0 finest.
+        A V-cycle at `level` owns the correction L(level+1) -> L(level)."""
+        out = []
+        for k, V in enumerate(getattr(self.net, "layers", [])):
+            level = 0
+            while isinstance(V, PDVCycle):
+                out.append((k, level, V))
+                V, level = V.mglayer, level + 1
+        return out
+
+    def param_logs(self):
+        """Derived series for `visualization/params.py::get_param_logs` (logged
+        under `params/`): alpha_z's mean / min / max over its channels, per
+        V-cycle and correction. alpha_z has M elements, above get_param_logs'
+        64-element cutoff, so without this its values never reach wandb --
+        only its grad_norm does. alpha_x (one element) is logged as is. A
+        "fixed" step is constant 1 and is left out. Three numbers per
+        correction, one host transfer for all of them."""
+        names, stats = [], []
+        for k, level, V in self.vcycles():
+            a = V.alpha_z
+            if getattr(a, "mode", "free") == "fixed":
+                continue
+            w = a.weight.detach().float().reshape(-1)
+            key = f"alpha_z/V{k + 1}_L{level + 1}toL{level}"
+            names += [f"{key}.mean", f"{key}.min", f"{key}.max"]
+            stats += [w.mean(), w.min(), w.max()]
+        if not stats:
+            return {}
+        return dict(zip(names, torch.stack(stats).tolist()))
+
     def load_state_dict(self, state_dict, strict=True, **kw):
         """`nn.Module.load_state_dict`, refusing a checkpoint that would split a
         SHARED module. Under `fas_copies="tied"` the downsampler's modules are

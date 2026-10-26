@@ -2080,6 +2080,84 @@ def fig_saturation(results, scope="anatomy", panel=3.2, dpi=None):
     return fig
 
 
+# ---------------------------------------------------------------------------
+# the coarse-correction steps alpha_x / alpha_z, read off a checkpoint
+# ---------------------------------------------------------------------------
+# x <- x + alpha_x P(w_c - u_c), z <- z + alpha_z P(wz_c - uz_c). alpha_x has one
+# element (C = 1) and is in wandb as is; alpha_z has M, above get_param_logs'
+# cutoff, so before 2026-10-26 it was never logged. A collapsed alpha_z switches
+# the DUAL correction off even when alpha_x is healthy. Checkpoint only: no data.
+def alpha_records(run, device=None):
+    """`[{run, outer, level, mode, alpha_x, alpha_z (np array, one per channel)}]`
+    for every V-cycle of `run`'s net, level = the FINE side of the correction
+    (L(level+1) -> L(level))."""
+    model = cached_model(run, device)
+    out = []
+    for k, level, V in model.vcycles():
+        mode = getattr(V, "alpha_mode", "free")
+        ax = V.alpha_x.weight.detach().float().cpu().numpy().reshape(-1)
+        az = V.alpha_z.weight.detach().float().cpu().numpy().reshape(-1)
+        if mode == "fixed":                        # the stored weights are not used
+            ax, az = np.ones_like(ax), np.ones_like(az)
+        out.append(dict(run=os.path.basename(os.path.normpath(run)), outer=k, level=level,
+                        mode=mode, alpha_x=ax, alpha_z=az))
+    return out
+
+
+def alpha_table(recs, near=0.05):
+    """Print alpha_x and alpha_z (mean / min / max over channels, share of
+    channels at or below `near`, share negative) per V-cycle and correction."""
+    if not recs:
+        print("no V-cycles")
+        return
+    print(f"{recs[0]['run']}  (alpha_mode={recs[0]['mode']}; alpha_z over its "
+          f"{recs[0]['alpha_z'].size} channels; '<= {near:g}' = effectively off)")
+    print(f"  {'V-cycle':<8}{'correction':<12}{'alpha_x':>9}{'az mean':>9}{'az min':>9}"
+          f"{'az max':>9}{'<= ' + format(near, 'g'):>9}{'< 0':>7}")
+    for r in recs:
+        az = r["alpha_z"]
+        print(f"  V{r['outer'] + 1:<7}L{r['level'] + 1} -> L{r['level']:<5}"
+              f"{float(r['alpha_x'].mean()):>+9.3f}{az.mean():>+9.3f}{az.min():>+9.3f}"
+              f"{az.max():>+9.3f}{100 * np.mean(az <= near):>8.0f}%{100 * np.mean(az < 0):>6.0f}%")
+
+
+def fig_alpha_z(results, panel=3.2, dpi=None):
+    """`results` = {label: alpha_records(...)}. One heatmap per run: rows = (V-cycle,
+    correction), columns = alpha_z's channels in their own order (so a channel
+    that is off in every V-cycle shows as a column), on a diverging scale with
+    0 white; alpha_x beside each row."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+    labels = list(results)
+    fig, ax = plt.subplots(len(labels), 2, squeeze=False, dpi=dpi,
+                           figsize=(4 * panel + 1.0, panel * 0.9 * len(labels) + 0.8),
+                           gridspec_kw=dict(width_ratios=[6, 1], wspace=0.08, hspace=0.6))
+    for i, lab in enumerate(labels):
+        recs = results[lab]
+        if not recs:
+            ax[i][0].set_axis_off(); ax[i][1].set_axis_off()
+            continue
+        Z = np.stack([r["alpha_z"] for r in recs])
+        X = np.array([float(r["alpha_x"].mean()) for r in recs])[:, None]
+        lo = min(-0.1, float(Z.min()), float(X.min()))
+        hi = max(1.0, float(Z.max()), float(X.max()))
+        norm = TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
+        rows = [f"V{r['outer'] + 1} L{r['level'] + 1}->L{r['level']}" for r in recs]
+        im = ax[i][0].imshow(Z, aspect="auto", cmap="RdBu_r", norm=norm, interpolation="nearest")
+        ax[i][0].set_yticks(range(len(rows))); ax[i][0].set_yticklabels(rows, fontsize=6)
+        ax[i][0].set_xlabel("alpha_z channel", fontsize=7); ax[i][0].tick_params(labelsize=6)
+        ax[i][0].set_title(f"{lab}: alpha_z ({recs[0]['mode']})", fontsize=9)
+        ax[i][1].imshow(X, aspect="auto", cmap="RdBu_r", norm=norm, interpolation="nearest")
+        for j, v in enumerate(X[:, 0]):
+            ax[i][1].text(0, j, f"{v:+.2f}", ha="center", va="center", fontsize=6)
+        ax[i][1].set_xticks([]); ax[i][1].set_yticks([])
+        ax[i][1].set_title("alpha_x", fontsize=9)
+        fig.colorbar(im, ax=list(ax[i]), fraction=0.02, pad=0.01).ax.tick_params(labelsize=6)
+    fig.suptitle("coarse-correction steps (white = 0: that correction is switched off)",
+                 fontsize=10)
+    return fig
+
+
 def render(npz_path, flip=None, out=None):
     """All three figures from a saved trace, to <stem>_{mg_levels,mg_outers,unet_decoder}.png."""
     import matplotlib

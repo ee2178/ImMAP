@@ -149,8 +149,28 @@ def test_refused():
             check(f"refused: {name}", True)
 
 
+def test_param_logs():
+    """alpha_z (M elements, above get_param_logs' cutoff) reaches wandb as
+    mean / min / max per V-cycle and correction; "fixed" logs none."""
+    from visualization.params import get_param_logs
+    n = _net()
+    V2 = n.net.layers[1]
+    with torch.no_grad():
+        V2.mglayer.alpha_z.weight.copy_(torch.tensor([-0.2, 0.0, 0.5, 2.0]).view(1, 4, 1, 1))
+    logs = get_param_logs(n)
+    keys = sorted(k for k in logs if "/alpha_z/" in k)
+    want = sorted(f"params/alpha_z/V{k}_L{l + 1}toL{l}.{s}" for k in (1, 2) for l in (0, 1)
+                  for s in ("mean", "min", "max"))
+    v = [logs[f"params/alpha_z/V2_L2toL1.{s}"] for s in ("mean", "min", "max")]
+    check("alpha_z mean / min / max per V-cycle and correction",
+          keys == want and max(abs(a - b) for a, b in zip(v, (0.575, -0.2, 2.0))) < 1e-6, str(v))
+    check("fixed: no alpha_z series", not any("/alpha_z/" in k
+                                              for k in get_param_logs(_net(alpha_mode="fixed"))))
+
+
 def main():
-    for t in (test_free, test_clamp, test_fixed, test_checkpoints, test_planar, test_refused):
+    for t in (test_free, test_clamp, test_fixed, test_checkpoints, test_planar, test_refused,
+              test_param_logs):
         print(f"\n== {t.__name__}")
         t()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")
