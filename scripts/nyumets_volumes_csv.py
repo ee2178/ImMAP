@@ -67,8 +67,25 @@ def dump_dir(root, run):
     raise SystemExit(f"no dump for {run} under {root} -- run scripts/dump_eval_nyumets.py first")
 
 
-def read_run(d):
-    """volume -> {"slice": (n,), metric: (n,)} from a run's dump, and the shared attrs."""
+def prior_similarity(ref, pri, mask):
+    """Per slice, how far the (registered) prior CT1 is from the current CT1: the mean squared
+    difference inside the evaluation mask, in the dump's intensity units (per-volume scaling, so
+    tissue ~1). 0 = the prior IS the current CT1; larger = a worse guide. (n,), NaN for slices
+    with almost no mask. Unlike a correlation it also counts a global brightness mismatch."""
+    n = ref.shape[0]
+    mse = np.full(n, np.nan)
+    for i in range(n):
+        m = mask[i] > 0
+        if m.sum() < 50:
+            continue
+        d = ref[i][m].astype(np.float64) - pri[i][m].astype(np.float64)
+        mse[i] = float((d * d).mean())
+    return mse
+
+
+def read_run(d, similarity=False):
+    """volume -> {"slice": (n,), metric: (n,)} from a run's dump, and the shared attrs. With
+    `similarity`, also "prior_mse" per slice (prior_similarity)."""
     out, attrs = {}, {}
     for f in sorted(os.listdir(d)):
         if not f.endswith(".h5"):
@@ -76,6 +93,9 @@ def read_run(d):
         with h5py.File(os.path.join(d, f), "r") as h:
             out[f[:-3]] = dict(slice=h["slice_index"][:].astype(int),
                                **{m: h[f"{m}_slice"][:].astype(float) for m in METRICS})
+            if similarity and "prior_ct1" in h and "organ_mask" in h:
+                out[f[:-3]]["prior_mse"] = prior_similarity(
+                    h["reference"][:], h["prior_ct1"][:], h["organ_mask"][:])
             if not attrs:
                 attrs = {k: h.attrs[k] for k in ("seed", "intensity_units", "nfe") if k in h.attrs}
     return out, attrs
@@ -99,6 +119,9 @@ def main(argv=None):
                    help="z-profile figure, path without extension ('' = none)")
     p.add_argument("--tikz", action="store_true",
                    help="also write the profile as pgfplots: <profile>.tikz + _standalone.tex")
+    p.add_argument("--similarity", default=os.path.join(HERE, "figures", "out",
+                                                         "nyumets_similarity"),
+                   help="gain vs prior-similarity figure, path without extension ('' = none)")
     p.add_argument("--from-csv", metavar="SLICES_CSV",
                    help="draw the z-profile from a slices.csv this script wrote (e.g. copied off "
                         "the cluster) instead of reading dumps; writes no CSV")
@@ -107,24 +130,34 @@ def main(argv=None):
     if a.from_csv:
         data, labels = {}, []
         with open(a.from_csv, newline="") as f:
-            for r in csv.DictReader(f):
-                if r["net"] not in data:
-                    data[r["net"]] = {}
-                    labels.append(r["net"])
-                d = data[r["net"]].setdefault(r["volume"], {"slice": [], "psnr": []})
-                d["slice"].append(int(r["slice"]))
-                d["psnr"].append(float(r["psnr"]))
+            rows = list(csv.DictReader(f))
+        if a.similarity:
+            if any(r.get("prior_mse") for r in rows):
+                nets = list(dict.fromkeys(r["net"] for r in rows))
+                similarity_plot(*gain_vs_similarity(rows, nets), nets, a.similarity)
+            else:
+                print("this slices.csv has no prior_mse column -- rebuild it on the cluster "
+                      "(scripts/nyumets_volumes_csv.py --profile '') for the similarity plot")
+        for r in rows:
+            if r["net"] not in data:
+                data[r["net"]] = {}
+                labels.append(r["net"])
+            d = data[r["net"]].setdefault(r["volume"], {"slice": [], "psnr": []})
+            d["slice"].append(int(r["slice"]))
+            d["psnr"].append(float(r["psnr"]))
         for lab in labels:
             for d in data[lab].values():
                 d["slice"], d["psnr"] = np.array(d["slice"]), np.array(d["psnr"])
         vols = sorted(set.intersection(*[set(data[lab]) for lab in labels]))
-        profile(data, labels, vols, a.trained_hi, a.profile or "nyumets_profile", a.tikz)
+        if a.profile:
+            profile(data, labels, vols, a.trained_hi, a.profile, a.tikz)
         return
 
     runs = [r.split("=", 1) if "=" in r else (r, r) for r in a.runs]
     data, attrs = {}, {}
-    for label, run in runs:
-        data[label], attrs[label] = read_run(dump_dir(a.root, run))
+    for i, (label, run) in enumerate(runs):
+        # the prior and the target are the same in every run's dump: measure similarity once
+        data[label], attrs[label] = read_run(dump_dir(a.root, run), similarity=(i == 0))
     labels = [lab for lab, _ in runs]
     for lab in labels[1:]:
         bad = {k for k in attrs[lab] if attrs[lab][k] != attrs[labels[0]].get(k)}
@@ -164,9 +197,12 @@ def main(argv=None):
                     continue
                 base = dict(anatomy=gname(g), R=0, net=lab, run=run, volume=v)
                 if g == groups[0]:
+                    s0 = data[labels[0]][v]                  # similarity lives in the first run
                     for i in np.where(sel)[0]:
+                        sim = {k: (f"{s0[k][i]:.6g}" if k in s0 and np.isfinite(s0[k][i]) else "")
+                               for k in ("prior_mse",)}
                         srows.append(dict(base, slice=int(d["slice"][i]),
-                                          **{m: f"{d[m][i]:.6g}" for m in METRICS}))
+                                          **{m: f"{d[m][i]:.6g}" for m in METRICS}, **sim))
                 vrows.append(dict(base, n_slices=int(sel.sum()),
                                   **{m: f"{np.nanmean(d[m][sel]):.6g}" for m in METRICS}))
     for name, rows in (("slices.csv", srows), ("volumes.csv", vrows)):
@@ -180,6 +216,8 @@ def main(argv=None):
 
     if a.profile:
         profile(data, labels, vols, a.trained_hi, a.profile, a.tikz)
+    if a.similarity:
+        similarity_plot(*gain_vs_similarity(srows, labels), labels, a.similarity)
 
     q = lambda s: f'"{s}"' if " " in s else s           # noqa: E731
     vin = os.path.relpath(os.path.join(a.out, "volumes.csv"), HERE)
@@ -191,6 +229,85 @@ def main(argv=None):
           f"--out figures/out/nyumets_bars\n"
           f"  python scripts/wilcoxon_main.py --in {vin} --ref {ref} "
           f"--out {os.path.join(os.path.dirname(vin), 'wilcoxon_volumes.csv')}")
+
+
+def gain_vs_similarity(rows, labels):
+    """slices.csv rows -> (gain, prior_mse) arrays over the slices both nets have: gain =
+    PSNR(last net) - PSNR(first net), the prior study's paired gain."""
+    by = {}
+    for r in rows:
+        by.setdefault((r["volume"], int(r["slice"])), {})[r["net"]] = r
+    g, e = [], []
+    for k, x in by.items():
+        if labels[0] in x and labels[-1] in x and x[labels[0]].get("prior_mse") not in (None, ""):
+            g.append(float(x[labels[-1]]["psnr"]) - float(x[labels[0]]["psnr"]))
+            e.append(float(x[labels[0]]["prior_mse"]))
+    g, e = np.asarray(g, float), np.asarray(e, float)
+    ok = np.isfinite(g) & np.isfinite(e) & (e > 0)
+    return g[ok], e[ok]
+
+
+def _ranks(x):
+    r = np.empty(x.size)
+    r[np.argsort(x, kind="mergesort")] = np.arange(x.size)
+    return r
+
+
+def similarity_plot(gain, mse, labels, out, n_bins=10):
+    """Per-slice gain of the prior study against how far the prior CT1 is from the current CT1
+    (prior_mse, log axis: it spans orders of magnitude): every slice as density, and the mean gain
+    (+- s.e.m.) in equal-count bins of the MSE, with the 10-90% range of the gain shaded. Prints
+    the bins and the rank correlation of MSE with gain."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    edges = np.unique(np.quantile(mse, np.linspace(0, 1, n_bins + 1)))
+    idx = np.clip(np.searchsorted(edges, mse, side="right") - 1, 0, len(edges) - 2)
+    rows = []
+    for b in range(len(edges) - 1):
+        s = idx == b
+        x = gain[s]
+        rows.append(dict(lo=edges[b], hi=edges[b + 1], mid=float(np.median(mse[s])), n=int(s.sum()),
+                         mean=float(x.mean()), se=float(x.std(ddof=1) / np.sqrt(x.size)),
+                         p10=float(np.percentile(x, 10)), p90=float(np.percentile(x, 90)),
+                         better=float((x > 0).mean())))
+    print(f"\nprior-study PSNR gain ({labels[-1]} - {labels[0]}) by prior MSE (prior CT1 vs "
+          f"current CT1 in the mask; low = similar), {gain.size} slices:")
+    print(f"  {'MSE range':>19} {'n':>6} {'mean gain':>10} {'+-se':>6} {'better':>7} {'p10':>6} {'p90':>6}")
+    for r in rows:
+        print(f"  {r['lo']:>9.4f}-{r['hi']:<9.4f} {r['n']:>6} {r['mean']:>+10.2f} {r['se']:>6.2f} "
+              f"{100 * r['better']:>6.0f}% {r['p10']:>+6.2f} {r['p90']:>+6.2f}")
+    rho = float(np.corrcoef(_ranks(mse), _ranks(gain))[0, 1])
+    print(f"  Spearman rank correlation of prior MSE with gain: {rho:+.3f}")
+
+    plt.rcParams.update({"font.size": 9, "axes.edgecolor": MUTED, "axes.labelcolor": INK,
+                         "xtick.color": MUTED, "ytick.color": MUTED, "font.family": "DejaVu Sans"})
+    fig, ax = plt.subplots(figsize=(5.2, 3.6))
+    lo, hi = np.percentile(gain, [0.5, 99.5])
+    ax.hexbin(mse, np.clip(gain, lo, hi), xscale="log", gridsize=60, cmap="Greys", bins="log",
+              mincnt=1, linewidths=0, zorder=1)
+    mid = np.array([r["mid"] for r in rows])
+    c = PALETTE[1]
+    ax.fill_between(mid, [r["p10"] for r in rows], [r["p90"] for r in rows], color=c, alpha=0.18,
+                    lw=0, zorder=2, label="10-90% of slices")
+    ax.errorbar(mid, [r["mean"] for r in rows], yerr=[r["se"] for r in rows], color=c, lw=1.6,
+                marker="o", ms=3.5, capsize=2, zorder=3, label="mean gain (± s.e.m.), per bin")
+    ax.axhline(0, color=MUTED, lw=0.8, zorder=2)
+    ax.set_xscale("log")
+    ax.set_xlabel("prior MSE: mean (prior CT1 − current CT1)² in the mask  (← more similar)")
+    ax.set_ylabel(f"PSNR gain, {labels[-1]} − {labels[0]} (dB)")
+    ax.grid(axis="y", color=GRID, lw=0.6, zorder=0)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    ax.legend(frameon=False, loc="upper right", fontsize=8)
+    fig.text(0.5, 0.005, f"{gain.size} test slices (grey: density, log scale); bins hold equal "
+             f"numbers of slices", ha="center", va="bottom", fontsize=7, color=MUTED)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{out}.{ext}", dpi=300)
+    print(f"wrote {out}.png, .pdf")
 
 
 def profile(data, labels, vols, trained_hi, out, tikz=False):
