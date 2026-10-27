@@ -187,9 +187,12 @@ panel; slices chosen by rule, not by eye.}
 
 \begin{figure}[h]
 \centering
-\figorbox{\figdir/fig3_alias.pdf}{Fig.\ 3: LPDSNet aliasing cases; columns LPDSNet, MGLPDSNet,
-reference, and $\times$5 error maps; arrows on the artifacts.}
-\caption{\todo{Residual aliasing in LPDSNet ...}}
+\includegraphics[width=\linewidth]{\figdir/fig3_alias.png}
+\caption{Residual aliasing in LPDSNet. Columns: zero-filled, E2E-VarNet, LPDSNet, MGLPDSNet and
+the ground truth, with PSNR per slice. Below each image: the boxed region and its absolute error.
+LPDSNet leaves thin line artifacts that are absent from the ground truth (brain, $R{=}8$: a bright
+streak; brain, $R{=}12$: a dark line; knee, $R{=}12$: an oblique streak), visible as bright lines in
+its error maps; MGLPDSNet and E2E-VarNet reconstruct the same regions without them.}
 \label{fig:alias}
 \end{figure}
 
@@ -199,10 +202,11 @@ reference, and $\times$5 error maps; arrows on the artifacts.}
 {\small\input{\figdir/main_table.tex}}\\[10pt]
 \input{\figdir/fig4_timing.tikz}
 \caption{Quantitative comparison. Top: PSNR, SSIM and NRMSE within the anatomy mask, mean
-$\pm$ s.e.m.\ over test volumes; bold: best per experiment; $^{*}$: differs from MGLPDSNet
-(paired Wilcoxon signed-rank over volumes, Holm-adjusted, $p<0.05$). Bottom: network time per
-$640\times320$, 20-coil slice on one NVIDIA L40S (median of 30 runs): inference, and one training
-step (forward + backward). Parameters: E2E-VarNet 29.5M, LPDSNet 1.0M, MGLPDSNet ($M{=}81$) 1.7M.}
+$\pm$ s.e.m.\ over test volumes (brain $n{=}815$, knee $n{=}100$); bold: best per experiment;
+$^{*}$: differs from MGLPDSNet (paired Wilcoxon signed-rank over volumes, Holm-adjusted,
+$p<0.05$). Bottom: network time per $640\times320$, 20-coil slice on one NVIDIA L40S (median of
+30 runs), forward and backward pass. Parameters: E2E-VarNet 29.5M, LPDSNet 1.0M, MGLPDSNet
+($M{=}81$) 1.7M.}
 \label{fig:bars}
 \end{figure}
 
