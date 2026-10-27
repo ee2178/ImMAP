@@ -1,4 +1,0 @@
-anatomy,R,metric,A,B,n,mean_A,mean_B,median_diff,A_better,r_rb,p,p_holm
-slices 70-109,0,psnr,UNet + prior w2,UNet,1007,25.7269,24.7918,0.8421,0.973188,0.988722,1.16279e-162,1.16279e-162
-slices 70-109,0,ssim,UNet + prior w2,UNet,1007,0.908282,0.877888,0.02992,0.981132,0.991677,1.27007e-163,1.27007e-163
-slices 70-109,0,nrmse,UNet + prior w2,UNet,1007,0.119728,0.130712,-0.0102822,0.966236,0.984823,2.13746e-161,2.13746e-161

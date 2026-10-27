@@ -1,98 +1,0 @@
-  R=8: 1/68 volumes  R=8: 2/68 volumes  R=8: 3/68 volumes  R=8: 4/68 volumes  R=8: 5/68 volumes  R=8: 6/68 volumes  R=8: 7/68 volumes  R=8: 8/68 volumes  R=8: 9/68 volumes  R=8: 10/68 volumes  R=8: 11/68 volumes  R=8: 12/68 volumes  R=8: 13/68 volumes  R=8: 14/68 volumes  R=8: 15/68 volumes  R=8: 16/68 volumes  R=8: 17/68 volumes  R=8: 18/68 volumes  R=8: 19/68 volumes  R=8: 20/68 volumes  R=8: 21/68 volumes  R=8: 22/68 volumes  R=8: 23/68 volumes  R=8: 24/68 volumes  R=8: 25/68 volumes  R=8: 26/68 volumes  R=8: 27/68 volumes  R=8: 28/68 volumes  R=8: 29/68 volumes  R=8: 30/68 volumes  R=8: 31/68 volumes  R=8: 32/68 volumes  R=8: 33/68 volumes  R=8: 34/68 volumes  R=8: 35/68 volumes  R=8: 36/68 volumes  R=8: 37/68 volumes  R=8: 38/68 volumes  R=8: 39/68 volumes  R=8: 40/68 volumes  R=8: 41/68 volumes  R=8: 42/68 volumes  R=8: 43/68 volumes  R=8: 44/68 volumes  R=8: 45/68 volumes  R=8: 46/68 volumes  R=8: 47/68 volumes  R=8: 48/68 volumes  R=8: 49/68 volumes  R=8: 50/68 volumes  R=8: 51/68 volumes  R=8: 52/68 volumes  R=8: 53/68 volumes  R=8: 54/68 volumes  R=8: 55/68 volumes  R=8: 56/68 volumes  R=8: 57/68 volumes  R=8: 58/68 volumes  R=8: 59/68 volumes  R=8: 60/68 volumes  R=8: 61/68 volumes  R=8: 62/68 volumes  R=8: 63/68 volumes  R=8: 64/68 volumes  R=8: 65/68 volumes  R=8: 66/68 volumes  R=8: 67/68 volumes  R=8: 68/68 volumes
-R=8: 68 volumes, 544 slices | new-line z > 3, >= 8 px, Hessian scale 1.5, tolerance 3 px
-
-method         slices w/ blob  median score  p90 score  max score
-varnetmaps                 6%             0          0       2159
-lpdsnet                    6%             0          0       2994
-mg81v6                     4%             0          0       1067
-
-STRONGEST new lines: varnetmaps
-volume                          sl   score  blobs   area   row   col   viewer filter
-file_brain_AXT2_202_2020522      0    2159     16    774   296    38   2020522 0
-file_brain_AXT2_202_2020522      3    1380     12    665   299    37   2020522 3
-file_brain_AXT2_202_2020522      1    1006      7    567   333    40   2020522 1
-file_brain_AXT2_202_2020522      5     896      5    251   280    39   2020522 5
-file_brain_AXT2_202_2020522      2     700      9    408   248    42   2020522 2
-file_brain_AXT2_202_2020522      4     600     11    401   302    38   2020522 4
-file_brain_AXT2_202_2020522      7     129      3     58   325    46   2020522 7
-file_brain_AXT2_202_2020088      0     117      3     47   436   210   2020088 0
-file_brain_AXT2_200_2000349      4     107      1     21   493   196   2000349 4
-file_brain_AXT2_200_2000349      1     102      2     32   499   194   2000349 1
-file_brain_AXT2_202_2020088      6      77      1     18   334   245   2020088 6
-file_brain_AXT2_200_2000130      0      73      2     34   262   148   2000130 0
-file_brain_AXT2_200_2000487      7      69      2     26   289   132   2000487 7
-file_brain_AXT2_200_2000264      1      63      1     13   536   222   2000264 1
-file_brain_AXT2_202_2020522      6      62      1     13   221   163   2020522 6
-file_brain_AXT2_202_2020088      2      59      1     13   207   205   2020088 2
-file_brain_AXT2_200_2000031      4      48      2     21   228   173   2000031 4
-file_brain_AXT2_200_2000045      1      47      1     13   252   219   2000045 1
-file_brain_AXT2_200_2000130      6      47      1     13   267   185   2000130 6
-file_brain_AXT2_200_2000250      5      47      1     13   242   228   2000250 5
-file_brain_AXT2_200_2000250      2      46      1     12   237   236   2000250 2
-file_brain_AXT2_200_2000078      2      43      1     10   255   137   2000078 2
-file_brain_AXT2_200_2000377      3      42      1     10   278   170   2000377 3
-file_brain_AXT2_200_2000195      0      41      1     10   245   190   2000195 0
-file_brain_AXT2_202_2020088      1      41      1     11   193   189   2020088 1
-file_brain_AXT2_200_2000019      4      39      1      9   498   155   2000019 4
-file_brain_AXT2_200_2000314      4      38      1     10   268   169   2000314 4
-file_brain_AXT2_200_2000349      3      37      1      8   502   196   2000349 3
-file_brain_AXT2_200_2000264      5      33      1      8   526   179   2000264 5
-file_brain_AXT2_200_2000182      7      32      1      8   285   179   2000182 7
-
-STRONGEST new lines: lpdsnet
-volume                          sl   score  blobs   area   row   col   viewer filter
-file_brain_AXT2_202_2020522      1    2994     12    904   280   195   2020522 1
-file_brain_AXT2_202_2020522      0    1885     12    940   317   201   2020522 0
-file_brain_AXT2_202_2020522      2    1828     19    807   285   197   2020522 2
-file_brain_AXT2_202_2020522      3    1370     17    629   273   194   2020522 3
-file_brain_AXT2_202_2020522      4     672     17    467   278   196   2020522 4
-file_brain_AXT2_202_2020522      5     258      4    104   270    41   2020522 5
-file_brain_AXT2_200_2000264      2     151      1     33   254   216   2000264 2
-file_brain_AXT2_200_2000487      7     121      3     47   483   191   2000487 7
-file_brain_AXT2_200_2000250      5     112      1     25   242   230   2000250 5
-file_brain_AXT2_202_2020522      6     104      2     36   244   181   2020522 6
-file_brain_AXT2_202_2020088      0      83      1     23   388   209   2020088 0
-file_brain_AXT2_200_2000130      4      83      1     21   232   226   2000130 4
-file_brain_AXT2_200_2000250      2      76      2     30   236   235   2000250 2
-file_brain_AXT2_200_2000519      6      64      1     14   406   133   2000519 6
-file_brain_AXT2_200_2000031      5      54      1     13   267   197   2000031 5
-file_brain_AXT2_200_2000257      2      54      1     14   473   227   2000257 2
-file_brain_AXT2_200_2000433      7      51      1     10   268   196   2000433 7
-file_brain_AXT2_200_2000069      7      50      1     12   251   195   2000069 7
-file_brain_AXT2_202_2020522      7      47      2     20   227   111   2020522 7
-file_brain_AXT2_200_2000519      1      43      1     12   499   248   2000519 1
-file_brain_AXT2_200_2000250      6      42      1     11   488   184   2000250 6
-file_brain_AXT2_202_2020088      7      42      1     12   329   219   2020088 7
-file_brain_AXT2_200_2000487      6      41      1     10   277   222   2000487 6
-file_brain_AXT2_200_2000160      4      41      1      9   242   200   2000160 4
-file_brain_AXT2_200_2000182      0      40      2     18   342   277   2000182 0
-file_brain_AXT2_200_2000358      6      38      1      9   459   234   2000358 6
-file_brain_AXT2_200_2000019      4      38      1      9   499   155   2000019 4
-file_brain_AXT2_202_2020088      5      36      1     10   347   220   2020088 5
-file_brain_AXT2_200_2000031      4      35      1      9   258   185   2000031 4
-file_brain_AXT2_200_2000045      4      34      1      9   521   223   2000045 4
-
-STRONGEST new lines: mg81v6
-volume                          sl   score  blobs   area   row   col   viewer filter
-file_brain_AXT2_202_2020522      4    1067      8    270   275    39   2020522 4
-file_brain_AXT2_202_2020522      0     956     11    499   270    38   2020522 0
-file_brain_AXT2_202_2020522      1     845     11    373   269    40   2020522 1
-file_brain_AXT2_202_2020522      2     527     11    384   290    37   2020522 2
-file_brain_AXT2_202_2020522      3     494     10    285   290    38   2020522 3
-file_brain_AXT2_202_2020522      5     269      4    123   220   163   2020522 5
-file_brain_AXT2_200_2000487      5      75      1     20   330   177   2000487 5
-file_brain_AXT2_200_2000250      5      65      1     16   243   231   2000250 5
-file_brain_AXT2_200_2000069      7      59      1     13   251   194   2000069 7
-file_brain_AXT2_200_2000078      2      53      2     22   253   139   2000078 2
-file_brain_AXT2_200_2000078      4      52      1     10   229   137   2000078 4
-file_brain_AXT2_200_2000031      5      48      1     12   267   197   2000031 5
-file_brain_AXT2_200_2000256      7      45      2     21   296   237   2000256 7
-file_brain_AXT2_200_2000021      7      41      1     10   348   306   2000021 7
-file_brain_AXT2_200_2000433      7      36      1      8   267   196   2000433 7
-file_brain_AXT2_200_2000250      6      35      1      9   488   184   2000250 6
-file_brain_AXT2_200_2000250      4      34      1      9   488   139   2000250 4
-file_brain_AXT2_202_2020522      6      31      1      9   274    42   2020522 6
-file_brain_AXT2_200_2000377      3      29      1      8   278   170   2000377 3
-file_brain_AXT2_200_2000264      2      29      1      8   255   215   2000264 2
-file_brain_AXT2_200_2000256      1      28      1      8   407   206   2000256 1
-wrote results/alias_detect/brain/detect_R8.csv, detect_R8.txt and up to 15 PNGs per method
