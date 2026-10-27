@@ -17,3 +17,7 @@ alias_scan/
 *_dumps.tar*
 *_dumps.zip
 figures/out/
+
+# local writing and evaluation outputs
+docs/
+results/
