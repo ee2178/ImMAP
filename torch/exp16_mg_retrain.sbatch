@@ -41,6 +41,10 @@
 #       mg100v6 mg121v6 mg144v6 (width), mg81v2 mg81v4 (depth), each vtxAnestU;
 #       mg81v6 / mg169v6 come from the main set
 #     SET=ablation sbatch --array=0-2 torch/exp16_mg_retrain.sbatch
+#     Task 2 holds mg81v4 ALONE (5 cells, PACK=2), which left its H200 idle
+#     enough to be cancelled (2026-10-27). A lone cell goes on an L40S, unpacked:
+#       SET=ablation ONLY=mg81v4vtxAnestU PACK=1 sbatch --array=0 \
+#           --constraint=l40s --mem=64GB torch/exp16_mg_retrain.sbatch
 #
 # PACK=2: each task trains two cells side by side on its GPU under CUDA MPS
 # (torch/_mg_recon_body.sh, "PACK"), because one batch-1 cell leaves an H200
