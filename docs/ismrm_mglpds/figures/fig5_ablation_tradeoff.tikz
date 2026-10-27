@@ -4,22 +4,22 @@
 %
 % THE NUMBERS: the two tables below. infer = inference ms (time_net_l40s_planar.txt: L40S,
 % 640x320, 20 coils -- brain-sized, the timing does not depend on the data); psnr = knee R8 test
-% mean (results/main/volumes.csv). `nan' = not evaluated yet: the point is left out. Fill the
-% psnr column from the exp16 ablation eval (torch/exp16_ablation_eval.sbatch).
+% mean of the exp16 nets (*vtxAnestU; results/ablation16_knee_R8, torch/exp16_ablation_eval.sbatch).
+% `nan' = not evaluated yet: the point is left out (V=4 is still training).
 \providecommand{\abltradewidth}{\linewidth}
 \pgfplotstableread{
 lab      infer  psnr
-{81}     49.6   29.06
-{100}    54.6   nan
-{121}    60.8   nan
-{144}    68.5   nan
-{169}    77.5   29.16
+{81}     49.6   29.14
+{100}    54.6   29.18
+{121}    60.8   29.18
+{144}    68.5   29.26
+{169}    77.5   29.27
 }\ablwidthdata
 \pgfplotstableread{
 lab      infer  psnr
-{2}      18.9   nan
+{2}      18.9   28.69
 {4}      34.9   nan
-{6}      49.6   29.06
+{6}      49.6   29.14
 }\abldepthdata
 % references, same axes: LPDSNet and E2E-VarNet (knee R8 PSNR, L40S inference)
 \def\refLPx{39.0}\def\refLPy{28.86}
@@ -43,7 +43,7 @@ lab      infer  psnr
   major tick length=2pt, grid=major, grid style={mbgrid, line width=0.3pt},
   unbounded coords=discard, scaled y ticks=false,
 ]
-\nextgroupplot[title={Width: subbands $M$ (6 V-cycles)}]
+\nextgroupplot[title={Width: subbands $M$ (6 V-cycles)}, xmin=30, xmax=85]
 \addplot[mbc2, line width=1pt, mark=*, mark size=1.8pt, point meta=explicit symbolic,
          nodes near coords, nodes near coords style={font=\scriptsize, text=mbink, anchor=south}]
   table[x=infer, y=psnr, meta=lab] {\ablwidthdata};

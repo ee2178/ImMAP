@@ -115,7 +115,7 @@ without it. \todo{How often it occurs: found in N of M test slices by ...}
 
 Across 815 brain and 100 knee test volumes (Figure~\ref{fig:bars}), MGLPDSNet improved on both
 LPDSNet and E2E-VarNet in every metric, anatomy and acceleration ($p<0.001$), by
-0.20--0.58\,dB PSNR over LPDSNet and 0.28--0.57\,dB over E2E-VarNet. It does so with 1.73M parameters, $17\times$ fewer than E2E-VarNet (29.5M), at an inference time of
+0.28--0.58\,dB PSNR over LPDSNet and 0.28--0.57\,dB over E2E-VarNet. It does so with 1.73M parameters, $17\times$ fewer than E2E-VarNet (29.5M), at an inference time of
 50\,ms per slice, against 39\,ms for LPDSNet and 48\,ms for E2E-VarNet.
 
 The ablations (Figure~\ref{fig:ablation}) show \todo{how quality scales with the number of
@@ -213,8 +213,9 @@ step (forward + backward). Parameters: E2E-VarNet 29.5M, LPDSNet 1.0M, MGLPDSNet
 \caption{Ablations, knee R=8: time against quality. Top: test PSNR against inference time
 ($640\times320$, 20 coils, NVIDIA L40S) across the width sweep (subbands $M$ at 6 V-cycles, left)
 and the depth sweep (V-cycles at $M{=}81$, right), with LPDSNet and E2E-VarNet for reference.
-Bottom: the same networks in full, mean $\pm$ s.e.m.\ over $n{=}100$ test volumes.
-\todo{remaining ablation evals}}
+Bottom: the same networks in full, mean $\pm$ s.e.m.\ over $n{=}100$ test volumes; bold: best
+in its sweep; $^{*}$: differs from $M{=}81$, 6 V-cycles (paired Wilcoxon signed-rank over volumes,
+Holm-adjusted, $p<0.05$). \todo{4 V-cycles: still training}}
 \label{fig:ablation}
 \end{figure}
 

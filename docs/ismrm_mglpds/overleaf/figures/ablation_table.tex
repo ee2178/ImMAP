@@ -1,23 +1,24 @@
-% Ablation table, knee R=8: PLACEHOLDER, hand-written. Replace with the generated table
-% (figures/table_ablation.py -> figures/out/ablation16_table.tex) once the exp16 eval is in.
-% Filled cells: PSNR/SSIM/NRMSE from results/main/volumes.csv (mean +- s.e.m., n=100 volumes);
-% inference ms from time_net_l40s_planar.txt; params from time_net. \todo{--} = not available yet.
+% Ablation table, knee R=8, hand-written from results/ablation16_knee_R8/ablation_table.md
+% (figures/table_ablation.py; exp16 nets *vtxAnestU, n=100 volumes, mean +- s.e.m.) plus the
+% two reference rows from results/main (same eval protocol). Inference ms from
+% time_net_l40s_planar.txt. Bold: best in its sweep; *: differs from M=81, V=6 (paired Wilcoxon
+% signed-rank over volumes, Holm-adjusted, p<0.05). \todo{--} = V=4, still training.
 % Needs \usepackage{booktabs}.
 \begin{tabular}{lccccc}
 \toprule
  & Params & Inference (ms) & PSNR (dB) $\uparrow$ & SSIM (\%) $\uparrow$ & NRMSE (\%) $\downarrow$ \\
 \midrule
 \multicolumn{6}{l}{\textit{Width: subbands $M$, 6 V-cycles}} \\
-$M{=}81$  & 1.73M & 49.6 & $29.06 \pm 0.24$ & $79.65 \pm 0.27$ & $7.28 \pm 0.15$ \\
-$M{=}100$ & 2.14M & 54.6 & \todo{--} & \todo{--} & \todo{--} \\
-$M{=}121$ & 2.59M & 60.8 & \todo{--} & \todo{--} & \todo{--} \\
-$M{=}144$ & \todo{--} & 68.5 & \todo{--} & \todo{--} & \todo{--} \\
-$M{=}169$ & 3.62M & 77.5 & $29.16 \pm 0.24$ & $79.91 \pm 0.26$ & $7.20 \pm 0.15$ \\
+$M{=}81$  & 1.73M & 49.6 & $29.14 \pm 0.24$ & $79.90 \pm 0.27$ & $7.22 \pm 0.15$ \\
+$M{=}100$ & 2.14M & 54.6 & $29.18 \pm 0.24^{*}$ & $79.93 \pm 0.26$ & $7.19 \pm 0.15^{*}$ \\
+$M{=}121$ & 2.59M & 60.8 & $29.18 \pm 0.24^{*}$ & $79.99 \pm 0.26^{*}$ & $7.19 \pm 0.15^{*}$ \\
+$M{=}144$ & 3.08M & 68.5 & $29.26 \pm 0.24^{*}$ & $\mathbf{80.31} \pm 0.26^{*}$ & $7.13 \pm 0.15^{*}$ \\
+$M{=}169$ & 3.62M & 77.5 & $\mathbf{29.27} \pm 0.24^{*}$ & $80.25 \pm 0.26^{*}$ & $\mathbf{7.12} \pm 0.15^{*}$ \\
 \midrule
 \multicolumn{6}{l}{\textit{Depth: V-cycles, $M{=}81$}} \\
-2 V-cycles & \todo{--} & 18.9 & \todo{--} & \todo{--} & \todo{--} \\
+2 V-cycles & 578k  & 18.9 & $28.69 \pm 0.26^{*}$ & $78.73 \pm 0.28^{*}$ & $7.59 \pm 0.15^{*}$ \\
 4 V-cycles & \todo{--} & 34.9 & \todo{--} & \todo{--} & \todo{--} \\
-6 V-cycles & 1.73M & 49.6 & $29.06 \pm 0.24$ & $79.65 \pm 0.27$ & $7.28 \pm 0.15$ \\
+6 V-cycles & 1.73M & 49.6 & $\mathbf{29.14} \pm 0.24$ & $\mathbf{79.90} \pm 0.27$ & $\mathbf{7.22} \pm 0.15$ \\
 \midrule
 \multicolumn{6}{l}{\textit{References}} \\
 LPDSNet    & 1.00M  & 39.0 & $28.86 \pm 0.25$ & $79.12 \pm 0.28$ & $7.45 \pm 0.15$ \\
