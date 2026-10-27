@@ -19,6 +19,9 @@
 \usepackage{xcolor}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,calc,positioning}
+\usepackage{pgfplots}
+\usepgfplotslibrary{groupplots}
+\pgfplotsset{compat=1.16}
 \usepackage{caption}
 \captionsetup{font=small,labelfont=bf}
 \usepackage[numbers,super,sort&compress]{natbib}
@@ -99,8 +102,8 @@ targets were SENSE combinations of the fully sampled data. All networks were tra
 with cosine decay, $3\times10^5$ steps). Baselines were LPDSNet\cite{ref_lpdsnet} (30 layers,
 169 subbands) and E2E-VarNet\cite{ref_varnet} given the same coil sensitivities
 \todo{, and RAM\cite{ref_ram} trained under the same protocol}. PSNR, SSIM and NRMSE were computed
-within the anatomy mask on \todo{N} test volumes at $\sigma=\todo{0.015}$, with paired Wilcoxon
-signed-rank tests (Holm-corrected); inference time was measured on \todo{one GPU type}.
+within the anatomy mask on 815 brain and 100 knee test volumes at $\sigma=\todo{0.015}$, with paired Wilcoxon
+signed-rank tests (Holm-corrected); network time was measured on one NVIDIA L40S.
 
 \section*{Results}
 Figure~\ref{fig:recon} shows representative reconstructions for each anatomy and acceleration.
@@ -110,9 +113,10 @@ Figure~\ref{fig:alias} shows LPDSNet's residual aliasing: \todo{describe, e.g.\ 
 anatomy shifted by FOV/R, clearly visible in the error map}. MGLPDSNet reconstructs the same slices
 without it. \todo{How often it occurs: found in N of M test slices by ...}
 
-Across \todo{N} test volumes (Figure~\ref{fig:bars}), MGLPDSNet \todo{improved on LPDSNet in every
-metric (p<...)}, with \todo{N}$\times$ fewer parameters than E2E-VarNet and an inference time of
-\todo{ms} per slice against \todo{ms}. \todo{Versus E2E-VarNet: ...}
+Across 815 brain and 100 knee test volumes (Figure~\ref{fig:bars}), MGLPDSNet improved on both
+LPDSNet and E2E-VarNet in every metric, anatomy and acceleration ($p<0.001$), by
+0.20--0.58\,dB PSNR over LPDSNet and 0.28--0.57\,dB over E2E-VarNet. It does so with 1.73M parameters, $17\times$ fewer than E2E-VarNet (29.5M), at an inference time of
+50\,ms per slice, against 39\,ms for LPDSNet and 48\,ms for E2E-VarNet.
 
 The ablations (Figure~\ref{fig:ablation}) show \todo{how quality scales with the number of
 subbands $M$ and of V-cycles, and the single-resolution LPDSNet row as the no-multigrid reference}.
@@ -191,17 +195,26 @@ reference, and $\times$5 error maps; arrows on the artifacts.}
 
 \begin{figure}[h]
 \centering
-\figorbox{\figdir/fig4_bars.pdf}{Fig.\ 4: PSNR / SSIM / NRMSE bars per task with Wilcoxon brackets
-(\texttt{figures/plot\_main\_bars.py --tikz}), and a table of parameters, inference time and mean metrics.}
-\caption{\todo{Quantitative comparison ...}}
+% main_table.tex: copy of figures/out/main_table.tex (rerun figures/table_main.py)
+{\small\input{\figdir/main_table.tex}}\\[10pt]
+\input{\figdir/fig4_timing.tikz}
+\caption{Quantitative comparison. Top: PSNR, SSIM and NRMSE within the anatomy mask, mean
+$\pm$ s.e.m.\ over test volumes; bold: best per experiment; $^{*}$: differs from MGLPDSNet
+(paired Wilcoxon signed-rank over volumes, Holm-adjusted, $p<0.05$). Bottom: network time per
+$640\times320$, 20-coil slice on one NVIDIA L40S (median of 30 runs): inference, and one training
+step (forward + backward). Parameters: E2E-VarNet 29.5M, LPDSNet 1.0M, MGLPDSNet ($M{=}81$) 1.7M.}
 \label{fig:bars}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\figorbox{\figdir/fig5_ablation.pdf}{Fig.\ 5: ablation table, knee R8: $M$ = 81, 100, 121, 144,
-169 at 6 V-cycles; 2, 4, 6 V-cycles at $M$ = 81; LPDSNet as the no-multigrid row.}
-\caption{\todo{Ablations ...}}
+\input{\figdir/fig5_ablation_tradeoff.tikz}\\[10pt]
+{\small\input{\figdir/ablation_table.tex}}
+\caption{Ablations, knee R=8: time against quality. Top: test PSNR against inference time
+($640\times320$, 20 coils, NVIDIA L40S) across the width sweep (subbands $M$ at 6 V-cycles, left)
+and the depth sweep (V-cycles at $M{=}81$, right), with LPDSNet and E2E-VarNet for reference.
+Bottom: the same networks in full, mean $\pm$ s.e.m.\ over $n{=}100$ test volumes.
+\todo{remaining ablation evals}}
 \label{fig:ablation}
 \end{figure}
 

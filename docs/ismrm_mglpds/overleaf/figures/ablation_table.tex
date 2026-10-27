@@ -1,0 +1,26 @@
+% Ablation table, knee R=8: PLACEHOLDER, hand-written. Replace with the generated table
+% (figures/table_ablation.py -> figures/out/ablation16_table.tex) once the exp16 eval is in.
+% Filled cells: PSNR/SSIM/NRMSE from results/main/volumes.csv (mean +- s.e.m., n=100 volumes);
+% inference ms from time_net_l40s_planar.txt; params from time_net. \todo{--} = not available yet.
+% Needs \usepackage{booktabs}.
+\begin{tabular}{lccccc}
+\toprule
+ & Params & Inference (ms) & PSNR (dB) $\uparrow$ & SSIM (\%) $\uparrow$ & NRMSE (\%) $\downarrow$ \\
+\midrule
+\multicolumn{6}{l}{\textit{Width: subbands $M$, 6 V-cycles}} \\
+$M{=}81$  & 1.73M & 49.6 & $29.06 \pm 0.24$ & $79.65 \pm 0.27$ & $7.28 \pm 0.15$ \\
+$M{=}100$ & 2.14M & 54.6 & \todo{--} & \todo{--} & \todo{--} \\
+$M{=}121$ & 2.59M & 60.8 & \todo{--} & \todo{--} & \todo{--} \\
+$M{=}144$ & \todo{--} & 68.5 & \todo{--} & \todo{--} & \todo{--} \\
+$M{=}169$ & 3.62M & 77.5 & $29.16 \pm 0.24$ & $79.91 \pm 0.26$ & $7.20 \pm 0.15$ \\
+\midrule
+\multicolumn{6}{l}{\textit{Depth: V-cycles, $M{=}81$}} \\
+2 V-cycles & \todo{--} & 18.9 & \todo{--} & \todo{--} & \todo{--} \\
+4 V-cycles & \todo{--} & 34.9 & \todo{--} & \todo{--} & \todo{--} \\
+6 V-cycles & 1.73M & 49.6 & $29.06 \pm 0.24$ & $79.65 \pm 0.27$ & $7.28 \pm 0.15$ \\
+\midrule
+\multicolumn{6}{l}{\textit{References}} \\
+LPDSNet    & 1.00M  & 39.0 & $28.86 \pm 0.25$ & $79.12 \pm 0.28$ & $7.45 \pm 0.15$ \\
+E2E-VarNet & 29.45M & 47.5 & $28.68 \pm 0.25$ & $79.23 \pm 0.28$ & $7.59 \pm 0.14$ \\
+\bottomrule
+\end{tabular}

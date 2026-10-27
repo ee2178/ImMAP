@@ -1,79 +1,106 @@
-% DRAFT Figure 1: the I2SB chain from the current T1 to the synthesized CT1, with the conditioning
-% injected into the network at every step. Tiles: one test case (slice 81); intermediates are the
-% bridge's closed-form marginal between the two ends under the trained schedule (illustrative).
+% Figure 1: the I2SB chain from the current T1 to the synthesized CT1. Each step: the U-Net predicts
+% x0_hat from the current state x_t and the conditioning (injected at every step); resampling
+% (the I2SB posterior) blends x0_hat with x_t and adds noise to give the next state. One test case,
+% exam 32931392_2665146101, slice 70: real images, the trained longitudinal bridge's own reverse
+% trajectory and its own x0_hat at each shown state (20 steps, seed 0; scripts/fig1_i2sb_tiles.py),
+% shown at t = 1, 0.75, 0.5, 0.25, 0 -- each gap stands for 5 steps. The chain, the x0_hat tiles,
+% the prior stacks and the acquired CT1 share one window; FLAIR and T2 have their own.
 \documentclass[border=6pt]{standalone}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usetikzlibrary{arrows.meta,positioning,calc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
+\graphicspath{{final/}}
 
 \definecolor{net}{HTML}{2A78D6}
 \definecolor{cond}{HTML}{EB6834}
 \definecolor{ink}{HTML}{0B0B0B}
 \definecolor{muted}{HTML}{52514E}
-
-\newcommand{\tile}[3]{% name, node name, width
-  \node[inner sep=0pt, draw=muted, line width=0.3pt] (#2) {\includegraphics[width=#3]{#1}};}
+\definecolor{rs}{HTML}{1BAF7A}
 
 \begin{document}
-\begin{tikzpicture}[font=\small, >={Stealth[length=2.2mm]},
+\begin{tikzpicture}[font=\small, >={Stealth[length=2.0mm]},
+  img/.style={inner sep=0pt, draw=muted, line width=0.3pt, fill=black},
   netbox/.style={draw=net, fill=net!8, rounded corners=2pt, line width=0.7pt,
-                 minimum width=1.25cm, minimum height=0.95cm, align=center, font=\footnotesize},
+                 minimum width=1.3cm, minimum height=0.7cm, align=center, font=\footnotesize},
+  rsbox/.style={draw=rs, fill=rs!10, rounded corners=6pt, line width=0.7pt, inner sep=2pt,
+                minimum width=1.3cm, align=center, font=\scriptsize},
   flow/.style={->, line width=0.8pt, ink},
   inj/.style={->, line width=0.8pt, cond}]
 
-  \def\tw{2.3cm}
-  % ---- the chain ------------------------------------------------------------------------
-  \node[inner sep=0pt, draw=muted, line width=0.3pt] (x1)  at (0,0)    {\includegraphics[width=\tw]{t1.png}};
-  \node[inner sep=0pt, draw=muted, line width=0.3pt] (x75) at (4.3,0)  {\includegraphics[width=\tw]{xt_75.png}};
-  \node[inner sep=0pt, draw=muted, line width=0.3pt] (x50) at (8.6,0)  {\includegraphics[width=\tw]{xt_50.png}};
-  \node[inner sep=0pt, draw=muted, line width=0.3pt] (x25) at (12.9,0) {\includegraphics[width=\tw]{xt_25.png}};
-  \node[inner sep=0pt, draw=muted, line width=0.3pt] (x0)  at (17.2,0) {\includegraphics[width=\tw]{longi.png}};
+  \def\tw{2.4cm}
+  \def\yl{-0.6}   % height of the chain's flow line
+  % ---- the chain: the sampler's real states -------------------------------------------------
+  \node[img] (x1)  at (0,0)    {\includegraphics[width=\tw]{step_00_t1.00.png}};
+  \node[img] (x75) at (4.6,0)  {\includegraphics[width=\tw]{step_05_t0.75.png}};
+  \node[img] (x50) at (9.2,0)  {\includegraphics[width=\tw]{step_10_t0.50.png}};
+  \node[img] (x25) at (13.8,0) {\includegraphics[width=\tw]{step_15_t0.25.png}};
+  \node[img] (x0)  at (18.4,0) {\includegraphics[width=\tw]{synth.png}};
 
-  \foreach \a/\b/\n in {x1/x75/n1, x75/x50/n2, x50/x25/n3, x25/x0/n4} {
-    \node[netbox] (\n) at ($(\a.east)!0.5!(\b.west)$) {U-Net\\[-1pt]$\hat x_0(x_t)$};
-    \draw[flow] (\a.east) -- (\n.west);
-    \draw[flow] (\n.east) -- (\b.west);
+  % one step per gap: x_t -> U-Net -> x0_hat -> resample (with x_t, + noise) -> next x_t
+  \foreach \a/\b/\n/\p in {x1/x75/1/pred_01_t1.00, x75/x50/2/pred_06_t0.75,
+                           x50/x25/3/pred_11_t0.50, x25/x0/4/pred_16_t0.25} {
+    \path ($(\a.east)!0.5!(\b.west)$) coordinate (g\n);
+    \node[netbox] (net\n) at ($(g\n)+(0,2.05)$) {U-Net};
+    \node[img] (xh\n) at ($(g\n)+(0,0.72)$) {\includegraphics[width=1.0cm]{\p.png}};
+    \node[font=\scriptsize, anchor=east] at (xh\n.west) {$\hat x_0$};
+    \node[rsbox] (rs\n) at ($(g\n)+(0,\yl)$) {resample\\[-2pt]+\,noise};
+    % x_t feeds the U-Net, and the resampling
+    \draw[flow] ($(\a.east)+(0,0.95)$) -- ++(0.25,0) |- (net\n.west);
+    \draw[flow] ($(\a.east)+(0,\yl)$) -- (rs\n.west);
+    \draw[flow] (net\n.south) -- (xh\n.north);
+    \draw[flow] (xh\n.south) -- (rs\n.north);
+    \draw[flow] (rs\n.east) -- ($(\b.west)+(0,\yl)$);
   }
 
-  % labels under the tiles
-  \node[below=2pt of x1, align=center]  {$x_1$: current T1\\(measured, $t{=}1$)};
-  \node[below=2pt of x75, align=center] {$x_{t}$, $t{=}0.75$};
-  \node[below=2pt of x50, align=center] {$x_{t}$, $t{=}0.5$};
-  \node[below=2pt of x25, align=center] {$x_{t}$, $t{=}0.25$};
+  \node[below=2pt of x1, align=center]  {$x_1$: current T1\\(acquired, $t{=}1$)};
+  \node[below=2pt of x75, align=center] {$x_t$, $t{=}0.75$};
+  \node[below=2pt of x50, align=center] {$x_t$, $t{=}0.5$};
+  \node[below=2pt of x25, align=center] {$x_t$, $t{=}0.25$};
   \node[below=2pt of x0, align=center]  {$\hat x_0$: synthesized CT1\\($t{=}0$)};
 
-  % time axis
+  % the acquired CT1, for reference only: not part of the chain, never seen by the model
+  \node[img, right=1.1cm of x0] (ref) {\includegraphics[width=\tw]{cur_ct1.png}};
+  \draw[muted, dashed, line width=0.5pt] ($(x0.north east)!0.5!(ref.north west)+(0,0.3)$)
+    -- ($(x0.south east)!0.5!(ref.south west)+(0,-0.9)$);
+  \node[below=2pt of ref, align=center, muted] {acquired CT1\\(reference)};
+
   \draw[->, muted, line width=0.6pt] ($(x1.south west)+(0,-1.25)$) -- ($(x0.south east)+(0,-1.25)$)
     node[pos=0, anchor=north west, font=\footnotesize, muted] {$t=1$: start at the patient's own anatomy}
     node[pos=1, anchor=north east, font=\footnotesize, muted] {$t=0$};
-  \node[font=\footnotesize, muted] at ($(x50.south)+(0,-2.0)$)
-    {20 steps; each: U-Net predicts $\hat x_0$, the bridge posterior gives the next $x_t$};
 
-  % ---- the conditioning, injected at every step -------------------------------------------
-  \coordinate (bus) at ($(x1.north)+(0,1.2)$);
-  \draw[cond, line width=1.1pt] ($(n1.north)+(-0.0,1.53)$) -- ($(n4.north)+(0,1.53)$);
-  \foreach \n in {n1,n2,n3,n4}
-    \draw[inj] ($(\n.north)+(0,1.53)$) -- (\n.north);
-  \node[cond, font=\footnotesize, anchor=south] at ($(n2.north)!0.5!(n3.north)+(0,1.55)$)
+  % ---- the conditioning, injected at every step ---------------------------------------------
+  \def\yb{3.05}   % height of the conditioning bus
+  \draw[cond, line width=1.1pt] ($(g1)+(0,\yb)$) -- ($(g4)+(0,\yb)$);
+  \foreach \n in {1,2,3,4}
+    \draw[inj] ($(g\n)+(0,\yb)$) -- (net\n.north);
+  \node[cond, font=\footnotesize, anchor=south] at ($(g2)!0.5!(g3)+(0,\yb+0.02)$)
     {same conditioning, input channels of the U-Net at every step};
 
-  % current exam (left) and registered prior (right), feeding the bus
-  \begin{scope}[shift={($(x1.north)+(-0.1,3.6)$)}]
-    \foreach \i in {2,1,0}
-      \node[inner sep=0pt, draw=muted, line width=0.3pt, fill=white] (c\i) at (0.18*\i,0.18*\i)
-        {\includegraphics[width=1.35cm]{t1.png}};
-    \node[align=center, font=\footnotesize, anchor=north] at (0.18,-0.8)
-      {current FLAIR, T1, T2\\[-1pt]\textcolor{red}{(draft: T1 tile ×3)}};
+  % current exam: FLAIR, T1, T2 side by side (left)
+  \def\cw{1.5cm}
+  \node[img] (cf) at ($(x1.north)+(-1.6,5.2)$) {\includegraphics[width=\cw]{cur_flair.png}};
+  \node[img, right=1.5mm of cf] (ct) {\includegraphics[width=\cw]{cur_t1.png}};
+  \node[img, right=1.5mm of ct] (c2) {\includegraphics[width=\cw]{cur_t2.png}};
+  \foreach \n/\l in {cf/FLAIR, ct/T1, c2/T2}
+    \node[font=\scriptsize, above=0pt of \n] {\l};
+  \node[font=\footnotesize, below=1pt of ct, align=center] {current exam};
+
+  % registered prior: T1 and CT1 stacks over slices z-2..z+2, the matched slice in front (right)
+  \begin{scope}[shift={($(x0.north)+(-3.0,4.95)$)}]
+    \foreach \d/\o in {+2/4, -2/3, +1/2, -1/1, +0/0}
+      \node[img] (pt\o) at (0.13*\o,0.13*\o) {\includegraphics[width=\cw]{prior_t1_\d.png}};
+    \node[font=\scriptsize, above=0pt of pt4] {T1};
   \end{scope}
-  \begin{scope}[shift={($(x0.north)+(-0.6,3.6)$)}]
-    \foreach \i in {4,3,2,1,0}
-      \node[inner sep=0pt, draw=muted, line width=0.3pt, fill=white] (p\i) at (0.16*\i,0.16*\i)
-        {\includegraphics[width=1.35cm]{prior_ct1.png}};
-    \node[align=center, font=\footnotesize, anchor=north] at (0.3,-0.8)
-      {prior T1 \& CT1, slices $z{-}2\ldots z{+}2$\\[-1pt]registered with FLAIR/T1/T2 only};
+  \begin{scope}[shift={($(x0.north)+(-0.8,4.95)$)}]
+    \foreach \d/\o in {+2/4, -2/3, +1/2, -1/1, +0/0}
+      \node[img] (pc\o) at (0.13*\o,0.13*\o) {\includegraphics[width=\cw]{prior_ct1_\d.png}};
+    \node[font=\scriptsize, above=0pt of pc4] {CT1};
   \end{scope}
-  \draw[cond, line width=1.1pt] ($(c0.south)+(0,-1.3)$) |- ($(n1.north)+(0,1.53)$);
-  \draw[cond, line width=1.1pt] ($(p0.south)+(0.3,-1.3)$) |- ($(n4.north)+(0,1.53)$);
+  \node[font=\footnotesize, align=center, anchor=north] at ($(pt0.south)!0.5!(pc0.south)+(0,-0.05)$)
+    {prior exam, slices $z{-}2\ldots z{+}2$,\\[-1pt]registered with FLAIR/T1/T2 only};
+
+  \draw[cond, line width=1.1pt] ($(ct.south)+(0,-0.5)$) |- ($(g1)+(0,\yb)$);
+  \draw[cond, line width=1.1pt] ($(pt0.south)!0.5!(pc0.south)+(0,-0.85)$) |- ($(g4)+(0,\yb)$);
 \end{tikzpicture}
 \end{document}

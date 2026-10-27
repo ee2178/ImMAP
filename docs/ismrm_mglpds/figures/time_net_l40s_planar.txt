@@ -1,0 +1,13 @@
+# Interactive L40S (gl017), 2026-10-27: 640x320, 20 coils, R=12, median of 30 (ms).
+# Configs from make_mg_recon_configs.py --planar-state, lpdsnet patched to complex_conv=planar
+# (both knobs change no parameter). Source of fig4_timing.tikz and fig5_ablation_timing.tikz.
+# Supersedes job 19233351, which ran lpdsnet on gauss convs and every net on complex state.
+varnetmaps_R12     gauss   -        infer    47.5  fwd    48.0  bwd    87.3
+lpdsnet_R12        planar  planar   infer    39.0  fwd    38.8  bwd    56.4
+mg81v6_R12         planar  planar   infer    49.6  fwd    57.2  bwd    77.6
+mg81v2_R12         planar  planar   infer    18.9  fwd    21.0  bwd    26.8
+mg81v4_R12         planar  planar   infer    34.9  fwd    39.3  bwd    52.0
+mg100v6_R12        planar  planar   infer    54.6  fwd    58.3  bwd    86.6
+mg121v6_R12        planar  planar   infer    60.8  fwd    62.1  bwd    93.5
+mg144v6_R12        planar  planar   infer    68.5  fwd    69.7  bwd   106.3
+mg169v6_R12        planar  planar   infer    77.5  fwd    79.2  bwd   119.5

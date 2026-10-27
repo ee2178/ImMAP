@@ -1,0 +1,52 @@
+% Network time for the three main methods, hand-written pgfplots (no generator script).
+% Needs \usepackage{pgfplots} \pgfplotsset{compat=1.16}. Width: \timingwidth, default \linewidth
+% (a LENGTH, as for main_bars.tikz). Method colours match main_bars.tikz.
+%
+% THE NUMBERS: edit the two rows below. ms per 640x320, 20-coil slice, median of scripts/time_net.py.
+%   infer  = the `infer' column (eval mode, no autograd)
+%   train  = forward + backward (the network's share of one training step)
+% Source: time_net_l40s_planar.txt (L40S, R=12): varnetmaps, lpdsnet, mg81v6; train = fwd + bwd.
+% Define \timingplaceholder{<text>} to put a red banner over the chart.
+\providecommand{\timingwidth}{\linewidth}
+\def\timingdevice{NVIDIA L40S}
+%                  E2E-VarNet  LPDSNet  MGLPDS
+\def\inferVN{47.5}  \def\inferLP{39.0}  \def\inferMG{49.6}
+\def\trainVN{135.3} \def\trainLP{95.2}  \def\trainMG{134.8}
+\definecolor{mbc0}{HTML}{2A78D6}
+\definecolor{mbc1}{HTML}{EB6834}
+\definecolor{mbc2}{HTML}{1BAF7A}
+\definecolor{mbink}{HTML}{0B0B0B}
+\definecolor{mbmuted}{HTML}{52514E}
+\definecolor{mbgrid}{HTML}{E1E0D9}
+\begin{tikzpicture}
+\pgfplotsset{timingaxis/.style={
+  xbar, scale only axis, width=0.36\timingwidth, height=0.13\timingwidth,
+  xmin=0, enlarge y limits=0.3, bar width=0.03\timingwidth, bar shift=0pt,
+  ytick={0,1,2}, yticklabels={MGLPDS, LPDSNet, E2E-VarNet}, y dir=normal,
+  yticklabel style={font=\footnotesize, text=mbink},
+  xticklabel style={font=\footnotesize, text=mbmuted}, title style={font=\small, text=mbink},
+  axis x line*=bottom, axis y line*=left, axis line style={mbmuted}, tick style={mbmuted},
+  major tick length=2pt, y axis line style={draw=none}, ytick style={draw=none},
+  xmajorgrids, grid style={mbgrid, line width=0.3pt},
+  nodes near coords, nodes near coords style={font=\scriptsize, text=mbink, anchor=west},
+  point meta=explicit symbolic,
+}}
+\begin{axis}[timingaxis, name=inf, title={Inference (ms / slice)},
+             xmax={1.25*max(\inferVN,\inferLP,\inferMG)}]
+\addplot[fill=mbc2, draw=white] coordinates {(\inferMG,0) [\inferMG]};
+\addplot[fill=mbc1, draw=white] coordinates {(\inferLP,1) [\inferLP]};
+\addplot[fill=mbc0, draw=white] coordinates {(\inferVN,2) [\inferVN]};
+\end{axis}
+\begin{axis}[timingaxis, at={($(inf.east)+(0.12\timingwidth,0)$)}, anchor=west,
+             title={Training step, forward + backward (ms)},
+             xmax={1.25*max(\trainVN,\trainLP,\trainMG)}, yticklabels={}]
+\addplot[fill=mbc2, draw=white] coordinates {(\trainMG,0) [\trainMG]};
+\addplot[fill=mbc1, draw=white] coordinates {(\trainLP,1) [\trainLP]};
+\addplot[fill=mbc0, draw=white] coordinates {(\trainVN,2) [\trainVN]};
+\end{axis}
+\node[font=\scriptsize, text=mbmuted, anchor=north] at ($(inf.south east)!0.5!(inf.south east)+(0.06\timingwidth,-0.035\timingwidth)$)
+  {\timingdevice, $640\times320$, 20 coils, median of 30 runs};
+\ifdefined\timingplaceholder
+\node[font=\small\bfseries, text=red, anchor=south] at ($(inf.north east)+(0.06\timingwidth,0.035\timingwidth)$) {\timingplaceholder};
+\fi
+\end{tikzpicture}

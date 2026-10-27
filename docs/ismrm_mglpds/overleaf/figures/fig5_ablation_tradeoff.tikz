@@ -1,0 +1,63 @@
+% Time vs quality across the two MGLPDS ablations (knee, R=8), hand-written pgfplots.
+% Needs \usepackage{pgfplots} \usepgfplotslibrary{groupplots} \pgfplotsset{compat=1.16}.
+% Width: \abltradewidth, default \linewidth (a LENGTH). Colours match main_bars.tikz.
+%
+% THE NUMBERS: the two tables below. infer = inference ms (time_net_l40s_planar.txt: L40S,
+% 640x320, 20 coils -- brain-sized, the timing does not depend on the data); psnr = knee R8 test
+% mean (results/main/volumes.csv). `nan' = not evaluated yet: the point is left out. Fill the
+% psnr column from the exp16 ablation eval (torch/exp16_ablation_eval.sbatch).
+\providecommand{\abltradewidth}{\linewidth}
+\pgfplotstableread{
+lab      infer  psnr
+{81}     49.6   29.06
+{100}    54.6   nan
+{121}    60.8   nan
+{144}    68.5   nan
+{169}    77.5   29.16
+}\ablwidthdata
+\pgfplotstableread{
+lab      infer  psnr
+{2}      18.9   nan
+{4}      34.9   nan
+{6}      49.6   29.06
+}\abldepthdata
+% references, same axes: LPDSNet and E2E-VarNet (knee R8 PSNR, L40S inference)
+\def\refLPx{39.0}\def\refLPy{28.86}
+\def\refVNx{47.5}\def\refVNy{28.68}
+\definecolor{mbc0}{HTML}{2A78D6}
+\definecolor{mbc1}{HTML}{EB6834}
+\definecolor{mbc2}{HTML}{1BAF7A}
+\definecolor{mbink}{HTML}{0B0B0B}
+\definecolor{mbmuted}{HTML}{52514E}
+\definecolor{mbgrid}{HTML}{E1E0D9}
+\begin{tikzpicture}
+\begin{groupplot}[
+  group style={group size=2 by 1, horizontal sep=0.12\abltradewidth},
+  scale only axis, width=0.36\abltradewidth, height=0.22\abltradewidth,
+  xmin=0, xmax=90, ymin=28.5, ymax=29.4,
+  xlabel={inference (ms / slice)}, ylabel={PSNR (dB) $\uparrow$},
+  ylabel style={font=\small}, xlabel style={font=\small}, title style={font=\small, text=mbink},
+  ticklabel style={font=\footnotesize}, yticklabel style={text=mbmuted, /pgf/number format/fixed,
+    /pgf/number format/precision=1}, xticklabel style={text=mbmuted},
+  axis x line*=bottom, axis y line*=left, axis line style={mbmuted}, tick style={mbmuted},
+  major tick length=2pt, grid=major, grid style={mbgrid, line width=0.3pt},
+  unbounded coords=discard, scaled y ticks=false,
+]
+\nextgroupplot[title={Width: subbands $M$ (6 V-cycles)}]
+\addplot[mbc2, line width=1pt, mark=*, mark size=1.8pt, point meta=explicit symbolic,
+         nodes near coords, nodes near coords style={font=\scriptsize, text=mbink, anchor=south}]
+  table[x=infer, y=psnr, meta=lab] {\ablwidthdata};
+\addplot[only marks, mark=square*, mark size=2pt, mbc1] coordinates {(\refLPx,\refLPy)};
+\node[font=\scriptsize, text=mbink, anchor=north] at (axis cs:\refLPx,\refLPy) {LPDSNet};
+\addplot[only marks, mark=triangle*, mark size=2.6pt, mbc0] coordinates {(\refVNx,\refVNy)};
+\node[font=\scriptsize, text=mbink, anchor=north] at (axis cs:\refVNx,\refVNy) {E2E-VarNet};
+\nextgroupplot[title={Depth: V-cycles ($M{=}81$)}, ylabel={}]
+\addplot[mbc2, line width=1pt, mark=*, mark size=1.8pt, point meta=explicit symbolic,
+         nodes near coords, nodes near coords style={font=\scriptsize, text=mbink, anchor=south}]
+  table[x=infer, y=psnr, meta=lab] {\abldepthdata};
+\addplot[only marks, mark=square*, mark size=2pt, mbc1] coordinates {(\refLPx,\refLPy)};
+\node[font=\scriptsize, text=mbink, anchor=north] at (axis cs:\refLPx,\refLPy) {LPDSNet};
+\addplot[only marks, mark=triangle*, mark size=2.6pt, mbc0] coordinates {(\refVNx,\refVNy)};
+\node[font=\scriptsize, text=mbink, anchor=north] at (axis cs:\refVNx,\refVNy) {E2E-VarNet};
+\end{groupplot}
+\end{tikzpicture}

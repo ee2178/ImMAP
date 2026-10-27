@@ -97,7 +97,8 @@ def read_run(d, similarity=False):
                 out[f[:-3]]["prior_mse"] = prior_similarity(
                     h["reference"][:], h["prior_ct1"][:], h["organ_mask"][:])
             if not attrs:
-                attrs = {k: h.attrs[k] for k in ("seed", "intensity_units", "nfe") if k in h.attrs}
+                attrs = {k: h.attrs[k] for k in ("seed", "intensity_units", "nfe", "data_range")
+                         if k in h.attrs}
     return out, attrs
 
 
@@ -122,6 +123,9 @@ def main(argv=None):
     p.add_argument("--similarity", default=os.path.join(HERE, "figures", "out",
                                                          "nyumets_similarity"),
                    help="gain vs prior-similarity figure, path without extension ('' = none)")
+    p.add_argument("--data-range", type=float, default=2.0,
+                   help="the metrics' data_range, for the prior's PSNR (10 log10(range^2 / prior_mse))"
+                        " in --from-csv mode; read from the dumps otherwise (abstract runs: 2.0)")
     p.add_argument("--from-csv", metavar="SLICES_CSV",
                    help="draw the z-profile from a slices.csv this script wrote (e.g. copied off "
                         "the cluster) instead of reading dumps; writes no CSV")
@@ -134,7 +138,8 @@ def main(argv=None):
         if a.similarity:
             if any(r.get("prior_mse") for r in rows):
                 nets = list(dict.fromkeys(r["net"] for r in rows))
-                similarity_plot(*gain_vs_similarity(rows, nets), nets, a.similarity, tikz=a.tikz)
+                similarity_plot(*gain_vs_similarity(rows, nets, a.data_range), nets, a.similarity,
+                                tikz=a.tikz)
             else:
                 print("this slices.csv has no prior_mse column -- rebuild it on the cluster "
                       "(scripts/nyumets_volumes_csv.py --profile '') for the similarity plot")
@@ -217,7 +222,8 @@ def main(argv=None):
     if a.profile:
         profile(data, labels, vols, a.trained_hi, a.profile, a.tikz)
     if a.similarity:
-        similarity_plot(*gain_vs_similarity(srows, labels), labels, a.similarity, tikz=a.tikz)
+        rng = float(attrs[labels[0]].get("data_range", a.data_range))
+        similarity_plot(*gain_vs_similarity(srows, labels, rng), labels, a.similarity, tikz=a.tikz)
 
     q = lambda s: f'"{s}"' if " " in s else s           # noqa: E731
     vin = os.path.relpath(os.path.join(a.out, "volumes.csv"), HERE)
@@ -231,9 +237,11 @@ def main(argv=None):
           f"--out {os.path.join(os.path.dirname(vin), 'wilcoxon_volumes.csv')}")
 
 
-def gain_vs_similarity(rows, labels):
-    """slices.csv rows -> (gain, prior_mse) arrays over the slices both nets have: gain =
-    PSNR(last net) - PSNR(first net), the prior study's paired gain."""
+def gain_vs_similarity(rows, labels, data_range):
+    """slices.csv rows -> (gain, prior PSNR) arrays over the slices both nets have: gain =
+    PSNR(last net) - PSNR(first net), the prior study's paired gain; prior PSNR = 10 log10(
+    data_range^2 / prior_mse), the registered prior CT1 scored against the current CT1 exactly as
+    the nets are (same mask, same data_range) -- log MSE up to a sign and a shift."""
     by = {}
     for r in rows:
         by.setdefault((r["volume"], int(r["slice"])), {})[r["net"]] = r
@@ -244,129 +252,100 @@ def gain_vs_similarity(rows, labels):
             e.append(float(x[labels[0]]["prior_mse"]))
     g, e = np.asarray(g, float), np.asarray(e, float)
     ok = np.isfinite(g) & np.isfinite(e) & (e > 0)
-    return g[ok], e[ok]
+    return g[ok], 10 * np.log10(data_range ** 2 / e[ok])
 
 
-def _ranks(x):
-    r = np.empty(x.size)
-    r[np.argsort(x, kind="mergesort")] = np.arange(x.size)
-    return r
-
-
-def similarity_plot(gain, mse, labels, out, n_bins=10, tikz=False):
-    """Per-slice gain of the prior study against how far the prior CT1 is from the current CT1
-    (prior_mse, log axis: it spans orders of magnitude): every slice as density, and the mean gain
-    (+- s.e.m.) in equal-count bins of the MSE, with the 10-90% range of the gain shaded. Prints
-    the bins and the rank correlation of MSE with gain."""
+def similarity_plot(gain, ppsnr, labels, out, n_bins=10, width=2.0, min_n=100, tikz=False):
+    """Per-slice gain of the prior study against how close the prior CT1 is to the current CT1
+    (the prior's own PSNR against it, dB; high = similar), as a line: mean gain +- 1 SD over the
+    slices in fixed `width`-dB bins spanning the data (bins with < `min_n` slices dropped; the
+    s.e.m. is ~0.01 dB, too small to draw). Also prints equal-count bins (deciles, for quoting in
+    text)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    edges = np.unique(np.quantile(mse, np.linspace(0, 1, n_bins + 1)))
-    idx = np.clip(np.searchsorted(edges, mse, side="right") - 1, 0, len(edges) - 2)
-    rows = []
-    for b in range(len(edges) - 1):
-        s = idx == b
+    def stats(s, lo, hi, mid):
         x = gain[s]
-        rows.append(dict(lo=edges[b], hi=edges[b + 1], mid=float(np.median(mse[s])), n=int(s.sum()),
-                         mean=float(x.mean()), se=float(x.std(ddof=1) / np.sqrt(x.size)),
-                         p10=float(np.percentile(x, 10)), p90=float(np.percentile(x, 90)),
-                         better=float((x > 0).mean())))
-    print(f"\nprior-study PSNR gain ({labels[-1]} - {labels[0]}) by prior MSE (prior CT1 vs "
-          f"current CT1 in the mask; low = similar), {gain.size} slices:")
-    print(f"  {'MSE range':>19} {'n':>6} {'mean gain':>10} {'+-se':>6} {'better':>7} {'p10':>6} {'p90':>6}")
-    for r in rows:
-        print(f"  {r['lo']:>9.4f}-{r['hi']:<9.4f} {r['n']:>6} {r['mean']:>+10.2f} {r['se']:>6.2f} "
-              f"{100 * r['better']:>6.0f}% {r['p10']:>+6.2f} {r['p90']:>+6.2f}")
-    rho = float(np.corrcoef(_ranks(mse), _ranks(gain))[0, 1])
-    print(f"  Spearman rank correlation of prior MSE with gain: {rho:+.3f}")
+        return dict(lo=lo, hi=hi, mid=mid, n=int(s.sum()), mean=float(x.mean()),
+                    sd=float(x.std(ddof=1)), se=float(x.std(ddof=1) / np.sqrt(x.size)),
+                    better=float((x > 0).mean()))
+
+    def table(rows, title):
+        print(f"\n{title}")
+        print(f"  {'prior PSNR (dB)':>19} {'n':>6} {'mean gain':>10} {'+-sd':>6} {'+-se':>6} {'better':>7}")
+        for r in rows:
+            print(f"  {r['lo']:>9.2f}-{r['hi']:<9.2f} {r['n']:>6} {r['mean']:>+10.2f} {r['sd']:>6.2f} "
+                  f"{r['se']:>6.2f} {100 * r['better']:>6.0f}%")
+
+    head = (f"prior-study PSNR gain ({labels[-1]} - {labels[0]}) by prior PSNR (prior CT1 vs "
+            f"current CT1 in the mask; high = similar), {gain.size} slices")
+    q = np.unique(np.quantile(ppsnr, np.linspace(0, 1, n_bins + 1)))
+    qi = np.clip(np.searchsorted(q, ppsnr, side="right") - 1, 0, len(q) - 2)
+    table([stats(qi == b, q[b], q[b + 1], 0.0) for b in range(len(q) - 1)],
+          head + ", equal-count bins:")
+
+    e = np.arange(np.floor(ppsnr.min() / width) * width, ppsnr.max() + width, width)
+    bi = np.clip(np.searchsorted(e, ppsnr, side="right") - 1, 0, len(e) - 2)
+    rows = [stats(bi == b, e[b], e[b + 1], 0.5 * (e[b] + e[b + 1]))
+            for b in range(len(e) - 1) if (bi == b).sum() >= min_n]
+    table(rows, head + f", {width:g} dB bins with >= {min_n} slices (plotted):")
 
     plt.rcParams.update({"font.size": 9, "axes.edgecolor": MUTED, "axes.labelcolor": INK,
                          "xtick.color": MUTED, "ytick.color": MUTED, "font.family": "DejaVu Sans"})
-    fig, ax = plt.subplots(figsize=(5.2, 3.6))
-    # the outermost 1% of gains fall off the axes rather than being clipped onto its edges
-    lo, hi = np.percentile(gain, [0.5, 99.5])
-    ax.hexbin(mse, gain, xscale="log", gridsize=(60, 120), cmap="Greys", bins="log",
-              mincnt=1, linewidths=0, zorder=1)
-    ax.set_ylim(lo - 0.05 * (hi - lo), hi + 0.05 * (hi - lo))
+    fig, ax = plt.subplots(figsize=(5.2, 3.4))
     mid = np.array([r["mid"] for r in rows])
-    c = PALETTE[1]
-    ax.fill_between(mid, [r["p10"] for r in rows], [r["p90"] for r in rows], color=c, alpha=0.18,
-                    lw=0, zorder=2, label="10-90% of slices")
-    ax.errorbar(mid, [r["mean"] for r in rows], yerr=[r["se"] for r in rows], color=c, lw=1.6,
-                marker="o", ms=3.5, capsize=2, zorder=3, label="mean gain (± s.e.m.), per bin")
+    ax.errorbar(mid, [r["mean"] for r in rows], yerr=[r["sd"] for r in rows], color=PALETTE[1],
+                lw=1.6, marker="o", ms=4, capsize=2.5, zorder=3)
     ax.axhline(0, color=MUTED, lw=0.8, zorder=2)
-    ax.set_xscale("log")
-    ax.set_xlabel("prior MSE: mean (prior CT1 − current CT1)² in the mask  (← more similar)")
-    ax.set_ylabel(f"PSNR gain, {labels[-1]} − {labels[0]} (dB)")
+    ax.set_xlabel("prior PSNR: registered prior CT1 vs current CT1 (dB)")
+    ax.set_ylabel("PSNR gain (dB)")
     ax.grid(axis="y", color=GRID, lw=0.6, zorder=0)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
-    ax.legend(frameon=False, loc="upper right", fontsize=8)
-    fig.text(0.5, 0.005, f"{gain.size} test slices (grey: density, log scale); bins hold equal "
-             f"numbers of slices", ha="center", va="bottom", fontsize=7, color=MUTED)
+    fig.text(0.5, 0.005, f"{gain.size} test slices; mean ± 1 SD in {width:g} dB bins",
+             ha="center", va="bottom", fontsize=7, color=MUTED)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     for ext in ("png", "pdf"):
         fig.savefig(f"{out}.{ext}", dpi=300)
     print(f"wrote {out}.png, .pdf")
     if tikz:
-        write_similarity_tikz(out, gain, mse, rows, labels, ax.get_ylim())
+        write_similarity_tikz(out, gain, rows, width)
 
 
-def write_similarity_tikz(out, gain, mse, rows, labels, ylim):
+def write_similarity_tikz(out, gain, rows, width):
     r"""The similarity plot as pgfplots: <out>.tikz (for \input; width \nyusimwidth, a LENGTH,
-    default \linewidth), <out>_density.png (the slice density, a raster: 40k points are too many
-    for TeX) and <out>_standalone.tex. The axis runs in log10(MSE) with 10^k tick labels, so the
-    raster's extent is plain numbers. The image is found at \figdir/<name>_density.png; \figdir
-    defaults to the .tikz's own folder (.)."""
-    from PIL import Image
-
+    default \linewidth) and <out>_standalone.tex."""
     name = os.path.basename(out)
     f = lambda v: f"{v:.5g}"                                             # noqa: E731
-    lx = np.log10(mse)
-    xlo, xhi = np.floor(lx.min() * 4) / 4, np.ceil(lx.max() * 4) / 4
-    ylo, yhi = ylim
-    H, _, _ = np.histogram2d(lx, gain, bins=(160, 120), range=((xlo, xhi), (ylo, yhi)))
-    D = np.log1p(H.T[::-1])                                              # rows top = ymax
-    shade = (255 - 200 * D / max(D.max(), 1e-9)).astype(np.uint8)       # white = empty
-    shade[H.T[::-1] == 0] = 255
-    Image.fromarray(shade, "L").save(f"{out}_density.png")
-
-    mid = [np.log10(r["mid"]) for r in rows]
-    up = " ".join(f"({f(x)},{f(r['p90'])})" for x, r in zip(mid, rows))
-    dn = " ".join(f"({f(x)},{f(r['p10'])})" for x, r in reversed(list(zip(mid, rows))))
-    mean = " ".join(f"({f(x)},{f(r['mean'])}) +- (0,{f(r['se'])})" for x, r in zip(mid, rows))
-    ticks = list(range(int(np.ceil(xlo)), int(np.floor(xhi)) + 1))
+    xlo, xhi = rows[0]["lo"], rows[-1]["hi"]
+    # explicit y limits: pgfplots' automatic ones ignore the error bars and clip them
+    lo = min(r["mean"] - r["sd"] for r in rows)
+    hi = max(r["mean"] + r["sd"] for r in rows)
+    ylo, yhi = np.floor((lo - 0.1) * 2) / 2, np.ceil((hi + 0.1) * 2) / 2
+    pts = " ".join(f"({f(r['mid'])},{f(r['mean'])}) +- (0,{f(r['sd'])})" for r in rows)
     L = [r"% Generated by scripts/nyumets_volumes_csv.py --tikz. Do not edit by hand: rerun it.",
          r"% Needs \usepackage{pgfplots} \pgfplotsset{compat=1.16}. Width: \nyusimwidth, a LENGTH",
-         r"% (default \linewidth). The density raster is \figdir/" + name + "_density.png.",
-         rf"% Caption text: {gain.size} test slices; grey: slice density (log scale); line: mean "
-         r"gain +/- s.e.m. in equal-count bins of the prior MSE; band: 10--90% of slices.",
+         r"% (default \linewidth).",
+         rf"% Caption text: {gain.size} test slices; mean gain +/- 1 SD over the slices in "
+         rf"{width:g} dB bins of the prior PSNR (bins with < 100 slices omitted).",
          r"\providecommand{\nyusimwidth}{\linewidth}",
-         r"\providecommand{\figdir}{.}",
          rf"\definecolor{{nysim}}{{HTML}}{{{PALETTE[1].lstrip('#').upper()}}}",
          r"\definecolor{nysimmuted}{HTML}{52514E}", r"\definecolor{nysimgrid}{HTML}{E1E0D9}",
          r"\begin{tikzpicture}",
-         r"\begin{axis}[width=\nyusimwidth, height=0.68\nyusimwidth, scale only axis=false,",
-         rf"  xmin={f(xlo)}, xmax={f(xhi)}, ymin={f(ylo)}, ymax={f(yhi)},",
-         "  xtick={" + ",".join(str(t) for t in ticks) + "}, xticklabels={"
-         + ",".join(f"$10^{{{t}}}$" for t in ticks) + "},",
+         # scale only axis: the axis box itself is 0.85 x 0.5 of the width, labels sit outside it
+         r"\begin{axis}[scale only axis, width=0.85\nyusimwidth, height=0.5\nyusimwidth,",
+         rf"  xmin={f(xlo)}, xmax={f(xhi)}, xtick distance={f(2 * width)},",
+         rf"  ymin={f(ylo)}, ymax={f(yhi)},",
          r"  axis lines=left, axis line style={nysimmuted}, tick style={nysimmuted},",
-         r"  tick align=outside, ymajorgrids, grid style={nysimgrid}, axis on top,",
-         r"  xlabel={prior MSE, mean (prior CT1 $-$ current CT1)$^2$ in the mask},",
-         rf"  ylabel={{PSNR gain, {labels[-1]} $-$ {labels[0]} (dB)}},",
-         r"  label style={font=\small}, tick label style={font=\footnotesize},",
-         r"  legend style={draw=none, fill=none, font=\footnotesize}, legend cell align=left,",
-         r"  legend pos=north east]",
-         rf"\addplot[forget plot] graphics[xmin={f(xlo)}, xmax={f(xhi)}, ymin={f(ylo)}, ymax={f(yhi)}] "
-         rf"{{\figdir/{name}_density.png}};",
-         rf"\addplot[draw=none, fill=nysim, fill opacity=0.22, area legend] coordinates {{{up} {dn}}} -- cycle;",
-         r"\addlegendentry{10--90\% of slices}",
-         r"\addplot[nysim, line width=1pt, mark=*, mark size=1.4pt, error bars/.cd, y dir=both,",
-         rf"  y explicit] coordinates {{{mean}}};",
-         r"\addlegendentry{mean gain ($\pm$ s.e.m.), per bin}",
+         r"  tick align=outside, ymajorgrids, grid style={nysimgrid},",
+         r"  xlabel={prior PSNR, registered prior CT1 vs.\ current CT1 (dB)},",
+         r"  ylabel={PSNR gain (dB)},",
+         r"  label style={font=\small}, tick label style={font=\footnotesize}]",
          rf"\addplot[nysimmuted, line width=0.5pt, forget plot] coordinates {{({f(xlo)},0) ({f(xhi)},0)}};",
+         r"\addplot[nysim, line width=1pt, mark=*, mark size=1.6pt, error bars/.cd, y dir=both,",
+         rf"  y explicit, error bar style={{line width=0.6pt}}] coordinates {{{pts}}};",
          r"\end{axis}", r"\end{tikzpicture}"]
     with open(f"{out}.tikz", "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(L) + "\n")
@@ -376,7 +355,7 @@ def write_similarity_tikz(out, gain, mse, rows, labels, ylim):
             r"\pgfplotsset{compat=1.16}",
             r"\newlength{\nyusimwidth}\setlength{\nyusimwidth}{11cm}",
             r"\begin{document}", rf"\input{{{name}.tikz}}", r"\end{document}"]) + "\n")
-    print(f"wrote {out}.tikz, {out}_density.png and {out}_standalone.tex")
+    print(f"wrote {out}.tikz and {out}_standalone.tex")
 
 
 def profile(data, labels, vols, trained_hi, out, tikz=False):

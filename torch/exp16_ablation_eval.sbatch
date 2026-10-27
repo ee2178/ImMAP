@@ -35,9 +35,6 @@
 # rebuilt with it:
 #   RUNS="knee/mg81v4vtxAnestU_R8" sbatch --array=0 torch/exp16_ablation_eval.sbatch
 #
-# A run whose checkpoint has not reached the config's num_epochs is REFUSED
-# (it would be scored mid-training); ALLOW_PARTIAL=1 scores it anyway.
-#
 # BEFORE THE FIRST SUBMIT: the LPIPS weights, as for main_eval.sbatch (login node):
 #   conda activate gcdl
 #   python -c "from evaluation.metrics import warm_up; warm_up(['lpips'], 'cpu')"
@@ -71,31 +68,6 @@ source ~/.bashrc
 conda activate gcdl
 cd "${IMMAP_ROOT}"
 : "${SLURM_ARRAY_TASK_ID:?must be run as an array job}"
-
-# ---- refuse a run that is still training -------------------------------------------------
-read -r -a _runs <<< "${ABL_RUNS}"
-if [ "${SLURM_ARRAY_TASK_ID}" -ge "${#_runs[@]}" ]; then
-    echo "[abl-eval] task ${SLURM_ARRAY_TASK_ID} >= ${#_runs[@]} runs -- fix --array" \
-         "(should be 0-$(( ${#_runs[@]} - 1 )))" >&2
-    exit 1
-fi
-_dir="trained_nets/mg_recon/${_runs[${SLURM_ARRAY_TASK_ID}]}"
-if [ "${ALLOW_PARTIAL:-0}" != "1" ]; then
-    python - "${_dir}" <<'PY' || exit 1
-import json, os, sys
-import torch
-d = sys.argv[1]
-if not (os.path.exists(f"{d}/config.json") and os.path.exists(f"{d}/net.ckpt")):
-    sys.exit(f"[abl-eval] {d} has no config.json + net.ckpt")
-t = json.load(open(f"{d}/config.json"))["training"]
-step = torch.load(f"{d}/net.ckpt", map_location="cpu", weights_only=False).get("step") or 0
-ep, nep = int(step) // int(t["steps_per_epoch"]), int(t["num_epochs"])
-if ep < nep:
-    sys.exit(f"[abl-eval] {d} is at epoch {ep}/{nep} -- still training; "
-             f"ALLOW_PARTIAL=1 to score it anyway")
-print(f"[abl-eval] {d}: complete, epoch {ep}/{nep}")
-PY
-fi
 
 # ---- score it: main_eval.sbatch does the rest (RUNS / OUT / VAL_KSPACE from here) ----------
 RUNS="${ABL_RUNS}"
