@@ -15,7 +15,7 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-1
+#SBATCH --array=0
 #
 # EXPERIMENT 17 -- V-CYCLES AT MATCHED CAPACITY, KNEE R=8, FULL LENGTH
 # (2026-10-29).
@@ -37,13 +37,12 @@
 # params/alpha_z per V-cycle: the question is whether fewer V-cycles make the
 # net keep the coarse correction (L1 -> L0 alpha away from 0).
 #
-# PACK=2: two cells per GPU under CUDA MPS (torch/_mg_recon_body.sh). Task 0 is
-# cells 0 + 1, task 1 is cells 2 + 3. Cell 0 is exp15's run: once it is
-# finished (or while exp15 still has it), LAUNCH-ONCE skips it and V=1 trains
-# ALONE on task 0 -- the situation that got exp16's lone cell cancelled for low
-# H200 utilization. V=1 is the longest sequential chain of
-# the four, so it may keep the GPU busier; if it is cancelled anyway, run it
-# unpacked on an L40S:
+# DEFAULT LAUNCH: V=2 and V=4 only (user, 2026-10-29), packed together on one
+# GPU (PACK=2, CUDA MPS, torch/_mg_recon_body.sh) -- task 0 is both.
+# V=1 is held back: its natural partner is cell 0, exp15's run, which
+# LAUNCH-ONCE skips, so packed V=1 would train ALONE on an H200 -- the
+# situation that got exp16's lone cell cancelled for low utilization. When it
+# is wanted, run it unpacked on an L40S:
 #     PACK=1 ONLY=mg81v1eqvtxAnest sbatch --array=0 --constraint=l40s --mem=64GB \
 #         torch/exp17_vcycle_capacity.sbatch
 #
@@ -53,16 +52,16 @@
 # SUBMIT FROM THE REPO ROOT.
 #   sbatch torch/exp17_vcycle_capacity.sbatch
 #
-# Check the index map:
+# Check the index map (cells 0, 1 of this selection = task 0):
 #   python scripts/make_mg_recon_configs.py --list-cells --anatomy knee --accels 8 \
-#       --only mg81v6vtxAnest mg81v1eqvtxAnest mg81v2eqvtxAnest mg81v4eqvtxAnest
+#       --only mg81v2eqvtxAnest mg81v4eqvtxAnest
 #
 # Evaluate against each other and exp15's vtxAnest with main_eval:
 #   RUNS="knee/mg81v6vtxAnest_R8 knee/mg81v1eqvtxAnest_R8 knee/mg81v2eqvtxAnest_R8 knee/mg81v4eqvtxAnest_R8" \
 #   OUT=results/exp17_knee_R8 VAL_KSPACE=measurement_awgn sbatch --array=0-3 torch/main_eval.sbatch
 
 ANATOMY=knee
-ONLY="${ONLY:-mg81v6vtxAnest mg81v1eqvtxAnest mg81v2eqvtxAnest mg81v4eqvtxAnest}"
+ONLY="${ONLY:-mg81v2eqvtxAnest mg81v4eqvtxAnest}"
 ACCELS="${ACCELS:-8}"
 PLANAR_STATE="${PLANAR_STATE-1}"     # `-`, not `:-`: an explicitly EMPTY value turns it off
 ATTN="flex"                          # matches the other knee launchers --
