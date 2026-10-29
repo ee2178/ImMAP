@@ -802,6 +802,44 @@ for _b in EXP16_BASES:
         MODELS[_name] = _exp16_cell(_b)
 EXP16_CELLS = tuple(b + EXP16_SUFFIX for b in EXP16_BASES)
 
+# ---------------------------------------------------------------------------
+#  EXP17: V-cycles at MATCHED capacity, knee R=8 (2026-10-29)
+#
+#  exp14's depth ablation (mg81v2 / mg81v4) is K=[V, [4, 4, 6]]: fewer V-cycles
+#  is also fewer layers, so it cannot separate "fewer coarse corrections" from
+#  "a smaller net". Here every cell keeps mg81v6's 84 layers (24 / 24 / 36 per
+#  level) and only moves them between V-cycles: iters = [4, 4, 6] * 6 / V.
+#  Scaling every level by the same factor holds the parameters AND the conv
+#  FLOPs fixed (each layer has the same weights at every level; a level's share
+#  of the cost does not change), so V is the only variable.
+#
+#      V = 1   K=[1, [24, 24, 36]]    (U-Net-like; NOT exp8's 30-layer mgunet)
+#      V = 2   K=[2, [12, 12, 18]]
+#      V = 4   K=[4, [6, 6, 9]]
+#      V = 6   K=[6, [4, 4, 6]]       = exp15's mg81v6vtxAnest, reused
+#
+#  FAS: option A with TIED copies and the parent-pi fix (user, 2026-10-29) --
+#  untied copies are per-V-cycle parameters (22% of mg81v6), so under MG_FAS
+#  the cells would not match. Alphas free. The hypothesis: with fewer V-cycles
+#  each coarse correction carries more, so the trained net leans on the coarse
+#  level instead of driving the L1 -> L0 alpha to ~0.
+#  Launcher: torch/exp17_vcycle_capacity.sbatch.
+# ---------------------------------------------------------------------------
+EXP17_VCYCLES = (1, 2, 4)
+_EXP17_FAS = dict(transfer_filter=MG_TRANSFER_FILTER, fas_dual="fixed_point", **_FAS_FIX)
+_V6 = LPDS_VCYCLE_K[0]
+for _v in EXP17_VCYCLES:
+    _iters = [i * _V6 // _v for i in EXP8_ITERS]
+    assert all(i * _V6 % _v == 0 for i in EXP8_ITERS) and all(i % 2 == 0 for i in _iters[:-1]), \
+        f"V={_v} does not split [4, 4, 6] x 6 into whole, even-split levels"
+    MODELS[f"mg81v{_v}eqvtxAnest"] = dict(
+        type="MGLPDSNet",
+        params=dict(MODELS["mg81v6"]["params"], K=[_v, _iters], **_EXP17_FAS),
+        training=dict(MODELS["mg81v6"]["training"]))
+# the V=6 point is exp15's cell: it must be the same net as the others' family
+assert MODELS["mg81v6vtxAnest"]["params"] == dict(MODELS["mg81v6"]["params"], **_EXP17_FAS)
+EXP17_CELLS = tuple(f"mg81v{v}eqvtxAnest" for v in EXP17_VCYCLES)
+
 # RAM (exp13): the Reconstruct Anything Model (Terris et al. 2025,
 # github.com/matthieutrs/ram), trained FROM SCRATCH under this grid's protocol --
 # same data, noise range, organ-masked loss, schedule and LR as every other cell.
@@ -853,7 +891,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
           "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet") \
-    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS)
+    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
