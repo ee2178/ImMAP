@@ -126,18 +126,16 @@ def test_top_slices():
         ac.main(["--runs", root, "--out", out, "--top-slices", "1"])
         with open(os.path.join(out, "slices_R8.csv")) as f:
             rows = list(csv.DictReader(f))
-        check("one row per slice x method", len(rows) == 6, str(len(rows)))
-        lp = [r for r in rows if r["method"] == "lpdsnet"]
-        check("the ranking is by rho, the ghost slice first",
-              [r["slice"] for r in lp] == ["3", "4"] and float(lp[0]["rho"]) > 0.8, str(lp[0]))
+        check("one row per slice", len(rows) == 2, str(len(rows)))
+        check("ranked by rho, the ghost slice first, set by the net with the ghost",
+              rows[0]["slice"] == "3" and rows[0]["best_method"] == "lpdsnet" and float(rows[0]["rho"]) > 0.8, str(rows[0]))
+        check("each net's own rho is recorded", all(f"rho_{m}" in rows[0] for m in ("lpdsnet", "varnetmaps", "mg81v6")))
+        check("only the ghost slice is flagged", [r["flagged"] for r in rows] == ["1", "0"])
+        check("a net with no strong place has rho -1",
+              rows[0]["rho_varnetmaps"] == "-1.0" and rows[1]["rho"] == "-1.0", str(rows))
+        check("flags_R8.txt lists it", "volA" in open(os.path.join(out, "flags_R8.txt")).read())
         crops = [n for n in os.listdir(out) if n.endswith(".png")]
-        check("only the ghost slice is flagged",
-              [(r["method"], r["slice"]) for r in rows if r["flagged"] == "1"] == [("lpdsnet", "3")])
-        check("flags_R8.txt counts it", "lpdsnet" in open(os.path.join(out, "flags_R8.txt")).read())
-        check("only the strong residual gets an image", len(crops) == 1 and "lpdsnet" in crops[0], str(crops))
-        faint_rows = [r for r in rows if r["method"] != "lpdsnet"]
-        check("a slice with no strong place has rho -1", all(r["rho"] == "-1.0" for r in faint_rows),
-              str([r["rho"] for r in faint_rows]))
+        check("one image per flagged slice, not one per net", crops == ["slice_R8_000_volA_s3.png"], str(crops))
 
 
 def main():

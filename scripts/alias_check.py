@@ -40,22 +40,24 @@ as long as wide. The slice score is the largest blob's summed z.
 The template is the zero-filled image of THAT dump, so the dump's `kspace_type`
 is a CSV column and the summary warns when a scan mixes types.
 
---top-slices N skips all of those tests and ranks whole SLICES by their highest rho
-instead, per method: slices_R<R>.csv has every slice, so the ranking can be read at
-any rho, and the top N get an image of the patch around that peak, the reference,
-zero-filled and every method side by side, each method with its own rho, as slice_R<R>_<method>_<rank>_<volume>_s<slice>.png. A slice counts once, so one volume
-can fill at most its own slices of the list. rho is only read at least half a window
-inside the eroded organ mask, where the window cannot reach the mask's edge (E and T
-share that edge whatever the network did), and only where the residual is strong
-enough to see: strength > --min-strength, the rms of E over the window in units of
-sigma, the median over the methods of 1.4826 MAD of E, so every method on a slice
-shares one scale and a method with more error is not scaled down. rho alone ignores
-size, so without this a faint residual can rank as high as a strong one. A slice
-with no such place has rho -1. A slice is FLAGGED when its rho > --flag-rho, or the
-value for its R in --flag-rho-by-r (knee's rho runs higher than brain's); only
-flagged slices get an image, and flags_R<R>.txt counts them per method and k-space
-type. Both cutoffs were chosen by eye on about a dozen slices, so a flag is a slice
-to LOOK at, not a verdict.
+--top-slices N skips all of those tests and ranks whole SLICES, each once, by the
+highest rho any method reaches on it: slices_R<R>.csv has every slice, with each
+method's own top rho and the method that set the slice's. rho is only read at least
+half a window inside the eroded organ mask, where the window cannot reach the mask's
+edge (E and T share that edge whatever the network did), and only where the residual
+is strong enough to see: strength > --min-strength, the rms of E over the window in
+units of sigma, the median over the methods of 1.4826 MAD of E, so every method on a
+slice shares one scale and a method with more error is not scaled down. rho alone
+ignores size, so without this a faint residual can rank as high as a strong one. A
+method with no such place has rho -1.
+
+A slice is FLAGGED when its rho > --flag-rho, or the value for its R in
+--flag-rho-by-r (knee's rho runs higher than brain's). A flagged slice gets ONE
+image, slice_R<R>_<rank>_<volume>_s<slice>.png, of the patch around that peak: the
+reference, zero-filled and every method side by side, each method with its rho there.
+flags_R<R>.txt counts flagged slices, and for each method the flagged slices where
+its own top rho clears the cutoff. Both cutoffs were chosen by eye on about a dozen
+slices, so a flag is a slice to LOOK at, not a verdict.
 
 Outputs (under --out): check_R<R>.csv (one row per slice x method), check_R<R>.txt,
 and with --png N the N strongest per method: reference, zero-filled, each method,
@@ -220,7 +222,7 @@ def render_patch(dumps, methods, method, vol, pos, sl, row, col, a, path):
     axs[1].axis("off")
     for ax, m in zip(axs[2:], methods):
         ax.imshow(ims[m][crop], cmap="gray", vmin=0, vmax=vmax, interpolation="nearest")
-        ax.set_title(f"{m}{' (ranked)' if m == method else ''}\nrho {rhos[m]:.2f}, strength {stren[m]:.1f}", fontsize=8)
+        ax.set_title(f"{m}{' (top)' if m == method else ''}\nrho {rhos[m]:.2f}, strength {stren[m]:.1f}", fontsize=8)
         ax.axis("off")
     fig.suptitle(f"{vol}  slice {sl}  (array row {row}, col {col})", fontsize=9)
     fig.tight_layout()
@@ -246,45 +248,54 @@ def parse_by_r(spec):
 
 
 def run_top_slices(dumps, vols, R, a):
-    rows = []
+    per_net = []
     for i, v in enumerate(vols):
         print(f"\r  R={R}: {i + 1}/{len(vols)} volumes", end="", file=sys.stderr, flush=True)
-        rows += scan_slices(dumps, v, a.methods, a)
+        per_net += scan_slices(dumps, v, a.methods, a)
     print(file=sys.stderr)
-    rows.sort(key=lambda r: -r["rho"])
     flag_rho = parse_by_r(a.flag_rho_by_r).get(R, a.flag_rho)
-    ranked = [dict(r, rank=k, flagged=int(r["rho"] > flag_rho)) for m in a.methods
-              for k, r in enumerate(x for x in rows if x["method"] == m)]
+    groups = {}
+    for r in per_net:
+        groups.setdefault((r["volume"], r["pos"]), []).append(r)
+    ranked = []
+    for rs in groups.values():
+        best = max(rs, key=lambda r: r["rho"])
+        row = {k: best[k] for k in ("volume", "slice", "pos", "kspace_type", "rho", "strength", "z", "row", "col")}
+        row["best_method"] = best["method"]
+        row["flagged"] = int(best["rho"] > flag_rho)
+        row.update({f"rho_{r['method']}": r["rho"] for r in rs})
+        ranked.append(row)
+    ranked.sort(key=lambda r: -r["rho"])
+    for k, r in enumerate(ranked):
+        r["rank"] = k
     with open(os.path.join(a.out, f"slices_R{R}.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(ranked[0]))
         w.writeheader()
         w.writerows(ranked)
-    if len({r["kspace_type"] for r in ranked}) > 1:
-        print(f"R={R} WARNING: this ranking mixes k-space types", file=sys.stderr)
-    kept = [r for r in ranked if r["rank"] < a.top_slices and r["flagged"]]
-    lines = [f"R={R}: {len(vols)} volumes, {len(ranked) // len(a.methods)} slices | flagged: "
-             f"rho > {flag_rho:g} where strength > {a.min_strength:g}, "
+    flagged = [r for r in ranked if r["flagged"]]
+    kept = flagged[:a.top_slices]
+    lines = [f"R={R}: {len(vols)} volumes, {len(ranked)} slices, {len(flagged)} flagged | "
+             f"rho > {flag_rho:g} on any method, where strength > {a.min_strength:g}, "
              f"window {a.win_rows}x{a.win_cols}", "",
-             f"{'method':<14}{'k-space':<20}{'flagged':>9}{'of':>7}{'share':>8}"]
-    for m in a.methods:
-        for k in sorted({r["kspace_type"] for r in ranked}):
-            x = [r for r in ranked if r["method"] == m and r["kspace_type"] == k]
-            if x:
-                n = sum(r["flagged"] for r in x)
-                lines.append(f"{m:<14}{k:<20}{n:>9}{len(x):>7}{100 * n / len(x):>7.0f}%")
-    for m in a.methods:
-        top = [r for r in ranked if r["method"] == m and r["flagged"]][:a.top_slices]
-        lines += ["", f"TOP FLAGGED: {m}", f"{'volume':<30}{'sl':>4}{'rho':>7}{'strength':>10}{'row':>6}{'col':>6}"]
-        lines += [f"{r['volume']:<30}{r['slice']:>4}{r['rho']:>7.2f}{r['strength']:>10.1f}{r['row']:>6}{r['col']:>6}"
-                  for r in top]
+             f"{'method':<14}{'k-space':<20}{'over cutoff':>12}{'flagged slices':>16}{'all slices':>12}"]
+    for k in sorted({r["kspace_type"] for r in ranked}):
+        x = [r for r in ranked if r["kspace_type"] == k]
+        fl = [r for r in x if r["flagged"]]
+        for m in a.methods:
+            lines.append(f"{m:<14}{k:<20}{sum(r[f'rho_{m}'] > flag_rho for r in fl):>12}{len(fl):>16}{len(x):>12}")
+    lines += ["", "TOP FLAGGED SLICES",
+              f"{'volume':<30}{'sl':>4}{'rho':>7}{'strength':>10}{'row':>6}{'col':>6}  "
+              + "".join(f"{m:>12}" for m in a.methods)]
+    lines += [f"{r['volume']:<30}{r['slice']:>4}{r['rho']:>7.2f}{r['strength']:>10.1f}{r['row']:>6}{r['col']:>6}  "
+              + "".join(f"{r[f'rho_{m}']:>12.2f}" for m in a.methods) for r in kept]
     txt = "\n".join(lines)
     print(txt)
     with open(os.path.join(a.out, f"flags_R{R}.txt"), "w") as f:
         f.write(txt + "\n")
     for r in kept:
-        render_patch(dumps, a.methods, r["method"], r["volume"], r["pos"], r["slice"], r["row"], r["col"], a,
-                     os.path.join(a.out, f"slice_R{R}_{r['method']}_{r['rank']:03d}_{r['volume']}_s{r['slice']}.png"))
-    print(f"R={R}: wrote slices_R{R}.csv ({len(ranked)} rows) and {len(kept)} crops to {a.out}")
+        render_patch(dumps, a.methods, r["best_method"], r["volume"], r["pos"], r["slice"], r["row"], r["col"], a,
+                     os.path.join(a.out, f"slice_R{R}_{r['rank']:03d}_{r['volume']}_s{r['slice']}.png"))
+    print(f"R={R}: wrote slices_R{R}.csv ({len(ranked)} slices) and {len(kept)} images to {a.out}")
 
 
 def scan_volume(dumps, vol, methods, a):
@@ -381,8 +392,8 @@ def main(argv=None):
                    help="--top-slices: per-R --flag-rho, e.g. 8:0.85,12:0.80")
     p.add_argument("--patch-size", type=int, default=48, help="patch shown by --top-slices (px)")
     p.add_argument("--top-slices", type=int, default=0,
-                   help="rank slices by their highest rho and save the top N per method, "
-                        "instead of flagging")
+                   help="rank slices by their highest rho on any method and save the top N "
+                        "flagged, one image each, instead of the blob tests")
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
 
