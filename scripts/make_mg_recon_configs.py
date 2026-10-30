@@ -879,6 +879,25 @@ MODELS["ramdrunet"] = dict(
           "conditioned on sigma/sqrt(2). Uses the operator's coil maps."),
 )
 
+# ---------------------------------------------------------------------------
+#  EXP18: the main comparison on Sljiva's training mask (2026-10-30)
+#
+#  <base>cf32 = <base> with center_frac = 0.32 / R and adjust_accel OFF, as
+#  Sljiva's scripts and config/synthmri_closure.yaml do. The outer spacing is then
+#  exactly R at every image width, where adjust_accel made it 21-23 at R=12, so the
+#  net sees one spacing per R. The ACS is added on top, so R is NOMINAL: effective
+#  about 6.2 at R=8 and 9.0-10.0 at R=12 (widths 240-644), and the problem is easier
+#  than the measured protocol's, so these numbers do not compare with its runs.
+#  At R=12 the narrowest axes get a 5-line ACS for the online maps (kernel_size 4).
+#  New NAMES, so every existing run dir stays as it is.
+#  Launcher: torch/exp18_mask_cf32.sbatch.
+# ---------------------------------------------------------------------------
+EXP18_BASES = ("varnetmaps", "lpdsnet", "ram", "mg81v6vtxAnestU", "mg169v6vtxAnestU")
+EXP18_SUFFIX = "cf32"
+for _b in EXP18_BASES:
+    MODELS[_b + EXP18_SUFFIX] = dict(MODELS[_b], center_frac_times_r=0.32, adjust_accel=False)
+EXP18_CELLS = tuple(b + EXP18_SUFFIX for b in EXP18_BASES)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -891,7 +910,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
           "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet") \
-    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS
+    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS + EXP18_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -1152,6 +1171,18 @@ def supports_level_panel(spec):
             and isinstance(K[1], (list, tuple)) and len(K[1]) > 1)
 
 
+def _has_center_frac(spec, args):
+    """Does this cell's mask take its ACS from a fraction of the axis?"""
+    return "center_frac_times_r" in spec or getattr(args, "center_frac", None) is not None
+
+
+def _cell_mri(spec, r):
+    """A cell's own mask, over the protocol's: exp18's center_frac = 0.32 / R."""
+    if "center_frac_times_r" not in spec:
+        return {}
+    return {"center_frac": spec["center_frac_times_r"] / r, "adjust_accel": spec["adjust_accel"]}
+
+
 def _opt_mri(args):
     """The optional `mri` keys, present ONLY when switched on.
 
@@ -1381,8 +1412,7 @@ def make_config(anatomy, r, model, args):
         # same lines the unrolled nets' online maps calibrate from. Pinning 20
         # there put 7 unsampled columns (and at R=4 an accelerated line) into
         # VarNet's calibration band.
-        params["acs_lines"] = ("mask" if getattr(args, "center_frac", None)
-                               is not None else 20)
+        params["acs_lines"] = "mask" if _has_center_frac(spec, args) else 20
     # Notes accumulate: a cell can be both an LPDS variant and on a backend
     # that swapped its similarity, and losing either one in the run directory
     # is how a caveat stops travelling with its numbers.
@@ -1488,6 +1518,7 @@ def make_config(anatomy, r, model, args):
             # Load-bearing, not decoration: the flat and multigrid arms share a
             # model class, so `spec["type"]` alone collides on one wandb run.
             "name": (f"{_display_name(spec['type'], params)}{_level_loss_tag(spec)}"
+                     f"{'_cf32' if 'center_frac_times_r' in spec else ''}"
                      f"_{anatomy}_R{r}_synth"),
         },
         "model": dict(
@@ -1553,8 +1584,7 @@ def make_config(anatomy, r, model, args):
             # a 13-line measured run and a 20-line legacy run both read "20"
             # and passed the comparability check. null says "derived", and
             # physics/mask.py::resolve_acs_lines is where it is derived.
-            "acs_lines": (None if getattr(args, "center_frac", None) is not None
-                          else 20),
+            "acs_lines": None if _has_center_frac(spec, args) else 20,
             "mask_dist": "uniform",
             "mask_offset": 0,
             # SAMPLING HEURISTICS (Sljiva/src/mask.jl).
@@ -1602,6 +1632,7 @@ def make_config(anatomy, r, model, args):
             # before committing the queue, and use "walsh" -- which is what
             # Sljiva's own multigrid experiments ran -- if it does not fit.
             **_opt_mri(args),
+            **_cell_mri(spec, r),
         },
         "optimizer": {
             "type": "Adam",
