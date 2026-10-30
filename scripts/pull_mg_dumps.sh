@@ -25,9 +25,12 @@ RS="8 12"
 BRAIN="file_brain_AXT2_200_2000182 file_brain_AXT2_202_2020522 file_brain_AXT2_200_2000024"
 KNEE="file1000283 file1000033 file1000052 file1000264 file1000635"
 
-remote_tar=$(ssh "$HOST" bash -s -- "$TAR" "$RUNS" "$RS" "$BRAIN" "$KNEE" <<'REMOTE' | tee /dev/stderr | sed -n "s/^wrote //p"
+# The settings go down as the script's first line: ssh joins its arguments into one command
+# string, so passing them as `bash -s -- "$RUNS" ...` would split every list on the far side.
+remote_tar=$({ printf 'TAR=%q RUNS=%q RS=%q BRAIN=%q KNEE=%q\n' "$TAR" "$RUNS" "$RS" "$BRAIN" "$KNEE"
+               cat <<'REMOTE'
 set -euo pipefail
-TAR=$1 RUNS=$2 RS=$3 BRAIN=$4 KNEE=$5
+USER=${USER:-$(whoami)}
 for d in /scratch/$USER/ImMAP ~/scratch/$USER/ImMAP ~/ImMAP; do
     [ -d "$d/trained_nets/mg_recon" ] && { cd "$d"; break; }
 done
@@ -41,12 +44,14 @@ for anat in brain knee; do
         if [ -f "$f" ]; then echo "$f" >> "$list"; else echo "missing: $f" >&2; fi
     done; done; done
 done
-echo "$(wc -l < "$list") files, $(du -ch $(cat "$list") | tail -1 | cut -f1)"
+n=$(wc -l < "$list")
+[ "$n" -gt 0 ] || { echo "none of the dumps found -- nothing to pack" >&2; rm -f "$list"; exit 1; }
+echo "$n files, $(du -ch $(cat "$list") | tail -1 | cut -f1)"
 tar cf "$TAR" -T "$list"
 rm -f "$list"
 echo "wrote $PWD/$TAR"
 REMOTE
-)
+             } | ssh "$HOST" bash -s | tee /dev/stderr | sed -n "s/^wrote //p")
 
 [ -n "$remote_tar" ] || { echo "tarball not built" >&2; exit 1; }
 scp "$HOST:$remote_tar" .

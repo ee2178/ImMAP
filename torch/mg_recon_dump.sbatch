@@ -7,25 +7,26 @@
 #SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32GB
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --job-name=MGDump
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=ee2178@nyu.edu
-#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
-#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-1            # 0 = brain, 1 = knee
+#SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.out
+#SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%j.err
 #
 # Dump per-volume reconstructions for the figure viewer (scripts/dump_eval.py).
 #
-#   sbatch torch/mg_recon_dump.sbatch                 # brain and knee
-#   sbatch --array=0 torch/mg_recon_dump.sbatch       # brain only
+#   sbatch torch/mg_recon_dump.sbatch                          # brain, then knee
+#   ANATOMY_LIST=brain sbatch torch/mg_recon_dump.sbatch       # brain only
 #
 # LPIPS is computed by default: download its weights once on a login node
 # first (see METRICS below).
 #
-# One array task per ANATOMY; each dumps every run matching ONLY, so a single
-# task covers that anatomy's R=4 and R=8 cells (R comes from each run's own
-# config, not from here). Output lands in
+# ONE GPU, the anatomies in turn (2026-10-29: was one array task per anatomy;
+# two GPUs queue longer than one does for a job this short). Each anatomy dumps
+# every run matching ONLY, so it covers that anatomy's R=8 and R=12 cells (R
+# comes from each run's own config, not from here). `sbatch --array=0` / `=1`
+# still works and dumps just brain / knee, as before. Output lands in
 #
 #     trained_nets/mg_recon/<anatomy>/<cell>/eval_dump/<volume>.h5
 #
@@ -34,8 +35,9 @@
 #
 # This is INFERENCE, then an aliasing scan over what was dumped
 # (scripts/alias_scan.py, CPU only; SCAN=0 skips it). At the default 60 brain /
-# 40 knee volumes expect ~1 h of dumping per anatomy -- mostly HDF5 compression,
-# not the nets -- and a few minutes of scan; 4 h is slack. The GPU is worth
+# 40 knee volumes expect ~1 h of dumping per anatomy for the eight main runs --
+# mostly HDF5 compression, not the nets -- ~1.5 h with the four RAM runs, and a
+# few minutes of scan; 8 h for both anatomies is slack. The GPU is worth
 # asking for because the unrolled nets are slow on CPU. Nothing here writes a
 # config or a checkpoint: a dump is derived data and rerunning it is always safe.
 #
@@ -53,13 +55,19 @@
 # train.py, neither of which a dump should ever do.
 
 ANATOMIES=(brain knee)
+# Which of them this job dumps, in order. Default all; an array task (old-style
+# `sbatch --array=1`) takes just ANATOMIES[task].
+ANATOMY_LIST="${ANATOMY_LIST:-}"
 
 # Substring filters on the run path, passed to --only. The trailing underscore
 # keeps `lpdsnet_` from also selecting a future cell whose name contains it.
 # MGLPDS-Big is mg169v6 for both anatomies (brain's `mglpds` stopgap retired
-# 2026-10-21); ONLY="... mglpds_" still dumps it.
+# 2026-10-21); ONLY="... mglpds_" still dumps it. RAM (exp13) is both its
+# cells: `ram_` (random init, "RAM-scratch") and `ramdrunet_` (DRUNet init,
+# "RAM"); `ram_` does not match `ramdrunet_R8`. A run not trained yet is
+# simply not found.
 _ONLY_GIVEN="${ONLY:+1}"
-ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ varnetmaps_}"
+ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ varnetmaps_ ram_ ramdrunet_}"
 # EXACT=1: the ONLY entries are run directory NAMES, matched exactly, so a cell
 # is dumped without its tagged probes (<cell>_500ep, <cell>_prof, ...):
 #   EXACT=1 ONLY="varnetmaps_R12 lpdsnet_R12 mg81v6_R12" sbatch --array=0 ...
@@ -87,7 +95,8 @@ VOLUMES="${VOLUMES:-}"
 # APPENDED to the existing dumps: each volume is its own <volume>.h5, so the
 # first-N files already in eval_dump/ are left alone (a listed volume that is
 # already there is rewritten). Unless ONLY is given, this dumps exactly the
-# main comparison's eight runs (EXACT), not the cells' tagged probes:
+# main comparison's runs (EXACT: the eight above and the four RAM runs), not
+# the cells' tagged probes:
 #   PICKS_DIR=results/picks sbatch torch/mg_recon_dump.sbatch
 # The picked volumes get their own noise draw (the generator restarts per run
 # over the listed volumes), the same for every run, so columns stay comparable.
@@ -143,72 +152,107 @@ conda activate gcdl
 cd "${IMMAP_ROOT}"
 
 set -eo pipefail
-: "${SLURM_ARRAY_TASK_ID:?must be run as an array job (sbatch sets SLURM_ARRAY_TASK_ID)}"
 
 mkdir -p logs
 
-N_TOTAL="${#ANATOMIES[@]}"
-if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TOTAL}" ]; then
-    echo "[dump] task ${SLURM_ARRAY_TASK_ID} >= ${N_TOTAL} anatomies -- fix --array"
-    echo "       (should be 0-$(( N_TOTAL - 1 )): ${ANATOMIES[*]})"
-    exit 1
-fi
-
-ANATOMY="${ANATOMIES[${SLURM_ARRAY_TASK_ID}]}"
-SLICE_RANGE="${SLICES[${SLURM_ARRAY_TASK_ID}]}"
-N_VOLUMES="${N_VOLUMES:-${NVOLS[${SLURM_ARRAY_TASK_ID}]}}"
-RUNS_ROOT="trained_nets/mg_recon/${ANATOMY}"
-
-if [ -n "${PICKS_DIR}" ]; then
-    _picks="${PICKS_DIR}/${ANATOMY}.txt"
-    if [ ! -s "${_picks}" ]; then
-        echo "[dump] PICKS_DIR=${PICKS_DIR}: no ${_picks} -- run" \
-             "scripts/rank_slices.py --from-csv results/main/slices.csv --pick ${PICKS_DIR}" >&2
+# Which anatomies: ANATOMY_LIST, else the array task's one, else all of them.
+if [ -z "${ANATOMY_LIST}" ] && [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    if [ "${SLURM_ARRAY_TASK_ID}" -ge "${#ANATOMIES[@]}" ]; then
+        echo "[dump] task ${SLURM_ARRAY_TASK_ID} >= ${#ANATOMIES[@]} anatomies -- fix --array"
+        echo "       (should be 0-$(( ${#ANATOMIES[@]} - 1 )): ${ANATOMIES[*]})"
         exit 1
     fi
-    VOLUMES="$(grep -v '^[[:space:]]*\(#\|$\)' "${_picks}" | tr -d '\r' | tr '\n' ' ')"
-    if [ -z "${_ONLY_GIVEN}" ]; then
-        ONLY="varnetmaps_R8 lpdsnet_R8 mg81v6_R8 mg169v6_R8 varnetmaps_R12 lpdsnet_R12 mg81v6_R12 mg169v6_R12"
-        EXACT=1
-    fi
-    echo "[dump] ${ANATOMY}: $(wc -w <<< "${VOLUMES}") picked volumes from ${_picks}"
+    ANATOMY_LIST="${ANATOMIES[${SLURM_ARRAY_TASK_ID}]}"
 fi
-
-if [ ! -d "${RUNS_ROOT}" ]; then
-    echo "[dump] ${RUNS_ROOT} does not exist -- nothing has been trained for" \
-         "${ANATOMY} yet, or the repo root is wrong (IMMAP_ROOT=${IMMAP_ROOT})." >&2
+ANATOMY_LIST="${ANATOMY_LIST:-${ANATOMIES[*]}}"
+# VOLUMES names one anatomy's files; PICKS_DIR is the way to list both.
+if [ -n "${VOLUMES}" ] && [ -z "${PICKS_DIR}" ] && [ "$(wc -w <<< "${ANATOMY_LIST}")" -gt 1 ]; then
+    echo "[dump] VOLUMES is one anatomy's list -- add ANATOMY_LIST=<anatomy>, or put" \
+         "the names in PICKS_DIR/<anatomy>.txt" >&2
     exit 1
 fi
+_VOLUMES_GIVEN="${VOLUMES}"
 
-echo "[dump] ${ANATOMY}: runs=${RUNS_ROOT} only='${ONLY}' slices=${SLICE_RANGE}" \
-     "volumes=${VOLUMES:-first ${N_VOLUMES}} metrics='${METRICS}' seed=${SEED}"
-echo "[dump] $(date '+%F %T')  node=$(hostname)"
+echo "[dump] $(date '+%F %T')  node=$(hostname)  anatomies: ${ANATOMY_LIST}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
-python scripts/dump_eval.py \
-    --runs "${RUNS_ROOT}" \
-    --only ${ONLY} ${EXACT:+--exact} \
-    --slices "${SLICE_RANGE}" \
-    --n-volumes "${N_VOLUMES}" \
-    ${VOLUMES:+--volumes ${VOLUMES}} \
-    --metrics ${METRICS} \
-    --seed "${SEED}" \
-    --workers "${WORKERS}" \
-    ${SIGMA:+--sigma "${SIGMA}"} \
-    --val-kspace-type "${VAL_KSPACE}" \
-    ${OUT:+--out "${OUT}/${ANATOMY}"}
+# One anatomy: dump, then scan. Returns non-zero on a failure, so the loop below
+# can go on to the next anatomy (set -e does not apply inside a `||` call).
+dump_anatomy() {
+    local ANATOMY="$1" i SLICE_RANGE N_VOL RUNS_ROOT VOLS="${_VOLUMES_GIVEN}"
+    local RUN_ONLY="${ONLY}" RUN_EXACT="${EXACT}" DUMPED _picks
+    for i in "${!ANATOMIES[@]}"; do
+        [ "${ANATOMIES[$i]}" = "${ANATOMY}" ] && break
+    done
+    if [ "${ANATOMIES[$i]}" != "${ANATOMY}" ]; then
+        echo "[dump] unknown anatomy '${ANATOMY}' (have: ${ANATOMIES[*]})" >&2
+        return 1
+    fi
+    SLICE_RANGE="${SLICES[$i]}"
+    N_VOL="${N_VOLUMES:-${NVOLS[$i]}}"
+    RUNS_ROOT="trained_nets/mg_recon/${ANATOMY}"
 
-echo "[dump] ${ANATOMY} done $(date '+%F %T')"
-DUMPED="${OUT:+${OUT}/${ANATOMY}}"
-DUMPED="${DUMPED:-${RUNS_ROOT}}"
-du -sh "${DUMPED}"/*/eval_dump 2>/dev/null || true
+    if [ -n "${PICKS_DIR}" ]; then
+        _picks="${PICKS_DIR}/${ANATOMY}.txt"
+        if [ ! -s "${_picks}" ]; then
+            echo "[dump] PICKS_DIR=${PICKS_DIR}: no ${_picks} -- run" \
+                 "scripts/rank_slices.py --from-csv results/main/slices.csv --pick ${PICKS_DIR}" >&2
+            return 1
+        fi
+        VOLS="$(grep -v '^[[:space:]]*\(#\|$\)' "${_picks}" | tr -d '\r' | tr '\n' ' ')"
+        if [ -z "${_ONLY_GIVEN}" ]; then
+            RUN_ONLY="varnetmaps_R8 lpdsnet_R8 mg81v6_R8 mg169v6_R8 ram_R8 ramdrunet_R8"
+            RUN_ONLY+=" varnetmaps_R12 lpdsnet_R12 mg81v6_R12 mg169v6_R12 ram_R12 ramdrunet_R12"
+            RUN_EXACT=1
+        fi
+        echo "[dump] ${ANATOMY}: $(wc -w <<< "${VOLS}") picked volumes from ${_picks}"
+    fi
 
-if [ "${SCAN}" != "0" ]; then
-    echo "[scan] aliasing scan of ${SCAN_TARGET} over ${DUMPED} $(date '+%F %T')"
-    python scripts/alias_scan.py \
-        --runs "${DUMPED}" \
-        --target "${SCAN_TARGET}" \
-        --png "${SCAN_PNG}" \
-        --out "${DUMPED}/alias_scan"
-    echo "[scan] done $(date '+%F %T') -> ${DUMPED}/alias_scan"
+    if [ ! -d "${RUNS_ROOT}" ]; then
+        echo "[dump] ${RUNS_ROOT} does not exist -- nothing has been trained for" \
+             "${ANATOMY} yet, or the repo root is wrong (IMMAP_ROOT=${IMMAP_ROOT})." >&2
+        return 1
+    fi
+
+    echo "[dump] ${ANATOMY}: runs=${RUNS_ROOT} only='${RUN_ONLY}' slices=${SLICE_RANGE}" \
+         "volumes=${VOLS:-first ${N_VOL}} metrics='${METRICS}' seed=${SEED}" \
+         "val_kspace=${VAL_KSPACE}  $(date '+%F %T')"
+
+    python scripts/dump_eval.py \
+        --runs "${RUNS_ROOT}" \
+        --only ${RUN_ONLY} ${RUN_EXACT:+--exact} \
+        --slices "${SLICE_RANGE}" \
+        --n-volumes "${N_VOL}" \
+        ${VOLS:+--volumes ${VOLS}} \
+        --metrics ${METRICS} \
+        --seed "${SEED}" \
+        --workers "${WORKERS}" \
+        ${SIGMA:+--sigma "${SIGMA}"} \
+        --val-kspace-type "${VAL_KSPACE}" \
+        ${OUT:+--out "${OUT}/${ANATOMY}"} || return 1
+
+    echo "[dump] ${ANATOMY} done $(date '+%F %T')"
+    DUMPED="${OUT:+${OUT}/${ANATOMY}}"
+    DUMPED="${DUMPED:-${RUNS_ROOT}}"
+    du -sh "${DUMPED}"/*/eval_dump 2>/dev/null || true
+
+    if [ "${SCAN}" != "0" ]; then
+        echo "[scan] aliasing scan of ${SCAN_TARGET} over ${DUMPED} $(date '+%F %T')"
+        python scripts/alias_scan.py \
+            --runs "${DUMPED}" \
+            --target "${SCAN_TARGET}" \
+            --png "${SCAN_PNG}" \
+            --out "${DUMPED}/alias_scan" || return 1
+        echo "[scan] done $(date '+%F %T') -> ${DUMPED}/alias_scan"
+    fi
+}
+
+FAILED=()
+for ANATOMY in ${ANATOMY_LIST}; do
+    dump_anatomy "${ANATOMY}" || FAILED+=("${ANATOMY}")
+done
+if [ "${#FAILED[@]}" -gt 0 ]; then
+    echo "[dump] FAILED: ${FAILED[*]} -- see above; the others finished" >&2
+    exit 1
 fi
+echo "[dump] all done $(date '+%F %T'): ${ANATOMY_LIST}"
