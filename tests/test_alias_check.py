@@ -13,9 +13,13 @@ Run with `python -m tests.test_alias_check`. CPU, a few seconds; no torch.
 
 from __future__ import annotations
 
+import csv
+import os
 import sys
+import tempfile
 from argparse import Namespace
 
+import h5py
 import numpy as np
 from scipy import ndimage as ndi
 
@@ -96,8 +100,44 @@ def test_patches():
           all(4 + half <= r < N - 4 - half and 4 + half <= c < N - 4 - half for _, _, r, c in top))
 
 
+def test_top_slices():
+    """Each slice x method counts once, and a volume cannot fill more than its slices."""
+    ghost = vline(120, 0.5)
+    with tempfile.TemporaryDirectory() as root:
+        # the other two nets: only a faint residual, which must not rank however it correlates
+        faint = 0.01 * np.random.default_rng(2).standard_normal((N, N))
+        for name, rec, zf in (("lpdsnet", REF + 0.4 * ghost, ZF + ghost), ("varnetmaps", REF + faint, ZF + ghost),
+                              ("mg81v6", REF + faint, ZF + ghost)):
+            d = os.path.join(root, f"{name}_R8", "eval_dump")
+            os.makedirs(d)
+            with h5py.File(os.path.join(d, "volA.h5"), "w") as h:
+                h["recon"] = np.stack([rec, REF + faint]).astype(np.complex64)
+                h["reference"] = np.stack([REF, REF]).astype(np.complex64)
+                h["zero_filled"] = np.stack([zf, ZF]).astype(np.complex64)
+                h["organ_mask"] = np.ones((2, N, N), np.uint8)
+                h["sampling_mask"] = np.stack([np.tile(MASK, (N, 1))] * 2)
+                h["slice_index"] = np.array([3, 4], np.int32)
+                h.attrs["kspace_type"] = "measurement_awgn"
+        out = os.path.join(root, "out")
+        ac.main(["--runs", root, "--out", out, "--top-slices", "1"])
+        with open(os.path.join(out, "slices_R8.csv")) as f:
+            rows = list(csv.DictReader(f))
+        check("one row per slice x method", len(rows) == 6, str(len(rows)))
+        lp = [r for r in rows if r["method"] == "lpdsnet"]
+        check("the ranking is by rho, the ghost slice first",
+              [r["slice"] for r in lp] == ["3", "4"] and float(lp[0]["rho"]) > 0.8, str(lp[0]))
+        crops = [n for n in os.listdir(out) if n.endswith(".png")]
+        check("only the ghost slice is flagged",
+              [(r["method"], r["slice"]) for r in rows if r["flagged"] == "1"] == [("lpdsnet", "3")])
+        check("flags_R8.txt counts it", "lpdsnet" in open(os.path.join(out, "flags_R8.txt")).read())
+        check("only the strong residual gets an image", len(crops) == 1 and "lpdsnet" in crops[0], str(crops))
+        faint_rows = [r for r in rows if r["method"] != "lpdsnet"]
+        check("a slice with no strong place has rho -1", all(r["rho"] == "-1.0" for r in faint_rows),
+              str([r["rho"] for r in faint_rows]))
+
+
 def main():
-    for t in (test_helpers, test_check_slice, test_patches):
+    for t in (test_helpers, test_check_slice, test_patches, test_top_slices):
         print(f"\n== {t.__name__}")
         t()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")

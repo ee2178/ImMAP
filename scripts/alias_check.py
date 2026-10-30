@@ -40,14 +40,21 @@ as long as wide. The slice score is the largest blob's summed z.
 The template is the zero-filled image of THAT dump, so the dump's `kspace_type`
 is a CSV column and the summary warns when a scan mixes types.
 
---patches N skips all of those tests and saves the N patches with the largest rho
-per method instead: patches_R<R>.csv, and a crop of each as
-patch_R<R>_<method>_<rank>_<volume>_s<slice>.png. rho is only read at least half a
-window inside the eroded organ mask, where the window cannot reach the mask's edge
-(E and T share that edge whatever the network did), and one patch is kept per
-window-sized neighbourhood. A list of patches to LOOK at: rho says the residual
-follows the zero-filled error there, not how strong it is, which is why each row
-also has z.
+--top-slices N skips all of those tests and ranks whole SLICES by their highest rho
+instead, per method: slices_R<R>.csv has every slice, so the ranking can be read at
+any rho, and the top N get an image of the patch around that peak, the reference,
+zero-filled and every method side by side, each method with its own rho, as slice_R<R>_<method>_<rank>_<volume>_s<slice>.png. A slice counts once, so one volume
+can fill at most its own slices of the list. rho is only read at least half a window
+inside the eroded organ mask, where the window cannot reach the mask's edge (E and T
+share that edge whatever the network did), and only where the residual is strong
+enough to see: strength > --min-strength, the rms of E over the window in units of
+sigma, the median over the methods of 1.4826 MAD of E, so every method on a slice
+shares one scale and a method with more error is not scaled down. rho alone ignores
+size, so without this a faint residual can rank as high as a strong one. A slice
+with no such place has rho -1. A slice is FLAGGED when its rho > --flag-rho; only
+flagged slices get an image, and flags_R<R>.txt counts them per method and k-space
+type. Both cutoffs were chosen by eye on about a dozen slices, so a flag is a slice
+to LOOK at, not a verdict.
 
 Outputs (under --out): check_R<R>.csv (one row per slice x method), check_R<R>.txt,
 and with --png N the N strongest per method: reference, zero-filled, each method,
@@ -126,8 +133,21 @@ def top_patches(rho, z, inner, a, n=5):
     return out
 
 
-def scan_patches(dumps, vol, methods, a):
-    """Patch rows [dict] of one volume, with the same reading as scan_volume."""
+def slice_sigma(ref, recs, inner):
+    """The scale of a slice's residuals, shared by its methods."""
+    es = [hp_pe(x - ref)[inner] for x in recs]
+    return float(np.median([1.4826 * np.median(np.abs(e - np.median(e))) for e in es]))
+
+
+def strength_map(e, sigma, win):
+    """rms of e over the window, in units of sigma."""
+    m = ndi.uniform_filter(e, win, mode="nearest")
+    v = ndi.uniform_filter(e * e, win, mode="nearest") - m * m
+    return np.sqrt(np.maximum(v, 0)) / (sigma + 1e-12)
+
+
+def scan_slices(dumps, vol, methods, a):
+    """One row [dict] per slice x method: its highest rho and where it is."""
     data, kspace = {}, {}
     for m in methods:
         with h5py.File(os.path.join(dumps[m], vol + ".h5"), "r") as h:
@@ -144,40 +164,120 @@ def scan_patches(dumps, vol, methods, a):
         if inner.sum() < 100:
             continue
         offsets = null_offsets(mask[j][0])
+        sigma = slice_sigma(ref[j], [data[m][j] for m in methods], inner)
+        win = (a.win_rows, a.win_cols)
         for m in methods:
-            rho, _, z, _ = check_slice(ref[j], zf[j], data[m][j], inner, offsets, a)
-            for r, zz, i, c in top_patches(rho, z, inner, a):
-                rows.append(dict(volume=vol, slice=int(sl_idx[j]), pos=j, method=m,
-                                 kspace_type=kspace[m], rho=round(r, 3), z=round(zz, 1),
-                                 row=i, col=c))
+            e = hp_pe(data[m][j] - ref[j])
+            st = strength_map(e, sigma, win)
+            rho = np.where(st > a.min_strength, local_corr(e, hp_pe(zf[j]), win), -np.inf)
+            z = np.abs(e) / (sigma + 1e-12)
+            top = top_patches(rho, z, inner, a, n=1)
+            r, zz, i, c = top[0] if top else (-1.0, 0.0, -1, -1)
+            rows.append(dict(volume=vol, slice=int(sl_idx[j]), pos=j, method=m,
+                             kspace_type=kspace[m], rho=round(r, 3),
+                             strength=round(float(st[i, c]), 1) if top else 0.0,
+                             z=round(zz, 1), row=i, col=c))
     return rows
 
 
-def run_patches(dumps, vols, R, a):
+def render_patch(dumps, methods, method, vol, pos, sl, row, col, a, path):
+    """The patch around (row, col) in the reference and each method's recon, with that
+    method's rho:
+    its highest in the window centred there, so a peak a pixel away still counts."""
+    ims, rhos = {}, {}
+    for m in methods:
+        with h5py.File(os.path.join(dumps[m], vol + ".h5"), "r") as h:
+            ims[m] = np.abs(h["recon"][pos])
+            if m == methods[0]:
+                ref, zf = np.abs(h["reference"][pos]), np.abs(h["zero_filled"][pos])
+    win = (a.win_rows, a.win_cols)
+    t = hp_pe(zf)
+    w = (slice(max(row - win[0] // 2, 0), row + win[0] // 2 + 1),
+         slice(max(col - win[1] // 2, 0), col + win[1] // 2 + 1))
+    organ = None
+    with h5py.File(os.path.join(dumps[methods[0]], vol + ".h5"), "r") as h:
+        organ = h["organ_mask"][pos] > 0
+    sigma = slice_sigma(ref, list(ims.values()), ndi.binary_erosion(organ, iterations=4))
+    stren = {}
+    for m in methods:
+        e = hp_pe(ims[m] - ref)
+        rho = local_corr(e, t, win)[w]
+        k = np.unravel_index(np.argmax(rho), rho.shape)
+        rhos[m], stren[m] = float(rho[k]), float(strength_map(e, sigma, win)[w][k])
+    half = a.patch_size // 2
+    y0, x0 = max(row - half, 0), max(col - half, 0)
+    crop = (slice(y0, row + half), slice(x0, col + half))
+    vmax = max(np.percentile(x[crop], 99.5) for x in [ref, *ims.values()]) or 1.0
+    fig, axs = plt_subplots(len(methods) + 2)
+    axs[0].imshow(ref[crop], cmap="gray", vmin=0, vmax=vmax, interpolation="nearest")
+    axs[0].set_title("reference\n", fontsize=9)
+    # its own brightness scale: a ghost in zero-filled is faint against anything else
+    axs[1].imshow(zf[crop], cmap="gray", vmin=0, vmax=np.percentile(zf[crop], 99.5) or 1.0,
+                  interpolation="nearest")
+    axs[1].set_title("zero-filled\n(own scale)", fontsize=9)
+    axs[0].axis("off")
+    axs[1].axis("off")
+    for ax, m in zip(axs[2:], methods):
+        ax.imshow(ims[m][crop], cmap="gray", vmin=0, vmax=vmax, interpolation="nearest")
+        ax.set_title(f"{m}{' (ranked)' if m == method else ''}\nrho {rhos[m]:.2f}, strength {stren[m]:.1f}", fontsize=8)
+        ax.axis("off")
+    fig.suptitle(f"{vol}  slice {sl}  (array row {row}, col {col})", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt_close(fig)
+
+
+def plt_subplots(n):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt.subplots(1, n, figsize=(2.6 * n, 3.2))
+
+
+def plt_close(fig):
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def run_top_slices(dumps, vols, R, a):
     rows = []
     for i, v in enumerate(vols):
         print(f"\r  R={R}: {i + 1}/{len(vols)} volumes", end="", file=sys.stderr, flush=True)
-        rows += scan_patches(dumps, v, a.methods, a)
+        rows += scan_slices(dumps, v, a.methods, a)
     print(file=sys.stderr)
     rows.sort(key=lambda r: -r["rho"])
-    kept = [r for m in a.methods for r in [x for x in rows if x["method"] == m][:a.patches]]
-    with open(os.path.join(a.out, f"patches_R{R}.csv"), "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(kept[0]))
+    ranked = [dict(r, rank=k, flagged=int(r["rho"] > a.flag_rho)) for m in a.methods
+              for k, r in enumerate(x for x in rows if x["method"] == m)]
+    with open(os.path.join(a.out, f"slices_R{R}.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(ranked[0]))
         w.writeheader()
-        w.writerows(kept)
-    if len({r["kspace_type"] for r in kept}) > 1:
-        print(f"R={R} WARNING: these patches mix k-space types", file=sys.stderr)
-    counts = {m: 0 for m in a.methods}
+        w.writerows(ranked)
+    if len({r["kspace_type"] for r in ranked}) > 1:
+        print(f"R={R} WARNING: this ranking mixes k-space types", file=sys.stderr)
+    kept = [r for r in ranked if r["rank"] < a.top_slices and r["flagged"]]
+    lines = [f"R={R}: {len(vols)} volumes, {len(ranked) // len(a.methods)} slices | flagged: "
+             f"rho > {a.flag_rho:g} where strength > {a.min_strength:g}, "
+             f"window {a.win_rows}x{a.win_cols}", "",
+             f"{'method':<14}{'k-space':<20}{'flagged':>9}{'of':>7}{'share':>8}"]
+    for m in a.methods:
+        for k in sorted({r["kspace_type"] for r in ranked}):
+            x = [r for r in ranked if r["method"] == m and r["kspace_type"] == k]
+            if x:
+                n = sum(r["flagged"] for r in x)
+                lines.append(f"{m:<14}{k:<20}{n:>9}{len(x):>7}{100 * n / len(x):>7.0f}%")
+    for m in a.methods:
+        top = [r for r in ranked if r["method"] == m and r["flagged"]][:a.top_slices]
+        lines += ["", f"TOP FLAGGED: {m}", f"{'volume':<30}{'sl':>4}{'rho':>7}{'strength':>10}{'row':>6}{'col':>6}"]
+        lines += [f"{r['volume']:<30}{r['slice']:>4}{r['rho']:>7.2f}{r['strength']:>10.1f}{r['row']:>6}{r['col']:>6}"
+                  for r in top]
+    txt = "\n".join(lines)
+    print(txt)
+    with open(os.path.join(a.out, f"flags_R{R}.txt"), "w") as f:
+        f.write(txt + "\n")
     for r in kept:
-        k = counts[r["method"]]
-        counts[r["method"]] += 1
-        i, c = r["row"], r["col"]
-        box = (i - a.win_rows // 2, i + a.win_rows // 2 + 1, c - a.win_cols // 2, c + a.win_cols // 2 + 1)
-        render(dumps, a.methods, r["method"], r["volume"], r["pos"], r["slice"],
-               (r["rho"], a.win_rows * a.win_cols, i, c, box), a,
-               os.path.join(a.out, f"patch_R{R}_{r['method']}_{k:02d}_{r['volume']}_s{r['slice']}.png"),
-               label=f"rho {r['rho']:.2f}, z {r['z']:.1f}")
-    print(f"R={R}: wrote patches_R{R}.csv and {len(kept)} crops to {a.out}")
+        render_patch(dumps, a.methods, r["method"], r["volume"], r["pos"], r["slice"], r["row"], r["col"], a,
+                     os.path.join(a.out, f"slice_R{R}_{r['method']}_{r['rank']:03d}_{r['volume']}_s{r['slice']}.png"))
+    print(f"R={R}: wrote slices_R{R}.csv ({len(ranked)} rows) and {len(kept)} crops to {a.out}")
 
 
 def scan_volume(dumps, vol, methods, a):
@@ -266,8 +366,14 @@ def main(argv=None):
     p.add_argument("--min-aspect", type=float, default=3.0, help="smallest length / width kept")
     p.add_argument("--top", type=int, default=20, help="detections listed per method")
     p.add_argument("--png", type=int, default=10, help="crops saved per method (0: none)")
-    p.add_argument("--patches", type=int, default=0,
-                   help="save the N largest-rho patches per method instead of flagging")
+    p.add_argument("--min-strength", type=float, default=2.5,
+                   help="--top-slices: smallest window rms of E, in units of sigma")
+    p.add_argument("--flag-rho", type=float, default=0.75,
+                   help="--top-slices: a slice is flagged when its rho is above this")
+    p.add_argument("--patch-size", type=int, default=48, help="patch shown by --top-slices (px)")
+    p.add_argument("--top-slices", type=int, default=0,
+                   help="rank slices by their highest rho and save the top N per method, "
+                        "instead of flagging")
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
 
@@ -284,8 +390,8 @@ def main(argv=None):
         vols = sorted(set.intersection(*[
             {os.path.basename(f)[:-3] for f in glob.glob(os.path.join(d, "*.h5"))}
             for d in dumps.values()]))
-        if a.patches:
-            run_patches(dumps, vols, R, a)
+        if a.top_slices:
+            run_top_slices(dumps, vols, R, a)
             continue
         rows, blobs = [], {}
         for i, v in enumerate(vols):
