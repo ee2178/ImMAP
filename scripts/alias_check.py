@@ -51,7 +51,8 @@ enough to see: strength > --min-strength, the rms of E over the window in units 
 sigma, the median over the methods of 1.4826 MAD of E, so every method on a slice
 shares one scale and a method with more error is not scaled down. rho alone ignores
 size, so without this a faint residual can rank as high as a strong one. A slice
-with no such place has rho -1. A slice is FLAGGED when its rho > --flag-rho; only
+with no such place has rho -1. A slice is FLAGGED when its rho > --flag-rho, or the
+value for its R in --flag-rho-by-r (knee's rho runs higher than brain's); only
 flagged slices get an image, and flags_R<R>.txt counts them per method and k-space
 type. Both cutoffs were chosen by eye on about a dozen slices, so a flag is a slice
 to LOOK at, not a verdict.
@@ -239,6 +240,11 @@ def plt_close(fig):
     plt.close(fig)
 
 
+def parse_by_r(spec):
+    """'8:0.85,12:0.80' -> {8: 0.85, 12: 0.8}."""
+    return {int(k): float(v) for k, v in (x.split(":") for x in (spec or "").split(",") if x)}
+
+
 def run_top_slices(dumps, vols, R, a):
     rows = []
     for i, v in enumerate(vols):
@@ -246,7 +252,8 @@ def run_top_slices(dumps, vols, R, a):
         rows += scan_slices(dumps, v, a.methods, a)
     print(file=sys.stderr)
     rows.sort(key=lambda r: -r["rho"])
-    ranked = [dict(r, rank=k, flagged=int(r["rho"] > a.flag_rho)) for m in a.methods
+    flag_rho = parse_by_r(a.flag_rho_by_r).get(R, a.flag_rho)
+    ranked = [dict(r, rank=k, flagged=int(r["rho"] > flag_rho)) for m in a.methods
               for k, r in enumerate(x for x in rows if x["method"] == m)]
     with open(os.path.join(a.out, f"slices_R{R}.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(ranked[0]))
@@ -256,7 +263,7 @@ def run_top_slices(dumps, vols, R, a):
         print(f"R={R} WARNING: this ranking mixes k-space types", file=sys.stderr)
     kept = [r for r in ranked if r["rank"] < a.top_slices and r["flagged"]]
     lines = [f"R={R}: {len(vols)} volumes, {len(ranked) // len(a.methods)} slices | flagged: "
-             f"rho > {a.flag_rho:g} where strength > {a.min_strength:g}, "
+             f"rho > {flag_rho:g} where strength > {a.min_strength:g}, "
              f"window {a.win_rows}x{a.win_cols}", "",
              f"{'method':<14}{'k-space':<20}{'flagged':>9}{'of':>7}{'share':>8}"]
     for m in a.methods:
@@ -370,6 +377,8 @@ def main(argv=None):
                    help="--top-slices: smallest window rms of E, in units of sigma")
     p.add_argument("--flag-rho", type=float, default=0.75,
                    help="--top-slices: a slice is flagged when its rho is above this")
+    p.add_argument("--flag-rho-by-r", default="",
+                   help="--top-slices: per-R --flag-rho, e.g. 8:0.85,12:0.80")
     p.add_argument("--patch-size", type=int, default=48, help="patch shown by --top-slices (px)")
     p.add_argument("--top-slices", type=int, default=0,
                    help="rank slices by their highest rho and save the top N per method, "

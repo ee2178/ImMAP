@@ -14,8 +14,12 @@
 #
 # Flag dumped slices with residual aliasing (scripts/alias_check.py --top-slices):
 # a slice is flagged when E = HP(|recon| - |ref|) follows T = HP(|zero-filled|)
-# (rho > FLAG_RHO) somewhere the residual is strong (strength > MIN_STRENGTH). CPU
+# (rho > its cutoff) somewhere the residual is strong (strength > MIN_STRENGTH). CPU
 # only; it reads the HDF5 of scripts/dump_eval.py.
+#
+# rho runs higher on knee, so the cutoff is per anatomy: brain FLAG_RHO, knee
+# KNEE_FLAG_RHO per R. Both were chosen by eye on a few local volumes (2026-10-30),
+# so recheck them on the measured dumps.
 #
 #   0  brain
 #   1  knee
@@ -46,6 +50,7 @@ METHODS="${METHODS:-varnetmaps lpdsnet mg81v6}"
 TOP_SLICES="${TOP_SLICES:-100}"
 MIN_STRENGTH="${MIN_STRENGTH:-2.5}"
 FLAG_RHO="${FLAG_RHO:-0.75}"
+KNEE_FLAG_RHO="${KNEE_FLAG_RHO:-8:0.85,12:0.80}"
 
 : "${SLURM_ARRAY_TASK_ID:?must be run as an array job (sbatch sets SLURM_ARRAY_TASK_ID)}"
 ANATOMY="${ANATOMIES[${SLURM_ARRAY_TASK_ID}]:-}"
@@ -71,6 +76,9 @@ conda activate gcdl
 cd "${IMMAP_ROOT}"
 set -eo pipefail
 
+BY_R=""
+[ "${ANATOMY}" = "knee" ] && BY_R="${KNEE_FLAG_RHO}"
+
 if [ ! -d "${DUMPS}/${ANATOMY}" ]; then
     echo "[alias] no ${DUMPS}/${ANATOMY} -- dump first (torch/dump_full_val.sbatch), or set DUMPS" >&2
     exit 1
@@ -83,5 +91,6 @@ python scripts/alias_check.py \
     --top-slices "${TOP_SLICES}" \
     --min-strength "${MIN_STRENGTH}" \
     --flag-rho "${FLAG_RHO}" \
+    ${BY_R:+--flag-rho-by-r "${BY_R}"} \
     --out "${OUT}/${ANATOMY}"
 echo "[alias] ${ANATOMY} done $(date '+%F %T')"

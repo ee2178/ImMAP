@@ -88,6 +88,10 @@ def test_check_slice():
     check("an under-reconstructed edge is not aliasing", not hit(blobs(ZF, weak), 95, 50))
 
 
+def test_flag_rho_by_r():
+    check("parse_by_r", ac.parse_by_r("8:0.85,12:0.80") == {8: 0.85, 12: 0.8} and ac.parse_by_r("") == {})
+
+
 def test_patches():
     ghost = vline(120, 0.5)
     rho, _, z, _ = ac.check_slice(REF, ZF + ghost, REF + 0.4 * ghost, INNER, ac.null_offsets(MASK), A)
@@ -137,7 +141,7 @@ def test_top_slices():
 
 
 def main():
-    for t in (test_helpers, test_check_slice, test_patches, test_top_slices):
+    for t in (test_helpers, test_check_slice, test_flag_rho_by_r, test_patches, test_top_slices):
         print(f"\n== {t.__name__}")
         t()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")
