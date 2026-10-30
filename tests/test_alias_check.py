@@ -4,8 +4,7 @@ scripts/alias_check.py: residual aliasing, with zero-filled as the template.
 Run with `python -m tests.test_alias_check`. CPU, a few seconds; no torch.
 
 1. hp_pe removes what is constant along phase-encode only.
-2. local_partial_corr: 1 for e == t; partialling out h removes agreement that h
-   explains; an unrelated pair stays near 0.
+2. local_corr: 1 for e == t; an unrelated pair stays near 0.
 3. null_offsets lie halfway between the aliasing shifts.
 4. check_slice: a ghost in both zero-filled and the residual is found where it is;
    an under-reconstructed edge and a clean recon are not; a line the zero-filled
@@ -64,12 +63,10 @@ def test_helpers():
     check("hp_pe removes what is flat along PE",
           np.abs(ac.hp_pe(np.tile(np.arange(N, dtype=float)[:, None], (1, N)))).max() < 1e-9)
     r = np.random.default_rng(1)
-    a, b, h = (ndi.gaussian_filter(r.standard_normal((N, N)), 1) for _ in range(3))
+    a, b = (ndi.gaussian_filter(r.standard_normal((N, N)), 1) for _ in range(2))
     win = (25, 9)
-    check("corr(e, e) = 1", np.median(ac.local_partial_corr(a, a, h, win)) > 0.99)
-    check("unrelated pair near 0", abs(np.median(ac.local_partial_corr(a, b, h, win))) < 0.1)
-    check("h explains the agreement -> near 0",
-          abs(np.median(ac.local_partial_corr(h + 0.01 * a, h + 0.01 * b, h, win))) < 0.15)
+    check("corr(e, e) = 1", np.median(ac.local_corr(a, a, win)) > 0.99)
+    check("unrelated pair near 0", abs(np.median(ac.local_corr(a, b, win))) < 0.1)
     off = ac.null_offsets(MASK)
     _, step = ac.ghost_period(MASK)
     check("null offsets are halfway between aliasing shifts",

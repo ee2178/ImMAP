@@ -14,25 +14,23 @@ What it measures
 ----------------
 Per slice and network, on magnitudes, all high-passed along phase-encode (HP):
 
-    T = HP(|zero-filled| - |ref|)   the aliasing template
-    E = HP(|recon| - |ref|)         the network's residual
-    H = HP(|ref|)                   the reference's own edges
+    T = HP(|zero-filled|)     the aliasing template
+    E = HP(|recon| - |ref|)   the network's residual
+    H = HP(|ref|)             the reference's own edges
 
-    rho  local correlation of E and T, in a sliding window, with H partialled out
+    rho  local correlation of E and T, in a sliding window
 
-An edge the network under-reconstructed has E ~ -c H, and zero-filled lacks that
-edge too, so E and T agree there without any aliasing; partialling out H removes
-that. What is left positive is structure the residual shares with the aliasing
-beyond the edge at that spot. Aliasing a network failed to remove keeps its sign,
-so only rho > 0 counts.
+T shows the slice's aliasing directly: copies of its edges spaced N/d apart. The
+true edge is one more copy, attenuated, but an edge the network under-reconstructed
+has E ~ -c H and so correlates NEGATIVELY with it, while aliasing a network failed
+to remove keeps its sign. So only rho > 0 counts.
 
     null  the largest rho of T shifted along PE by (k + 1/2) N/d: between the
           aliasing shifts, so the slice's own chance agreement at no real offset
     z     |E| / sigma, sigma = 1.4826 MAD of E over the eroded organ mask
 
     edge  the largest |H| within 2 px. An under-reconstructed edge has |E| < |H|,
-          and partialling out H does not remove all of it (a blurred edge is not a
-          scaled copy of the edge), so a flagged pixel must have |E| > edge.
+          so a flagged pixel must have |E| > edge.
 
 A pixel is flagged when rho > --rho, rho - null > --margin, z > --z and |E| > edge,
 so the flagged pixels follow the line itself rather than the window. Blobs are
@@ -78,22 +76,15 @@ def hp_pe(x, k=7):
     return x - ndi.uniform_filter1d(x, k, axis=1, mode="nearest")
 
 
-def local_partial_corr(e, t, h, win):
-    """Local correlation of e and t with h partialled out, in a `win` box."""
+def local_corr(e, t, win):
+    """Local correlation of e and t in a `win` box."""
     def m(a):
         return ndi.uniform_filter(a, win, mode="nearest")
 
-    me, mt, mh = m(e), m(t), m(h)
+    me, mt = m(e), m(t)
     ee = np.maximum(m(e * e) - me * me, 0)
     tt = np.maximum(m(t * t) - mt * mt, 0)
-    hh = np.maximum(m(h * h) - mh * mh, 0)
-    et, eh, th = m(e * t) - me * mt, m(e * h) - me * mh, m(t * h) - mt * mh
-    eps = 1e-12
-    r_et = et / np.sqrt(ee * tt + eps)
-    r_eh = eh / np.sqrt(ee * hh + eps)
-    r_th = th / np.sqrt(tt * hh + eps)
-    den = np.sqrt(np.maximum(1 - r_eh ** 2, 1e-6) * np.maximum(1 - r_th ** 2, 1e-6))
-    return np.clip((r_et - r_eh * r_th) / den, -1, 1)
+    return np.clip((m(e * t) - me * mt) / np.sqrt(ee * tt + 1e-12), -1, 1)
 
 
 def null_offsets(mask_row, n=2):
@@ -104,10 +95,10 @@ def null_offsets(mask_row, n=2):
 
 def check_slice(ref, zf, rec, inner, offsets, a):
     """(rho, null, z, flagged blobs) for one network on one slice."""
-    t, e, h = hp_pe(zf - ref), hp_pe(rec - ref), hp_pe(ref)
+    t, e, h = hp_pe(zf), hp_pe(rec - ref), hp_pe(ref)
     win = (a.win_rows, a.win_cols)
-    rho = local_partial_corr(e, t, h, win)
-    null = np.max([local_partial_corr(e, np.roll(t, s, axis=1), h, win) for s in offsets], axis=0)
+    rho = local_corr(e, t, win)
+    null = np.max([local_corr(e, np.roll(t, s, axis=1), win) for s in offsets], axis=0)
     sigma = 1.4826 * np.median(np.abs(e[inner] - np.median(e[inner])))
     z = np.abs(e) / (sigma + 1e-12)
     edge = ndi.maximum_filter(np.abs(h), size=5)
