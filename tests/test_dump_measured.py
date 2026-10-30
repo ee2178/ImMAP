@@ -160,8 +160,8 @@ def main():
             sys.argv = argv
 
         for name in RUNS:
-            got = sorted(os.listdir(os.path.join(out, name))) if os.path.isdir(
-                os.path.join(out, name)) else []
+            got = sorted(os.listdir(os.path.join(out, name, "eval_dump"))) if os.path.isdir(
+                os.path.join(out, name, "eval_dump")) else []
             check(f"{name}: dumped one file per volume", got == [v + ".h5" for v in VOLS],
                   str(got))
 
@@ -197,9 +197,9 @@ def main():
                                          "adjust_accel", "acs_lines")}))
 
         # the measurement is shared: same seed -> same mask, noise, online maps
-        with h5py.File(os.path.join(out, "lpdsnet_R2", "volA.h5")) as f1, \
-                h5py.File(os.path.join(out, "varnetmaps_R2", "volA.h5")) as f2, \
-                h5py.File(os.path.join(out, "mg_R2", "volA.h5")) as f3:
+        with h5py.File(os.path.join(out, "lpdsnet_R2", "eval_dump", "volA.h5")) as f1, \
+                h5py.File(os.path.join(out, "varnetmaps_R2", "eval_dump", "volA.h5")) as f2, \
+                h5py.File(os.path.join(out, "mg_R2", "eval_dump", "volA.h5")) as f3:
             zf = [f["zero_filled"][:] for f in (f1, f2, f3)]
             masks = [f["sampling_mask"][:] for f in (f1, f2, f3)]
             organ = f1["organ_mask"][:] > 0

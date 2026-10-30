@@ -41,7 +41,7 @@ _CANDIDATES = [
     ("LPDSNet",       "lpdsnet_R8"),
     ("MGLPDS-Small",  "mg81v6_R8"),
     ("MGLPDS-Big",    "mg169v6_R8"),
-    ("RAM",           "ramdrunet_R8"),     # exp13; left out until dumped
+    ("RAM",           "ram_R8"),     # exp13; left out until dumped
 ]
 
 

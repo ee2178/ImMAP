@@ -193,7 +193,7 @@ def test_helpers(ks, sm):
           de.out_dir(os.path.join("a", "b"), "a", None).replace("\\", "/")
           == "a/b/eval_dump")
     check("out_dir: --out mirrors the run tree",
-          de.out_dir(os.path.join("a", "b"), "a", "o").replace("\\", "/") == "o/b")
+          de.out_dir(os.path.join("a", "b"), "a", "o").replace("\\", "/") == "o/b/eval_dump")
     check("same_source ignores batch-shaped keys",
           de.same_source({"name": "fastmri", "anatomy": "brain"},
                          {"name": "fastmri", "anatomy": "brain", "batch_size": 4}))

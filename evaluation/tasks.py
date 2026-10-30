@@ -116,6 +116,30 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None, call=None
             zf = extra["Zinv"] * zf
         extras.update(zero_filled=zf, sampling_mask=mask, sigma_n=sigma_n)
 
+        # Optional Tikhonov CG-SENSE, (E^H E + lam I) x = E^H y, on the SAME
+        # measurement and operator the net saw: the linear recon's leftover
+        # aliasing, for comparison with the net's (scripts/dump_eval.py
+        # --cg-sense-lam). Asked for by putting `cg_sense_lam` in `extras`.
+        # The maps are the run's: the online estimate (`online_smaps`, e.g.
+        # ESPIRiT from the measurement's ACS) when it has one. A net that
+        # estimates its own maps gets flat placeholders in E, so no CG-SENSE.
+        lam = extras.get("cg_sense_lam")
+        if lam is not None and not getattr(net, "uses_operator_smaps", True):
+            print(f"[cg_sense] skipped: {type(net).__name__} does not use the "
+                  f"operator's coil maps, so E holds placeholders")
+            lam = None
+        if lam is not None:
+            from solvers.cg import batched_cg
+            lam = float(lam)
+            with torch.no_grad():
+                x = batched_cg(lambda v: E.adjoint(E(v)) + lam * v, E.adjoint(y),
+                               tol=float(extras.get("cg_sense_tol", 1e-6)),
+                               max_iter=int(extras.get("cg_sense_iters", 100)))
+            sense = T.forward(x)
+            if mri.get("whiten_kspace", False) and "Zinv" in extra:
+                sense = extra["Zinv"] * sense
+            extras["cg_sense"] = sense
+
     return image, out, organ_mask
 
 

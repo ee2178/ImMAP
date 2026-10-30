@@ -19,15 +19,15 @@
 # PSNR, SSIM, NRMSE, LPIPS on every val volume, for the significance tests in
 # scripts/wilcoxon_main.py. RUNS_PER_TASK runs per array task, one after the
 # other on that task's GPU (2026-10-29: was one GPU per run, 16 of them, which
-# queued longer than the runs took). With the default 6:
+# queued longer than the runs took). With the default 5:
 #
-#   0  brain R8   varnetmaps lpdsnet mg81v6 mg169v6 ram ramdrunet
-#   1  brain R12  varnetmaps lpdsnet mg81v6 mg169v6 ram ramdrunet
-#   2  knee  R8   varnetmaps lpdsnet mg81v6 mg169v6 ram ramdrunet
-#   3  knee  R12  varnetmaps lpdsnet mg81v6 mg169v6 ram ramdrunet
+#   0  brain R8   varnetmaps lpdsnet mg81v6 mg169v6 ram
+#   1  brain R12  varnetmaps lpdsnet mg81v6 mg169v6 ram
+#   2  knee  R8   varnetmaps lpdsnet mg81v6 mg169v6 ram
+#   3  knee  R12  varnetmaps lpdsnet mg81v6 mg169v6 ram
 #
-# RAM is exp13 (torch/exp13_ram.sbatch): `ramdrunet` (DRUNet-initialised
-# trunk, labelled "RAM") and `ram` (random init, "RAM-scratch").
+# RAM is exp13's `ram` cell (torch/exp13_ram.sbatch), labelled "RAM". `ramdrunet`,
+# its DRUNet-initialised twin ("RAM-DRUNet"), is not trained; RUNS= scores it if it ever is.
 # MGLPDS-Big is `mg169v6` for both anatomies (brain's full-length runs finished
 # 2026-10-21; until then brain used the `mglpds` run as a stopgap). A directory
 # carrying RENAMED_FROM_mglpds.txt is that stopgap renamed, NOT a trained
@@ -42,9 +42,9 @@
 #   python -c "from evaluation.metrics import warm_up; warm_up(['lpips'], 'cpu')"
 #
 # Submit from the repo root:
-#   sbatch torch/main_eval.sbatch                  # all 24 runs on 4 GPUs
+#   sbatch torch/main_eval.sbatch                  # all 20 runs on 4 GPUs
 #   sbatch --array=2-3 torch/main_eval.sbatch      # knee only
-#   RUNS_PER_TASK=12 sbatch --array=0-1 ...        # 2 GPUs, one per anatomy
+#   RUNS_PER_TASK=10 sbatch --array=0-1 ...        # 2 GPUs, one per anatomy
 #   RUNS_PER_TASK=1 sbatch --array=5,11 ...        # single runs, as before
 # Task t runs entries t*RUNS_PER_TASK .. (t+1)*RUNS_PER_TASK-1 of RUNS, so
 # --array must cover ceil(#RUNS / RUNS_PER_TASK) tasks.
@@ -81,7 +81,7 @@
 #
 # NEW RUNS ONLY (e.g. the RAM cells) -- runs already scored resume as done, in
 # seconds, so a whole group can be resubmitted; or one task over just them:
-#   RUNS="brain/ram_R8 brain/ramdrunet_R8 brain/ram_R12 brain/ramdrunet_R12" \
+#   RUNS="brain/ram_R8 brain/ram_R12 knee/ram_R8 knee/ram_R12" \
 #   RUNS_PER_TASK=4 sbatch --array=0 torch/main_eval.sbatch
 
 # OTHER RUN SETS (e.g. the exp14 knee ablations): RUNS="<anatomy>/<run> ..."
@@ -93,15 +93,15 @@
 # numbers), so the ablation tree is complete on its own.
 _RUNS_GIVEN="${RUNS:-}"
 RUNS=(
-    brain/varnetmaps_R8  brain/lpdsnet_R8  brain/mg81v6_R8  brain/mg169v6_R8  brain/ram_R8  brain/ramdrunet_R8
-    brain/varnetmaps_R12 brain/lpdsnet_R12 brain/mg81v6_R12 brain/mg169v6_R12 brain/ram_R12 brain/ramdrunet_R12
-    knee/varnetmaps_R8   knee/lpdsnet_R8   knee/mg81v6_R8   knee/mg169v6_R8   knee/ram_R8   knee/ramdrunet_R8
-    knee/varnetmaps_R12  knee/lpdsnet_R12  knee/mg81v6_R12  knee/mg169v6_R12  knee/ram_R12  knee/ramdrunet_R12
+    brain/varnetmaps_R8  brain/lpdsnet_R8  brain/mg81v6_R8  brain/mg169v6_R8  brain/ram_R8
+    brain/varnetmaps_R12 brain/lpdsnet_R12 brain/mg81v6_R12 brain/mg169v6_R12 brain/ram_R12
+    knee/varnetmaps_R8   knee/lpdsnet_R8   knee/mg81v6_R8   knee/mg169v6_R8   knee/ram_R8
+    knee/varnetmaps_R12  knee/lpdsnet_R12  knee/mg81v6_R12  knee/mg169v6_R12  knee/ram_R12
 )
 if [ -n "${_RUNS_GIVEN}" ]; then
     read -r -a RUNS <<< "${_RUNS_GIVEN}"
 fi
-RUNS_PER_TASK="${RUNS_PER_TASK:-6}"
+RUNS_PER_TASK="${RUNS_PER_TASK:-5}"
 # Rediscretized multigrid runs LAUNCHED BEFORE 2026-10-07 trained with the
 # Galerkin coarse operator on slice sizes that do not divide by the stride
 # (operators/coarse.py); they must be evaluated the same way. Of the runs above

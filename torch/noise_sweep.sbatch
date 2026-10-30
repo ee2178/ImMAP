@@ -27,7 +27,7 @@
 #    0- 3  brain R8   varnetmaps lpdsnet mg81v6 mg169v6
 #    4- 7  knee  R8   varnetmaps lpdsnet mg81v6 mg169v6
 #    RAM, or another R, through RUNS (one task per entry, in order):
-#      RUNS="brain/ramdrunet_R8 knee/ramdrunet_R8" sbatch --array=0-1 torch/noise_sweep.sbatch
+#      RUNS="brain/ram_R8 knee/ram_R8" sbatch --array=0-1 torch/noise_sweep.sbatch
 #
 # THE MEASUREMENT is MEASURED k-space + AWGN at sigma (VAL_KSPACE, default
 # measurement_awgn), as the nets train and as every other evaluation scores them.

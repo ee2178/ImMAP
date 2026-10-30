@@ -88,8 +88,8 @@ LABELS = {
     "mg81v6": "MGLPDS-Small",
     "mg169v6": "MGLPDS-Big",
     "mglpds": "MGLPDS-Big",
-    "ramdrunet": "RAM",          # exp13: DRUNet-initialised trunk, our protocol
-    "ram": "RAM-scratch",        # the same net from a random init
+    "ram": "RAM",                # exp13: the trained RAM, random init, our protocol
+    "ramdrunet": "RAM-DRUNet",   # the same net with a DRUNet-initialised trunk (not trained)
 }
 
 DEFAULT_METRICS = ["psnr", "ssim", "nrmse", "lpips"]
@@ -438,6 +438,9 @@ def combine(out_root):
             print(f"  [{meta['run']}] {', '.join(stale)}: older definition -- left "
                   f"blank; re-score with --recompute {' '.join(stale)}")
             ms = [m for m in ms if m not in stale]
+        # The label from today's LABELS, not the one stored when the run was
+        # scored: renaming a net must not need its rows scored again.
+        meta["label"] = label_of(meta["run"])
         key = dict(anatomy=meta["anatomy"], R=meta["R"], net=meta["label"],
                    run=meta["run"])
         per_vol = {}

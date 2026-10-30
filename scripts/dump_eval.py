@@ -141,11 +141,14 @@ def load_run(run_dir, device):
 
 
 def out_dir(run_dir, runs_root, out_root):
-    """Where this run's volumes go: beside the checkpoint, or mirrored under --out."""
+    """Where this run's volumes go: beside the checkpoint, or mirrored under --out.
+
+    Always `.../eval_dump/`, so alias_scan.py and alias_detect.py can read a
+    mirrored tree as they read the real one."""
     if out_root is None:
         return os.path.join(run_dir, "eval_dump")
     rel = os.path.relpath(run_dir, runs_root)
-    return os.path.join(out_root, "." if rel == "." else rel)
+    return os.path.normpath(os.path.join(out_root, rel, "eval_dump"))
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +230,7 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
              sigma, dest):
     """Push every (volume, slice) through the net and write one HDF5 per volume."""
     lo, hi = parse_slices(args.slices)
+    cg_lam = getattr(args, "cg_sense_lam", None)      # callers without the option: no CG-SENSE
 
     val = dict(cfg["data"]["val"])
     val.update(enumerate_slices=True, start_slice=lo, end_slice=hi,
@@ -271,6 +275,8 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         "n_params": int(n_params),
         "step": int(step or 0),
         "metrics": list(metrics),
+        # -1 = no CG-SENSE stored (HDF5 attributes cannot hold None)
+        "cg_sense_lam": (-1.0 if cg_lam is None else float(cg_lam)),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -293,6 +299,9 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
             cur = vol
 
         extras = {}
+        if cg_lam is not None:
+            extras.update(cg_sense_lam=cg_lam,
+                          cg_sense_iters=getattr(args, "cg_sense_iters", 100))
         gt, recon, metric_mask = adapter(model, batch, cfg, device, sigma, gen,
                                          extras=extras)
 
@@ -315,6 +324,9 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         if "zero_filled" in extras:
             buf.setdefault("zero_filled", []).append(
                 keep(_np(extras["zero_filled"])).astype(np.complex64))
+        if "cg_sense" in extras:
+            buf.setdefault("cg_sense", []).append(
+                keep(_np(extras["cg_sense"])).astype(np.complex64))
         if "sampling_mask" in extras:
             buf.setdefault("sampling_mask", []).append(
                 (np.abs(_np(extras["sampling_mask"])) > 0).astype(np.uint8))
@@ -365,6 +377,11 @@ def main():
                    help=f"how the measurement is made (default {EVAL_KSPACE_TYPE}: "
                         f"measured k-space + AWGN, as the nets train, whatever the "
                         f"run's config says)")
+    p.add_argument("--cg-sense-lam", type=float,
+                   help="also store `cg_sense`: Tikhonov CG-SENSE, (E^H E + lam I) x "
+                        "= E^H y, on the same measurement the net saw")
+    p.add_argument("--cg-sense-iters", type=int, default=100,
+                   help="CG iterations for --cg-sense-lam")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)

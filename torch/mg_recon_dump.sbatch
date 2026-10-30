@@ -28,10 +28,11 @@
 # comes from each run's own config, not from here). `sbatch --array=0` / `=1`
 # still works and dumps just brain / knee, as before. Output lands in
 #
-#     trained_nets/mg_recon/<anatomy>/<cell>/eval_dump/<volume>.h5
+#     trained_nets/mg_recon_measured/<anatomy>/<cell>/eval_dump/<volume>.h5
 #
-# beside the checkpoint that produced it. Pull those down and open them with
-# figures/viewer.py -- see docs/plotting.md.
+# (see OUT below; VAL_KSPACE=simulated writes under trained_nets/mg_recon/, beside
+# the checkpoint). Pull those down and open them with figures/viewer.py -- see
+# docs/plotting.md.
 #
 # This is INFERENCE, then an aliasing scan over what was dumped
 # (scripts/alias_scan.py, CPU only; SCAN=0 skips it). At the default 60 brain /
@@ -45,7 +46,7 @@
 # (4 methods x R8/R12) is ~19 GB, and knee about the same. That stays on the
 # cluster: the scan writes its ranking and PNGs of the worst slices to
 #
-#     trained_nets/mg_recon/<anatomy>/alias_scan/scan_R<R>.{txt,csv}, R*_*.png
+#     <the same tree>/<anatomy>/alias_scan/scan_R<R>.{txt,csv}, R*_*.png
 #
 # which is all you need to pull down. rsync individual volumes for the viewer
 # once the scan has said which ones are worth looking at.
@@ -62,12 +63,12 @@ ANATOMY_LIST="${ANATOMY_LIST:-}"
 # Substring filters on the run path, passed to --only. The trailing underscore
 # keeps `lpdsnet_` from also selecting a future cell whose name contains it.
 # MGLPDS-Big is mg169v6 for both anatomies (brain's `mglpds` stopgap retired
-# 2026-10-21); ONLY="... mglpds_" still dumps it. RAM (exp13) is both its
-# cells: `ram_` (random init, "RAM-scratch") and `ramdrunet_` (DRUNet init,
-# "RAM"); `ram_` does not match `ramdrunet_R8`. A run not trained yet is
+# 2026-10-21); ONLY="... mglpds_" still dumps it. RAM is exp13's `ram` cell;
+# `ramdrunet` (its DRUNet-initialised twin, not trained) is left out, and
+# `ram_` does not match it. A run not trained yet is
 # simply not found.
 _ONLY_GIVEN="${ONLY:+1}"
-ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ varnetmaps_ ram_ ramdrunet_}"
+ONLY="${ONLY:-lpdsnet_ mg169v6_ mg81v6_ varnetmaps_ ram_}"
 # EXACT=1: the ONLY entries are run directory NAMES, matched exactly, so a cell
 # is dumped without its tagged probes (<cell>_500ep, <cell>_prof, ...):
 #   EXACT=1 ONLY="varnetmaps_R12 lpdsnet_R12 mg81v6_R12" sbatch --array=0 ...
@@ -95,7 +96,7 @@ VOLUMES="${VOLUMES:-}"
 # APPENDED to the existing dumps: each volume is its own <volume>.h5, so the
 # first-N files already in eval_dump/ are left alone (a listed volume that is
 # already there is rewritten). Unless ONLY is given, this dumps exactly the
-# main comparison's runs (EXACT: the eight above and the four RAM runs), not
+# main comparison's runs (EXACT: the eight above and the two RAM runs), not
 # the cells' tagged probes:
 #   PICKS_DIR=results/picks sbatch torch/mg_recon_dump.sbatch
 # The picked volumes get their own noise draw (the generator restarts per run
@@ -120,7 +121,21 @@ SIGMA="${SIGMA:-}"                      # empty = each run's own val_noise_std
 # alternative. The dump records it, and the viewer warns when dumps made both
 # ways are put side by side.
 VAL_KSPACE="${VAL_KSPACE:-measurement_awgn}"
-OUT="${OUT:-}"                          # empty = <run>/eval_dump/
+# Also store `cg_sense`, Tikhonov CG-SENSE on the same measurement
+# ((E^H E + lam I) x = E^H y, 100 CG iterations), e.g. CG_SENSE_LAM=1e-3.
+# It does not depend on the net, so one run per anatomy is enough:
+#   CG_SENSE_LAM=1e-3 EXACT=1 ONLY="lpdsnet_R8 lpdsnet_R12" sbatch torch/mg_recon_dump.sbatch
+CG_SENSE_LAM="${CG_SENSE_LAM:-}"        # empty = no CG-SENSE
+# Where the dumps go, as OUT/<anatomy>/<cell>/eval_dump/<volume>.h5. Measured
+# dumps have their own tree by default (2026-10-30), so they never overwrite the
+# simulated ones under <run>/eval_dump/, which have the same file names. An
+# explicitly EMPTY OUT= writes beside the checkpoint. Open a tree in the viewer
+# with --dump-root trained_nets/mg_recon_measured/<anatomy>.
+if [ "${VAL_KSPACE}" = "measurement_awgn" ]; then
+    OUT="${OUT-trained_nets/mg_recon_measured}"
+else
+    OUT="${OUT-}"
+fi
 WORKERS="${WORKERS:-4}"
 SCAN="${SCAN:-1}"                       # 0 = dump only, no aliasing scan
 SCAN_TARGET="${SCAN_TARGET:-lpdsnet}"   # the method under suspicion
@@ -201,8 +216,8 @@ dump_anatomy() {
         fi
         VOLS="$(grep -v '^[[:space:]]*\(#\|$\)' "${_picks}" | tr -d '\r' | tr '\n' ' ')"
         if [ -z "${_ONLY_GIVEN}" ]; then
-            RUN_ONLY="varnetmaps_R8 lpdsnet_R8 mg81v6_R8 mg169v6_R8 ram_R8 ramdrunet_R8"
-            RUN_ONLY+=" varnetmaps_R12 lpdsnet_R12 mg81v6_R12 mg169v6_R12 ram_R12 ramdrunet_R12"
+            RUN_ONLY="varnetmaps_R8 lpdsnet_R8 mg81v6_R8 mg169v6_R8 ram_R8"
+            RUN_ONLY+=" varnetmaps_R12 lpdsnet_R12 mg81v6_R12 mg169v6_R12 ram_R12"
             RUN_EXACT=1
         fi
         echo "[dump] ${ANATOMY}: $(wc -w <<< "${VOLS}") picked volumes from ${_picks}"
@@ -229,6 +244,7 @@ dump_anatomy() {
         --workers "${WORKERS}" \
         ${SIGMA:+--sigma "${SIGMA}"} \
         --val-kspace-type "${VAL_KSPACE}" \
+        ${CG_SENSE_LAM:+--cg-sense-lam "${CG_SENSE_LAM}"} \
         ${OUT:+--out "${OUT}/${ANATOMY}"} || return 1
 
     echo "[dump] ${ANATOMY} done $(date '+%F %T')"
