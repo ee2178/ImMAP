@@ -90,13 +90,21 @@ LABELS = {
     "mglpds": "MGLPDS-Big",
     "ram": "RAM",                # exp13: the trained RAM, random init, our protocol
     "ramdrunet": "RAM-DRUNet",   # the same net with a DRUNet-initialised trunk (not trained)
+    # exp18: the main comparison on center_frac = 0.32 / R, adjust_accel off. Same
+    # labels, so the tables and tests read them; never in one tree with the old mask
+    # (--replace-other-masks, wilcoxon_main.PREFERRED_CELLS).
+    "varnetmapscf32": "E2E-VarNet",
+    "lpdsnetcf32": "LPDSNet",
+    "mg81v6vtxAnestUcf32": "MGLPDS-Small",
+    "mg169v6vtxAnestUcf32": "MGLPDS-Big",
+    "ramcf32": "RAM",
 }
 
 DEFAULT_METRICS = ["psnr", "ssim", "nrmse", "lpips"]
 META_KEYS = ("run", "anatomy", "R", "step", "sigma", "seed", "slices", "val_kspace_type",
              "mask_source",
              "metrics", "n_volumes", "use_organ_mask", "rediscretize_embedded",
-             "transfer_filter", "volume_select")
+             "transfer_filter", "volume_select", "center_frac", "adjust_accel")
 
 
 def cell_of(run):
@@ -183,7 +191,10 @@ def _setup(run_dir, anatomy, args, metric_names, device):
               # ...and with the transfer the net was built with
               "transfer_filter": filt_trained,
               # ...on the first N (or all) volumes
-              "volume_select": "first"}
+              "volume_select": "first",
+              # ...on the mask of its own config: the eval has always read it there
+              "center_frac": cfg.get("mri", {}).get("center_frac"),
+              "adjust_accel": bool(cfg.get("mri", {}).get("adjust_accel", False))}
     if getattr(args, "mask", "organ") == "organ":
         force_organ_mask(cfg)
     if args.val_kspace_type:
@@ -213,6 +224,8 @@ def _setup(run_dir, anatomy, args, metric_names, device):
                 val_kspace_type=val_kspace_type(cfg),
                 transfer_filter=filt,
                 volume_select=volume_select,
+                center_frac=cfg.get("mri", {}).get("center_frac"),
+                adjust_accel=bool(cfg.get("mri", {}).get("adjust_accel", False)),
                 metric_versions={m: metric_version(m) for m in metric_names})
 
     val = dict(cfg["data"]["val"])
@@ -415,6 +428,26 @@ def recompute_run(run_dir, anatomy, args, names, device):
     return csv_path
 
 
+def replace_other_masks(out_root, anatomy, run):
+    """Drop the rows of runs of `run`'s anatomy and R scored on ANOTHER sampling mask.
+
+    A meta without the mask keys predates them, so it is an older mask. Only called
+    once `run` is scored, so a failed pass leaves the old results in place."""
+    dest = os.path.join(out_root, anatomy)
+    with open(os.path.join(dest, f"{run}.meta.json")) as f:
+        meta = json.load(f)
+    pattern = (meta["center_frac"], meta["adjust_accel"])
+    for mp in glob.glob(os.path.join(dest, "*.meta.json")):
+        with open(mp) as f:
+            old = json.load(f)
+        if old["R"] != meta["R"] or (old.get("center_frac"), old.get("adjust_accel")) == pattern:
+            continue
+        print(f"  [{run}] replaces {anatomy}/{old['run']} (another mask)")
+        for path in (mp, mp[:-len(".meta.json")] + ".slices.csv"):
+            if os.path.exists(path):
+                os.remove(path)
+
+
 def combine(out_root):
     """Merge every <anatomy>/<run>.slices.csv into slices.csv and volumes.csv."""
     metas = sorted(glob.glob(os.path.join(out_root, "*", "*.meta.json")))
@@ -455,12 +488,20 @@ def combine(out_root):
               f"{len(per_vol):>4} volumes / {len(rows):>5} slices "
               f"(of {meta['n_volumes']} volumes)")
 
-    kinds = {}
+    kinds, masks = {}, {}
     for mp in metas:
         with open(mp) as f:
             m = json.load(f)
         kinds.setdefault(m.get("val_kspace_type", "unrecorded (before 2026-10-20)"),
                          []).append(f"{m['anatomy']}/{m['run']}")
+        masks.setdefault(f"center_frac={m.get('center_frac', 'unrecorded')} "
+                         f"adjust_accel={m.get('adjust_accel', 'unrecorded')}",
+                         []).append(f"{m['anatomy']}/{m['run']}")
+    if len(masks) > 1:
+        print("  [WARNING] runs here used different sampling masks -- their numbers are "
+              "not comparable across experiments:")
+        for k, runs in sorted(masks.items()):
+            print(f"      {k}: {', '.join(runs)}")
     if len(kinds) > 1:
         print("  [WARNING] runs here were measured differently -- their numbers are "
               "not comparable; keep each kind in its own --out:")
@@ -527,6 +568,9 @@ def main():
     p.add_argument("--limit", type=int, help="stop after N slices (smoke test)")
     p.add_argument("--overwrite", action="store_true",
                    help="discard this run's previous rows instead of resuming")
+    p.add_argument("--replace-other-masks", action="store_true",
+                   help="once a run is scored, delete the rows under --out of runs of the "
+                        "same anatomy and R scored on another sampling mask")
     p.add_argument("--recompute", nargs="+", metavar="METRIC",
                    help="re-score these metrics on the rows each run already has, "
                         "keeping every other column (e.g. --recompute nrmse)")
@@ -551,6 +595,8 @@ def main():
                 recompute_run(run_dir, args.anatomy, args, args.recompute, device)
             else:
                 eval_run(run_dir, args.anatomy, args, args.metrics, device)
+                if args.replace_other_masks and not args.limit:
+                    replace_other_masks(args.out, args.anatomy, run)
     elif not args.combine:
         raise SystemExit("nothing to do: give --anatomy and --run, or --combine")
 

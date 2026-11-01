@@ -314,6 +314,37 @@ def test_sample_and_sigma(tmp, ks, sm):
           f"{psnr[0.01]:.2f} -> {psnr[3.0]:.2f} dB")
 
 
+def test_replace_other_masks(tmp):
+    root = os.path.join(tmp, "replace")
+
+    def put(anatomy, run, R, **mask):
+        d = os.path.join(root, anatomy)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{run}.meta.json"), "w") as f:
+            json.dump(dict(run=run, anatomy=anatomy, R=R, **mask), f)
+        with open(os.path.join(d, f"{run}.slices.csv"), "w") as f:
+            f.write("volume,slice\n")
+
+    new = dict(center_frac=0.04, adjust_accel=False)
+    put("knee", "lpdsnetcf32_R8", 8, **new)
+    put("knee", "ramcf32_R8", 8, **new)
+    put("knee", "lpdsnet_R8", 8)                                  # predates the keys
+    put("knee", "ram_R8", 8, center_frac=0.04, adjust_accel=True)
+    put("knee", "lpdsnet_R12", 12)                                # another R
+    put("brain", "lpdsnet_R8", 8)                                 # another anatomy
+    epv.replace_other_masks(root, "knee", "lpdsnetcf32_R8")
+    left = sorted(f"{a}/{n}" for a in ("brain", "knee")
+                  for n in os.listdir(os.path.join(root, a)) if n.endswith(".meta.json"))
+    check("replace: only the other masks of that anatomy and R go", left == [
+        "brain/lpdsnet_R8.meta.json", "knee/lpdsnet_R12.meta.json",
+        "knee/lpdsnetcf32_R8.meta.json", "knee/ramcf32_R8.meta.json"])
+    check("replace: the rows go with the meta",
+          not os.path.exists(os.path.join(root, "knee", "ram_R8.slices.csv")))
+    check("cf32 cells keep the table labels",
+          epv.label_of("varnetmapscf32_R8") == "E2E-VarNet"
+          and epv.label_of("mg81v6vtxAnestUcf32_R12") == "MGLPDS-Small")
+
+
 def test_wilcoxon(tmp):
     rng = np.random.default_rng(1)
     n = 30
@@ -362,6 +393,7 @@ def main():
         test_val_kspace(tmp, ks, sm)
         test_force_mask(tmp, ks, sm)
         test_sample_and_sigma(tmp, ks, sm)
+        test_replace_other_masks(tmp)
         test_wilcoxon(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

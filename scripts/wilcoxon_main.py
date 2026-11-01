@@ -49,7 +49,8 @@ ORDER = ["E2E-VarNet", "LPDSNet", "MGLPDS-Small", "MGLPDS-Big"]
 
 # Runs that share a display label (brain's MGLPDS-Big stopgap `mglpds` and the
 # real `mg169v6`): keep the FIRST of these present, never pool the two.
-PREFERRED_CELLS = ["mg169v6", "mglpds"]
+PREFERRED_CELLS = ["varnetmapscf32", "lpdsnetcf32", "mg81v6vtxAnestUcf32",
+                   "mg169v6vtxAnestUcf32", "ramcf32", "mg169v6", "mglpds"]
 
 
 def _cell(run):

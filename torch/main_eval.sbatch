@@ -21,10 +21,20 @@
 # other on that task's GPU (2026-10-29: was one GPU per run, 16 of them, which
 # queued longer than the runs took). With the default 5:
 #
-#   0  brain R8   varnetmaps lpdsnet mg81v6 mg169v6 ram
-#   1  brain R12  varnetmaps lpdsnet mg81v6 mg169v6 ram
-#   2  knee  R8   varnetmaps lpdsnet mg81v6 mg169v6 ram
-#   3  knee  R12  varnetmaps lpdsnet mg81v6 mg169v6 ram
+#   0  brain R8   varnetmaps lpdsnet mg81v6vtxAnestU mg169v6vtxAnestU ram, each cf32
+#   1  brain R12  the same
+#   2  knee  R8   the same
+#   3  knee  R12  the same
+#
+# THE NETS ARE exp18's (2026-11-01): center_frac = 0.32 / R, adjust_accel off. The
+# mask comes from each run's own config.json, as do the online ESPIRiT maps, sigma
+# (val_noise_std) and organ mask, so the eval follows the run's training. A task
+# whose nets are not trained yet fails those entries and scores the rest.
+#
+# REPLACING THE OLD RESULTS: REPLACE_OLD=1 deletes, once each new run is scored, the
+# rows in ${OUT} of that anatomy and R on another mask -- only those; the other
+# experiments stay until their nets are scored. So exp18's knee R8 over results/main:
+#   REPLACE_OLD=1 sbatch --array=2 torch/main_eval.sbatch
 #
 # RAM is exp13's `ram` cell (torch/exp13_ram.sbatch), labelled "RAM". `ramdrunet`,
 # its DRUNet-initialised twin ("RAM-DRUNet"), is not trained; RUNS= scores it if it ever is.
@@ -93,10 +103,10 @@
 # numbers), so the ablation tree is complete on its own.
 _RUNS_GIVEN="${RUNS:-}"
 RUNS=(
-    brain/varnetmaps_R8  brain/lpdsnet_R8  brain/mg81v6_R8  brain/mg169v6_R8  brain/ram_R8
-    brain/varnetmaps_R12 brain/lpdsnet_R12 brain/mg81v6_R12 brain/mg169v6_R12 brain/ram_R12
-    knee/varnetmaps_R8   knee/lpdsnet_R8   knee/mg81v6_R8   knee/mg169v6_R8   knee/ram_R8
-    knee/varnetmaps_R12  knee/lpdsnet_R12  knee/mg81v6_R12  knee/mg169v6_R12  knee/ram_R12
+    brain/varnetmapscf32_R8  brain/lpdsnetcf32_R8  brain/mg81v6vtxAnestUcf32_R8  brain/mg169v6vtxAnestUcf32_R8  brain/ramcf32_R8
+    brain/varnetmapscf32_R12 brain/lpdsnetcf32_R12 brain/mg81v6vtxAnestUcf32_R12 brain/mg169v6vtxAnestUcf32_R12 brain/ramcf32_R12
+    knee/varnetmapscf32_R8   knee/lpdsnetcf32_R8   knee/mg81v6vtxAnestUcf32_R8   knee/mg169v6vtxAnestUcf32_R8   knee/ramcf32_R8
+    knee/varnetmapscf32_R12  knee/lpdsnetcf32_R12  knee/mg81v6vtxAnestUcf32_R12  knee/mg169v6vtxAnestUcf32_R12  knee/ramcf32_R12
 )
 if [ -n "${_RUNS_GIVEN}" ]; then
     read -r -a RUNS <<< "${_RUNS_GIVEN}"
@@ -198,6 +208,7 @@ eval_run() {
         --val-kspace-type "${VAL_KSPACE}" \
         ${TRANSFER_FILTER:+--transfer-filter "${TRANSFER_FILTER}"} \
         ${RECOMPUTE:+--recompute ${RECOMPUTE}} \
+        ${REPLACE_OLD:+--replace-other-masks} \
         ${EXTRA} || return 1
     echo "[eval] ${ENTRY} done $(date '+%F %T')"
 
