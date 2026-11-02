@@ -59,7 +59,7 @@ def random_bank(M, seed):
     return [("random", L, None)]
 
 
-def trained_banks(path, M, sigma):
+def trained_banks(path, M, sigma, device):
     """One bank per fine-level layer: its analysis, synthesis and thresholds from the checkpoint."""
     from models.lpds import make_lpds_layer, set_weight
     ck = torch.load(path, map_location="cpu", weights_only=False)
@@ -77,17 +77,23 @@ def trained_banks(path, M, sigma):
         w = sd[f"{pre}.prox.prox.tau.weight"]
         w = w.reshape(w.shape[0], -1)
         lam = (w[0] + (w[1] * sigma if w.shape[0] > 1 else 0)).view(1, -1, 1, 1)
-        out.append((pre, L, lam))
+        out.append((pre, L.to(device), lam.to(device)))
     return out, ck.get("step")
 
 
-def measure(L, x, g, lam, box, amp):
+def responses(L, x, g, device):
+    """(g, A x, A g) as tensors: the same for every lam and amplitude, so computed once."""
+    gt = torch.from_numpy(g.astype(np.complex64))[None, None].to(device)
+    xt = torch.from_numpy(x.astype(np.complex64))[None, None].to(device)
+    with torch.no_grad():
+        return gt, L.analysis(xt), L.analysis(gt)
+
+
+def measure(L, resp, lam, box, amp):
     r0, r1, c0, c1 = box
     s = (slice(None), slice(None), slice(r0 // 2, r1 // 2), slice(c0 // 2, c1 // 2))
-    gt = torch.from_numpy(g.astype(np.complex64))[None, None]
-    xt = torch.from_numpy(x.astype(np.complex64))[None, None]
+    gt, ax, ag = resp
     with torch.no_grad():
-        ax, ag = L.analysis(xt), L.analysis(gt)
         z0 = clip(ax, lam)
         z = clip(ax + amp * ag, lam)
         lam_map = lam * torch.ones_like(ax.real)
@@ -116,6 +122,7 @@ def main(argv=None):
     p.add_argument("--lam-scales", type=float, nargs="+", default=[1, 3, 10],
                    help="with --ckpt: multiples of each channel's trained threshold")
     p.add_argument("--amps", type=float, nargs="+", default=[0.25, 1, 4])
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
 
@@ -134,11 +141,11 @@ def main(argv=None):
     x = ref - ref.mean()
 
     if a.ckpt:
-        banks, step = trained_banks(a.ckpt, a.M, a.sigma)
+        banks, step = trained_banks(a.ckpt, a.M, a.sigma, a.device)
         head = f"trained filters, {len(banks)} fine layers (median over layers), step {step}"
         settings = [(f"lam x{s:g}", s) for s in a.lam_scales]
     else:
-        banks = random_bank(a.M, a.seed)
+        banks = [(n, L.to(a.device), lam) for n, L, lam in random_bank(a.M, a.seed)]
         head = f"random unit-norm filters, M={a.M}, seed {a.seed}: the mechanism only, not a trained prior"
         settings = [(f"lam {v:g}", v) for v in a.lams]
 
@@ -146,13 +153,15 @@ def main(argv=None):
              f"||ghost|| = {np.linalg.norm(ghost):.3f}, the anatomical control is scaled to match",
              "", f"{'setting':<14}{'added':<9}{'amp':>5}{'on clip':>9}{'changed':>9}{'flipped':>9}"
              f"{'force':>9}{'linear':>9}{'force/lin':>10}"]
+    resp = {name: [responses(L, x, g, a.device) for _, L, _ in banks]
+            for name, g in (("ghost", ghost), ("anatomy", anat))}
     for label, v in settings:
-        for name, g in (("ghost", ghost), ("anatomy", anat)):
+        for name in resp:
             for amp in a.amps:
                 ms = []
-                for _, L, lam in banks:
-                    use = (lam * v) if lam is not None else torch.tensor(float(v))
-                    ms.append(measure(L, x, g, use, a.box, amp))
+                for (_, L, lam), r in zip(banks, resp[name]):
+                    use = (lam * v) if lam is not None else torch.tensor(float(v), device=a.device)
+                    ms.append(measure(L, r, use, a.box, amp))
                 m = {k: float(np.median([q[k] for q in ms])) for k in ms[0]}
                 lines.append(f"{label:<14}{name:<9}{amp:>5g}{m['sat']:>9.0%}{m['changed']:>9.0%}{m['flipped']:>9.1%}"
                              f"{m['force']:>9.3f}{m['linear']:>9.3f}{m['force'] / max(m['linear'], 1e-9):>10.3f}")
