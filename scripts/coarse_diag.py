@@ -35,6 +35,26 @@ A knockout on a trained net overstates that path's value, since the later sweeps
 trained to expect it: read it against the other knockouts, and against a net TRAINED
 without the path (exp19's az0 cell, torch/exp19_coarse_op.sbatch).
 
+TRAJECTORY: does a correction ADD aliasing? Knockouts cannot say, since the later sweeps
+expect the path they remove. On the unmodified forward, the fine iterate of each V-cycle at
+
+    pre    after pre-smoothing      +x   pre + alpha_x P(dx)
+    +z     +x + dx_z                post after post-smoothing
+
+and how much ghost each holds, by projection. HP is alias_check.py's high-pass, then a 4-tap
+average on both axes: exact nulls at pi and pi/2, because the mid-net iterates carry lattice
+tones there (see SPECTRA) that are nearly orthogonal to a ghost but far larger, and leaked
+into this number before they were filtered. With H = HP(|ref|) and T = HP(|zero-filled|), the
+template G is T with its component along H removed, so a true edge does not count, and
+
+    beta = <HP(|x| - |ref|), G> / <G, G>
+
+is 1 for the zero-filled image and 0 for the reference, signed, in magnitudes masked as the
+dumps are. It can exceed 1: the zero-filled image is scaled down by the mask, so raising the
+image's amplitude raises its ghost with it. `beta` is over the eroded organ, `beta_win` over
+the window where the full output's rho peaks, which asks when the aliasing left in the output
+appeared; rows with no such window leave it empty. Treat small differences as nothing.
+
 SLICES. --sample-volumes volumes at random (the same draw for every run), each with
 --slices-per-volume spaced over its training range, plus the top --top-flagged flagged
 slices of --flags (an alias_check.py slices_R<R>.csv), so a net's numbers exist both
@@ -42,8 +62,9 @@ in general and where the aliasing is. The `source` column says which. --coarse-o
 the coarse operator at inference (no parameter depends on it): a diagnostic, since the
 net learned around the operator it trained with.
 
-Outputs under --out: <anatomy>/<run>[_op<op>].{knockouts,spectra}.csv, and with
---combine (the sbatch runs it after each task) knockouts.csv, spectra.csv, summary.txt.
+Outputs under --out: <anatomy>/<run>[_op<op>].{knockouts,spectra,trajectory}.csv, and with
+--combine (the sbatch runs it after each task) knockouts.csv, spectra.csv, trajectory.csv,
+summary.txt.
 """
 
 from __future__ import annotations
@@ -184,6 +205,103 @@ def run_knockouts(net, y, E, sigma, names=tuple(KNOCKOUTS)):
     return outs, spectra
 
 
+def run_trajectory(net, y, E, sigma):
+    """One forward -> `[(outer, stage, x)]`: the fine iterate around each correction."""
+    rows, handles = [], []
+
+    def add(mod, fn):
+        handles.append(mod.register_forward_hook(fn))
+
+    for k, level, V in net.vcycles():
+        if level:
+            continue
+        held = {}
+
+        def on_pre(m, a, out, k=k, held=held):
+            held["x"] = out[0][0]
+            rows.append((k, "pre", held["x"]))
+
+        def on_x(m, a, out, k=k, held=held):
+            held["x"] = held["x"] + out
+            rows.append((k, "+x", held["x"]))
+
+        def on_z(m, a, out, held=held):
+            held["dz"] = out
+
+        def on_tau(m, a, tau, k=k, V=V, held=held):
+            dz = held.pop("dz", None)
+            if dz is not None:
+                step = torch.as_tensor(tau).real.reshape(-1)[0]
+                rows.append((k, "+z", held["x"] - step * V.lpdsB.first.synthesis(dz)))
+
+        def on_post(m, a, out, k=k):
+            rows.append((k, "post", out[0][0]))
+
+        add(V.lpdsA, on_pre)
+        add(V.alpha_x, on_x)
+        add(V.alpha_z, on_z)
+        add(V.lpdsB.first.tau, on_tau)
+        add(V, on_post)
+    try:
+        with torch.no_grad():
+            out = net(y, E=E, sigma=sigma)
+    finally:
+        for h in handles:
+            h.remove()
+    return (out[0] if isinstance(out, tuple) else out).detach(), rows
+
+
+def hp_no_tones(x):
+    """`hp_pe`, then a 4-tap average per axis: exact nulls at pi and pi/2."""
+    return ndi.uniform_filter1d(ndi.uniform_filter1d(hp_pe(x), 4, axis=0, mode="nearest"),
+                                4, axis=1, mode="nearest")
+
+
+def ghost_template(ref, zf):
+    """`G`: the zero-filled image's high-pass with its component along the reference's removed."""
+    h, t = hp_no_tones(ref), hp_no_tones(zf)
+    return t - h * float((t * h).sum() / max((h * h).sum(), 1e-30))
+
+
+def ghost_fraction(rec, ref, G, where):
+    """`beta` of the docstring: 1 for the zero-filled image, 0 for the reference."""
+    g = G[where]
+    return float((hp_no_tones(rec - ref)[where] * g).sum() / max((g * g).sum(), 1e-30))
+
+
+def score_trajectory(gt, zf, organ, out, rows, T, a):
+    """`[{outer, stage, beta, beta_win}]` for `run_trajectory`'s rows; `out` on the embedded grid."""
+    keep = organ[0, 0].abs().cpu().numpy() > 0
+    mag = lambda t: np.abs(t[0, 0].cpu().numpy()) * keep       # noqa: E731
+    ref, zf_m = mag(gt), mag(zf)
+    inner = ndi.binary_erosion(keep, iterations=4)
+    if inner.sum() < 100:
+        return []
+    final = mag(T.forward(out))
+    # x is DC-removed (preprocessing/kspace.py); the output minus the last iterate is mu
+    last = rows[-1][2]
+    mu = (out - (to_complex(last) if not last.is_complex() else last)).mean()
+    sigma = slice_sigma(ref, [final], inner)
+    win = (a.win_rows, a.win_cols)
+    e = hp_pe(final - ref)
+    rho = np.where(strength_map(e, sigma, win) > a.min_strength,
+                   local_corr(e, hp_pe(zf_m), win), -np.inf)
+    top = top_patches(rho, np.abs(e) / (sigma + 1e-12), inner, a, n=1)
+    box = None
+    if top:
+        box = np.zeros_like(keep)
+        i, j = top[0][2], top[0][3]
+        box[max(i - win[0] // 2, 0):i + win[0] // 2 + 1, max(j - win[1] // 2, 0):j + win[1] // 2 + 1] = True
+        box &= inner
+    G = ghost_template(ref, zf_m)
+    out_rows = []
+    for outer, stage, x in rows:
+        im = mag(T.forward((to_complex(x) if not x.is_complex() else x) + mu))
+        out_rows.append(dict(outer=outer, stage=stage, beta=ghost_fraction(im, ref, G, inner),
+                             beta_win=ghost_fraction(im, ref, G, box) if box is not None else ""))
+    return out_rows
+
+
 def top_rho(rec, ref, zf, inner, sigma, a):
     """alias_check.py's slice score for one image: `(rho, strength)`, -1 with no strong place."""
     win = (a.win_rows, a.win_cols)
@@ -267,7 +385,7 @@ def run_diag(run_dir, a, device):
     metrics = build_metrics(METRICS)
     adapter = build_adapter(cfg["task"])
     gen = torch.Generator(device=device)
-    kn_rows, sp_rows = [], []
+    kn_rows, sp_rows, tr_rows = [], [], []
     for i, (vol, sl, source) in enumerate(picks):
         batch = load_batch(cfg, vol, sl)
         if batch is None:
@@ -279,6 +397,7 @@ def run_diag(run_dir, a, device):
         def call(net, y, E, sig):
             got["outs"], got["spectra"] = run_knockouts(net, y, E, sig)
             got["zf"] = E.adjoint(y)
+            got["traj_out"], got["traj"] = run_trajectory(net, y, E, sig)
             return got["outs"]["full"]
 
         gt, recon, organ = adapter(model, batch, cfg, device, sigma, gen, call=call)
@@ -290,12 +409,14 @@ def run_diag(run_dir, a, device):
         kn_rows += [dict(base, **r) for r in score_slice(gt, outs, T.forward(got["zf"]),
                                                          organ, metrics, a)]
         sp_rows += [dict(base, **r) for r in got["spectra"]]
+        tr_rows += [dict(base, **r) for r in score_trajectory(gt, T.forward(got["zf"]), organ,
+                                                              got["traj_out"], got["traj"], T, a)]
         if (i + 1) % 10 == 0 or i + 1 == len(picks):
             print(f"  {i + 1}/{len(picks)}", flush=True)
 
     dest = os.path.join(a.out, anatomy)
     os.makedirs(dest, exist_ok=True)
-    for kind, rows in (("knockouts", kn_rows), ("spectra", sp_rows)):
+    for kind, rows in (("knockouts", kn_rows), ("spectra", sp_rows), ("trajectory", tr_rows)):
         write_csv(os.path.join(dest, f"{run}.{kind}.csv"), rows)
     return kn_rows, sp_rows
 
@@ -313,7 +434,27 @@ def _floats(rows, key):
     return np.array([float(r[key]) for r in rows])
 
 
-def summarize(kn_rows, sp_rows):
+def trajectory_lines(rows, key, raise_by=0.02):
+    """Mean `key` per V-cycle and stage, and how often each correction raises it by `raise_by`."""
+    rows = [r for r in rows if r[key] != ""]
+    if not rows:
+        return [f"  no slice has {key}"]
+    at = {}
+    for r in rows:
+        at.setdefault((int(r["outer"]), r["volume"], int(r["slice"])), {})[r["stage"]] = float(r[key])
+    lines = [f"  {'V':>3}{'pre':>9}{'+x':>9}{'+z':>9}{'post':>9}{'x raises':>10}{'z raises':>10}{'n':>5}"]
+    for outer in sorted({k[0] for k in at}):
+        s = [v for k, v in at.items() if k[0] == outer]
+        mean = lambda st: np.mean([v[st] for v in s if st in v]) if any(st in v for v in s) else np.nan  # noqa: E731
+        up_x = np.mean([v["+x"] - v["pre"] > raise_by for v in s])
+        with_z = [v for v in s if "+z" in v]
+        up_z = np.mean([v["+z"] - v["+x"] > raise_by for v in with_z]) if with_z else np.nan
+        lines.append(f"  {outer + 1:>3}{mean('pre'):>9.3f}{mean('+x'):>9.3f}{mean('+z'):>9.3f}{mean('post'):>9.3f}"
+                     f"{100 * up_x:>9.0f}%{100 * up_z:>9.0f}%{len(s):>5}")
+    return lines
+
+
+def summarize(kn_rows, sp_rows, tr_rows=()):
     """The tables a reader wants, one block per run. Means over slices."""
     lines = []
     for run in sorted({r["run"] for r in kn_rows}):
@@ -358,6 +499,17 @@ def summarize(kn_rows, sp_rows):
                          f"{_floats(sx, 'rel_norm').mean():>9.4f}{_floats(sx, 'hf').mean():>8.3f}"
                          f"{zr}{hfz / max(hfx + hfz, 1e-30):>12.3f}")
         lines.append("")
+        tr = [r for r in tr_rows if r["run"] == run]
+        if tr:
+            lines.append("ghost in the fine iterate by stage: 1 = the zero-filled image's, 0 = the reference's; "
+                         "'raises' = share of slices up by more than 0.02")
+            for source in sorted({r["source"] for r in tr}, reverse=True):
+                sr = [r for r in tr if r["source"] == source]
+                lines.append(f"{source}, beta_win (where the output's rho peaks)")
+                lines += trajectory_lines(sr, "beta_win")
+                lines.append(f"{source}, beta (whole organ)")
+                lines += trajectory_lines(sr, "beta")
+            lines.append("")
     return lines
 
 
@@ -365,7 +517,7 @@ def combine(out):
     """Merge every run under `out`; written through a temporary file, so a reader never
     sees half of one."""
     merged = {}
-    for kind in ("knockouts", "spectra"):
+    for kind in ("knockouts", "spectra", "trajectory"):
         rows = []
         for p in sorted(glob.glob(os.path.join(out, "*", f"*.{kind}.csv"))):
             with open(p, newline="") as f:
@@ -375,7 +527,7 @@ def combine(out):
         merged[kind] = rows
     tmp = os.path.join(out, "summary.txt.partial")
     with open(tmp, "w") as f:
-        f.write("\n".join(summarize(merged["knockouts"], merged["spectra"])) + "\n")
+        f.write("\n".join(summarize(merged["knockouts"], merged["spectra"], merged["trajectory"])) + "\n")
     os.replace(tmp, os.path.join(out, "summary.txt"))
     print(f"[coarse_diag] merged {len({r['run'] for r in merged['knockouts']})} runs into {out}")
 

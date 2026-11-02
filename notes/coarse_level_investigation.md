@@ -74,6 +74,31 @@ sbatch torch/coarse_diag.sbatch
 | gal and fold match the baseline | Operator ruled out, as a retrain rather than a swap |
 | Nothing changes the images | Look at untied copies, or at a loss that scores the coarse levels |
 
+## Update 2026-11-02: the real test is aliasing, and the RAM gap
+
+The user cares about aliasing removal, not whether coarse images look like images. The danger
+is a coarse correction ADDING aliasing, and there is still a gap to RAM to explain.
+
+- All exp19 nets, including Galerkin, still have diverging coarse images: operator ruled out
+  as the cause of that. Aliasing scan on these nets not run yet.
+- With fixed weights the V-cycle works as a solver (scratchpad test): coarse stays put when the
+  fine level is solved, and improves from an unconverged start.
+- `coarse_diag` on `mg81v6vtxAnestUcf32_R8`: no knockout lowers mean rho. `ax0` costs 7.4 dB and
+  rho goes .25 -> .75 (flagged .57 -> .92), `az0` costs 1.66 dB.
+- Fine `x` is full of narrow tones in V1-V4 (`e7` at pi, `e4` at pi/2, almost nothing between);
+  clean by V6. L1's own period-2 tone reaches the fine level at pi/2 through P. Hypothesis, not
+  shown: x's sub-lattices act as hidden channels in the unsampled part of k-space.
+- `coarse_diag` now also writes `trajectory.csv`: ghost content of the fine iterate at pre, +x, +z
+  and post per V-cycle, with how often each correction raises it. This is the direct test of
+  whether a correction adds aliasing. Not yet run on real data.
+- RAM gap, hypothesis only. Over-cutoff counts on knee R8: RAM 13, Big 21, LPDSNet 25, Small 28,
+  VarNet 30. LPDSNet has no coarse level and sits with Small, so the coarse level may not be the
+  gap; VarNet has long reach and is worst, so reach alone is not it. RAM alone feeds measurement
+  features (y, its decoding, Krylov terms) to every block as separate channels. LPDS's z update
+  only sees A xbar, so the data residual reaches it mixed into x. Test: remove that conditioning
+  from trained RAM at inference and rerun the scan; if confirmed, add an analysis of the data
+  residual to the z step.
+
 ## Next, if needed
 
 1. Measure the untied-copy forcing: `(B_C1 - B_dF) z_c` against `R r_fine`, per V-cycle.

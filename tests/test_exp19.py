@@ -331,6 +331,49 @@ def test_rho():
     check("PSNR orders the same way", rows["ax0"]["psnr"] < rows["az0"]["psnr"] < rows["full"]["psnr"])
 
 
+def test_ghost_fraction():
+    """beta is exactly 1 on the zero-filled image and 0 on the reference, tells the two apart
+    in between, does not count a blurred edge, and shrugs off a lattice tone."""
+    H, W = 160, 128
+    g = torch.Generator().manual_seed(3)
+    yy = torch.arange(H)[:, None].double() - H / 2
+    xx = torch.arange(W)[None, :].double() - W / 2
+    disc = ((yy / 50) ** 2 + (xx / 8) ** 2 < 1).double()
+    ref = (0.5 + 0.4 * disc).numpy()
+    ghost = torch.roll(disc, W // 4, dims=1).numpy()
+    zf = 0.6 * ref + 0.3 * ghost + 0.002 * torch.randn(H, W, generator=g, dtype=torch.float64).numpy()
+    G = cd.ghost_template(ref, zf)
+    all_ = (ref > 0)
+    b = lambda im: cd.ghost_fraction(im, ref, G, all_)                       # noqa: E731
+    check("beta: zero-filled ~ 1, reference = 0", abs(b(zf) - 1) < 0.02 and abs(b(ref)) < 1e-9,
+          f"{b(zf):.4f}, {b(ref):.4f}")
+    half = ref + 0.5 * (zf - 0.6 * ref)
+    check("beta: half the ghost reads about 1/2 of it", 0.3 < b(half) < 0.7, f"{b(half):.3f}")
+    blur = ref - 0.1 * cd.hp_pe(ref)
+    check("beta: an edge error does not read as ghost", abs(b(blur)) < 0.05, f"{b(blur):.3f}")
+    n_y, n_x = yy.numpy(), xx.numpy()
+    for name, t in (("pi along PE", (-1.0) ** (n_x % 2)), ("pi along readout", (-1.0) ** (n_y % 2)),
+                    ("checkerboard", (-1.0) ** ((n_x + n_y) % 2)),
+                    ("pi/2 along PE", torch.cos(torch.pi / 2 * xx).numpy())):
+        tone = ref + 0.2 * t + 0 * n_y
+        check(f"beta: a lattice tone does not read as ghost ({name})", abs(b(tone)) < 0.02,
+              f"{b(tone):.4f}")
+
+
+def test_trajectory():
+    net = _net()
+    with torch.no_grad():
+        full = net(Y, sigma=SIG)[0]
+    out, rows = cd.run_trajectory(net, Y, None, SIG)
+    check("trajectory: the forward is unchanged, and the last post is the output",
+          torch.equal(out, full) and torch.equal(rows[-1][2], full))
+    check("trajectory: four stages per fine V-cycle", [r[1] for r in rows[:4]] == ["pre", "+x", "+z", "post"]
+          and len(rows) == 8 and {r[0] for r in rows} == {0, 1}, str([r[1] for r in rows[:4]]))
+    az0 = _net(alpha_z_zero=True)
+    _, rows = cd.run_trajectory(az0, Y, None, SIG)
+    check("trajectory: alpha_z_zero has no +z", not [r for r in rows if r[1] == "+z"] and len(rows) == 6)
+
+
 def test_whole_pass(tmp):
     """`run_diag` + `combine` with the real adapter, measurement and metrics; only the
     loader is synthetic, there being no fastMRI here."""
@@ -364,8 +407,9 @@ def test_whole_pass(tmp):
     with open(os.path.join(out, "summary.txt")) as f:
         text = f.read()
     print("\n" + text)
-    check("summary: every knockout, both slice sources, per-V spectra",
-          all(k in text for k in cd.KNOCKOUTS) and "flagged" in text and "L2->L1" in text)
+    check("summary: every knockout, both slice sources, per-V spectra, ghost by stage",
+          all(k in text for k in cd.KNOCKOUTS) and "flagged" in text and "L2->L1" in text
+          and "flagged, beta (whole organ)" in text)
     import csv
     with open(os.path.join(out, "knockouts.csv"), newline="") as f:
         rows = list(csv.DictReader(f))
@@ -375,7 +419,8 @@ def test_whole_pass(tmp):
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        for fn in (test_folded, test_alpha_z_zero, test_spectrum, test_hooks, test_rho):
+        for fn in (test_folded, test_alpha_z_zero, test_spectrum, test_hooks, test_rho,
+                   test_ghost_fraction, test_trajectory):
             print(f"\n--- {fn.__name__}")
             fn()
         for fn in (test_cells, test_whole_pass):
