@@ -59,6 +59,7 @@ refuses to put mismatched ones side by side.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime
 import json
 import os
@@ -189,6 +190,18 @@ def resolve_volumes(val_cfg, names, n_volumes):
     return vols
 
 
+def read_flagged(path, top=0):
+    """{volume: {source slices}} of the flagged rows of an alias_check.py slices_R<R>.csv,
+    the `top` highest ranked if set."""
+    with open(path, newline="") as f:
+        rows = sorted((r for r in csv.DictReader(f) if int(r["flagged"])),
+                      key=lambda r: int(r["rank"]))
+    out = {}
+    for r in rows[:top] if top else rows:
+        out.setdefault(r["volume"], set()).add(int(r["slice"]))
+    return out
+
+
 def same_source(a, b):
     """Do two val configs read the same images? Columns must, or the figure lies."""
     keys = ("name", "anatomy", "kspace_root", "smap_root", "scale_fac")
@@ -231,6 +244,7 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
     """Push every (volume, slice) through the net and write one HDF5 per volume."""
     lo, hi = parse_slices(args.slices)
     cg_lam = getattr(args, "cg_sense_lam", None)      # callers without the option: no CG-SENSE
+    keep_slices = getattr(args, "keep_slices", None)  # {volume: slices}: the net runs on no others
 
     val = dict(cfg["data"]["val"])
     val.update(enumerate_slices=True, start_slice=lo, end_slice=hi,
@@ -294,6 +308,8 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         if args.limit and i >= args.limit:
             break
         vol, sl = ds.item_id(i)
+        if keep_slices is not None and sl not in keep_slices.get(vol, ()):
+            continue
         if vol != cur:
             flush()
             cur = vol
@@ -386,6 +402,9 @@ def main():
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--limit", type=int, help="stop after N slices (smoke test)")
+    p.add_argument("--flags", help="an alias_check.py slices_R<R>.csv: run the net only on its "
+                                   "flagged slices, in place of --volumes and --slices")
+    p.add_argument("--flags-top", type=int, default=0, help="--flags: only the top N flagged slices")
     args = p.parse_args()
 
     device = torch.device(args.device or
@@ -408,6 +427,14 @@ def main():
     # config and checked against the rest.
     with open(os.path.join(runs[0], "config.json")) as f:
         first_val = json.load(f)["data"]["val"]
+    args.keep_slices = None
+    if args.flags:
+        args.keep_slices = read_flagged(args.flags, args.flags_top)
+        if not args.keep_slices:
+            raise SystemExit(f"nothing flagged in {args.flags}")
+        args.volumes = sorted(args.keep_slices)
+        _sl = [s for v in args.keep_slices.values() for s in v]
+        args.slices = f"{min(_sl)}:{max(_sl) + 1}"
     volumes = resolve_volumes(first_val, args.volumes, args.n_volumes)
     print(f"{len(runs)} run(s) | {len(volumes)} volume(s) | slices "
           f"{args.slices or 'all'} | device {device}")

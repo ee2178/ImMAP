@@ -186,20 +186,23 @@ def scan_slices(dumps, vol, methods, a):
 def render_patch(dumps, methods, method, vol, pos, sl, row, col, a, path):
     """The patch around (row, col) in the reference and each method's recon, with that
     method's rho:
-    its highest in the window centred there, so a peak a pixel away still counts."""
+    its highest in the window centred there, so a peak a pixel away still counts. `pos` is
+    the stack position, or {method: position} when the dumps hold different slices; the
+    reference, zero-filled and organ mask come from methods[0]."""
+    at = pos if isinstance(pos, dict) else {m: pos for m in methods}
     ims, rhos = {}, {}
     for m in methods:
         with h5py.File(os.path.join(dumps[m], vol + ".h5"), "r") as h:
-            ims[m] = np.abs(h["recon"][pos])
+            ims[m] = np.abs(h["recon"][at[m]])
             if m == methods[0]:
-                ref, zf = np.abs(h["reference"][pos]), np.abs(h["zero_filled"][pos])
+                ref, zf = np.abs(h["reference"][at[m]]), np.abs(h["zero_filled"][at[m]])
     win = (a.win_rows, a.win_cols)
     t = hp_pe(zf)
     w = (slice(max(row - win[0] // 2, 0), row + win[0] // 2 + 1),
          slice(max(col - win[1] // 2, 0), col + win[1] // 2 + 1))
     organ = None
     with h5py.File(os.path.join(dumps[methods[0]], vol + ".h5"), "r") as h:
-        organ = h["organ_mask"][pos] > 0
+        organ = h["organ_mask"][at[methods[0]]] > 0
     sigma = slice_sigma(ref, list(ims.values()), ndi.binary_erosion(organ, iterations=4))
     stren = {}
     for m in methods:
@@ -228,6 +231,7 @@ def render_patch(dumps, methods, method, vol, pos, sl, row, col, a, path):
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt_close(fig)
+    return rhos, stren
 
 
 def plt_subplots(n):
