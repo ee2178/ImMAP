@@ -898,6 +898,30 @@ for _b in EXP18_BASES:
     MODELS[_b + EXP18_SUFFIX] = dict(MODELS[_b], center_frac_times_r=0.32, adjust_accel=False)
 EXP18_CELLS = tuple(b + EXP18_SUFFIX for b in EXP18_BASES)
 
+# ---------------------------------------------------------------------------
+#  EXP19: is the coarse level solving the coarse problem? (2026-11-01)
+#
+#  mg81v6vtxAnestUcf32 (exp18's MGLPDS-Small, reused, not retrained) with one thing
+#  changed. Coarse images are near perfect with alpha = 1 fixed and detail-like with
+#  free alphas, and two explanations are tested apart:
+#    OPERATOR  the cropped coarse Gram misses Galerkin by 43-48% on high-frequency
+#              input (1-2% on image-like input), which a net's early, unstructured
+#              iterates may be. gal = full Galerkin; fold = the folded mask, about
+#              rediscretization's cost (operators/coarse.py).
+#    DUAL PATH z's correction reaches the image through B_f alpha_z P(delta z), which
+#              P does not low-pass. az0 = no dual correction (models/mg_lpds.py).
+#  Launcher: torch/exp19_coarse_op.sbatch. Diagnostic: scripts/coarse_diag.py.
+# ---------------------------------------------------------------------------
+EXP19_BASE = "mg81v6vtxAnestUcf32"
+EXP19 = {
+    "mg81v6vtxAnestUgalcf32": dict(coarse_op="galerkin"),
+    "mg81v6vtxAnestUfoldcf32": dict(coarse_op="folded"),
+    "mg81v6vtxAnestUaz0cf32": dict(alpha_z_zero=True),
+}
+for _n, _extra in EXP19.items():
+    MODELS[_n] = dict(MODELS[EXP19_BASE], params=dict(MODELS[EXP19_BASE]["params"], **_extra))
+EXP19_CELLS = tuple(EXP19)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -910,7 +934,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
           "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet") \
-    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS + EXP18_CELLS
+    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS + EXP18_CELLS + EXP19_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -1325,7 +1349,7 @@ def _display_name(spec_type, params):
         tag = "M%dK%dx%s" % (params.get("M", 169), k_out,
                              "-".join(str(i) for i in iters))
         if params.get("coarse_op", "galerkin") != "galerkin":
-            tag += "_rd"
+            tag += "_fold" if params["coarse_op"] == "folded" else "_rd"
         # exp15: otherwise the fixes would share mg81v6's wandb name
         if params.get("transfer_filter") not in (None, "sinc"):
             tag += "_" + str(params["transfer_filter"])
@@ -1337,6 +1361,8 @@ def _display_name(spec_type, params):
             tag += "_nest"
         if params.get("alpha_mode", "free") != "free":
             tag += "_alpha" + params["alpha_mode"]
+        if params.get("alpha_z_zero"):
+            tag += "_az0"
         return "%s_%s" % (spec_type, tag)
     if spec_type == "RAM":
         # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.

@@ -230,6 +230,13 @@ def _check_fas_parent_pi(flag):
 #: (a diagnostic, like `set_fas_dual`). "clamp" / "fixed" need widen == 1,
 #: where alpha_z is a per-channel scale; with widen > 1 it is a channel-mixing
 #: 1x1 conv with no step-size reading.
+#:
+#: `alpha_z_zero=True` (exp19, 2026-11-01) removes the DUAL correction at every level
+#: and leaves alpha_x to `alpha_mode`. A z correction reaches the image through
+#: B_f alpha_z P(delta z), so a smooth coarse envelope times the fine atoms can carry
+#: detail no primal correction could: P low-passes delta x, but not B_f. The coarse dual
+#: still runs, and shapes the primal correction through x_c's sweeps; only its way back
+#: up is gone. Same parameters, so a checkpoint loads either way (a diagnostic).
 ALPHA_MODES = ("free", "clamp", "fixed")
 DEFAULT_ALPHA_RANGE = (0.0, 1.0)
 
@@ -246,15 +253,24 @@ def _check_alpha_mode(mode, alpha_range, widen):
     return mode, (lo, hi)
 
 
+def _check_alpha_z_zero(flag, widen):
+    if not isinstance(flag, bool):
+        raise ValueError(f"alpha_z_zero must be true or false, got {flag!r}")
+    if flag and int(widen) != 1:
+        raise ValueError(f"alpha_z_zero needs widen == 1, got widen={widen}")
+    return flag
+
+
 class _StepScale(_ChannelScale):
     """`_ChannelScale` whose weight is a multigrid step: projected into
-    [lo, hi] by `project_` ("clamp"), or held at 1 and not learned ("fixed").
+    [lo, hi] by `project_` ("clamp"), or held at 1 ("fixed") or at 0 ("zero",
+    `alpha_z_zero`) and not learned.
     Same parameter as `_ChannelScale`, so checkpoints are interchangeable."""
 
     def __init__(self, channels, gain, mode, alpha_range):
-        super().__init__(channels, 1.0 if mode == "fixed" else gain)
+        super().__init__(channels, {"fixed": 1.0, "zero": 0.0}.get(mode, gain))
         self.mode, self.lo, self.hi = mode, float(alpha_range[0]), float(alpha_range[1])
-        if mode == "fixed":
+        if mode in ("fixed", "zero"):
             self.weight.requires_grad_(False)
         elif mode == "clamp":
             self.project_()
@@ -262,6 +278,8 @@ class _StepScale(_ChannelScale):
     def forward(self, x):
         if self.mode == "fixed":            # exactly 1, whatever a loaded checkpoint holds
             return x
+        if self.mode == "zero":
+            return torch.zeros_like(x)
         return super().forward(x)
 
     @torch.no_grad()
@@ -270,6 +288,8 @@ class _StepScale(_ChannelScale):
             self.weight.clamp_(self.lo, self.hi)
         elif self.mode == "fixed":
             self.weight.fill_(1.0)
+        elif self.mode == "zero":
+            self.weight.fill_(0.0)
 
     def extra_repr(self):
         return (f"mode={self.mode}" + (f", range=[{self.lo:g}, {self.hi:g}]"
@@ -502,10 +522,11 @@ class PDVCycle(nn.Module):
                  spectral_init=True, transfer_filter=None,
                  learn_transfer=False, coarse_op="galerkin", fas_dual="legacy",
                  fas_copies="untied", fas_parent_pi=False, alpha_mode="free",
-                 alpha_range=None, **layer_kws):
+                 alpha_range=None, alpha_z_zero=False, **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
         self.alpha_mode, self.alpha_range = _check_alpha_mode(alpha_mode, alpha_range, widen)
+        self.alpha_z_zero = _check_alpha_z_zero(alpha_z_zero, widen)
         if coarse_op not in COARSE_OPS:
             raise ValueError(f"coarse_op must be one of {COARSE_OPS}, got {coarse_op!r}")
         self.coarse_op = coarse_op
@@ -570,7 +591,7 @@ class PDVCycle(nn.Module):
                                     fas_copies=fas_copies,
                                     fas_parent_pi=fas_parent_pi,
                                     alpha_mode=alpha_mode, alpha_range=alpha_range,
-                                    **coarse_kws)
+                                    alpha_z_zero=alpha_z_zero, **coarse_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
                 C, M_c, spectral_init=False, **coarse_kws))
@@ -597,7 +618,9 @@ class PDVCycle(nn.Module):
             self.alpha_x = _ChannelScale(C, alpha0)
         else:
             self.alpha_x = _StepScale(C, alpha0, self.alpha_mode, self.alpha_range)
-        if self.widen == 1:
+        if self.alpha_z_zero:
+            self.alpha_z = _StepScale(M, alpha0, "zero", self.alpha_range)
+        elif self.widen == 1:
             self.alpha_z = (_ChannelScale(M, alpha0) if self.alpha_mode == "free" else
                             _StepScale(M, alpha0, self.alpha_mode, self.alpha_range))
         else:
@@ -648,12 +671,13 @@ class PDVCycle(nn.Module):
         # prolongate and apply the two coarse-correction steps separately
         # image path stays fixed; latent path follows dF's restriction
         x = x + self.alpha_x(prolong(wx_c - x_c, filter=self.transfer_filter))
-        corr_z = wz_c - z_c
-        if self.transfer is not None:
-            corr_z = self.transfer.prolong(corr_z)
-        else:
-            corr_z = prolong(corr_z, filter=self.transfer_filter)
-        z = z + self.alpha_z(corr_z)
+        if not self.alpha_z_zero:
+            corr_z = wz_c - z_c
+            if self.transfer is not None:
+                corr_z = self.transfer.prolong(corr_z)
+            else:
+                corr_z = prolong(corr_z, filter=self.transfer_filter)
+            z = z + self.alpha_z(corr_z)
 
         # post-smooth, inheriting the pre-smoother's cache
         state, cache = self.lpdsB((x, z), y_tilde, E=E, sigma=sigma, pi=pi,
@@ -678,7 +702,8 @@ class PDVCycle(nn.Module):
                 f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}, "
                 f"fas_copies={self.fas_copies}, "
                 f"fas_parent_pi={getattr(self, 'fas_parent_pi', False)}, "
-                f"alpha_mode={getattr(self, 'alpha_mode', 'free')}")
+                f"alpha_mode={getattr(self, 'alpha_mode', 'free')}, "
+                f"alpha_z_zero={self.alpha_z_zero}")
 
 
 # ===========================================================================
@@ -726,13 +751,15 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  preproc="kspace", resize_noise=False, julia_compat=False,
                  transfer_filter=None, learn_transfer=False,
                  coarse_op="galerkin", fas_dual="legacy", fas_copies="untied",
-                 fas_parent_pi=False, alpha_mode="free", alpha_range=None):
+                 fas_parent_pi=False, alpha_mode="free", alpha_range=None,
+                 alpha_z_zero=False):
         super().__init__()
         K_outer, iters = _parse_K(K)
         # The coarse-correction steps (ALPHA_MODES); "free" -- what every net
         # before 2026-10-26 trained with -- stays the default so old configs,
         # which lack the key, build the same net.
         self.alpha_mode, self.alpha_range = _check_alpha_mode(alpha_mode, alpha_range, widen)
+        self.alpha_z_zero = _check_alpha_z_zero(alpha_z_zero, widen)
         # How the coarse levels apply the DUAL FAS correction (see FAS_DUAL),
         # which operators the corrections are formed with (FAS_COPIES), and
         # whether a nested level restricts its residual net of its own pi
@@ -785,7 +812,7 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 learn_transfer=self.learn_transfer, coarse_op=coarse_op,
                 fas_dual=fas_dual, fas_copies=fas_copies,
                 fas_parent_pi=fas_parent_pi, alpha_mode=alpha_mode,
-                alpha_range=alpha_range, **layer_kws))
+                alpha_range=alpha_range, alpha_z_zero=alpha_z_zero, **layer_kws))
             if fas_dual == "gradient":
                 _check_gradient_fas_proxes(self)
 
@@ -918,7 +945,7 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
         names, stats = [], []
         for k, level, V in self.vcycles():
             a = V.alpha_z
-            if getattr(a, "mode", "free") == "fixed":
+            if getattr(a, "mode", "free") in ("fixed", "zero"):
                 continue
             w = a.weight.detach().float().reshape(-1)
             key = f"alpha_z/V{k + 1}_L{level + 1}toL{level}"
@@ -954,7 +981,8 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 f"coarse_op={self.coarse_op}, fas_dual={self.fas_dual}, "
                 f"fas_copies={self.fas_copies}, "
                 f"fas_parent_pi={getattr(self, 'fas_parent_pi', False)}, "
-                f"alpha_mode={getattr(self, 'alpha_mode', 'free')}")
+                f"alpha_mode={getattr(self, 'alpha_mode', 'free')}, "
+                f"alpha_z_zero={self.alpha_z_zero}")
 
 
 PLANAR_STATE_ENV = "IMMAP_PLANAR_STATE"

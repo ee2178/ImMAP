@@ -2099,6 +2099,8 @@ def alpha_records(run, device=None):
         az = V.alpha_z.weight.detach().float().cpu().numpy().reshape(-1)
         if mode == "fixed":                        # the stored weights are not used
             ax, az = np.ones_like(ax), np.ones_like(az)
+        if getattr(V.alpha_z, "mode", None) == "zero":
+            az = np.zeros_like(az)
         out.append(dict(run=os.path.basename(os.path.normpath(run)), outer=k, level=level,
                         mode=mode, alpha_x=ax, alpha_z=az))
     return out

@@ -24,6 +24,18 @@ them. At R=16 on a 320-line axis the central 160 columns hold the ACS and only
 a few outer lines, so the two coarse problems differ -- by how much is what
 tests/test_coarse_operator.py measures. Used by
 `MGLPDSNet(coarse_op="rediscretize")` through `coarsen` below.
+
+FOLDED (`coarse_op="folded"`, 2026-11-01): the same coarse FFTs and maps, with the
+mask replaced by what the Galerkin Gram actually applies. R and P are not brickwall
+filters, so with no coils `R F^H M F P` is diagonal in coarse k-space, with
+
+    D_c(k_c) = sum_folds |H(k_c + b N_c)|^2 M(k_c + b N_c),      H(0) = 1
+
+where the crop has 1 at coarse Nyquist and Galerkin has about |H(pi/2)|^2 ~ 1/4 per
+image, and the crop drops the outer lines Galerkin folds in. `Mask(sqrt(D_c))` is
+exact there and approximate with coils (it needs S P ~ P S_c): what that costs is
+measured by tests/test_coarse_operator.py::test_folded. Levels recurse: the coarse
+Mask's |m|^2 is D_c, the next level's input.
 """
 
 from __future__ import annotations
@@ -34,7 +46,7 @@ import torch
 
 from operators.fourier import FFT2D
 from operators.mask import Mask
-from operators.resample import DEFAULT_FACTOR, restrict
+from operators.resample import DEFAULT_FACTOR, restrict, transfer_kernel
 from operators.sense import Sense
 from operators.truncate import Truncate
 
@@ -60,6 +72,25 @@ def crop_center(t, factor=DEFAULT_FACTOR):
     return out
 
 
+def fold_mask(mask, size, factor=DEFAULT_FACTOR, filter=None):
+    """`sqrt(D_c)`: the coarse mask whose Gram matches Galerkin (module docstring).
+
+    `size` is the measured `(H, W)`, which a broadcast mask `(..., 1, W)` does not
+    state. The result is full size whatever the input: the fold of a mask constant
+    along readout still varies along it, by sum_folds |H(k)|^2.
+    """
+    H, W = size
+    dtype = mask.real.dtype if mask.is_complex() else (
+        mask.dtype if mask.is_floating_point() else torch.float32)
+    d = (mask.abs() if mask.is_complex() else mask.to(dtype)).pow(2).expand(*mask.shape[:-2], H, W)
+    k = transfer_kernel(filter, factor, dtype=dtype, device=mask.device)[0, 0]
+    h2 = torch.fft.fft2(k / k.sum(), s=(H, W)).abs().pow(2)      # DC at index 0
+    w = torch.fft.ifftshift(d, dim=(-2, -1)) * h2
+    # index a * N_c + j of the uncentred grid is frequency j + a N_c: an image of j
+    w = w.reshape(*w.shape[:-2], factor, H // factor, factor, W // factor)
+    return torch.fft.fftshift(w.sum(dim=(-4, -2)), dim=(-2, -1)).sqrt()
+
+
 def coarse_smaps(smaps, factor=DEFAULT_FACTOR, filter=None, renorm=True,
                  eps=1e-12):
     """`restrict(S)`, optionally renormalised to unit RSS where nonzero.
@@ -75,9 +106,11 @@ def coarse_smaps(smaps, factor=DEFAULT_FACTOR, filter=None, renorm=True,
     return sc
 
 
-def coarse_sense(mask, smaps, factor=DEFAULT_FACTOR, filter=None, renorm=True):
+def coarse_sense(mask, smaps, factor=DEFAULT_FACTOR, filter=None, renorm=True,
+                 folded=False):
     """`(E_c, mask_c, smaps_c)` with `E_c = Mask(mask_c) @ FFT2D() @ Sense(smaps_c)`."""
-    mask_c = crop_center(mask, factor)
+    mask_c = (fold_mask(mask, smaps.shape[-2:], factor, filter) if folded
+              else crop_center(mask, factor))
     smaps_c = coarse_smaps(smaps, factor, filter=filter, renorm=renorm)
     return Mask(mask_c) @ FFT2D() @ Sense(smaps_c), mask_c, smaps_c
 
@@ -87,7 +120,7 @@ def coarse_data(y, factor=DEFAULT_FACTOR):
     return crop_center(y, factor) / factor
 
 
-COARSE_OPS = ("galerkin", "rediscretize")
+COARSE_OPS = ("galerkin", "rediscretize", "folded")
 
 # Rediscretize an EMBEDDED operator (`E @ Truncate`) too? True since 2026-10-07.
 # Before that such slices fell back to Galerkin, so a "rediscretize" net trained
@@ -137,8 +170,9 @@ def coarse_truncate(T, factor=DEFAULT_FACTOR):
     return Truncate(big_c, small_c, offset=off_c), tuple(phase)
 
 
-def rediscretize(E, factor=DEFAULT_FACTOR, filter=None):
+def rediscretize(E, factor=DEFAULT_FACTOR, filter=None, folded=False):
     """The rediscretized `E_c` for `Mask @ FFT2D @ Sense [@ Truncate]`, else None.
+    `folded`: with the folded mask (module docstring) instead of the crop.
 
     With the image-domain embedding (`E @ Truncate`: a measured size that is
     not a multiple of the model's stride, solved on a slightly larger grid) the
@@ -184,14 +218,14 @@ def rediscretize(E, factor=DEFAULT_FACTOR, filter=None):
             # the window's shifted coarse lattice (circular, like the FOV)
             smaps = torch.roll(smaps, shifts=(-phase[0], -phase[1]), dims=(-2, -1))
 
-    E_c, _, _ = coarse_sense(mask, smaps, factor, filter=filter)
+    E_c, _, _ = coarse_sense(mask, smaps, factor, filter=filter, folded=folded)
     return E_c if (T_c is None or T_c.is_identity) else E_c @ T_c
 
 
 def coarsen(E, coarse_op="galerkin", filter=None):
     """One level's coarse operator: Galerkin `E . P`, or rediscretized.
 
-    "rediscretize" falls back to Galerkin wherever `rediscretize` returns None
+    "rediscretize" / "folded" fall back to Galerkin wherever `rediscretize` returns None
     (see there), so a batch the rediscretization cannot express still trains,
     at the old cost.
     """
@@ -199,8 +233,8 @@ def coarsen(E, coarse_op="galerkin", filter=None):
 
     if coarse_op not in COARSE_OPS:
         raise ValueError(f"coarse_op must be one of {COARSE_OPS}, got {coarse_op!r}")
-    if coarse_op == "rediscretize":
-        E_c = rediscretize(E, filter=filter)
+    if coarse_op in ("rediscretize", "folded"):
+        E_c = rediscretize(E, filter=filter, folded=coarse_op == "folded")
         if E_c is not None:
             return E_c
     return galerkin(E, filter=filter)
