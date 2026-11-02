@@ -244,13 +244,29 @@ DEFAULT_ALPHA_RANGE = (0.0, 1.0)
 def _check_alpha_mode(mode, alpha_range, widen):
     if mode not in ALPHA_MODES:
         raise ValueError(f"alpha_mode must be one of {ALPHA_MODES}, got {mode!r}")
-    lo, hi = (float(v) for v in (alpha_range or DEFAULT_ALPHA_RANGE))
+    # hi = None: a floor with no ceiling, since a JSON config cannot hold infinity
+    lo, hi = alpha_range or DEFAULT_ALPHA_RANGE
+    lo, hi = float(lo), float("inf") if hi is None else float(hi)
     if not lo <= hi:
         raise ValueError(f"alpha_range must be [lo, hi] with lo <= hi, got {alpha_range!r}")
     if mode != "free" and int(widen) != 1:
         raise ValueError(f"alpha_mode={mode!r} needs widen == 1 (alpha_z is a per-channel "
                          f"step only then); got widen={widen}")
     return mode, (lo, hi)
+
+
+#: `lam_level_scale` (exp20, 2026-11-02) multiplies the initial threshold by this per
+#: level down, so L_l starts at lam0 * scale^l. Asking F_c(x_c) ~ F(P x_c) / 4 of an edge
+#: seen with the same filters gives lam_c = lam / 2: the edge has half the coarse pixels,
+#: so ||A^H P x_c||_1 ~ 2 ||A_c^H x_c||_1. The noise term already scales, through sigma_c =
+#: 0.41 sigma, and starts at 0; the constant term does not, so 1.0 (every net before exp20)
+#: leaves it 2x too large at L1 and 4x at L2. Init only: thresholds stay learned and the
+#: parameters are the same, so any checkpoint loads whatever this was.
+def _check_lam_level_scale(scale):
+    scale = float(scale)
+    if not scale > 0:
+        raise ValueError(f"lam_level_scale must be positive, got {scale}")
+    return scale
 
 
 def _check_alpha_z_zero(flag, widen):
@@ -522,7 +538,7 @@ class PDVCycle(nn.Module):
                  spectral_init=True, transfer_filter=None,
                  learn_transfer=False, coarse_op="galerkin", fas_dual="legacy",
                  fas_copies="untied", fas_parent_pi=False, alpha_mode="free",
-                 alpha_range=None, alpha_z_zero=False, **layer_kws):
+                 alpha_range=None, alpha_z_zero=False, lam_level_scale=1.0, **layer_kws):
         super().__init__()
         assert len(iters) >= 2, "a V-cycle needs at least two levels"
         self.alpha_mode, self.alpha_range = _check_alpha_mode(alpha_mode, alpha_range, widen)
@@ -580,6 +596,14 @@ class PDVCycle(nn.Module):
             if pk.get("Mh") is not None:
                 pk["Mh"] = int(pk["Mh"]) * self.widen
                 coarse_kws["prox_kws"] = pk
+        lam_level_scale = _check_lam_level_scale(lam_level_scale)
+        if lam_level_scale != 1.0:
+            # The thresholds are not preloaded from the fine level, so this is what they start at.
+            coarse_kws["lam0"] = coarse_kws["lam0"] * lam_level_scale
+            pk = dict(coarse_kws.get("prox_kws") or {})
+            if "tau0" in pk:
+                pk["tau0"] = pk["tau0"] * lam_level_scale
+            coarse_kws["prox_kws"] = pk
 
         if len(iters) > 2:
             self.mglayer = PDVCycle(iters[1:], C, M_c, widen=self.widen,
@@ -591,7 +615,8 @@ class PDVCycle(nn.Module):
                                     fas_copies=fas_copies,
                                     fas_parent_pi=fas_parent_pi,
                                     alpha_mode=alpha_mode, alpha_range=alpha_range,
-                                    alpha_z_zero=alpha_z_zero, **coarse_kws)
+                                    alpha_z_zero=alpha_z_zero,
+                                    lam_level_scale=lam_level_scale, **coarse_kws)
         else:
             self.mglayer = LPDSStack(iters[1], lambda: make_lpds_layer(
                 C, M_c, spectral_init=False, **coarse_kws))
@@ -752,7 +777,7 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  transfer_filter=None, learn_transfer=False,
                  coarse_op="galerkin", fas_dual="legacy", fas_copies="untied",
                  fas_parent_pi=False, alpha_mode="free", alpha_range=None,
-                 alpha_z_zero=False):
+                 alpha_z_zero=False, lam_level_scale=1.0):
         super().__init__()
         K_outer, iters = _parse_K(K)
         # The coarse-correction steps (ALPHA_MODES); "free" -- what every net
@@ -812,7 +837,8 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 learn_transfer=self.learn_transfer, coarse_op=coarse_op,
                 fas_dual=fas_dual, fas_copies=fas_copies,
                 fas_parent_pi=fas_parent_pi, alpha_mode=alpha_mode,
-                alpha_range=alpha_range, alpha_z_zero=alpha_z_zero, **layer_kws))
+                alpha_range=alpha_range, alpha_z_zero=alpha_z_zero,
+                lam_level_scale=lam_level_scale, **layer_kws))
             if fas_dual == "gradient":
                 _check_gradient_fas_proxes(self)
 

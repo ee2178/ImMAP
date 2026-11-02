@@ -922,6 +922,26 @@ for _n, _extra in EXP19.items():
     MODELS[_n] = dict(MODELS[EXP19_BASE], params=dict(MODELS[EXP19_BASE]["params"], **_extra))
 EXP19_CELLS = tuple(EXP19)
 
+# ---------------------------------------------------------------------------
+#  EXP20: thresholds matched across levels, and a floor on alpha (2026-11-02)
+#
+#  mg81v6vtxAnestUcf32 again, reused as the baseline, with pure LPDS layers and FAS:
+#    lam    lam_level_scale=0.5: coarse thresholds start at lam0 / 2^l, what matching
+#           the coarse objective to the fine one asks of an edge (models/mg_lpds.py).
+#    floor  alpha_mode=clamp in [0.5, no ceiling]: the correction cannot be turned off,
+#           where free alphas collapse at L1 -> L0 and [0, 1] or fixed at 1 scored worse.
+#           alpha_mode covers alpha_x and alpha_z alike, so both have the floor.
+#  Launcher: torch/exp20_lam_floor.sbatch.
+# ---------------------------------------------------------------------------
+EXP20 = {
+    "mg81v6vtxAnestUlamcf32": dict(lam_level_scale=0.5),
+    "mg81v6vtxAnestUfloorcf32": dict(alpha_mode="clamp", alpha_range=[0.5, None]),
+    "mg81v6vtxAnestUlamfloorcf32": dict(lam_level_scale=0.5, alpha_mode="clamp", alpha_range=[0.5, None]),
+}
+for _n, _extra in EXP20.items():
+    MODELS[_n] = dict(MODELS[EXP19_BASE], params=dict(MODELS[EXP19_BASE]["params"], **_extra))
+EXP20_CELLS = tuple(EXP20)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -934,7 +954,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
           "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet") \
-    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS + EXP18_CELLS + EXP19_CELLS
+    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS + EXP18_CELLS + EXP19_CELLS + EXP20_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -1361,8 +1381,12 @@ def _display_name(spec_type, params):
             tag += "_nest"
         if params.get("alpha_mode", "free") != "free":
             tag += "_alpha" + params["alpha_mode"]
+        if params.get("alpha_range") and params["alpha_range"][1] is None:
+            tag += "_floor%g" % params["alpha_range"][0]
         if params.get("alpha_z_zero"):
             tag += "_az0"
+        if params.get("lam_level_scale", 1.0) != 1.0:
+            tag += "_lamx%g" % params["lam_level_scale"]
         return "%s_%s" % (spec_type, tag)
     if spec_type == "RAM":
         # Not `RAM_mg`: _variant reads a missing K as "mg", which is meaningless here.
