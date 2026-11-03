@@ -71,7 +71,8 @@ from operators.identity import Identity
 from operators.resample import (GridTransfer, _check_filter, prolong,
                                 restrict, restrict_noise)
 from preprocessing.image import post_process, pre_process
-from preprocessing.kspace import kspace_post_process, kspace_pre_process
+from preprocessing.kspace import _pad_complex, kspace_post_process, kspace_pre_process
+from models.cg_init import CGInit
 
 
 # ===========================================================================
@@ -777,8 +778,17 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  transfer_filter=None, learn_transfer=False,
                  coarse_op="galerkin", fas_dual="legacy", fas_copies="untied",
                  fas_parent_pi=False, alpha_mode="free", alpha_range=None,
-                 alpha_z_zero=False, lam_level_scale=1.0):
+                 alpha_z_zero=False, lam_level_scale=1.0, cg_init=False,
+                 cg_fact_init=1.0):
         super().__init__()
+        # cg_init (exp21, 2026-11-03): start from RAM's realigned input, CG-SENSE at
+        # deepinv's defaults (models/cg_init.py), instead of E^H y. Layer 0 still
+        # spends its sweep forming z from that x, so the layer count is unchanged.
+        # cg_fact_init: the learned `fact`'s start (1 is RAM's, trained RAM ends ~23).
+        if cg_init and preproc == "image":
+            raise ValueError("cg_init needs a measurement operator; preproc='image' "
+                             "is denoising, where E = I and the solve returns E^H y")
+        self.cg_init = CGInit(fact_init=cg_fact_init) if cg_init else None
         K_outer, iters = _parse_K(K)
         # The coarse-correction steps (ALPHA_MODES); "free" -- what every net
         # before 2026-10-26 trained with -- stays the default so old configs,
@@ -851,9 +861,18 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
         # `y` here and `set_sensitivity_map(E, smaps)` before preprocessing.
         # `mg_lpds.jl` does exactly that when `use_smaps=false`.
 
+        # The start is solved on the operator as given, before preprocessing pads
+        # it; a warm start handed in (`state`, e.g. LADMM's reuse_latent) wins.
+        x0 = (self.cg_init(y, E, sigma)
+              if self.cg_init is not None and state is None and not isinstance(E, Identity)
+              else None)
+
         if self.preproc == "kspace":
             y_tilde, E, params = kspace_pre_process(y, E, self.pad_stride)
             post = kspace_post_process
+            if x0 is not None:
+                mu, pad = params
+                x0 = (_pad_complex(x0, pad) if any(pad) else x0) - mu
         else:
             x_adj = E.adjoint(y) if not isinstance(E, Identity) else y
             if self.preproc == "identity":
@@ -863,11 +882,14 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                 y_tilde, params = pre_process(x_adj, self.pad_stride)
                 post = lambda x, p: post_process(x, list(p))    # noqa: E731
 
+        if x0 is not None:
+            state = (x0, None)
+
         planar = self.planar_state_active() and torch.is_complex(y_tilde)
         if planar:
             y_tilde = to_planar(y_tilde)
             if state is not None:
-                state = tuple(to_planar(s) for s in state)
+                state = tuple(None if s is None else to_planar(s) for s in state)
 
         (x, z), _ = self.net(state, y_tilde, E=E, sigma=sigma, cache={})
         if planar:

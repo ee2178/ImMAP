@@ -12,7 +12,10 @@ def _bsum(x, keepdim=True):
     return x.sum(dim=tuple(range(1, x.dim())), keepdim=keepdim)
 
 
-def batched_cg(A, b, x0=None, tol=1e-6, max_iter=100, verbose=False):
+STOP_RULES = ("ratio", "rhs")
+
+
+def batched_cg(A, b, x0=None, tol=1e-6, max_iter=100, verbose=False, stop="ratio"):
     """Conjugate gradients on a BATCH of independent Hermitian PSD systems.
 
     Unlike `cg` above, the inner products are reduced per batch element, so
@@ -21,11 +24,25 @@ def batched_cg(A, b, x0=None, tol=1e-6, max_iter=100, verbose=False):
     worst-conditioned one and the batch converges at the speed of its slowest
     member -- which matters here because the unrolled networks call this
     inside every layer.
+
+    `stop` picks the stopping rule:
+      "ratio"  sqrt(|r_k|^2 / |r_{k-1}|^2) < tol for the worst image, or no entry
+               of x moved by tol (Sljiva's rule; the default, what every caller
+               before 2026-11-03 used)
+      "rhs"    |r_k| < tol |b| for EVERY image, checked after the update and nothing
+               else: deepinv 0.4.2's `conjugate_gradient`, iteration for iteration.
+               Its every-100-iterations residual refresh is not reproduced, so
+               the two agree up to max_iter = 101.
     """
+    if stop not in STOP_RULES:
+        raise ValueError(f"stop must be one of {STOP_RULES}, got {stop!r}")
     x = torch.zeros_like(b) if x0 is None else x0
     r = b - A(x)
     p = r.clone()
     rs_old = _bsum((r.conj() * r).real)
+    if stop == "rhs":
+        b_sq = _bsum((b.conj() * b).real)
+        rs_tol = torch.where(b_sq > 0, b_sq, torch.ones_like(b_sq)) * tol ** 2
 
     for k in range(int(max_iter)):
         Ap = A(p)
@@ -36,6 +53,15 @@ def batched_cg(A, b, x0=None, tol=1e-6, max_iter=100, verbose=False):
         x = x + alpha * p
         r = r - alpha * Ap
         rs_new = _bsum((r.conj() * r).real)
+        if stop == "rhs":
+            if verbose:
+                print(f"k: {k:3d}, |r|/|b| = {(rs_new / rs_tol).sqrt().max().item() * tol:.3e}")
+            if bool(torch.all(rs_new < rs_tol)):
+                break
+            beta = rs_new / (rs_old + 1e-8)
+            p = r + beta * p
+            rs_old = rs_new
+            continue
         beta = rs_new / (rs_old + 1e-8)
         relres = torch.sqrt(beta).max()
         if verbose:
@@ -75,9 +101,11 @@ class _ImplicitTCG(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, C, kw, lam, b, *params):
+    def forward(ctx, C, kw, x0, lam, b, *params):
+        # x0 only warm-starts the forward solve: the solution does not depend on
+        # it, so it gets no gradient, and the backward solve starts from zero.
         with torch.no_grad():
-            x = batched_cg(lambda v: lam * v + C(v), b, **kw)
+            x = batched_cg(lambda v: lam * v + C(v), b, x0=x0, **kw)
         ctx.C, ctx.kw = C, kw
         ctx.save_for_backward(x, lam, *params)
         return x
@@ -89,37 +117,40 @@ class _ImplicitTCG(torch.autograd.Function):
         with torch.no_grad():
             g = batched_cg(lambda v: lam * v + ctx.C(v), gx, **ctx.kw)
 
-        gb = g if ctx.needs_input_grad[3] else None
+        gb = g if ctx.needs_input_grad[4] else None
         glam = None
-        if ctx.needs_input_grad[2]:
+        if ctx.needs_input_grad[3]:
             glam = _reduce_to(-(x.conj() * g).real, lam.shape)
 
         gparams = [None] * len(params)
-        if params and any(ctx.needs_input_grad[4:]):
+        if params and any(ctx.needs_input_grad[5:]):
             with torch.enable_grad():
                 out = ctx.C(x.detach())
                 grads = torch.autograd.grad(out, params, grad_outputs=-g,
                                             allow_unused=True, retain_graph=False)
             gparams = list(grads)
-        return (None, None, glam, gb, *gparams)
+        return (None, None, None, glam, gb, *gparams)
 
 
 def tcg(C, lam, b, params=(), implicit=False, tol=1e-3, max_iter=10,
-        verbose=False, x0=None):
+        verbose=False, x0=None, stop="ratio"):
     """Solve `(lam I + C) x = b`.
 
     `C` is a callable normal operator (e.g. `E.gram`).  `lam > 0` may be a
     scalar or a per-image tensor.  Set `implicit=True` and list the tensors C
     depends on in `params` to get the O(1)-memory implicit gradient instead of
-    backprop through the iterations.
+    backprop through the iterations. `x0` warm-starts the forward solve either
+    way (the implicit backward solve starts from zero), and `stop` is
+    `batched_cg`'s stopping rule.
     """
-    kw = dict(tol=tol, max_iter=max_iter, verbose=verbose)
+    kw = dict(tol=tol, max_iter=max_iter, verbose=verbose, stop=stop)
     if not implicit:
         return batched_cg(lambda v: lam * v + C(v), b, x0=x0, **kw)
     if not torch.is_tensor(lam):
         lam = torch.as_tensor(float(lam), device=b.device,
                               dtype=b.real.dtype if b.is_complex() else b.dtype)
-    return _ImplicitTCG.apply(C, kw, lam, b, *tuple(params))
+    x0 = None if x0 is None else x0.detach()
+    return _ImplicitTCG.apply(C, kw, x0, lam, b, *tuple(params))
 
 
 def cg(A, b, x0 = None, tol = 1e-6, max_iter = 100, verbose = False):

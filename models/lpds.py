@@ -124,9 +124,11 @@ class LPDSLayer(nn.Module):
         # every later sweep has moved x, and a stale hit would be silent.
         hint = cache.pop("_gram_x", None)
 
-        if state is None:
+        if state is None or state[1] is None:
             # Cold start (`lpds.jl` third method): x = y~, z = prox_{g*}(A y~).
-            x = y_tilde
+            # `(x0, None)` starts from a given primal instead (MGLPDSNet's
+            # `cg_init`), with z formed from it the same way.
+            x = y_tilde if state is None else state[0]
             z, cache = self.prox(self.analysis(x), sigma, cache)
             return (x, z), cache
 

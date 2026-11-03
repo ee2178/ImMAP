@@ -54,7 +54,8 @@ import torch.nn as nn
 
 from models.e2evarnet._fastmri import _shim as fastmri
 from models.e2evarnet._fastmri.varnet import VarNet
-from operators.accessors import get_mask, get_sensitivity_map
+from models.cg_init import CGInit
+from operators.accessors import get_mask, get_sensitivity_map, set_mask
 
 
 class E2EVarNet(nn.Module):
@@ -67,8 +68,17 @@ class E2EVarNet(nn.Module):
 
     def __init__(self, num_cascades=12, sens_chans=8, sens_pools=4,
                  chans=18, pools=4, mask_center=True, acs_lines=None,
-                 use_smaps=False, output="rss"):
+                 use_smaps=False, output="rss", cg_init=False, cg_fact_init=1.0):
         super().__init__()
+        # cg_init (exp21, 2026-11-03): the cascades start from F S x0, the full
+        # k-space of RAM's realigned input (models/cg_init.py), instead of y. Every
+        # cascade's data consistency still pulls the sampled lines toward y. Needs
+        # the operator's maps, both to solve for x0 and to take it to coil k-space.
+        # cg_fact_init: the learned `fact`'s start (1 is RAM's, trained RAM ends ~23).
+        if cg_init and not use_smaps:
+            raise ValueError("cg_init needs use_smaps=True: the start is solved with "
+                             "the operator's maps, which this VarNet would not use")
+        self.cg_init = CGInit(fact_init=cg_fact_init) if cg_init else None
         self.net = VarNet(num_cascades=num_cascades, sens_chans=sens_chans,
                           sens_pools=sens_pools, chans=chans, pools=pools,
                           mask_center=mask_center)
@@ -180,7 +190,12 @@ class E2EVarNet(nn.Module):
         # resolve_conj: maps built as a conj() view cannot be viewed as real
         sens = torch.view_as_real(sm.resolve_conj().contiguous())  # (B, C, H, W, 2)
 
-        kspace_pred = ks.clone()
+        if self.cg_init is None:
+            kspace_pred = ks.clone()
+        else:
+            x0 = self.cg_init(y, E, sigma)
+            full = set_mask(E, torch.ones_like(get_mask(E))).forward(x0)
+            kspace_pred = torch.view_as_real(full.resolve_conj().contiguous())
         for cascade in self.net.cascades:
             kspace_pred = cascade(kspace_pred, ks, mask, sens)
 

@@ -942,6 +942,26 @@ for _n, _extra in EXP20.items():
     MODELS[_n] = dict(MODELS[EXP19_BASE], params=dict(MODELS[EXP19_BASE]["params"], **_extra))
 EXP20_CELLS = tuple(EXP20)
 
+# ---------------------------------------------------------------------------
+#  EXP21: every net started where RAM starts (2026-11-03)
+#
+#  RAM does not start from E^H y: `realign_input` hands its U-Net CG-SENSE at deepinv's
+#  defaults (models/cg_init.py). exp18's other nets, given the same start with
+#  `cg_init=True` and nothing else changed, so ramcf32 is the reference and the gap left
+#  is the architecture's. <base>cgcf32 = <base>cf32 + cg_init. The start costs up to 50
+#  fine Grams forward and 50 backward per step (lpdsnet's whole forward is 29).
+#  `fact` starts at 1, as RAM's `fact_realign` does, so the start is controlled to RAM's.
+#  At 1 our mu is 3-5 and the start is ~E^H y; trained RAM ends near 23, a partial
+#  CG-SENSE (mu ~ 0.15, 7-9 CG iterations; results/cg_init/brain_s5_fact23.txt), so
+#  read the learned `cg_init.fact` too. `cg_fact_init` can change the start.
+#  Launcher: torch/exp21_cg_init.sbatch.
+# ---------------------------------------------------------------------------
+EXP21_BASES = ("varnetmaps", "lpdsnet", "mg81v6vtxAnestU", "mg169v6vtxAnestU")
+for _b in EXP21_BASES:
+    _src = MODELS[_b + EXP18_SUFFIX]
+    MODELS[_b + "cg" + EXP18_SUFFIX] = dict(_src, params=dict(_src["params"], cg_init=True))
+EXP21_CELLS = tuple(b + "cg" + EXP18_SUFFIX for b in EXP21_BASES)
+
 # `varnet` is OPT_IN and `varnetmaps` is not, since 2026-09-29: the published
 # VarNet's lead over the unrolled nets was its own map estimation, so the
 # baseline in every default grid is now VarNet on the operator's maps. The two
@@ -954,7 +974,7 @@ OPT_IN = ("mllpdsw2", "mlcdlw2", "mlsplitw2", "varnet",
           "mllpds64", "mllpds64k20", "mllpds128k20",
           # depth instead of width (exp6)
           "mllpds48k54", "mllpds64k40") + EXP8_CELLS + EXP9_CELLS + EXP14_CELLS + EXP12_CELLS + ("ram", "ramdrunet") \
-    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS + EXP18_CELLS + EXP19_CELLS + EXP20_CELLS
+    + EXP15_CELLS + tuple(c for c in EXP16_CELLS if c not in EXP15_CELLS) + EXP17_CELLS + EXP18_CELLS + EXP19_CELLS + EXP20_CELLS + EXP21_CELLS
 
 # Both settings hold acs_lines at 20, so the two accelerations differ only in
 # how far apart the outer lines sit.
@@ -1568,6 +1588,7 @@ def make_config(anatomy, r, model, args):
             # Load-bearing, not decoration: the flat and multigrid arms share a
             # model class, so `spec["type"]` alone collides on one wandb run.
             "name": (f"{_display_name(spec['type'], params)}{_level_loss_tag(spec)}"
+                     f"{'_cg' if params.get('cg_init') else ''}"
                      f"{'_cf32' if 'center_frac_times_r' in spec else ''}"
                      f"_{anatomy}_R{r}_synth"),
         },
