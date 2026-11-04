@@ -327,7 +327,10 @@ _job_alive() {
              "still owns ${RUN_DIR}. Assuming it does not." >&2
         return 1
     fi
-    [ -n "$(squeue -h -j "${id}" 2>/dev/null)" ]
+    # Exactly this job: an array's first task has the array's own id, and `squeue -j`
+    # on that lists EVERY task of the array -- so a cancelled task 0 read as alive
+    # while any sibling still ran. %A is each task's own job id.
+    squeue -h -j "${id}" -o "%A" 2>/dev/null | grep -qx "${id}"
 }
 
 # ---- per-cell bookkeeping (epoch override, run tag, fresh wandb run, launch-once) ---------
