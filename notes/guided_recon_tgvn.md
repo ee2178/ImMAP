@@ -62,9 +62,12 @@ The guide is FULLY SAMPLED for now (how far the side scan can be accelerated is 
     ceiling 0.060; raised slightly for margin), INTENSITY-RELATIVE per slice (decided
     2026-11-05: slice intensities differ several-fold within a volume, so one absolute tau is
     near-silent on bright slices; per-slice normalization of the data was rejected as unfair):
-    tau_i = tau * s_i / tau_ref, s_i = RMS of |x1| over its Otsu foreground, tau_ref = the
-    median s (to be measured). Only the bridge noise scales; the net's time conditioning and
-    the data stay in raw units.
+    tau_i = tau * s_i / tau_ref, s_i = RMS of |x1| over its Otsu foreground, tau_ref = 0.1481
+    (median s; s spans [0.082, 0.306], 3.7x, over 60 train slices). Only the bridge noise
+    scales; the net's time conditioning and the data stay in raw units.
+    FINDING: the per-slice aliasing gap spread is NOT explained by intensity (std/mean 0.45
+    absolute vs 0.44 relative). Relative tau equalizes noise vs IMAGE, not noise vs GAP; on a
+    bright slice with a small gap the bridge noise now sits well above the gap.
   - Known asymmetry: plain TGVN learns its maps, BridgeTGVN uses online ESPIRiT. A
     TGVN(use_smaps=True) control exists if the comparison needs it.
 - Set 2 (later): longitudinal -- TGVN and SB-LGGS (the bridge data fidelity).

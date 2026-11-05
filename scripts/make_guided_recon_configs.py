@@ -73,10 +73,12 @@ TAU = 0.03
 # zero-filled image over its Otsu foreground (sb/i2sb_recon.py::bridge_noise_scale) -- slices of
 # one volume differ several-fold in intensity, and one absolute tau is near-silent on the bright
 # ones. TAU_REF is the MEDIAN s over training slices, so TAU stays the tau of a typical slice.
-# UNMEASURED: scripts/calibrate_recon_bridge.py prints it. Left None, an sbtgvn run refuses to
-# start, rather than train on a made-up reference.
+# Measured 2026-11-05 (calibrate_recon_bridge.py, sbtgvn_R8_g1, 60 train slices): median s =
+# 0.1481, range [0.082, 0.306]; the gap rule in these units gives tau 0.0212 (absolute: 0.0234).
+# The per-slice GAP spread barely moves under the scaling (std/mean 0.45 -> 0.44): intensity sets
+# how visible the noise is, but not how large the aliasing gap is. Re-measure for another main R.
 TAU_SCALE = "x1_rms"
-TAU_REF = None
+TAU_REF = 0.1481
 SCHEDULE = dict(kind="brownian", tau=TAU, n_points=1000, beta_max=0.3)
 
 TGVN_SIZE = dict(num_cascades=12, sens_chans=8, sens_pools=4, chans=18, pools=4)

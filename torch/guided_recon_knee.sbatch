@@ -34,10 +34,10 @@
 # line phase per training step (offset 0 at validation).
 #
 # sbtgvn bridge: tau = 0.03 (gap rule 0.0234 at R=8), INTENSITY-RELATIVE per slice --
-# tau_i = tau * s_i / tau_ref, s_i the RMS of the zero-filled image's foreground. tau_ref (the
-# median s) is UNMEASURED and the sbtgvn cells refuse to start without it:
+# tau_i = tau * s_i / tau_ref, s_i the RMS of the zero-filled image's foreground; tau_ref = 0.1481,
+# the median s over 60 train slices at R=8, from
 #     python scripts/calibrate_recon_bridge.py config/knee/guided/sbtgvn_R8_g1.json --slices 60
-# then set TAU_REF in scripts/make_guided_recon_configs.py.
+# (TAU_REF in scripts/make_guided_recon_configs.py; re-measure for another main R).
 #
 # RESUME: a requeued cell continues from its run dir's config.json + net.ckpt; REGENERATE never
 # touches a started run. FORCE_RESTART=1 moves the old run aside and starts over.
