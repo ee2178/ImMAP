@@ -31,6 +31,7 @@ from models.level_trace import (LEVEL_LOSS_OUTERS, _pd_chains, _transfer_kws,
 from visualization.image import levels_panel, recon_panel, upsample_repeat
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
+from operators.fourier import ifftc
 
 
 # `_embed` moved to training/common.py so evaluation/tasks.py can build the
@@ -194,6 +195,72 @@ def _level_loss(net, levels, recon_e, x0, image, organ_mask, T, zinv, use_mask, 
             terms.append(loss_fn(g * wl, x * wl, sigma))
         total = total + weights[l - 1] * (sum(terms) / len(terms))
     return total
+
+
+# ---------------------------------------------------------------------------
+# GUIDED RECONSTRUCTION (side information)
+# ---------------------------------------------------------------------------
+# A paired loader (datasets/fastmri/paired.py) appends the fully-sampled SIDE k-space to the
+# recon 5-tuple. What a model receives from it is the model's call:
+#   guide_domain "kspace"  the side k-space itself (TGVN reduces it with its own maps)
+#   otherwise              the side IMAGE: its coil combination under the operator's maps --
+#                          the same maps E uses, so guide and target share one phase reference --
+#                          zero-padded onto the embedded grid when the net solves on one.
+# Whether a model takes a guide at all is `net.guided` when it says so (TGVN(guided=False) is the
+# no-side-information baseline), else whether its forward has a `guide` parameter. A loader
+# without side data and a model that needs a guide is an error; side data and a model that takes
+# none (E2E-VarNet, LPDSNet, ...) is how the unguided baselines train on the SAME paired data.
+# Unguided runs on the 5-tuple loader never reach any of this.
+def _unpack(batch):
+    """-> (kspace, smaps, image, organ_mask, pad_hw, side), side None for a 5-tuple."""
+    if len(batch) == 6:
+        return tuple(batch)
+    if len(batch) != 5:
+        raise ValueError(f"recon batches have 5 (or, paired, 6) elements; got {len(batch)}")
+    return (*batch, None)
+
+
+def _wants_guide(net):
+    g = getattr(net, "guided", None)
+    if g is not None:
+        return bool(g)
+    import inspect
+    try:
+        return "guide" in inspect.signature(net.forward).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _check_paired(net, kspace_type, online_smaps):
+    """Refuse the combinations that would use the paired loader's placeholder coil maps."""
+    if kspace_type == "simulated":
+        raise ValueError("paired (guided) data carries no coil maps, so kspace_type "
+                         "'simulated' cannot synthesize a measurement from it; use "
+                         "'measurement_awgn' with online_smaps")
+    if getattr(net, "uses_operator_smaps", True) and not online_smaps:
+        raise ValueError(f"{type(net).__name__} reads the operator's coil maps, and paired data "
+                         f"has none: set mri.online_smaps ('espirit' or 'walsh')")
+
+
+def _guide(net, side, smaps, T, device):
+    """The guide `net` consumes from the side k-space, or None."""
+    if not _wants_guide(net):
+        return None
+    if side is None:
+        raise ValueError(f"{type(net).__name__} is a guided model but the loader provides no "
+                         f"side information; use a paired loader (data name 'fastmri_paired')")
+    side = side.to(device, non_blocking=True)
+    if getattr(net, "guide_domain", "image") == "kspace":
+        return side
+    g = Sense(smaps).adjoint(ifftc(side))
+    return g if T.is_identity else T.adjoint(g)
+
+
+def _forward(net, y, E, sigma, guide):
+    """net(y, E, sigma), plus `guide` only when there is one (unguided nets take no such arg)."""
+    if guide is None:
+        return net(y, E=E, sigma=sigma)
+    return net(y, E=E, sigma=sigma, guide=guide)
 
 
 def train_recon(
@@ -391,10 +458,13 @@ def train_recon(
 
             prof.start()
             try:
-                kspace, smaps, image, organ_mask, pad_hw = next(train_iter)
+                batch = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                kspace, smaps, image, organ_mask, pad_hw = next(train_iter)
+                batch = next(train_iter)
+            kspace, smaps, image, organ_mask, pad_hw, side = _unpack(batch)
+            if side is not None:
+                _check_paired(net, kspace_type, online_smaps)
 
             kspace = kspace.to(device, non_blocking=True)
             smaps = smaps.to(device, non_blocking=True)
@@ -434,15 +504,16 @@ def train_recon(
             # the scanner used. T crops back and its adjoint zero-pads, so
             # E @ T is exact -- no resampled mask, no reflect-padded maps.
             E, T = _embed(net, E, image, pad_hw)
+            guide = _guide(net, side, smaps, T, device)
             prof.mark("measure")
 
             opt.zero_grad(set_to_none=True)
 
             if level_weights:
                 with collect_level_outputs(net, level_loss_outers) as lv:
-                    recon_e, (x0, _) = net(y, E=E, sigma=sigma_n)
+                    recon_e, (x0, _) = _forward(net, y, E, sigma_n, guide)
             else:
-                recon_e, _ = net(y, E=E, sigma=sigma_n)
+                recon_e, _ = _forward(net, y, E, sigma_n, guide)
             recon = T.forward(recon_e)
             prof.mark("forward")
 
@@ -492,7 +563,8 @@ def train_recon(
             prof.mark("opt")
 
             # one eval-mode forward on this batch, timed apart from the step
-            prof.infer(net, y, E, sigma_n)
+            if guide is None:                  # the profiler's eval forward is unguided-only
+                prof.infer(net, y, E, sigma_n)
             prof.end(image.shape[-2:], embedded=not T.is_identity)
 
             if step_ok:
@@ -629,8 +701,11 @@ def train_recon(
 
             with torch.no_grad():
 
-                for (kspace_v, smaps_v, image_v, organ_mask_v,
-                     pad_hw_v) in val_loader:
+                for batch_v in val_loader:
+                    (kspace_v, smaps_v, image_v, organ_mask_v, pad_hw_v,
+                     side_v) = _unpack(batch_v)
+                    if side_v is not None:
+                        _check_paired(net, val_kspace_type or kspace_type, online_smaps)
 
                     kspace_v = kspace_v.to(device, non_blocking=True)
                     smaps_v = smaps_v.to(device, non_blocking=True)
@@ -663,8 +738,9 @@ def train_recon(
                     smaps_v = extra_v["smaps"]
                     E_v = Mask(mask_v) @ FFT2D() @ Sense(smaps_v)
                     E_v, T_v = _embed(net, E_v, image_v, pad_hw_v)
+                    guide_v = _guide(net, side_v, smaps_v, T_v, device)
 
-                    recon_v, _ = net(y_v, E=E_v, sigma=sigma_v)
+                    recon_v, _ = _forward(net, y_v, E_v, sigma_v, guide_v)
                     recon_v = T_v.forward(recon_v)
 
                     if whiten_kspace and "Zinv" in extra_v:

@@ -1,0 +1,320 @@
+# -*- coding: utf-8 -*-
+"""I2SB for MRI reconstruction (sb/i2sb_recon.py, models/sb_recon_unet.py, training/i2sb_recon.py)
+on synthetic multicoil data.
+
+Run with `python -m tests.test_i2sb_recon` or pytest.
+
+Pinned:
+  * the complex bridge: x1 = E^H y, forward_sample at step 0 is ~x0, and the reverse sampler
+    driven by an ORACLE regressor lands on x0 -- complex noise and all;
+  * SBReconUnet's planar round trip (complex in, complex out) and its guard rails;
+  * the training loop runs, updates the net, writes net.ckpt / net_ema.ckpt / net_bestval.ckpt,
+    and refuses a schedule mismatch and an embedding it cannot use;
+  * the shipped configs: every key reaches train_i2sb_recon exactly once, and the model builds.
+
+Runs locally on torch 1.12 with the same stubs as tests/test_train_unsb.py.
+"""
+import inspect
+import json
+import os
+import sys
+import tempfile
+import types
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+if "weights_only" not in inspect.signature(torch.load).parameters:    # torch 1.12 (local only)
+    _torch_load = torch.load
+    torch.load = lambda *a, **k: _torch_load(*a, **{n: v for n, v in k.items() if n != "weights_only"})
+
+try:
+    import torch.nn.attention.flex_attention  # noqa: F401
+except ImportError:
+    _m = types.ModuleType("torch.nn.attention")
+    _m.__path__ = []
+    _f = types.ModuleType("torch.nn.attention.flex_attention")
+    _f.flex_attention = _f.create_block_mask = lambda *a, **k: None
+    _m.flex_attention = _f
+    sys.modules["torch.nn.attention"] = _m
+    sys.modules["torch.nn.attention.flex_attention"] = _f
+sys.modules.setdefault("nibabel", types.ModuleType("nibabel"))
+
+try:
+    import torchvision.utils  # noqa: F401
+except ImportError:
+    _tv, _tvu = types.ModuleType("torchvision"), types.ModuleType("torchvision.utils")
+
+    def _make_grid(t, nrow=8, **k):
+        t = t if t.ndim == 4 else t[None]
+        rows = [torch.cat(list(t[i:i + nrow]), dim=-1) for i in range(0, len(t), nrow)]
+        return torch.cat(rows, dim=-2)
+
+    _tvu.make_grid, _tvu.save_image, _tv.utils = _make_grid, (lambda *a, **k: None), _tvu
+    sys.modules["torchvision"], sys.modules["torchvision.utils"] = _tv, _tvu
+
+try:
+    import wandb as _wandb_mod  # noqa: F401
+    _have_wandb = hasattr(_wandb_mod, "Image")
+except ImportError:
+    _have_wandb = False
+if not _have_wandb:
+    _w = types.ModuleType("wandb")
+    _w.Image = lambda data, **kw: ("image", tuple(np.shape(data)))
+    sys.modules["wandb"] = _w
+sys.modules.setdefault("lpips", types.ModuleType("lpips"))
+
+try:                                    # `training/__init__` imports every trainer; skip it locally
+    import training  # noqa: F401
+except Exception:                       # noqa: BLE001
+    for _k in [k for k in sys.modules if k == "training" or k.startswith("training.")]:
+        del sys.modules[_k]
+    _pkg = types.ModuleType("training")
+    _pkg.__path__ = [os.path.join(REPO, "training")]
+    sys.modules["training"] = _pkg
+
+from operators import Mask, FFT2D, Sense                                   # noqa: E402
+from physics.mask import get_mask_cached                                   # noqa: E402
+from sb.base import build_schedule, forward_sample                         # noqa: E402
+from sb.i2sb_recon import bridge_start, i2sb_recon_sample                  # noqa: E402
+from models.sb_recon_unet import SBReconUnet, to_planar, from_planar       # noqa: E402
+from training.i2sb_recon import train_i2sb_recon                           # noqa: E402
+
+TAU, N, H, NC = 0.1, 1000, 32, 4
+MRI = dict(R=4, acs_lines=4, kspace_type="simulated", mask_dist="uniform")
+
+
+class FakeWandb:
+    def __init__(self):
+        self.calls = []
+
+    def log(self, d, step=None):
+        self.calls.append((step, d))
+
+    def keys(self):
+        return {k for _, d in self.calls for k in d}
+
+
+def phantom(n, seed=0):
+    """(kspace, smaps, image, mask, pad_hw) like the fastMRI recon loader, unit-RSS maps."""
+    g = torch.Generator().manual_seed(seed)
+    yy, xx = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, H))
+    disk = ((yy ** 2 + xx ** 2) < 0.6).float()
+    mag = disk * (0.5 + 0.5 * torch.rand(n, 1, H, H, generator=g))
+    phase = 0.3 * torch.randn(n, 1, 1, 1, generator=g)
+    image = (mag * torch.exp(1j * phase)).to(torch.complex64)
+    smaps = torch.randn(n, NC, H, H, generator=g) + 1j * torch.randn(n, NC, H, H, generator=g)
+    smaps = (smaps / smaps.abs().pow(2).sum(1, keepdim=True).sqrt()).to(torch.complex64)
+    kspace = torch.zeros(n, NC, H, H, dtype=torch.complex64)
+    mask = torch.ones(n, 1, H, H, dtype=torch.bool)
+    pad_hw = torch.tensor([[H, H]] * n)
+    return kspace, smaps, image, mask, pad_hw
+
+
+def loader(n=4, bs=2, seed=0):
+    return DataLoader(TensorDataset(*phantom(n, seed)), batch_size=bs, shuffle=False)
+
+
+def make_net(seed=0, tau=TAU, cond_x1=True):
+    torch.manual_seed(seed)
+    return SBReconUnet(cond_x1=cond_x1, model_channels=32, num_res_blocks=1, channel_mult=(1, 2),
+                       attention_resolutions=(16,), image_size=H, num_head_channels=32,
+                       kind="brownian", tau=tau, n_points=N)
+
+
+def operator(smaps, image):
+    mask = get_mask_cached(image, R=MRI["R"], acs_lines=MRI["acs_lines"], mode="uniform")
+    return Mask(mask) @ FFT2D() @ Sense(smaps)
+
+
+def raises(exc, fn, needle=""):
+    try:
+        fn()
+    except exc as e:
+        assert needle in str(e), f"{needle!r} not in {e}"
+        return
+    raise AssertionError(f"{exc.__name__} not raised")
+
+
+def run(net, save_dir, num_epochs=2, start_epoch=0, wandb=None, **kw):
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    args = dict(num_epochs=num_epochs, steps_per_epoch=2, val_every_epochs=1, accum_steps=2,
+                ema_decay=0.9, noise_std=(0.0, 0.01), val_noise_std=0.005, val_seed=0,
+                kind="brownian", tau=TAU, n_points=N, val_mode="full_recon", val_nfe=2,
+                save_dir=save_dir, **MRI)
+    args.update(kw)
+    return train_i2sb_recon(net, opt, None, "cpu", loader(), loader(n=2, seed=1),
+                            wandb=wandb, start_epoch=start_epoch, **args)
+
+
+# ---------------------------------------------------------------------------------------------
+def test_planar_round_trip():
+    x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
+    p = to_planar(x)
+    assert p.shape == (2, 2, 8, 8) and not p.is_complex()
+    assert torch.equal(from_planar(p), x)
+
+
+def test_adapter_is_complex_in_complex_out_and_guards():
+    net = make_net()
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    x = torch.randn(2, 1, H, H, dtype=torch.complex64)
+    out, _ = net(x, sigma=sched.std_fwd[[3, 500]].view(-1, 1, 1, 1), x1=x)
+    assert out.shape == x.shape and out.is_complex()
+    raises(TypeError, lambda: net(x.real, sigma=sched.std_fwd[:2], x1=x), "complex")
+    raises(ValueError, lambda: net(x, sigma=sched.std_fwd[:2]), "needs x1")
+    raises(ValueError, lambda: SBReconUnet(C=4), "sets the UNet's C")
+    out, _ = make_net(cond_x1=False)(x, sigma=sched.std_fwd[:2])          # no x1 needed
+    assert out.shape == x.shape
+
+
+def test_bridge_start_is_the_adjoint_and_step0_is_x0():
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    x1 = bridge_start(y, E)
+    assert torch.allclose(x1, E.adjoint(y))
+    raises(ValueError, lambda: bridge_start(y, E, "cg"), "not supported")
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    xt = forward_sample(sched, torch.zeros(2, dtype=torch.long), image, x1, deterministic=True)
+    assert (xt - image).abs().max() < 1e-2 * image.abs().max()
+    # complex bridge noise has total std std_sb: E|eps|^2 = 1
+    xt = forward_sample(sched, torch.full((2,), N // 2, dtype=torch.long), image, image)
+    from sb.base import bridge_coeffs
+    std = float(bridge_coeffs(sched)[2][N // 2])
+    emp = float((xt - image).abs().pow(2).mean().sqrt())
+    assert abs(emp / std - 1) < 0.05, (emp, std)
+
+
+def test_oracle_regressor_samples_to_x0():
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+
+    def oracle(x_t, sigma=None, **_):
+        return image, None
+
+    for posterior in ("ddpm", "interpolant"):
+        torch.manual_seed(0)
+        rec, xs, preds = i2sb_recon_sample(oracle, y, E, sched, nfe=10, posterior=posterior,
+                                           verbose=False)
+        assert rec.is_complex() and rec.shape == image.shape
+        err = float((rec - image).abs().max() / image.abs().max())
+        assert err < 0.05, (posterior, err)
+
+
+def test_training_loop_updates_and_checkpoints():
+    with tempfile.TemporaryDirectory() as d:
+        net = make_net()
+        before = [p.detach().clone() for p in net.parameters()]
+        wb = FakeWandb()
+        run(net, d, wandb=wb)
+        changed = sum(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
+        assert changed > 0
+        for f in ("net.ckpt", "net_ema.ckpt", "net_bestval.ckpt"):
+            assert os.path.exists(os.path.join(d, f)), f
+        keys = wb.keys()
+        for k in ("train/loss", "val/psnr", "val/zf_psnr", "val/recon_example"):
+            assert k in keys, (k, sorted(keys))
+
+
+def test_single_pass_validation_and_resume():
+    with tempfile.TemporaryDirectory() as d:
+        net = make_net()
+        run(net, d, num_epochs=1, val_mode="single_pass")
+        run(net, d, num_epochs=2, start_epoch=1, val_mode="single_pass",
+            ckpt=os.path.join(d, "net.ckpt"))
+
+
+def test_refuses_schedule_mismatch_and_embedding():
+    with tempfile.TemporaryDirectory() as d:
+        raises(ValueError, lambda: run(make_net(tau=0.2), d), "schedule mismatch")
+        net = make_net()
+        net.pad_stride = 64                                  # pretend it needs a bigger grid
+        raises(ValueError, lambda: run(net, d), "pad_stride")
+
+
+def test_bridge_target_follows_the_operator_maps():
+    """Online maps in a different phase convention: x0 must be the image THEY produce from the
+    full k-space, gt the stored image, and |x0| == |gt| (the metrics are unchanged)."""
+    import training.i2sb_recon as tir
+    from operators.fourier import fftc
+    kspace, smaps, image, mask, pad_hw = phantom(2)
+    kspace = fftc(smaps * image)                                     # consistent full k-space
+    yy = torch.linspace(-2, 2, H)
+    phase = torch.exp(1j * (yy[:, None] + 0.5 * yy[None, :])).to(torch.complex64)
+    online = smaps * phase                                           # same maps, other reference
+
+    real = tir.prepare_measurement
+    def fake(**kw):
+        y, s, extra = real(**{**kw, "kspace_type": "simulated", "online_smaps": None})
+        return y, s, {**extra, "smaps": online, "smaps_data": smaps}
+    tir.prepare_measurement = fake
+    try:
+        meas = dict(R=4, acs_lines=4, mask_dist="uniform", mask_offset=0, center_frac=None,
+                    adjust_accel=False, noise_dist="uniform", online_smaps="espirit",
+                    online_smaps_kws=None, x1_source="adjoint")
+        batch = (kspace, smaps, image, mask, pad_hw)
+        net = make_net()
+        x0, x1, y, E, s, om, gt = tir._measure(batch, net, "cpu", kspace_type="measurement_awgn",
+                                               noise_std=0.0, x0_source="operator", **meas)
+        assert torch.allclose(gt, image)
+        assert torch.allclose(x0, image * phase.conj(), atol=1e-5)
+        assert torch.allclose(x0.abs(), gt.abs(), atol=1e-5)
+        x0s = tir._measure(batch, net, "cpu", kspace_type="measurement_awgn", noise_std=0.0,
+                           x0_source="stored", **meas)[0]
+        assert torch.allclose(x0s, image)
+        x0sim = tir._measure(batch, net, "cpu", kspace_type="simulated", noise_std=0.0,
+                             x0_source="operator", **meas)[0]
+        assert torch.allclose(x0sim, image)                          # simulated: image IS x0
+    finally:
+        tir.prepare_measurement = real
+
+
+def test_shipped_configs_reach_the_loop_and_build():
+    from models import build_model
+    params = inspect.signature(train_i2sb_recon).parameters
+    for anat in ("brain", "knee"):
+        path = os.path.join(REPO, "config", anat, "i2sb", "unet_R8.json")
+        with open(path) as f:
+            cfg = json.load(f)
+        assert cfg["task"] == "i2sb_recon"
+        blocks = [cfg["training"], cfg["mri"], cfg["i2sb"], cfg["paths"]]
+        seen = set()
+        for b in blocks:
+            for k in b:
+                assert k in params, f"{anat}: {k!r} is not a train_i2sb_recon argument"
+                assert k not in seen, f"{anat}: {k!r} appears in two config blocks"
+                seen.add(k)
+        for k in ("kind", "tau", "n_points", "beta_max"):
+            assert cfg["model"]["params"][k] == cfg["i2sb"][k], (anat, k)
+        net = build_model(cfg)
+        assert isinstance(net, SBReconUnet)
+        net.assert_schedule_matches(build_schedule(
+            **{k: cfg["i2sb"][k] for k in ("kind", "tau", "n_points", "beta_max")}))
+
+
+def main():
+    tests = sorted((n, f) for n, f in globals().items() if n.startswith("test_") and callable(f))
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"  ok    {name}")
+        except Exception as e:                                             # noqa: BLE001
+            failed += 1
+            import traceback
+            traceback.print_exc(limit=6)
+            print(f"  FAIL  {name}: {type(e).__name__}: {e}")
+    print(f"{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

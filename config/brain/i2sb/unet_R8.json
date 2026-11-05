@@ -1,0 +1,143 @@
+{
+    "task": "i2sb_recon",
+    "experiment": {
+        "name": "I2SB_unet_brain_R8"
+    },
+    "model": {
+        "type": "SBReconUnet",
+        "params": {
+            "cond_x1": true,
+            "model_channels": 64,
+            "num_res_blocks": 2,
+            "channel_mult": [
+                1,
+                2,
+                3,
+                4
+            ],
+            "attention_resolutions": [
+                40
+            ],
+            "image_size": 320,
+            "num_heads": 4,
+            "num_head_channels": 32,
+            "dropout": 0.0,
+            "use_scale_shift_norm": true,
+            "resblock_updown": false,
+            "conv_resample": true,
+            "t0": 0.0001,
+            "T": 1.0,
+            "kind": "brownian",
+            "tau": 0.11,
+            "n_points": 1000,
+            "beta_max": 0.3
+        }
+    },
+    "i2sb": {
+        "kind": "brownian",
+        "tau": 0.11,
+        "n_points": 1000,
+        "beta_max": 0.3,
+        "deterministic": false,
+        "posterior": "ddpm",
+        "x1_source": "adjoint",
+        "x0_source": "operator",
+        "val_mode": "full_recon",
+        "val_nfe": 20
+    },
+    "data": {
+        "train": {
+            "name": "fastmri",
+            "task": "recon",
+            "anatomy": "brain",
+            "batch_size": 1,
+            "crop_size": null,
+            "center_crop": null,
+            "random_flips": false,
+            "start_slice": 0,
+            "end_slice": 8,
+            "scale_fac": 2000.0,
+            "kspace_root": "../datasets/fastmri/brain/multicoil_train",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/train_espirit",
+            "pad_multiple": 1,
+            "organ_mask_source": "none",
+            "num_workers": 8
+        },
+        "val": {
+            "name": "fastmri",
+            "task": "recon",
+            "anatomy": "brain",
+            "batch_size": 1,
+            "crop_size": null,
+            "center_crop": null,
+            "random_flips": false,
+            "start_slice": 0,
+            "end_slice": 1,
+            "scale_fac": 2000.0,
+            "kspace_root": "../datasets/fastmri/brain/multicoil_val",
+            "smap_root": "../datasets/fastmri_preprocessed/brain_T2W_coil_combined/val_espirit",
+            "pad_multiple": 1,
+            "organ_mask_source": "none",
+            "num_workers": 8
+        }
+    },
+    "mri": {
+        "R": 8,
+        "acs_lines": null,
+        "mask_dist": "uniform",
+        "mask_offset": 0,
+        "kspace_type": "measurement_awgn",
+        "whiten_kspace": false,
+        "center_frac": 0.04,
+        "adjust_accel": true,
+        "online_smaps": "espirit",
+        "online_smaps_kws": {
+            "thresh_eig": 0.0,
+            "kernel_size": 4,
+            "maxit": 10
+        }
+    },
+    "training": {
+        "num_epochs": 1500,
+        "steps_per_epoch": 200,
+        "val_every_epochs": 25,
+        "accum_steps": 4,
+        "ema_decay": 0.99,
+        "ema_warmup": true,
+        "noise_std": [
+            0.01,
+            0.02
+        ],
+        "noise_dist": "uniform",
+        "val_noise_std": 0.015,
+        "val_seed": 1234,
+        "use_organ_mask": false,
+        "val_slices": 100,
+        "loss_type": "complex-mse",
+        "loss_weight": "uniform",
+        "clip_grad": 1.0,
+        "backtrack_thresh": null,
+        "backtrack_factor": 0.9
+    },
+    "paths": {
+        "save_dir": "trained_nets/i2sb_recon/brain/unet_R8",
+        "ckpt": null
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0001
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1e-06,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "i2sb_recon",
+        "id": null
+    }
+}

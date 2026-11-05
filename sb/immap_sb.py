@@ -2,7 +2,8 @@
 sb/immap_sb.py -- ImMAP-SB: I2SB sampling with a learned data-consistency prox.
 
 Structurally ImMAP (denoise, then a data prox, at every step of an annealed schedule) on a
-Schrodinger bridge. (The earlier self-paced variant lives in sb/immap_sb_ascent.py.)
+Schrodinger bridge, on I2SB's fixed reverse schedule. (The annealed-ascent form, with ImMAP's
+self-paced noise ladder, is sb/immap_sb_ascent.py; it takes the same prox.)
 
 At every reverse step the trained regressor's endpoint estimate x_hat = D(z_t, t) ~ E[x0 | z_t]
 is replaced, before the ordinary posterior update, by

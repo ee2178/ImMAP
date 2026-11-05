@@ -24,6 +24,8 @@ from .sb_guided_groupcdl import SBGuidedGroupCDL
 from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
 from .sb_unet_lggs import SBUnetLGGS
+from .sb_recon_unet import SBReconUnet
+from .tgvn import TGVN
 from .unsb_nets import PatchDiscriminator, PatchEncoder, FeatureTap, PatchNCE, build_critics
 from .forward_ops import ForwardOp
 
@@ -95,6 +97,16 @@ def build_model(cfg):
     # guide. Train with training.u_weight > 0 so the UNet output stays a CT1 estimate.
     elif model_type == "SBUnetLGGS":
         return SBUnetLGGS(**params)
+
+    # SBUnet as an I2SB RECONSTRUCTION regressor (task "i2sb_recon"): complex x_t (and the
+    # zero-filled x1) in as planar channels, complex x0_hat out. Ignores y / E.
+    elif model_type == "SBReconUnet":
+        return SBReconUnet(**params)
+
+    # TGVN (models/tgvn/): the trust-guided variational network, vendored. `guided: false` is the
+    # paper's matched image-domain E2E-VarNet (no side information).
+    elif model_type == "TGVN":
+        return TGVN(**params)
 
     # Multi*level* family (models/ml_cdlnet.py): the hierarchy is the MODEL
     # (x = D_1 D_2 ... D_L g_L), not a solver device, so the transfer operators

@@ -16,6 +16,7 @@ from training import (
     train_synthesis,
     train_dt_synthesis,
     train_i2sb,
+    train_i2sb_recon,
     train_latent_i2sb,
     train_unsb,
     train_forward_op,
@@ -428,6 +429,26 @@ def main(config_path):
             start_epoch=start_step//steps_per_epoch,
             **backtrack_state,
             **train_kws,
+            **cfg["i2sb"],
+            **cfg["paths"],
+            )
+    elif task == "i2sb_recon":
+        # I2SB for MRI reconstruction (training/i2sb_recon.py): the recon loader's batch becomes
+        # the bridge pair (x0 = image, x1 = E^H y) on the device, with cfg["mri"]'s measurement.
+        steps_per_epoch = cfg["training"]["steps_per_epoch"]
+
+        train_i2sb_recon(
+            net=model,
+            opt=optimizer,
+            sched=scheduler,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            wandb=wandb,
+            start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
+            **train_kws,
+            **cfg["mri"],
             **cfg["i2sb"],
             **cfg["paths"],
             )
