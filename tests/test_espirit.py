@@ -22,7 +22,7 @@ the whole module skips rather than fails there, and runs on the cluster.
 import torch
 
 from operators.fourier import fftc
-from physics.smaps import espirit, espirit_soft
+from physics.smaps import _eigh_batched, espirit, espirit_soft
 
 FAIL = []
 
@@ -194,10 +194,34 @@ def test_maps_explain_the_data():
           err < 1e-4, f"max |‖s‖-1| = {err:.2e}")
 
 
+def test_eigh_sub_batches_are_exact():
+    """_eigh_batched (sub-batches, for cuSOLVER's batched-solver limits) returns the same
+    eigenpairs as one eigh call, and names non-finite input instead of a solver error."""
+    g = torch.Generator().manual_seed(0)
+    A = torch.randn(3, 37, 5, 6, generator=g, dtype=torch.complex64)
+    G = A @ A.conj().transpose(-2, -1)                                  # (3, 37, 5, 5) Hermitian
+    w0, v0 = torch.linalg.eigh(G)
+    w1, v1 = _eigh_batched(G, max_batch=8)                              # 111 matrices / 8
+    check("sub-batched eigenvalues match one call", bool(torch.allclose(w0, w1, atol=1e-4)),
+          f"max diff {float((w0 - w1).abs().max()):.2e}")
+    # eigenvectors are defined up to phase: compare the projectors v v^H
+    P0 = v0[..., -1:] @ v0[..., -1:].conj().transpose(-2, -1)
+    P1 = v1[..., -1:] @ v1[..., -1:].conj().transpose(-2, -1)
+    check("sub-batched top eigenvectors match", bool(torch.allclose(P0, P1, atol=1e-4)))
+    bad = G.clone()
+    bad[1, 2, 0, 0] = float("nan")
+    try:
+        _eigh_batched(bad)
+        check("non-finite input is named", False, "no error")
+    except ValueError as e:
+        check("non-finite input is named", "NaN/Inf" in str(e))
+
+
 def main():
     if not have_lapack():
         return 0
-    for fn in (test_batch_does_not_change_a_slice, test_batch_order_does_not_matter,
+    for fn in (test_eigh_sub_batches_are_exact,
+               test_batch_does_not_change_a_slice, test_batch_order_does_not_matter,
                test_soft_maps_are_batch_independent,
                test_phase_reference_is_the_strongest_coil, test_maps_explain_the_data):
         print(f"\n--- {fn.__name__}")

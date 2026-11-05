@@ -48,7 +48,16 @@ The guide is FULLY SAMPLED for now (how far the side scan can be accelerated is 
 - Set 1 (built 2026-11-05): multi-contrast knee, PDFS <- PD, R=8. `torch/guided_recon_knee.sbatch`
   cells from `scripts/make_guided_recon_configs.py` (main R, model, guide R):
   tgvn_R8_g1, tgvn_R8_g2, sbtgvn_R8_g1, sbtgvn_R8_g2, lpdsnet_R8 (the grid's LPDSNet, no guide).
-  Optional: varnet_img, lggs. Loader `fastmri_paired`; target = RSS of PDFS.
+  Optional: varnet_img, lggs. Loader `fastmri_paired`.
+  - TARGET (decided 2026-11-05): the OFFLINE SENSE image of each PDFS volume, ESPIRiT at ACS 32
+    from the fully-sampled k-space (torch/espirit_knee_pairs.sbatch ->
+    knee_coil_combined/pdfs_espirit_acs32), not TGVN's RSS. TGVN's own pipeline is a SENSE
+    combination under LEARNED maps, magnitude, scored against RSS; with a fixed SENSE target all
+    models share one complex-derived ground truth. i2sb-TGVN still bridges to the online-map
+    combination (x0_source "operator": the offline maps' phase reference is not the operator's)
+    and is scored like the rest, |.| against the offline image. The maps' thresh_eig 0.95
+    support makes the target exactly 0 outside the anatomy; scoring stays full-frame
+    (organ_mask_source "none", as the grid) unless switched to "smaps".
   - Guide acceleration knob `mri.guide_R` (1 = fully sampled): equispaced, `guide_acs_lines` 0
     (TGVN's side masks have no centre), line phase redrawn per training step, offset 0 at val.
   - TGVN gets a noise-level plane in each regularizer Phi (`cond_sigma`; upstream TGVN has no
@@ -68,8 +77,10 @@ The guide is FULLY SAMPLED for now (how far the side scan can be accelerated is 
     FINDING: the per-slice aliasing gap spread is NOT explained by intensity (std/mean 0.45
     absolute vs 0.44 relative). Relative tau equalizes noise vs IMAGE, not noise vs GAP; on a
     bright slice with a small gap the bridge noise now sits well above the gap.
-  - Known asymmetry: plain TGVN learns its maps, BridgeTGVN uses online ESPIRiT. A
-    TGVN(use_smaps=True) control exists if the comparison needs it.
+  - Coil maps (decided 2026-11-05): plain TGVN ALSO runs on the operator's online ESPIRiT maps
+    (`use_smaps: true`, SensitivityModel deleted), like BridgeTGVN and LPDSNet -- every model
+    gets the same maps, and at the reduced budget TGVN need not learn them. This departs from
+    the published TGVN, which estimates its own.
 - Set 2 (later): longitudinal -- TGVN and SB-LGGS (the bridge data fidelity).
 
 ## Idea (2026-11-05, not built): dual bridge for jointly accelerated contrasts

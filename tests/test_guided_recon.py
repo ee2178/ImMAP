@@ -152,6 +152,23 @@ def make_data(root, n_pairs=3, bad_pair=True, swap=False):
     return csv, maps
 
 
+def make_maps(root, out):
+    """Offline maps + SENSE images for every PDFS file in `root`, laid out as
+    scripts/make_espirit_smaps.py writes them (smaps (S, C, H, W), image (S, H, W))."""
+    os.makedirs(out, exist_ok=True)
+    for name in sorted(os.listdir(root)):
+        if not name.startswith("pdfs"):
+            continue
+        with h5py.File(os.path.join(root, name), "r") as f:
+            k = torch.from_numpy(f["kspace"][()])
+        sm = torch.from_numpy(MAPS)[None].expand(k.shape[0], -1, -1, -1)
+        img = (sm.conj() * ifftc(k)).sum(dim=1)
+        with h5py.File(os.path.join(out, name), "w") as f:
+            f.create_dataset("smaps", data=sm.numpy())
+            f.create_dataset("image", data=img.numpy())
+    return out
+
+
 def raises(exc, fn, needle=""):
     try:
         fn()
@@ -204,10 +221,10 @@ def panel_tiles(img):
     return (panel.shape[-1] + 2) // (W + 2), caption
 
 
-def run_recon(net, csv, root, d, **mri):
+def run_recon(net, csv, root, d, data=None, **mri):
     loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,
                                             drop_last=False, scale_fac=1.0, start_slice=1,
-                                            end_slice=3, num_workers=0)
+                                            end_slice=3, num_workers=0, **(data or {}))
     opt = torch.optim.Adam(net.parameters(), lr=1e-4)
     kw = dict(R=4, acs_lines=4, kspace_type="measurement_awgn", noise_std=(0.0, 0.01),
               val_noise_std=0.005, val_seed=0, loss_type="magnitude-nl1-nl2", num_epochs=1,
@@ -247,6 +264,61 @@ def test_loader_pairs_drops_and_checks():
     with tempfile.TemporaryDirectory() as root:
         csv, _ = make_data(root, bad_pair=False, swap=True)
         raises(ValueError, lambda: PairedKneeDataset(csv, root), "pd column = side")
+
+
+def test_loader_offline_sense_target():
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as mroot:
+        csv, _ = make_data(root)
+        make_maps(root, mroot)
+        ds = PairedKneeDataset(csv, root, scale_fac=2.0, start_slice=1, end_slice=3,
+                               enumerate_slices=True, target="sense", smap_root=mroot,
+                               organ_mask_source="smaps")
+        k, sm, img, organ, _, _ = ds[1]                                   # pdfs0, slice 2
+        with h5py.File(os.path.join(mroot, "pdfs0.h5"), "r") as f:
+            want = torch.from_numpy(f["image"][2])[None] * 2.0
+        assert torch.allclose(img, want)                                  # stored, scaled
+        assert torch.allclose(sm, torch.from_numpy(MAPS))                 # real maps
+        assert torch.equal(organ, sm.abs().sum(0, keepdim=True) > 0)      # map support
+        rss = ifftc(k).abs().pow(2).sum(0, keepdim=True).sqrt()
+        assert not torch.allclose(img.abs(), rss)                         # not the RSS
+        raises(ValueError, lambda: PairedKneeDataset(csv, root, target="sense"), "smap_root")
+        raises(ValueError, lambda: PairedKneeDataset(csv, root, organ_mask_source="smaps"),
+               "offline maps")
+        os.remove(os.path.join(mroot, "pdfs1.h5"))
+        raises(FileNotFoundError, lambda: PairedKneeDataset(csv, root, target="sense",
+                                                            smap_root=mroot), "pdfs1.h5")
+
+
+def test_train_recon_on_the_sense_target():
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as mroot,             tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        make_maps(root, mroot)
+        spy = Spy(TGVN(**TINY_TGVN))
+        wb = run_recon(spy, csv, root, d, data=dict(target="sense", smap_root=mroot))
+        assert spy.guides and os.path.exists(os.path.join(d, "net.ckpt"))
+        assert any("val/psnr" in c for c in wb.calls)
+
+
+def test_tgvn_on_operator_maps_uses_online_estimate():
+    """The shipped TGVN cells (use_smaps + cond_sigma) train on the operator's ONLINE maps: the
+    loop must estimate them, and refuse without online_smaps."""
+    import physics.online_smaps as osm
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as mroot,             tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        make_maps(root, mroot)
+        net = TGVN(use_smaps=True, cond_sigma=True, **TINY_TGVN)
+        assert net.uses_operator_smaps and net.net.sens_net is None
+        data = dict(target="sense", smap_root=mroot)
+        raises(ValueError, lambda: run_recon(net, csv, root, d, data=data), "online")
+        calls = []
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: (calls.append(1),
+                                                  torch.from_numpy(MAPS)[None].expand_as(y))[1]
+        try:
+            wb = run_recon(net, csv, root, d, data=data, online_smaps="espirit")
+        finally:
+            osm.online_smaps = real
+        assert calls and any("val/psnr" in c for c in wb.calls)
 
 
 def test_tgvn_adapter_guided_and_baseline():

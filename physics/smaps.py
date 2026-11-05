@@ -101,6 +101,37 @@ def walsh(y: torch.Tensor, ks: int = 5, stride: int = 2,
     # resolve_conj: a lazy conj view breaks view_as_real downstream (E2EVarNet)
     return smaps.conj().resolve_conj()
 
+# Matrices per eigh call. Large CUDA batches of small Hermitian matrices are routed to cuSOLVER's
+# batched solver, which on some torch / CUDA builds refuses the call outright at its buffer-size
+# query (CUSOLVER_STATUS_INVALID_VALUE, seen 2026-11-05 on the knee ESPIRiT job with 4 x 8192
+# complex 15x15 matrices per call). Splitting is exact -- each matrix is decomposed on its own.
+EIGH_MAX_BATCH = 4096
+
+
+def _eigh_batched(G: torch.Tensor, max_batch: int = EIGH_MAX_BATCH):
+    """torch.linalg.eigh over (..., n, n) in sub-batches of at most `max_batch` matrices, with a
+    CPU retry for any sub-batch the GPU solver refuses. Same eigenpairs as one eigh call."""
+    if not bool(torch.isfinite(G.real).all() & torch.isfinite(G.imag).all()
+                if G.is_complex() else torch.isfinite(G).all()):
+        raise ValueError("ESPIRiT: the per-pixel calibration matrices contain NaN/Inf -- the "
+                         "k-space (or its ACS region) is not finite")
+    n = G.shape[-1]
+    Gf = G.reshape(-1, n, n)
+    w = torch.empty(Gf.shape[:-1], device=G.device, dtype=G.real.dtype)
+    v = torch.empty_like(Gf)
+    for i in range(0, Gf.shape[0], max_batch):
+        g = Gf[i:i + max_batch]
+        try:
+            wi, vi = torch.linalg.eigh(g)
+        except RuntimeError:                     # torch.linalg.LinAlgError is a RuntimeError
+            if g.device.type == "cpu":
+                raise
+            wi, vi = torch.linalg.eigh(g.cpu())
+            wi, vi = wi.to(g.device), vi.to(g.device)
+        w[i:i + max_batch], v[i:i + max_batch] = wi, vi
+    return w.reshape(G.shape[:-1]), v.reshape(G.shape)
+
+
 def espirit(
     kspace: torch.Tensor,  # (B, C, Nx, Ny)
     acs_size: Tuple[int, int] = (24, 24),
@@ -229,7 +260,7 @@ def espirit(
             Vblk = Vk[:, p0:p1]                                      # (B, Pb, C, K)
             Gq = torch.einsum("bpck,bpdk->bpcd",
                           Vblk, Vblk.conj()) / (ks ** 2)         # (B, Pb, C, C)
-            w, v = torch.linalg.eigh(Gq)                             # w ascending
+            w, v = _eigh_batched(Gq)                                 # w ascending
             lam[:, p0:p1] = w[..., -M:].flip(-1)                    # [λ1, λ2, ...] desc
             Q[:, p0:p1] = v[..., -M:].flip(-1)                    # matching vectors
 
@@ -342,7 +373,7 @@ def espirit_soft(
         Vblk = Vk[:, p0:p1]                                      # (B, Pb, C, K)
         Gq = torch.einsum("bpck,bpdk->bpcd",
                           Vblk, Vblk.conj()) / (ks ** 2)         # (B, Pb, C, C)
-        w, v = torch.linalg.eigh(Gq)                             # w ascending
+        w, v = _eigh_batched(Gq)                                 # w ascending
         lams[:, p0:p1] = w[..., -M:].flip(-1)                    # [λ1, λ2, ...] desc
         maps[:, p0:p1] = v[..., -M:].flip(-1)                    # matching vectors
 

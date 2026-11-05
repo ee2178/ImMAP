@@ -27,11 +27,19 @@ What is inherited, from what scripts/make_mg_recon_configs.py writes TODAY for k
 What is set here:
     data.name    fastmri_paired: TGVN's patient-level PD/PDFS splits
                  (config/knee/guided/splits/), raw k-space from fastMRI train AND val
-    target       RSS of the PDFS k-space (no offline maps exist for PDFS; TGVN's target too)
+    target       the OFFLINE SENSE image of the PDFS volume (ESPIRiT, ACS 32, from the full
+                 k-space; PDFS_MAPS, written by torch/espirit_knee_pairs.sbatch) -- not TGVN's RSS.
+                 Every model is scored on |.| against it; i2sb-TGVN still bridges to the
+                 combination under the operator's own (online) maps, x0_source "operator",
+                 since the offline maps' phase reference is not the operator's.
     guide        mri.guide_R: the PD scan undersampled by equispaced lines with no centre
                  (TGVN's side mask), redrawn per training step; 1 = fully sampled
     TGVN         upstream defaults (12 cascades, 18 chans) + a noise-level plane in each
-                 regularizer (cond_sigma; upstream TGVN takes no noise level)
+                 regularizer (cond_sigma; upstream TGVN takes no noise level), on the
+                 OPERATOR'S online ESPIRiT maps (use_smaps) instead of its own SensitivityModel:
+                 the same maps i2sb-TGVN and LPDSNet get, so the comparison differs in the
+                 method, not in who estimates the coil maps (decided 2026-11-05; at the reduced
+                 budget, not learning the maps also makes TGVN's job easier)
     i2sb-TGVN    BridgeTGVN: the same TGVN, on the operator's (online ESPIRiT) maps, started at
                  x_t, conditioned on the bridge position and sigma_n; complex-MSE loss (the
                  bridge state is complex; the grid's magnitude NL1+NL2 cannot train it). Its
@@ -60,6 +68,9 @@ DEFAULT_MODELS = ("tgvn", "sbtgvn", "lpdsnet")
 SPLITS = "config/knee/guided/splits"
 KSPACE_ROOTS = ["../datasets/fastmri/knee/multicoil_train",
                 "../datasets/fastmri/knee/multicoil_val"]
+# Offline ESPIRiT maps + SENSE images of the PDFS (target) volumes: torch/espirit_knee_pairs.sbatch
+PDFS_MAPS = "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32"
+TARGET = "sense"
 
 # Brownian-bridge temperature for i2sb-TGVN, tau = RMS(x0 - x1)/2 inside the object at the main
 # R (written to BOTH i2sb and model.params). Measured 2026-11-05 with
@@ -94,7 +105,7 @@ LGGS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
 MODELS = {
     "tgvn": dict(task="recon", guided=True, grid_base="varnet", pad_multiple=1,
                  model=dict(type="TGVN", params=dict(guided=True, cond_sigma=True,
-                                                     **TGVN_SIZE))),
+                                                     use_smaps=True, **TGVN_SIZE))),
     "sbtgvn": dict(task="i2sb_recon", guided=True, grid_base="varnet", pad_multiple=1,
                    model=dict(type="BridgeTGVN", params=dict(guided=True, cond_sigma=True,
                                                              **TGVN_SIZE, **SCHEDULE))),
@@ -102,7 +113,7 @@ MODELS = {
                     model=None),                       # the grid's lpdsnet model block
     "varnet_img": dict(task="recon", guided=False, grid_base="varnet", pad_multiple=1,
                        model=dict(type="TGVN", params=dict(guided=False, cond_sigma=True,
-                                                           **TGVN_SIZE))),
+                                                           use_smaps=True, **TGVN_SIZE))),
     "lggs": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
                  model=dict(type="LGGS", params=LGGS_PARAMS)),
 }
@@ -128,6 +139,8 @@ def _data(split, base_split, pad_multiple):
             "split_csv": f"{SPLITS}/{split}.csv",
             "kspace_roots": list(KSPACE_ROOTS),
             **{k: base_split[k] for k in keep if k in base_split},
+            "target": TARGET,
+            "smap_root": PDFS_MAPS,
             "pad_multiple": pad_multiple,
             "num_workers": 8}
 
