@@ -59,13 +59,24 @@ def per_image_sigma(sigma, batch, device):
     return s.reshape(batch)
 
 
+def ram_signal_level(y):
+    """RAM's signal statistic `num` for each image of `y`, as a (B,) tensor.
+
+    mean(|Re y|, |Im y|) over every entry, unsampled zeros included: the mean of
+    RAM's real (B, 2, C, H, W) tensor. RAM's snr is this over sigma. A real `y`
+    has no imaginary part, so the same statistic is mean|y| / 2 there."""
+    B = y.shape[0]
+    a = y.real.abs() + y.imag.abs() if torch.is_complex(y) else y.abs()
+    return a.reshape(B, -1).sum(1) / (2 * y[0].numel())
+
+
 def ram_gamma(y, sigma):
     """RAM's prox weight gamma for each image of `y` (B, C, H, W), complex k-space.
 
     `sigma` is ImMAP's complex std, (B,) or a scalar."""
     B = y.shape[0]
     s = per_image_sigma(sigma, B, y.device) / math.sqrt(2.0)
-    num = (y.real.abs() + y.imag.abs()).reshape(B, -1).sum(1) / (2 * y[0].numel())
+    num = ram_signal_level(y)
     snr = num / (s + 1e-4)
     return 1.0 / (1e-4 + 1.0 / snr)
 

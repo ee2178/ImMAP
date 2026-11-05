@@ -115,6 +115,17 @@ def main():
           f"{vs_rel / 2:.4f}  (tau_scale='x1_rms')")
     print(f"  per-slice gap spread (std/mean): absolute {cv(per):.2f}, relative "
           f"{cv(rel_per):.2f}")
+    # How the gap follows intensity: fit gap_i ~ s_i^b in log space. b = 1 means the gap is
+    # proportional to intensity (tau ~ s is exact); b = 0 means unrelated (an absolute tau is);
+    # in between, tau ~ s^b equalizes noise-to-gap best. Equal spreads above do NOT mean b = 0:
+    # dividing by s removes the part that follows intensity and adds s's own spread back where
+    # the gap does not follow it.
+    lg, ls = torch.log(per), torch.log(s)
+    b = float(((lg - lg.mean()) * (ls - ls.mean())).sum() / (ls - ls.mean()).pow(2).sum())
+    r = float(torch.corrcoef(torch.stack([lg, ls]))[0, 1])
+    res = per / (s / s_ref) ** b
+    print(f"  gap vs intensity: corr(log gap, log s) = {r:.2f}, fit gap ~ s^{b:.2f}; "
+          f"spread of gap / s^b = {cv(res):.2f}")
     print(f"  config's current tau: {i2sb.get('tau')}, tau_scale: "
           f"{i2sb.get('tau_scale', 'none')}, tau_ref: {i2sb.get('tau_ref')}")
 

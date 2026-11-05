@@ -118,7 +118,7 @@
         "x1_source": "adjoint",
         "x0_source": "operator",
         "tau_scale": "x1_rms",
-        "tau_ref": null,
+        "tau_ref": 0.1481,
         "val_mode": "full_recon",
         "val_nfe": 20
     }

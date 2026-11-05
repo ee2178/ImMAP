@@ -262,6 +262,13 @@ def trace_forward(net, *args, **kwargs):
             if hasattr(getattr(v, "dF", None), "_trace_level"):
                 del v.dF._trace_level
 
+    # scale_norm (MGLPDSNet): the levels ran on y / s, the output is back in data units.
+    # Every record is a state, residual or difference of them, so linear in the scale:
+    # put them in data units too, so every reader compares like with like.
+    if getattr(net, "scale_norm", False):
+        sb = net.last_scale
+        rec = {k: {n: t * sb for n, t in d.items()} for k, d in rec.items()}
+
     # What the level below handed back, before alpha and prolongation. Formed
     # here rather than hooked because it is a DIFFERENCE of two records that
     # live in different slots.

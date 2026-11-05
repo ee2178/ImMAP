@@ -72,7 +72,7 @@ from operators.resample import (GridTransfer, _check_filter, prolong,
                                 restrict, restrict_noise)
 from preprocessing.image import post_process, pre_process
 from preprocessing.kspace import _pad_complex, kspace_post_process, kspace_pre_process
-from models.cg_init import CGInit
+from models.cg_init import CGInit, ram_signal_level
 
 
 # ===========================================================================
@@ -491,6 +491,17 @@ def gram_or_x(E, x, planar=False):
     return E.gram(x)
 
 
+def _scale_sigma(sigma, s):
+    """`sigma / s` per image, for `scale_norm`: sigma a float, a 0-d tensor, (B,),
+    (B, 1, 1, 1) or a (B, 1, H, W) map; s is (B,). None stays None (noise-blind)."""
+    if sigma is None:
+        return None
+    sig = torch.as_tensor(sigma, device=s.device, dtype=s.dtype)
+    if sig.dim() <= 1:
+        return sig / s
+    return sig / s.view(-1, *([1] * (sig.dim() - 1)))
+
+
 def _restrict_measurement(y, E, sigma, R, static, coarse_op="galerkin"):
     """Coarsen `(y, E, sigma)` -- the parts of the level that never move.
 
@@ -779,8 +790,19 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  coarse_op="galerkin", fas_dual="legacy", fas_copies="untied",
                  fas_parent_pi=False, alpha_mode="free", alpha_range=None,
                  alpha_z_zero=False, lam_level_scale=1.0, cg_init=False,
-                 cg_fact_init=1.0):
+                 cg_fact_init=1.0, scale_norm=False):
         super().__init__()
+        # scale_norm (exp22, 2026-11-05): run the net on y / s with noise level sigma / s,
+        # s = RAM's signal statistic mean(|Re y|, |Im y|) per image (models/cg_init.py::
+        # ram_signal_level), and scale the result back by s. Everything but the thresholds
+        # is linear, so this makes the net exactly scale-equivariant: f(c y, c sigma) =
+        # c f(y, sigma). Without it a threshold's constant term (lam0) is in absolute data
+        # units and means something different on a bright volume than on a dim one; with it
+        # thresholds read sigma / s, RAM's 1/snr. Adds no parameter, so lam0 must be given
+        # in normalized units. A state handed in, and the (x, z) returned, stay in data units.
+        if not isinstance(scale_norm, bool):
+            raise ValueError(f"scale_norm must be true or false, got {scale_norm!r}")
+        self.scale_norm = scale_norm
         # cg_init (exp21, 2026-11-03): start from RAM's realigned input, CG-SENSE at
         # deepinv's defaults (models/cg_init.py), instead of E^H y. Layer 0 still
         # spends its sweep forming z from that x, so the layer count is unchanged.
@@ -856,6 +878,19 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
     def forward(self, y, E=None, sigma=None, state=None):
         if E is None:
             E = Identity()
+        if not self.scale_norm:
+            return self._forward(y, E, sigma, state)
+        s = ram_signal_level(y).clamp_min(1e-12).to(y.real.dtype)        # (B,)
+        sb = s.view(-1, 1, 1, 1)
+        # The levels a trace records live in normalized units; level_images rescales them.
+        self.last_scale = sb.detach()
+        if state is not None:
+            state = tuple(None if t is None else t / sb for t in state)
+        x_hat, (x, z) = self._forward(y / s.view(-1, *([1] * (y.dim() - 1))), E,
+                                      _scale_sigma(sigma, s), state)
+        return x_hat * sb, (x * sb, z * sb)
+
+    def _forward(self, y, E, sigma, state):
 
         # SEAM for a future SensitivityNet: estimate the maps from the ACS of
         # `y` here and `set_sensitivity_map(E, smaps)` before preprocessing.

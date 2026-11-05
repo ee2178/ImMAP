@@ -245,6 +245,11 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
     lo, hi = parse_slices(args.slices)
     cg_lam = getattr(args, "cg_sense_lam", None)      # callers without the option: no CG-SENSE
     keep_slices = getattr(args, "keep_slices", None)  # {volume: slices}: the net runs on no others
+    # Optional, for scripts/scale_sweep.py: `call(net, y, E, sigma) -> image` replaces the
+    # plain forward (the recon adapter's hook), and `on_item(volume, slice)` is told which
+    # slice the next forward is.
+    call = getattr(args, "call", None)
+    on_item = getattr(args, "on_item", None)
 
     val = dict(cfg["data"]["val"])
     val.update(enumerate_slices=True, start_slice=lo, end_slice=hi,
@@ -318,8 +323,10 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         if cg_lam is not None:
             extras.update(cg_sense_lam=cg_lam,
                           cg_sense_iters=getattr(args, "cg_sense_iters", 100))
+        if on_item is not None:
+            on_item(vol, sl)
         gt, recon, metric_mask = adapter(model, batch, cfg, device, sigma, gen,
-                                         extras=extras)
+                                         extras=extras, **({"call": call} if call else {}))
 
         # The ANATOMY mask is taken from the batch, not from the adapter: the
         # adapter returns None for it whenever the run did not train with it,
