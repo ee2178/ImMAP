@@ -116,6 +116,33 @@ def _make_physics(E, sigma):
     return _ImMAPPhysics(E, sigma)
 
 
+def _pin_noise_device(physics, device, depth=3):
+    """Put every noise level in `physics`, `.base` and `.base.base` on `device`.
+
+    `realign_input` reads sigma from exactly those three places. `_PinnedGaussianNoise`
+    stops deepinv 0.4.2's `.to("cpu")` from moving it, but another deepinv version can
+    reach the CPU another way (a wrapper copying the noise model, or moving sigma without
+    `_apply`; seen 2026-11-05 in a non-gcdl env, `dump_eval.py` on RAM). This puts the
+    tensor back wherever it is stored -- buffer, parameter or plain attribute -- so the
+    forward does not depend on the deepinv version. No-op when it is already there.
+    """
+    p = physics
+    for _ in range(depth):
+        nm = getattr(p, "noise_model", None)
+        s = getattr(nm, "sigma", None) if nm is not None else None
+        if torch.is_tensor(s) and s.device != device:
+            if "sigma" in nm._buffers:
+                nm._buffers["sigma"] = s.to(device)
+            elif "sigma" in nm._parameters:
+                nm._parameters["sigma"] = nn.Parameter(s.detach().to(device),
+                                                       requires_grad=s.requires_grad)
+            else:
+                nm.__dict__["sigma"] = s.to(device)
+        p = getattr(p, "base", None)
+        if p is None:
+            break
+
+
 def _ram_forward(net, y, physics, sigma):
     """`RAM.forward` (upstream ram.py, lines 294-318), per-sample sigma.
 
@@ -133,6 +160,7 @@ def _ram_forward(net, y, physics, sigma):
     x_temp = physics.A_adjoint(y)
     pad = (-x_temp.size(-2) % 8, -x_temp.size(-1) % 8)
     physics = Pad(physics, pad)
+    _pin_noise_device(physics, y.device)
 
     x_in = physics.A_adjoint(y)
 
