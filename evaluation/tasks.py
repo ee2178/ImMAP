@@ -131,14 +131,30 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None, call=None
         if lam is not None:
             from solvers.cg import batched_cg
             lam = float(lam)
-            with torch.no_grad():
-                x = batched_cg(lambda v: E.adjoint(E(v)) + lam * v, E.adjoint(y),
-                               tol=float(extras.get("cg_sense_tol", 1e-6)),
-                               max_iter=int(extras.get("cg_sense_iters", 100)))
-            sense = T.forward(x)
+
+            def solve(Eop):
+                with torch.no_grad():
+                    return batched_cg(lambda v: Eop.adjoint(Eop(v)) + lam * v, Eop.adjoint(y),
+                                      tol=float(extras.get("cg_sense_tol", 1e-6)),
+                                      max_iter=int(extras.get("cg_sense_iters", 100)))
+
+            sense = T.forward(solve(E))
             if mri.get("whiten_kspace", False) and "Zinv" in extra:
                 sense = extra["Zinv"] * sense
             extras["cg_sense"] = sense
+            # `cg_sense_stored_maps` (flag) -> `cg_sense_stored`: the same solve on the same
+            # y, but through the STORED maps
+            # (the ones the reference S^H c is made with) instead of the run's online
+            # estimate. Where the two disagree, aliasing left by the operator-map solve but
+            # not by this one is coil-map mismatch, which no prior removes
+            # (scripts/cg_sense_check.py). Unwhitened only: the stored maps have no Zinv.
+            if extras.get("cg_sense_stored_maps") and mri.get("online_smaps"):
+                if mri.get("whiten_kspace", False):
+                    print("[cg_sense] stored-map solve skipped: whitened k-space")
+                else:
+                    E_s, T_s = embed_for_net(net, Mask(mask) @ FFT2D() @ Sense(smaps),
+                                             image, pad_hw)
+                    extras["cg_sense_stored"] = T_s.forward(solve(E_s))
 
     return image, out, organ_mask
 

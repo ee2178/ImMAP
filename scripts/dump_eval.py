@@ -322,7 +322,8 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         extras = {}
         if cg_lam is not None:
             extras.update(cg_sense_lam=cg_lam,
-                          cg_sense_iters=getattr(args, "cg_sense_iters", 100))
+                          cg_sense_iters=getattr(args, "cg_sense_iters", 100),
+                          cg_sense_stored_maps=bool(getattr(args, "cg_sense_stored", False)))
         if on_item is not None:
             on_item(vol, sl)
         gt, recon, metric_mask = adapter(model, batch, cfg, device, sigma, gen,
@@ -350,6 +351,9 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         if "cg_sense" in extras:
             buf.setdefault("cg_sense", []).append(
                 keep(_np(extras["cg_sense"])).astype(np.complex64))
+        if "cg_sense_stored" in extras:
+            buf.setdefault("cg_sense_stored", []).append(
+                keep(_np(extras["cg_sense_stored"])).astype(np.complex64))
         if "sampling_mask" in extras:
             buf.setdefault("sampling_mask", []).append(
                 (np.abs(_np(extras["sampling_mask"])) > 0).astype(np.uint8))
@@ -405,6 +409,10 @@ def main():
                         "= E^H y, on the same measurement the net saw")
     p.add_argument("--cg-sense-iters", type=int, default=100,
                    help="CG iterations for --cg-sense-lam")
+    p.add_argument("--cg-sense-stored", action="store_true",
+                   help="with --cg-sense-lam, also store `cg_sense_stored`: the same solve "
+                        "through the STORED maps (the reference's) instead of the online "
+                        "estimate, to separate map mismatch from aliasing")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)
