@@ -965,23 +965,26 @@ EXP21_CELLS = tuple(b + "cg" + EXP18_SUFFIX for b in EXP21_BASES)
 # ---------------------------------------------------------------------------
 #  EXP22: thresholds in RAM's noise coefficient (2026-11-05)
 #
-#  `scale_norm=True` runs the net on y / s and sigma / s, s = RAM's signal statistic
-#  mean(|Re y|, |Im y|) (models/mg_lpds.py), so the nets are exactly scale-equivariant
-#  and the thresholds read sigma / s = RAM's 1/snr instead of an absolute sigma. Data
-#  are only relatively normalized (scale_fac), so an absolute lam0 meant something
-#  different per volume. No cg start: each cell is its exp18 twin plus this, so the
-#  conditioning is the only change (mg81 also takes exp20's lam_level_scale=0.5).
-#  lam0 is re-expressed in normalized units: s ~ 0.0035 on brain at cf32 R8 (image
-#  amplitude ~1; 0.0025 at R12, since the mean counts the unsampled zeros), so the
-#  data-unit 1e-3 is ~0.3. Knee not measured locally; trained thresholds move ~10x
-#  from their init anyway (memory: L0 .013 from 1e-3).
+#  `scale_norm="p99"` runs the net on y / s and sigma / s (models/mg_lpds.py), so the nets
+#  are exactly scale-equivariant and the thresholds read sigma / s instead of an absolute
+#  sigma. Data are only relatively normalized (scale_fac), so an absolute lam0 meant
+#  something different per slice: knee tissue brightness spreads 2.6x (10-90%) across
+#  slices. s = 99th percentile of |E^H y| / mean(E^H E 1), the zero-filled image's
+#  bright-tissue level: it tracks the reference's 99th percentile to 1.3x, where RAM's
+#  mean|y| (the first choice) managed 2.2x and |mu| was worse than nothing
+#  (scripts/scale_stat_compare.py, results/scale_stats/knee, 2026-11-05).
+#  No cg start: each cell is its exp18 twin plus this, so the conditioning is the only
+#  change (mg81 also takes exp20's lam_level_scale=0.5). lam0 in normalized units: the
+#  median s on knee R8 is 0.927, so the data-unit 1e-3 becomes 1.1e-3.
 #  Launcher: torch/exp22_scale_norm.sbatch.
 # ---------------------------------------------------------------------------
-SCALE_NORM_LAM0 = 0.3
+SCALE_NORM = "p99"
+SCALE_NORM_LAM0 = 1.1e-3
 EXP22 = {
-    "lpdsnetsncf32": ("lpdsnetcf32", dict(scale_norm=True, lam0=SCALE_NORM_LAM0)),
+    "lpdsnetsncf32": ("lpdsnetcf32", dict(scale_norm=SCALE_NORM, lam0=SCALE_NORM_LAM0)),
     "mg81v6vtxAnestUsnlamcf32": ("mg81v6vtxAnestUcf32",
-                                 dict(scale_norm=True, lam0=SCALE_NORM_LAM0, lam_level_scale=0.5)),
+                                 dict(scale_norm=SCALE_NORM, lam0=SCALE_NORM_LAM0,
+                                      lam_level_scale=0.5)),
 }
 for _n, (_b, _extra) in EXP22.items():
     MODELS[_n] = dict(MODELS[_b], params=dict(MODELS[_b]["params"], **_extra))
@@ -1614,7 +1617,7 @@ def make_config(anatomy, r, model, args):
             # model class, so `spec["type"]` alone collides on one wandb run.
             "name": (f"{_display_name(spec['type'], params)}{_level_loss_tag(spec)}"
                      f"{'_cg' if params.get('cg_init') else ''}"
-                     f"{'_sn' if params.get('scale_norm') else ''}"
+                     f"{'_sn' + ('' if params.get('scale_norm') is True else str(params['scale_norm'])) if params.get('scale_norm') else ''}"
                      f"{'_cf32' if 'center_frac_times_r' in spec else ''}"
                      f"_{anatomy}_R{r}_synth"),
         },

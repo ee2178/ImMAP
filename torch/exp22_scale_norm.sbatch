@@ -17,13 +17,15 @@
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
 #SBATCH --array=0
 #
-# EXPERIMENT 22 -- THRESHOLDS IN RAM'S NOISE COEFFICIENT (2026-11-05), full length, exp18's
-# mask (center_frac = 0.32 / R, adjust_accel off). `scale_norm=True` runs each net on y / s
-# and sigma / s, s = RAM's signal statistic mean(|Re y|, |Im y|), and scales the output back:
-# exactly scale-equivariant, thresholds conditioned on sigma / s = RAM's 1/snr
-# (make_mg_recon_configs.py::EXP22, models/mg_lpds.py). No cg start, so each cell is its
-# exp18 twin plus this; mg81 also takes exp20's lam_level_scale=0.5. lam0 = 0.3 in
-# normalized units. ramcf32 is the reference and is not retrained.
+# EXPERIMENT 22 -- SCALE-NORMALIZED THRESHOLDS (2026-11-05), full length, exp18's mask
+# (center_frac = 0.32 / R, adjust_accel off). `scale_norm="p99"` runs each net on y / s and
+# sigma / s, s = the 99th percentile of |E^H y| / mean(E^H E 1) (the zero-filled image's
+# bright-tissue level), and scales the output back: exactly scale-equivariant, thresholds
+# in units of the slice's own brightness (make_mg_recon_configs.py::EXP22,
+# models/mg_lpds.py; the statistic was chosen by scripts/scale_stat_compare.py). No cg
+# start, so each cell is its exp18 twin plus this; mg81 also takes exp20's
+# lam_level_scale=0.5. lam0 = 1.1e-3 in normalized units. ramcf32 is the reference and is
+# not retrained.
 #
 # Cells: lpdsnetsncf32 mg81v6vtxAnestUsnlamcf32, knee R8: 2 cells, 1 task at PACK=2.
 #

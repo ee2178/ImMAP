@@ -397,9 +397,11 @@ def test_generator_cells_and_config_keys():
         return
     loops = {"recon": (("training", "mri", "paths"), tr.train_recon),
              "i2sb_recon": (("training", "mri", "i2sb", "paths"), train_i2sb_recon)}
+    import yaml
     for name in names:
         with open(os.path.join(root, f"{name}.json")) as f:
-            cfg = json.load(f)
+            cfg = yaml.safe_load(f)                 # how train.py reads it: 1e-06 is a STRING
+        assert isinstance(cfg["scheduler"]["params"]["eta_min"], float),             f"{name}: eta_min loads as {cfg['scheduler']['params']['eta_min']!r}"
         blocks, fn = loops[cfg["task"]]
         params = inspect.signature(fn).parameters
         seen = set()

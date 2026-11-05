@@ -491,6 +491,38 @@ def gram_or_x(E, x, planar=False):
     return E.gram(x)
 
 
+SCALE_STATS = ("p99", "ram")
+
+
+def _check_scale_norm(v):
+    if v is None or v is False:
+        return None
+    if v is True:
+        return "ram"
+    if v not in SCALE_STATS:
+        raise ValueError(f"scale_norm must be false, true (= 'ram') or one of {SCALE_STATS}, "
+                         f"got {v!r}")
+    return v
+
+
+@torch.no_grad()
+def scale_statistic(y, E, kind):
+    """The per-image scale `scale_norm` divides by, (B,). Homogeneous of degree 1 in y,
+    so the net stays exactly scale-equivariant; it depends on y only, never on a weight."""
+    if kind == "ram":
+        return ram_signal_level(y)
+    if kind == "p99":
+        B = y.shape[0]
+        xa = E.adjoint(y) if not isinstance(E, Identity) else y
+        mag = xa.abs().reshape(B, -1).float()
+        if isinstance(E, Identity):
+            g = torch.ones(B, device=y.device)
+        else:
+            g = E.adjoint(E(torch.ones_like(xa))).real.reshape(B, -1).mean(1).float()
+        return torch.quantile(mag, 0.99, dim=1) / g.clamp_min(1e-12)
+    raise ValueError(f"unknown scale statistic {kind!r}")
+
+
 def _scale_sigma(sigma, s):
     """`sigma / s` per image, for `scale_norm`: sigma a float, a 0-d tensor, (B,),
     (B, 1, 1, 1) or a (B, 1, H, W) map; s is (B,). None stays None (noise-blind)."""
@@ -793,16 +825,22 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
                  cg_fact_init=1.0, scale_norm=False):
         super().__init__()
         # scale_norm (exp22, 2026-11-05): run the net on y / s with noise level sigma / s,
-        # s = RAM's signal statistic mean(|Re y|, |Im y|) per image (models/cg_init.py::
-        # ram_signal_level), and scale the result back by s. Everything but the thresholds
-        # is linear, so this makes the net exactly scale-equivariant: f(c y, c sigma) =
-        # c f(y, sigma). Without it a threshold's constant term (lam0) is in absolute data
-        # units and means something different on a bright volume than on a dim one; with it
-        # thresholds read sigma / s, RAM's 1/snr. Adds no parameter, so lam0 must be given
-        # in normalized units. A state handed in, and the (x, z) returned, stay in data units.
-        if not isinstance(scale_norm, bool):
-            raise ValueError(f"scale_norm must be true or false, got {scale_norm!r}")
-        self.scale_norm = scale_norm
+        # and scale the result back by s. Everything but the thresholds is linear, so this
+        # makes the net exactly scale-equivariant, f(c y, c sigma) = c f(y, sigma), whatever
+        # s is. Without it a threshold's constant term (lam0) is in absolute data units and
+        # means something different on a bright slice than on a dim one; with it thresholds
+        # read sigma / s. The statistic (`SCALE_STATS`) decides whether a threshold then
+        # means the same on every slice:
+        #   "p99"  99th percentile of |E^H y| / mean(E^H E 1): the zero-filled image's
+        #          bright-tissue level, the sampled fraction divided out. Tracks the
+        #          reference's own 99th percentile to 1.3x (10-90%) on knee R8, against
+        #          2.2x for "ram" (scripts/scale_stat_compare.py, 2026-11-05).
+        #   "ram"  RAM's mean(|Re y|, |Im y|) over all k-space (models/cg_init.py::
+        #          ram_signal_level). Scales with object coverage and with the mask.
+        # True means "ram" (the first exp22 configs), False / None is off. Adds no
+        # parameter, so lam0 must be given in normalized units. A state handed in, and the
+        # (x, z) returned, stay in data units.
+        self.scale_norm = _check_scale_norm(scale_norm)
         # cg_init (exp21, 2026-11-03): start from RAM's realigned input, CG-SENSE at
         # deepinv's defaults (models/cg_init.py), instead of E^H y. Layer 0 still
         # spends its sweep forming z from that x, so the layer count is unchanged.
@@ -880,7 +918,7 @@ class MGLPDSNet(LevelTraceMixin, nn.Module):
             E = Identity()
         if not self.scale_norm:
             return self._forward(y, E, sigma, state)
-        s = ram_signal_level(y).clamp_min(1e-12).to(y.real.dtype)        # (B,)
+        s = scale_statistic(y, E, self.scale_norm).clamp_min(1e-12).to(y.real.dtype)  # (B,)
         sb = s.view(-1, 1, 1, 1)
         # The levels a trace records live in normalized units; level_images rescales them.
         self.last_scale = sb.detach()

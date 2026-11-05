@@ -195,6 +195,20 @@ def config_path(root, r, model, g):
     return os.path.join(root, ANATOMY, "guided", f"{cell_name(r, model, g)}.json")
 
 
+def _write_config():
+    """training/config_io.py::write_config, loaded BY PATH (as make_mg_recon_configs.py does):
+    it spells floats so yaml.safe_load -- how train.py reads configs -- gets numbers back
+    (json.dump's `1e-06` loads as the STRING '1e-06'), and refuses a config that would not
+    round-trip. By path, because `import training...` would run training/__init__.py
+    (torchvision)."""
+    import importlib.util
+    p = os.path.join(REPO, "training", "config_io.py")
+    spec = importlib.util.spec_from_file_location("_immap_config_io", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.write_config
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -206,6 +220,7 @@ def main():
     p.add_argument("--list-cells", action="store_true",
                    help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name' and exit")
     args = p.parse_args()
+    write_config = _write_config()
 
     todo = cells(args.accels, args.models, args.guide_accels)
     if args.list_cells:
@@ -220,9 +235,7 @@ def main():
             cfg = make_config(r, m, g, grid)
             path = config_path(args.out, r, m, g)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", newline="\n") as f:
-                json.dump(cfg, f, indent=4)
-                f.write("\n")
+            write_config(cfg, path)
             print(f"{path}: {cfg['task']} {cfg['model']['type']} R={r} guide_R={g} "
                   f"lr={cfg['optimizer']['params']['lr']}")
 

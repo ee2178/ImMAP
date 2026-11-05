@@ -13,7 +13,8 @@ Run with `python -m tests.test_scale_norm`. CPU, a few seconds.
    scale_norm=False is bit-identical to a net built without the key.
 4. It is the plain net on normalized inputs: scale_norm(y, sigma) = s . plain(y/s, sigma/s).
 5. A state handed in is in data units: the warm start round-trips.
-6. The exp22 cells build, change only what they say, and have names of their own.
+6. The exp22 cells build (scale_norm "p99"), change only what they say, and have names of
+   their own; True still means "ram"; p99 matches its definition.
 7. Level traces are in data units: `level_images` still finds a constant DC, and the
    finest level + DC is the output.
 """
@@ -27,6 +28,7 @@ import sys
 import torch
 
 from models.cg_init import ram_gamma, ram_signal_level
+from models.mg_lpds import scale_statistic
 from tests.test_cg_init import FAIL, check, problem, rel
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
@@ -64,8 +66,9 @@ def equivariance_checks():
     E, y, sig = problem(B=2)
     c = torch.tensor([7.0, 0.05])
     cy = y * c.view(-1, 1, 1, 1)
-    for name in NETS:
-        net = build(name, scale_norm=True)
+    for name, kind in [(n, k) for n in NETS for k in ("ram", "p99")]:
+        net = build(name, scale_norm=kind)
+        name = f"{name}/{kind}"
         for label, s0, s1 in (("(B,)", sig, sig * c),
                               ("(B,1,1,1)", sig.view(-1, 1, 1, 1), (sig * c).view(-1, 1, 1, 1))):
             a, (xa, za) = net(y, E=E, sigma=s0)
@@ -78,16 +81,16 @@ def equivariance_checks():
         b, _ = net(y * 3.0, E=E, sigma=0.045)
         check(f"2. {name}: float sigma", rel(b, 3.0 * a) < 1e-4, f"{rel(b, 3.0 * a):.1e}")
 
-        plain = build(name)
+        plain = build(name.split("/")[0])
         a, _ = plain(y, E=E, sigma=sig)
         b, _ = plain(cy, E=E, sigma=sig * c)
         check(f"3. {name}: the plain net is NOT equivariant", rel(b, a * c.view(-1, 1, 1, 1)) > 1e-3,
               f"{rel(b, a * c.view(-1, 1, 1, 1)):.1e}")
-        off = build(name, scale_norm=False)
+        off = build(name.split("/")[0], scale_norm=False)
         check(f"3. {name}: scale_norm=False is the plain net",
               torch.equal(off(y, E=E, sigma=sig)[0], a))
 
-        s = ram_signal_level(y)
+        s = scale_statistic(y, E, kind)
         ref, _ = plain(y / s.view(-1, 1, 1, 1), E=E, sigma=sig / s)
         out, _ = net(y, E=E, sigma=sig)
         check(f"4. {name}: = s . plain(y / s, sigma / s)", rel(out, ref * s.view(-1, 1, 1, 1)) < 1e-5)
@@ -101,7 +104,7 @@ def equivariance_checks():
 @torch.no_grad()
 def trace_checks():
     E, y, sig = problem(B=1, H=48, W=48, sigma=(0.015,))
-    net = build("vcycle", scale_norm=True)
+    net = build("vcycle", scale_norm="p99")
     out, imgs = net.forward_level_images(y, E=E, sigma=sig)
     ok = imgs is not None and float((imgs[0] - out[0]).abs().max() / out[0].abs().max()) < 1e-5
     check("7. level_images under scale_norm: finest level + DC = output", ok)
@@ -116,14 +119,20 @@ def generator_checks():
         same_spec = {k: v for k, v in a.items() if k != "params"} == {k: v for k, v in b.items() if k != "params"}
         check(f"6. {cell} = {src} + {sorted(extra)}", diff == set(extra) and same_spec, str(diff))
         net = build_model({"model": {"type": a["type"], "params": a["params"]}})
-        check(f"6. {cell} builds with scale_norm on", net.scale_norm is True)
+        check(f"6. {cell} builds with scale_norm p99", net.scale_norm == "p99")
         check(f"6. {cell} is OPT_IN", cell in gen.OPT_IN)
-        names.add(gen._display_name(a["type"], a["params"]) + "_sn")
+        names.add(gen._display_name(a["type"], a["params"]) + "_snp99")
     taken = {gen._display_name(gen.MODELS[c]["type"], gen.MODELS[c]["params"])
              for c in gen.EXP18_CELLS + gen.EXP20_CELLS}
     check("6. exp22 run names are distinct", len(names) == len(gen.EXP22) and not names & taken,
           str(sorted(names)))
     from models.mg_lpds import MGLPDSNet
+    check("6. scale_norm=True still means 'ram'", MGLPDSNet(**NETS["flat"], scale_norm=True).scale_norm == "ram")
+    E, y, _ = problem(B=2)
+    xa = E.adjoint(y).abs().reshape(2, -1)
+    g = E.adjoint(E(torch.ones_like(E.adjoint(y)))).real.reshape(2, -1).mean(1)
+    check("6. p99 = quantile(|E^H y|, .99) / mean(E^H E 1)",
+          rel(scale_statistic(y, E, "p99"), torch.quantile(xa, 0.99, dim=1) / g) < 1e-6)
     try:
         MGLPDSNet(**NETS["flat"], scale_norm="yes")
         check("6. a non-bool scale_norm is refused", False)

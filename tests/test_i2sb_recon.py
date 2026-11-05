@@ -284,8 +284,10 @@ def test_shipped_configs_reach_the_loop_and_build():
     params = inspect.signature(train_i2sb_recon).parameters
     for anat in ("brain", "knee"):
         path = os.path.join(REPO, "config", anat, "i2sb", "unet_R8.json")
+        import yaml
         with open(path) as f:
-            cfg = json.load(f)
+            cfg = yaml.safe_load(f)                 # how train.py reads it: 1e-06 is a STRING
+        assert isinstance(cfg["scheduler"]["params"]["eta_min"], float),             f"{anat}: eta_min loads as {cfg['scheduler']['params']['eta_min']!r}"
         assert cfg["task"] == "i2sb_recon"
         blocks = [cfg["training"], cfg["mri"], cfg["i2sb"], cfg["paths"]]
         seen = set()
