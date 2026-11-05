@@ -40,6 +40,14 @@ Usage
         --shard 3 --num-shards 8
 
     --dry-run lists what would be written and computes nothing.
+
+PAIRED (GUIDED) DATA. `--pairs-csv` takes the volumes from TGVN-style pair CSVs (columns
+`pd,pdfs`; config/knee/guided/splits/*.csv) instead of an existing maps directory -- the PDFS knee
+volumes have none -- and `--contrast` picks the column. Those splits draw from fastMRI's train AND
+val folders, so every file is looked up in each of `--kspace-roots`. `--out` is required, and
+--anatomy / --split only label the log:
+
+    python scripts/make_espirit_smaps.py --anatomy knee         --pairs-csv config/knee/guided/splits/{train,val,test}.csv --contrast pdfs         --kspace-roots ../datasets/fastmri/knee/multicoil_train                        ../datasets/fastmri/knee/multicoil_val         --out ../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32 --acs 32
 """
 
 from __future__ import annotations
@@ -151,13 +159,84 @@ def stats(smaps, image, kspace, device):
 
 
 # ---------------------------------------------------------------------------
+def _split_files(args):
+    """(files, kroot_of, kroot, sroot, out) for one fastMRI split, as originally."""
+    kroot = args.kspace_root or KSPACE[args.anatomy].format(split=args.split)
+    sroot = args.smap_root or SMAPS[args.anatomy].format(split=args.split)
+    out = args.out or (sroot if args.overwrite else sroot.rstrip("/") + "_espirit")
+
+    if os.path.abspath(out) == os.path.abspath(sroot) and not args.overwrite:
+        raise SystemExit("--out equals the input maps; pass --overwrite to mean it.")
+    if not os.path.isdir(kroot):
+        raise SystemExit(f"missing: {kroot}")
+
+    # The existing map directory defines the split. Enumerating the raw kspace
+    # root instead would silently pull in volumes this split excludes.
+    #
+    # The Walsh maps may have been DELETED to free disk for these ones, so the
+    # split can also come from a file list saved beforehand: `--file-list`, or
+    # `<smap-root>.files` beside the old directory (one .h5 name per line).
+    # ESPIRiT never reads the Walsh maps themselves -- it works from k-space --
+    # so the names are all this needs from them.
+    flist = args.file_list or sroot.rstrip("/") + ".files"
+    if os.path.isdir(sroot):
+        files = sorted(f for f in os.listdir(sroot) if f.endswith(".h5"))
+    elif os.path.isfile(flist):
+        with open(flist) as fh:
+            files = sorted(ln.strip() for ln in fh if ln.strip().endswith(".h5"))
+        print(f"  {sroot} is gone; split taken from {flist}")
+    else:
+        raise SystemExit(
+            f"missing: {sroot}, and no file list at {flist}. The split is defined "
+            f"by the old maps' file names; restore the directory or write the "
+            f"list (one .h5 name per line) and pass --file-list.")
+
+    return files, {f: kroot for f in files}, kroot, sroot, out
+
+
+def _pairs_files(args):
+    """(files, kroot_of, sroot, out) for the --contrast column of TGVN pair CSVs: the union over
+    the CSVs, each file found in the first of --kspace-roots that has it."""
+    import csv
+    if not args.out:
+        raise SystemExit("--pairs-csv needs --out: there is no existing maps root to derive it from")
+    if not args.kspace_roots:
+        raise SystemExit("--pairs-csv needs --kspace-roots")
+    names = []
+    for path in args.pairs_csv:
+        with open(path, newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        if not rows or set(rows[0]) != {"pd", "pdfs"}:
+            raise SystemExit(f"{path}: expected columns 'pd,pdfs'")
+        names += [os.path.basename(r[args.contrast]) for r in rows]
+    files = sorted(set(names))
+    kroot_of, missing = {}, []
+    for f in files:
+        hit = next((r for r in args.kspace_roots if os.path.exists(os.path.join(r, f))), None)
+        if hit is None:
+            missing.append(f)
+        kroot_of[f] = hit
+    if missing:
+        raise SystemExit(f"{len(missing)} of {len(files)} {args.contrast} volumes are in none of "
+                         f"{args.kspace_roots}, e.g. {missing[:3]}")
+    return files, kroot_of, f"(pairs: {', '.join(args.pairs_csv)}, {args.contrast})", args.out
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--anatomy", choices=("brain", "knee"), required=True)
-    p.add_argument("--split", choices=("train", "val"), required=True)
+    p.add_argument("--split", choices=("train", "val"), default=None,
+                   help="required unless --pairs-csv is given")
     p.add_argument("--kspace-root", default=None)
+    p.add_argument("--pairs-csv", nargs="*", default=None,
+                   help="TGVN-style pair CSVs (pd,pdfs); the volumes of --contrast in them, "
+                        "instead of an existing maps directory")
+    p.add_argument("--contrast", choices=("pd", "pdfs"), default="pdfs",
+                   help="with --pairs-csv: which column's volumes to map")
+    p.add_argument("--kspace-roots", nargs="*", default=None,
+                   help="with --pairs-csv: k-space directories, searched in order per file")
     p.add_argument("--smap-root", default=None,
                    help="the EXISTING maps; read only, to enumerate the files "
                         "that belong to this split")
@@ -189,40 +268,18 @@ def main():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
-    kroot = args.kspace_root or KSPACE[args.anatomy].format(split=args.split)
-    sroot = args.smap_root or SMAPS[args.anatomy].format(split=args.split)
-    out = args.out or (sroot if args.overwrite else sroot.rstrip("/") + "_espirit")
-
-    if os.path.abspath(out) == os.path.abspath(sroot) and not args.overwrite:
-        raise SystemExit("--out equals the input maps; pass --overwrite to mean it.")
-    if not os.path.isdir(kroot):
-        raise SystemExit(f"missing: {kroot}")
-
-    # The existing map directory defines the split. Enumerating the raw kspace
-    # root instead would silently pull in volumes this split excludes.
-    #
-    # The Walsh maps may have been DELETED to free disk for these ones, so the
-    # split can also come from a file list saved beforehand: `--file-list`, or
-    # `<smap-root>.files` beside the old directory (one .h5 name per line).
-    # ESPIRiT never reads the Walsh maps themselves -- it works from k-space --
-    # so the names are all this needs from them.
-    flist = args.file_list or sroot.rstrip("/") + ".files"
-    if os.path.isdir(sroot):
-        files = sorted(f for f in os.listdir(sroot) if f.endswith(".h5"))
-    elif os.path.isfile(flist):
-        with open(flist) as fh:
-            files = sorted(ln.strip() for ln in fh if ln.strip().endswith(".h5"))
-        print(f"  {sroot} is gone; split taken from {flist}")
+    if args.pairs_csv:
+        files, kroot_of, sroot, out = _pairs_files(args)
+        kroot = ", ".join(args.kspace_roots)
     else:
-        raise SystemExit(
-            f"missing: {sroot}, and no file list at {flist}. The split is defined "
-            f"by the old maps' file names; restore the directory or write the "
-            f"list (one .h5 name per line) and pass --file-list.")
+        if args.split is None:
+            raise SystemExit("--split is required without --pairs-csv")
+        files, kroot_of, kroot, sroot, out = _split_files(args)
     files = files[args.shard::args.num_shards]
     if not files:
-        raise SystemExit(f"no .h5 in {sroot} for shard {args.shard}")
+        raise SystemExit(f"no volumes for shard {args.shard}/{args.num_shards}")
 
-    print(f"anatomy={args.anatomy} split={args.split} "
+    print(f"anatomy={args.anatomy} split={args.split or args.contrast} "
           f"shard {args.shard}/{args.num_shards}")
     print(f"  kspace in  {kroot}")
     print(f"  maps in    {sroot}")
@@ -248,7 +305,7 @@ def main():
             skipped += 1
             continue
 
-        with h5py.File(os.path.join(kroot, fname), "r") as f:
+        with h5py.File(os.path.join(kroot_of[fname], fname), "r") as f:
             kspace = np.asarray(f["kspace"])
         if kspace.ndim != 4:
             print(f"  [{i}] {fname}: unexpected kspace {kspace.shape} -- skipped")
@@ -271,7 +328,7 @@ def main():
             f.attrs.update(dict(
                 method="espirit", acs=args.acs, kernel_size=args.kernel_size,
                 thresh_eig=args.thresh_eig, thresh_rowspace=args.thresh_rowspace,
-                source_kspace=os.path.join(kroot, fname),
+                source_kspace=os.path.join(kroot_of[fname], fname),
                 # Written by the kernel-flip-corrected espirit(); tells
                 # scripts/fix_espirit_flip.py to leave this file alone.
                 orientation_fixed=True))
