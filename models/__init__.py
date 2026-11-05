@@ -25,7 +25,7 @@ from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
 from .sb_unet_lggs import SBUnetLGGS
 from .sb_recon_unet import SBReconUnet
-from .tgvn import TGVN
+from .tgvn import TGVN, BridgeTGVN
 from .unsb_nets import PatchDiscriminator, PatchEncoder, FeatureTap, PatchNCE, build_critics
 from .forward_ops import ForwardOp
 
@@ -107,6 +107,11 @@ def build_model(cfg):
     # paper's matched image-domain E2E-VarNet (no side information).
     elif model_type == "TGVN":
         return TGVN(**params)
+
+    # TGVN as an I2SB x0-regressor (task "i2sb_recon"): known maps, complex output, cascades
+    # started at x_t, Phi conditioned on the bridge position. Schedule params match cfg["i2sb"].
+    elif model_type == "BridgeTGVN":
+        return BridgeTGVN(**params)
 
     # Multi*level* family (models/ml_cdlnet.py): the hierarchy is the MODEL
     # (x = D_1 D_2 ... D_L g_L), not a solver device, so the transfer operators

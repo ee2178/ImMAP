@@ -37,20 +37,24 @@ def bridge_start(y, E, source="adjoint"):
     raise ValueError(f"x1_source {source!r} not supported; use one of {X1_SOURCES}")
 
 
-def predict_x0_recon(net, x_t, sigma, x1=None, y=None, E=None, sigma_n=None):
-    """Run a recon bridge regressor; returns the complex x0 estimate."""
-    out, _ = net(x_t, sigma=sigma, x1=x1, y=y, E=E, sigma_n=sigma_n)
+def predict_x0_recon(net, x_t, sigma, x1=None, y=None, E=None, sigma_n=None, guide=None):
+    """Run a recon bridge regressor; returns the complex x0 estimate. `guide` (side
+    information, guided regressors only) is passed only when there is one."""
+    kw = {} if guide is None else {"guide": guide}
+    out, _ = net(x_t, sigma=sigma, x1=x1, y=y, E=E, sigma_n=sigma_n, **kw)
     return out
 
 
 @torch.no_grad()
 def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoint", nfe=None,
-                      deterministic=False, posterior="ddpm", log_count=1, verbose=True):
+                      deterministic=False, posterior="ddpm", log_count=1, verbose=True,
+                      guide=None):
     """Reconstruct x0 from (y, E) along the reverse bridge.
 
-    `x1` defaults to bridge_start(y, E, x1_source); pass it to reuse one already built. y, E and
-    sigma_n are held fixed along the whole trajectory. Returns (recon, xs, pred_x0s), as
-    sb.base.reverse_sample (no clip_denoise: a complex image has no [-1, 1] box)."""
+    `x1` defaults to bridge_start(y, E, x1_source); pass it to reuse one already built. y, E,
+    sigma_n and the guide (side information) are held fixed along the whole trajectory.
+    Returns (recon, xs, pred_x0s), as sb.base.reverse_sample (no clip_denoise: a complex image
+    has no [-1, 1] box)."""
     device = sched.std_fwd.device
     x1 = bridge_start(y, E, x1_source) if x1 is None else x1
     x1 = x1.to(device)
@@ -58,7 +62,8 @@ def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoin
     def pred_x0_fn(x_t, step):
         step_t = torch.full((x_t.shape[0],), step, device=device, dtype=torch.long)
         sigma = forward_std(sched, step_t, xdim=x_t.shape[1:])
-        return predict_x0_recon(net, x_t, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n)
+        return predict_x0_recon(net, x_t, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n,
+                                guide=guide)
 
     return reverse_sample(sched, pred_x0_fn, x1, nfe=nfe, deterministic=deterministic,
                           posterior=posterior, clip_denoise=False, log_count=log_count,

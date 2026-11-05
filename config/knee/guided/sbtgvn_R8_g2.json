@@ -1,21 +1,26 @@
 {
-    "task": "recon",
+    "task": "i2sb_recon",
     "experiment": {
-        "name": "guided_knee_PDFS_from_PD_varnet_img_R8"
+        "name": "guided_knee_PDFS_from_PD_sbtgvn_R8_g2"
     },
     "model": {
-        "type": "TGVN",
+        "type": "BridgeTGVN",
         "params": {
-            "guided": false,
+            "guided": true,
+            "cond_sigma": true,
             "num_cascades": 12,
             "sens_chans": 8,
             "sens_pools": 4,
             "chans": 18,
-            "pools": 4
+            "pools": 4,
+            "kind": "brownian",
+            "tau": 0.1,
+            "n_points": 1000,
+            "beta_max": 0.3
         }
     },
     "paths": {
-        "save_dir": "trained_nets/guided_recon/knee/varnet_img_R8",
+        "save_dir": "trained_nets/guided_recon/knee/sbtgvn_R8_g2",
         "ckpt": null
     },
     "data": {
@@ -61,7 +66,7 @@
         "noise_dist": "uniform",
         "val_noise_std": 0.015,
         "val_seed": 1234,
-        "loss_type": "magnitude-nl1-nl2",
+        "loss_type": "complex-mse",
         "clip_grad": 0.05,
         "use_organ_mask": false,
         "backtrack_thresh": null,
@@ -81,7 +86,10 @@
             "thresh_eig": 0.0,
             "kernel_size": 4,
             "maxit": 10
-        }
+        },
+        "guide_R": 2,
+        "guide_acs_lines": 0,
+        "guide_mask_dist": "uniform"
     },
     "optimizer": {
         "type": "Adam",
@@ -99,5 +107,17 @@
     "wandb": {
         "project": "guided_recon",
         "id": null
+    },
+    "i2sb": {
+        "kind": "brownian",
+        "tau": 0.1,
+        "n_points": 1000,
+        "beta_max": 0.3,
+        "deterministic": false,
+        "posterior": "ddpm",
+        "x1_source": "adjoint",
+        "x0_source": "operator",
+        "val_mode": "full_recon",
+        "val_nfe": 20
     }
 }

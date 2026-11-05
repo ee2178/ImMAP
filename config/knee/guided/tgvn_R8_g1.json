@@ -1,12 +1,13 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "guided_knee_PDFS_from_PD_tgvn_R8"
+        "name": "guided_knee_PDFS_from_PD_tgvn_R8_g1"
     },
     "model": {
         "type": "TGVN",
         "params": {
             "guided": true,
+            "cond_sigma": true,
             "num_cascades": 12,
             "sens_chans": 8,
             "sens_pools": 4,
@@ -15,7 +16,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/guided_recon/knee/tgvn_R8",
+        "save_dir": "trained_nets/guided_recon/knee/tgvn_R8_g1",
         "ckpt": null
     },
     "data": {
@@ -81,7 +82,10 @@
             "thresh_eig": 0.0,
             "kernel_size": 4,
             "maxit": 10
-        }
+        },
+        "guide_R": 1,
+        "guide_acs_lines": 0,
+        "guide_mask_dist": "uniform"
     },
     "optimizer": {
         "type": "Adam",

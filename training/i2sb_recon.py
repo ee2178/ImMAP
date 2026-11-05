@@ -68,7 +68,7 @@ from training.common import backtrack as do_backtrack, resync_schedule
 from training.i2sb import _bridge_loss
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
-from training.recon import _ckpt_field
+from training.recon import _check_paired, _ckpt_field, _guide, _unpack
 from visualization.image import recon_panel
 from visualization.params import get_param_logs
 from visualization.wandb_image import wandb_image
@@ -80,12 +80,17 @@ X0_SOURCES = ("operator", "stored")
 
 def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center_frac,
              adjust_accel, kspace_type, noise_std, noise_dist, online_smaps, online_smaps_kws,
-             x1_source, x0_source="operator", generator=None):
-    """One recon batch -> (x0, x1, y, E, sigma_n, organ_mask, gt), all on `device`.
+             x1_source, x0_source="operator", guide_R=1, guide_acs_lines=0,
+             guide_mask_dist="uniform", guide_offset=0, generator=None):
+    """One recon batch -> (x0, x1, y, E, sigma_n, organ_mask, gt, guide), all on `device`.
 
     x0 is the bridge target (see `x0_source` in the module docstring); gt is the stored image,
-    the ground truth metrics are scored against."""
-    kspace, smaps, image, organ_mask, pad_hw = batch
+    the ground truth metrics are scored against. guide is what the net takes from a paired
+    loader's side k-space (training/recon.py::_guide: undersampled per guide_R, routed by the
+    net's guide_domain), or None."""
+    kspace, smaps, image, organ_mask, pad_hw, side = _unpack(batch)
+    if side is not None:
+        _check_paired(net, kspace_type, online_smaps)
     kspace = kspace.to(device, non_blocking=True)
     smaps = smaps.to(device, non_blocking=True)
     image = image.to(device, non_blocking=True)
@@ -116,7 +121,9 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
     x0 = image
     if x0_source == "operator" and online_smaps and kspace_type != "simulated":
         x0 = Sense(extra["smaps"]).adjoint(ifftc(kspace))
-    return x0, x1, y, E, sigma_n, organ_mask, image
+    guide = _guide(net, side, extra["smaps"], T, device, guide_R, guide_acs_lines,
+                   guide_mask_dist, guide_offset)
+    return x0, x1, y, E, sigma_n, organ_mask, image, guide
 
 
 def train_i2sb_recon(
@@ -159,6 +166,9 @@ def train_i2sb_recon(
     center_frac=None,
     adjust_accel=False,
     val_kspace_type=None,
+    guide_R=1,                       # paired data only: side-scan acceleration, 1 = fully
+    guide_acs_lines=0,               # sampled; see training/recon.py::undersample_guide
+    guide_mask_dist="uniform",
     # ---- I2SB method (cfg["i2sb"]) ----
     kind="brownian",
     tau=0.1,
@@ -202,7 +212,8 @@ def train_i2sb_recon(
     meas = dict(R=R, acs_lines=acs_lines, mask_dist=mask_dist, mask_offset=mask_offset,
                 center_frac=center_frac, adjust_accel=adjust_accel, noise_dist=noise_dist,
                 online_smaps=online_smaps, online_smaps_kws=online_smaps_kws,
-                x1_source=x1_source, x0_source=x0_source)
+                x1_source=x1_source, x0_source=x0_source, guide_R=guide_R,
+                guide_acs_lines=guide_acs_lines, guide_mask_dist=guide_mask_dist)
 
     ema = None
     if ema_decay:
@@ -255,14 +266,16 @@ def train_i2sb_recon(
                 except StopIteration:
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
-                x0, x1, y, E, sigma_n, organ_mask, gt = _measure(
-                    batch, net, device, kspace_type=kspace_type, noise_std=noise_std, **meas)
+                x0, x1, y, E, sigma_n, organ_mask, gt, guide = _measure(
+                    batch, net, device, kspace_type=kspace_type, noise_std=noise_std,
+                    guide_offset="random", **meas)
 
                 b = x0.shape[0]
                 step = torch.randint(0, interval, (b,), device=device)
                 x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
                 std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
-                pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n)
+                pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
+                                        guide=guide)
                 loss = _bridge_loss(loss_fn, loss_type, x0, pred, organ_mask, use_organ_mask,
                                     None, 1.0, std_fwd, loss_weight,
                                     loss_weight_max=loss_weight_max)
@@ -374,20 +387,21 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
     last = None
 
     for batch in val_loader:
-        x0, x1, y, E, sigma_n, organ_mask, gt = _measure(
+        x0, x1, y, E, sigma_n, organ_mask, gt, guide = _measure(
             batch, net, device, kspace_type=kspace_type, noise_std=noise_std, generator=gen,
-            **meas)
+            guide_offset=0, **meas)
         bs = x0.shape[0]
         if val_mode == "full_recon":
             pred, _, _ = i2sb_recon_sample(net, y, E, bridge, sigma_n=sigma_n, x1=x1,
                                            nfe=val_nfe, deterministic=deterministic,
-                                           posterior=posterior, verbose=False)
+                                           posterior=posterior, verbose=False, guide=guide)
             std_fwd = torch.zeros(bs, 1, 1, 1, device=device)
         else:
             step = torch.randint(0, interval, (bs,), generator=gen, device=device)
             x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
-            pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n)
+            pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
+                                    guide=guide)
         # unweighted in both modes, so val/loss is comparable across loss_weight settings
         loss = _bridge_loss(loss_fn, loss_type, x0, pred, organ_mask, use_organ_mask,
                             None, 1.0, std_fwd, "uniform")

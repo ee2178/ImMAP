@@ -242,14 +242,31 @@ def _check_paired(net, kspace_type, online_smaps):
                          f"has none: set mri.online_smaps ('espirit' or 'walsh')")
 
 
-def _guide(net, side, smaps, T, device):
-    """The guide `net` consumes from the side k-space, or None."""
+def undersample_guide(side, guide_R=1, guide_acs_lines=0, guide_mask_dist="uniform",
+                      guide_offset=0):
+    """The side k-space as an ACCELERATED guide scan would acquire it, or as is at guide_R = 1.
+
+    Defaults follow TGVN's knee side scans: equispaced phase-encode lines with NO fully-sampled
+    centre (EquiSpacedMaskFunc, center_fractions=[0]); `guide_offset="random"` redraws the line
+    phase per call as fastMRI's mask function does in training -- pass a fixed offset at
+    validation. No noise is added: the guide is the raw side measurement."""
+    if side is None or float(guide_R) == 1:
+        return side
+    m = get_mask(side[:, :1], R=guide_R, acs_lines=int(guide_acs_lines), mode=guide_mask_dist,
+                 offset=guide_offset)
+    return m * side
+
+
+def _guide(net, side, smaps, T, device, guide_R=1, guide_acs_lines=0, guide_mask_dist="uniform",
+           guide_offset=0):
+    """The guide `net` consumes from the side k-space (undersampled per guide_R), or None."""
     if not _wants_guide(net):
         return None
     if side is None:
         raise ValueError(f"{type(net).__name__} is a guided model but the loader provides no "
                          f"side information; use a paired loader (data name 'fastmri_paired')")
-    side = side.to(device, non_blocking=True)
+    side = undersample_guide(side.to(device, non_blocking=True), guide_R, guide_acs_lines,
+                             guide_mask_dist, guide_offset)
     if getattr(net, "guide_domain", "image") == "kspace":
         return side
     g = Sense(smaps).adjoint(ifftc(side))
@@ -288,6 +305,12 @@ def train_recon(
     # R of 8.2. `center_frac` is its ACS-as-a-fraction convention.
     center_frac=None,
     adjust_accel=False,
+    # GUIDE (side scan) acceleration, for paired data: 1 = fully sampled. The guide is
+    # undersampled with equispaced lines, `guide_acs_lines` centre lines (TGVN: none), a fresh
+    # line phase per training step and offset 0 at validation. See undersample_guide.
+    guide_R=1,
+    guide_acs_lines=0,
+    guide_mask_dist="uniform",
     noise_std=(0.0, 0.01),
     noise_dist="uniform",
     # Validation noise. `val_noise_std=None` redraws from `noise_std` like
@@ -504,7 +527,8 @@ def train_recon(
             # the scanner used. T crops back and its adjoint zero-pads, so
             # E @ T is exact -- no resampled mask, no reflect-padded maps.
             E, T = _embed(net, E, image, pad_hw)
-            guide = _guide(net, side, smaps, T, device)
+            guide = _guide(net, side, smaps, T, device, guide_R, guide_acs_lines,
+                           guide_mask_dist, guide_offset="random")
             prof.mark("measure")
 
             opt.zero_grad(set_to_none=True)
@@ -738,7 +762,8 @@ def train_recon(
                     smaps_v = extra_v["smaps"]
                     E_v = Mask(mask_v) @ FFT2D() @ Sense(smaps_v)
                     E_v, T_v = _embed(net, E_v, image_v, pad_hw_v)
-                    guide_v = _guide(net, side_v, smaps_v, T_v, device)
+                    guide_v = _guide(net, side_v, smaps_v, T_v, device, guide_R,
+                                     guide_acs_lines, guide_mask_dist, guide_offset=0)
 
                     recon_v, _ = _forward(net, y_v, E_v, sigma_v, guide_v)
                     recon_v = T_v.forward(recon_v)

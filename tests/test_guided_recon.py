@@ -103,12 +103,28 @@ S, C, H, W = 4, 4, 32, 32
 TINY_TGVN = dict(num_cascades=2, sens_chans=4, sens_pools=2, chans=4, pools=2)
 
 
+def _smooth_maps(seed=7):
+    """Smooth unit-RSS coil maps: shared by every synthetic volume, so the tests can hand the
+    TRUE maps to code paths that would estimate them online."""
+    g = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.linspace(-1, 1, H), np.linspace(-1, 1, W), indexing="ij")
+    sm = []
+    for c in range(C):
+        a = 2 * np.pi * c / C
+        sm.append(np.exp(-((yy - 0.7 * np.sin(a)) ** 2 + (xx - 0.7 * np.cos(a)) ** 2))
+                  * np.exp(1j * (g.random() * 2 * np.pi + yy * c)))
+    sm = np.stack(sm)
+    return (sm / np.sqrt((np.abs(sm) ** 2).sum(0, keepdims=True))).astype(np.complex64)
+
+
+MAPS = _smooth_maps()
+
+
 def _vol(g):
     yy, xx = np.meshgrid(np.linspace(-1, 1, H), np.linspace(-1, 1, W), indexing="ij")
     disk = ((yy ** 2 + xx ** 2) < 0.6).astype(np.float32)
     img = disk[None] * (0.5 + 0.5 * g.random((S, H, W)))
-    sm = g.standard_normal((C, H, W)) + 1j * g.standard_normal((C, H, W))
-    sm = sm / np.sqrt((np.abs(sm) ** 2).sum(0, keepdims=True))
+    sm = MAPS
     coils = sm[None] * img[:, None]
     return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(coils, axes=(-2, -1)), norm="ortho"),
                            axes=(-2, -1)).astype(np.complex64), sm.astype(np.complex64)
@@ -265,28 +281,151 @@ def test_train_recon_end_to_end_lggs_gets_the_side_image():
         assert spy.guides and all(g == (1, 1, H, W) for g in spy.guides), spy.guides
 
 
-def test_generator_lggs_point_and_config_keys():
+def test_generator_cells_and_config_keys():
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import make_guided_recon_configs as gen
     from models.guided_lpds import lggs_defaults
+    from training.i2sb_recon import train_i2sb_recon
     assert gen.LGGS_PARAMS == lggs_defaults(attn_backend="flex")[0]
-    params = inspect.signature(tr.train_recon).parameters
-    path = os.path.join(REPO, "config", "knee", "guided", "tgvn_R8.json")
-    if not os.path.exists(path):
+    names = [gen.cell_name(*c) for c in gen.cells()]
+    assert names == ["tgvn_R8_g1", "tgvn_R8_g2", "sbtgvn_R8_g1", "sbtgvn_R8_g2", "lpdsnet_R8"]
+    root = os.path.join(REPO, "config", "knee", "guided")
+    if not os.path.exists(os.path.join(root, "tgvn_R8_g1.json")):
         print("    (skipped key check: run scripts/make_guided_recon_configs.py first)")
         return
-    for m in gen.MODELS:
-        with open(os.path.join(REPO, "config", "knee", "guided", f"{m}_R8.json")) as f:
+    loops = {"recon": (("training", "mri", "paths"), tr.train_recon),
+             "i2sb_recon": (("training", "mri", "i2sb", "paths"), train_i2sb_recon)}
+    for name in names:
+        with open(os.path.join(root, f"{name}.json")) as f:
             cfg = json.load(f)
+        blocks, fn = loops[cfg["task"]]
+        params = inspect.signature(fn).parameters
         seen = set()
-        for block in ("training", "mri", "paths"):
+        for block in blocks:
             for k in cfg[block]:
-                assert k in params, f"{m}: {block}.{k} is not a train_recon argument"
-                assert k not in seen, f"{m}: {k} in two blocks"
+                assert k in params, f"{name}: {block}.{k} is not a {fn.__name__} argument"
+                assert k not in seen, f"{name}: {k} in two blocks"
                 seen.add(k)
         assert cfg["data"]["train"]["name"] == "fastmri_paired"
-        assert set(inspect.signature(get_paired_knee_loader).parameters) >= \
-            set(cfg["data"]["train"]) - {"name"}
+        assert set(inspect.signature(get_paired_knee_loader).parameters) >=             set(cfg["data"]["train"]) - {"name"}
+        if cfg["task"] == "i2sb_recon":
+            for k in ("kind", "tau", "n_points", "beta_max"):
+                assert cfg["model"]["params"][k] == cfg["i2sb"][k], (name, k)
+        assert cfg["mri"]["guide_R"] == (2 if name.endswith("_g2") else 1)
+
+
+def test_guide_undersampling():
+    side = torch.randn(1, C, H, W, dtype=torch.complex64) + 1
+    assert tr.undersample_guide(side, 1) is side
+    g = tr.undersample_guide(side, 2, guide_offset=0)
+    cols = (g[0, 0] != 0).any(dim=0)
+    assert cols.tolist() == [i % 2 == 0 for i in range(W)]            # every 2nd line, no ACS
+    phases = {tuple((tr.undersample_guide(side, 2, guide_offset="random")[0, 0] != 0)
+                    .any(dim=0).tolist()) for _ in range(20)}
+    assert len(phases) == 2                                          # redrawn per call
+    sm = torch.randn(1, C, H, W, dtype=torch.complex64)
+    from operators.truncate import Truncate
+    k = tr._guide(TGVN(**TINY_TGVN), side, sm, Truncate((H, W), (H, W)), "cpu", 2, 0,
+                  "uniform", 0)
+    assert torch.equal(k, g)
+
+
+def test_cond_plane_is_scale_equivariant():
+    from models.tgvn import CondNormUnet
+    torch.manual_seed(0)
+    u = CondNormUnet(4, 2, n_cond=2, noise_channels=(1,)).eval()
+    x = torch.randn(2, 1, H, W, 2)
+    cond = torch.tensor([[0.3, 0.05], [-0.2, 0.02]])
+    with torch.no_grad():
+        u.cond = cond
+        out = u(x)
+        u.cond = cond * torch.tensor([1.0, 7.0])                      # sigma x 7, position kept
+        out7 = u(7.0 * x)
+        u.cond = cond * torch.tensor([1.0, 3.0])                      # sigma moves: output moves
+        out3 = u(x)
+    assert torch.allclose(out7, 7.0 * out, rtol=1e-3, atol=1e-4)
+    assert not torch.allclose(out3, out, atol=1e-5)
+    u.cond = None
+    raises(RuntimeError, lambda: u(x), "cond")
+
+
+def _tiny_batch():
+    with tempfile.TemporaryDirectory() as root:
+        csv, _ = make_data(root)
+        k, _, _, _, _, side = PairedKneeDataset(csv, root, scale_fac=1.0)[0]
+    k, side = k[None], side[None]
+    mask = get_mask_cached(k[:, :1], R=4, acs_lines=4, mode="uniform")
+    return mask * k, side, Mask(mask) @ FFT2D() @ Sense(torch.from_numpy(MAPS)[None])
+
+
+def test_tgvn_cond_and_known_maps():
+    y, side, E = _tiny_batch()
+    net = TGVN(cond_sigma=True, **TINY_TGVN)
+    raises(ValueError, lambda: net(y, E=E, guide=side), "sigma")
+    assert net(y, E=E, sigma=torch.tensor([0.01]), guide=side)[0].shape == (1, 1, H, W)
+    km = TGVN(use_smaps=True, output="complex", **TINY_TGVN)
+    assert km.net.sens_net is None and km.uses_operator_smaps
+    out = km(y, E=E, guide=side)[0]
+    assert out.is_complex() and out.shape == (1, 1, H, W)
+    raises(ValueError, lambda: TGVN(output="complex", **TINY_TGVN), "use_smaps")
+
+
+def test_bridge_tgvn_forward():
+    from models.tgvn import BridgeTGVN
+    from sb.base import build_schedule
+    y, side, E = _tiny_batch()
+    net = BridgeTGVN(tau=0.1, **TINY_TGVN)
+    net.assert_schedule_matches(build_schedule(kind="brownian", tau=0.1, n_points=1000))
+    x_t = E.adjoint(y)
+    out, _ = net(x_t, sigma=build_schedule(tau=0.1).std_fwd[[500]], y=y, E=E,
+                 sigma_n=torch.tensor([0.01]), guide=side)
+    assert out.is_complex() and out.shape == (1, 1, H, W)
+    raises(ValueError, lambda: net(x_t, sigma=None, y=y, E=E, sigma_n=0.01, guide=side),
+           "bridge position")
+
+
+class BridgeSpy(torch.nn.Module):
+    def __init__(self, net):
+        super().__init__()
+        self.net, self.guides = net, []
+        for a in ("guided", "guide_domain", "uses_operator_smaps", "pad_stride"):
+            setattr(self, a, getattr(net, a))
+
+    def assert_schedule_matches(self, sched):
+        self.net.assert_schedule_matches(sched)
+
+    def forward(self, x_t, sigma=None, x1=None, y=None, E=None, sigma_n=None, guide=None):
+        self.guides.append(guide.detach().clone())
+        return self.net(x_t, sigma=sigma, x1=x1, y=y, E=E, sigma_n=sigma_n, guide=guide)
+
+
+def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
+    from models.tgvn import BridgeTGVN
+    from training.i2sb_recon import train_i2sb_recon
+    import physics.online_smaps as osm
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,
+                                                drop_last=False, scale_fac=1.0, start_slice=1,
+                                                end_slice=3, num_workers=0)
+        spy = BridgeSpy(BridgeTGVN(tau=0.1, **TINY_TGVN))
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
+        try:
+            train_i2sb_recon(spy, torch.optim.Adam(spy.parameters(), lr=1e-4), None, "cpu",
+                             loader(), loader(), num_epochs=1, steps_per_epoch=2,
+                             val_every_epochs=1, R=4, acs_lines=4,
+                             kspace_type="measurement_awgn", online_smaps="espirit",
+                             noise_std=(0.0, 0.01), val_noise_std=0.005, val_seed=0,
+                             loss_type="complex-mse", tau=0.1, val_mode="full_recon",
+                             val_nfe=2, guide_R=2, save_dir=d)
+        finally:
+            osm.online_smaps = real
+        assert len(spy.guides) >= 4                       # 2 train steps + val sampler calls
+        for g in spy.guides:
+            cols = (g[0, 0] != 0).any(dim=0)
+            assert int(cols.sum()) == W // 2, int(cols.sum())          # half the lines
+        assert os.path.exists(os.path.join(d, "net_bestval.ckpt"))
 
 
 def main():

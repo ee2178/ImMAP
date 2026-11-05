@@ -45,10 +45,39 @@ ESPIRiT, uniform center_frac mask, magnitude NL1+NL2, Adam + cosine over 300k ba
 a like-for-like comparison at reduced compute; TGVN's own recipe can be scaled back up later.
 The guide is FULLY SAMPLED for now (how far the side scan can be accelerated is a later study).
 
-- Set 1 (built): multi-contrast knee, PDFS <- PD. `torch/guided_recon_knee.sbatch`,
-  `scripts/make_guided_recon_configs.py`: varnet_img (TGVN's matched no-guide VarNet), tgvn
-  (12 x 18), lggs (published point), R=8 only for now. Loader `fastmri_paired`; target = RSS.
+- Set 1 (built 2026-11-05): multi-contrast knee, PDFS <- PD, R=8. `torch/guided_recon_knee.sbatch`
+  cells from `scripts/make_guided_recon_configs.py` (main R, model, guide R):
+  tgvn_R8_g1, tgvn_R8_g2, sbtgvn_R8_g1, sbtgvn_R8_g2, lpdsnet_R8 (the grid's LPDSNet, no guide).
+  Optional: varnet_img, lggs. Loader `fastmri_paired`; target = RSS of PDFS.
+  - Guide acceleration knob `mri.guide_R` (1 = fully sampled): equispaced, `guide_acs_lines` 0
+    (TGVN's side masks have no centre), line phase redrawn per training step, offset 0 at val.
+  - TGVN gets a noise-level plane in each regularizer Phi (`cond_sigma`; upstream TGVN has no
+    noise input). The plane is sigma / sqrt(tr Cov) of the NormUnet input, so it is in the
+    U-Net's normalized units (scale-equivariant; pinned in tests).
+  - i2sb-TGVN = `BridgeTGVN`: TGVN cascades on the operator's online-ESPIRiT maps (known-maps
+    mode; upstream estimates its own, which a complex bridge cannot use), started at x_t, Phi
+    conditioned on the bridge position (s_log) and sigma_n; complex-MSE loss; x0 in the operator's
+    phase (x0_source "operator"); x1 = E^H y. No bridge-fidelity term yet (roadmap option 2).
+    tau is an unmeasured 0.1 -- run `scripts/calibrate_recon_bridge.py` on the cluster first.
+  - Known asymmetry: plain TGVN learns its maps, BridgeTGVN uses online ESPIRiT. A
+    TGVN(use_smaps=True) control exists if the comparison needs it.
 - Set 2 (later): longitudinal -- TGVN and SB-LGGS (the bridge data fidelity).
+
+## Idea (2026-11-05, not built): dual bridge for jointly accelerated contrasts
+
+Scan time with 20x main + 2x guide is dominated by the guide; accelerate BOTH contrasts at a
+moderate common R instead. Two bridges, zf contrast A -> full A and zf B -> full B, with each
+regressor conditioned on the other bridge's current state, interleaved during sampling. The
+motivation: accelerating the guide pushes TGVN to undo the guide's aliasing in one shot, and a
+two-stage "reconstruct the guide, then condition on it" pipeline can lose detail; the bridges
+refine both together. Notes from discussion:
+- Principled form: a JOINT bridge on (x_A, x_B) with independent per-contrast bridge noise; the
+  regressors learn E[x0_A | x_t^A, x_t^B, y_A, y_B] (and B's). Training draws both states at the
+  same t from the joint pairs, so the reverse process is consistent; interleaving (update A, then
+  B on A's newer state) is a Gauss-Seidel sampler variant of it.
+- A TGVN-style regressor fits: DC on its own k-space, trust guidance with the OTHER bridge's
+  current state as the side image.
+- Optional asymmetric times (t_A != t_B) let a bridge condition on a cleaner partner.
 
 ## Integration plan (ImMAP side)
 

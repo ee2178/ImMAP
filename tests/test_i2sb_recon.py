@@ -262,8 +262,10 @@ def test_bridge_target_follows_the_operator_maps():
                     online_smaps_kws=None, x1_source="adjoint")
         batch = (kspace, smaps, image, mask, pad_hw)
         net = make_net()
-        x0, x1, y, E, s, om, gt = tir._measure(batch, net, "cpu", kspace_type="measurement_awgn",
-                                               noise_std=0.0, x0_source="operator", **meas)
+        x0, x1, y, E, s, om, gt, guide = tir._measure(batch, net, "cpu",
+                                                      kspace_type="measurement_awgn",
+                                                      noise_std=0.0, x0_source="operator", **meas)
+        assert guide is None                                          # 5-tuple batch: no side
         assert torch.allclose(gt, image)
         assert torch.allclose(x0, image * phase.conj(), atol=1e-5)
         assert torch.allclose(x0.abs(), gt.abs(), atol=1e-5)
