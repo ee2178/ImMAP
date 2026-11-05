@@ -35,7 +35,8 @@ What is set here:
     i2sb-TGVN    BridgeTGVN: the same TGVN, on the operator's (online ESPIRiT) maps, started at
                  x_t, conditioned on the bridge position and sigma_n; complex-MSE loss (the
                  bridge state is complex; the grid's magnitude NL1+NL2 cannot train it). Its
-                 tau is TAU below, measured at R=8 with scripts/calibrate_recon_bridge.py.
+                 tau is TAU below, intensity-relative per slice (TAU_SCALE / TAU_REF);
+                 calibrate with scripts/calibrate_recon_bridge.py.
 
     python scripts/make_guided_recon_configs.py                  # the five default cells
     python scripts/make_guided_recon_configs.py --guide-accels 1 2 4 --models tgvn
@@ -64,8 +65,18 @@ KSPACE_ROOTS = ["../datasets/fastmri/knee/multicoil_train",
 # R (written to BOTH i2sb and model.params). Measured 2026-11-05 with
 # scripts/calibrate_recon_bridge.py on sbtgvn_R8_g1 (knee PDFS, R=8, measured protocol, 60 train
 # slices): RMS 0.0469 -> tau 0.0234; per-slice median 0.043, range [0.027, 0.125]; top-10% tail
-# 0.121 -> tau 0.060 (ceiling). Re-measure for another main R.
-TAU = 0.0234
+# 0.121 -> tau 0.060 (ceiling). Re-measure for another main R. Set to 0.03, a little above the
+# gap rule, on the user's call: the measurement noise is real even where coil combination hides
+# it in the image, and a slightly wider ladder is the safer side.
+TAU = 0.03
+# INTENSITY-RELATIVE bridge: slice i runs at tau_i = TAU * s_i / TAU_REF, s_i the RMS of its
+# zero-filled image over its Otsu foreground (sb/i2sb_recon.py::bridge_noise_scale) -- slices of
+# one volume differ several-fold in intensity, and one absolute tau is near-silent on the bright
+# ones. TAU_REF is the MEDIAN s over training slices, so TAU stays the tau of a typical slice.
+# UNMEASURED: scripts/calibrate_recon_bridge.py prints it. Left None, an sbtgvn run refuses to
+# start, rather than train on a made-up reference.
+TAU_SCALE = "x1_rms"
+TAU_REF = None
 SCHEDULE = dict(kind="brownian", tau=TAU, n_points=1000, beta_max=0.3)
 
 TGVN_SIZE = dict(num_cascades=12, sens_chans=8, sens_pools=4, chans=18, pools=4)
@@ -150,6 +161,7 @@ def make_config(r, model, g, grid):
         cfg["training"]["loss_type"] = "complex-mse"
         cfg["i2sb"] = {**SCHEDULE, "deterministic": False, "posterior": "ddpm",
                        "x1_source": "adjoint", "x0_source": "operator",
+                       "tau_scale": TAU_SCALE, "tau_ref": TAU_REF,
                        "val_mode": "full_recon", "val_nfe": 20}
     return cfg
 

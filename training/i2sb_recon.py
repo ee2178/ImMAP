@@ -61,7 +61,8 @@ from operators import Mask, FFT2D, Sense
 from operators.fourier import ifftc
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from sb.base import build_schedule, n_steps, forward_sample, forward_std
-from sb.i2sb_recon import X1_SOURCES, bridge_start, predict_x0_recon, i2sb_recon_sample
+from sb.i2sb_recon import (TAU_SCALES, X1_SOURCES, bridge_noise_scale, bridge_start,
+                           predict_x0_recon, i2sb_recon_sample)
 from training.common import (EMA, POSTFIX_EVERY, apply_loss_mask, embed_for_net, get_lr,
                              load_ckpt, prepare_measurement, save_ckpt, save_ema_ckpt)
 from training.common import backtrack as do_backtrack, resync_schedule
@@ -178,6 +179,9 @@ def train_i2sb_recon(
     posterior="ddpm",
     x1_source="adjoint",
     x0_source="operator",            # bridge target in E's phase convention; see module doc
+    tau_scale="none",                # "x1_rms": each sample's tau follows its zero-filled
+    tau_ref=None,                    # image's intensity, tau_i = tau * scale(x1_i) / tau_ref;
+                                     # see sb/i2sb_recon.py::bridge_noise_scale
     val_mode="full_recon",
     val_nfe=20,
     # ---- paths (cfg["paths"]) ----
@@ -198,6 +202,12 @@ def train_i2sb_recon(
         raise ValueError(f"x0_source {x0_source!r} not in {X0_SOURCES}")
     if x1_source not in X1_SOURCES:
         raise ValueError(f"x1_source {x1_source!r} not in {X1_SOURCES}")
+    if tau_scale not in TAU_SCALES:
+        raise ValueError(f"tau_scale {tau_scale!r} not in {TAU_SCALES}")
+    if tau_scale != "none" and not (tau_ref and float(tau_ref) > 0):
+        raise ValueError(f"tau_scale={tau_scale!r} needs tau_ref > 0, the median slice scale of "
+                         f"the training data: run scripts/calibrate_recon_bridge.py")
+    kappa_fn = lambda x1: bridge_noise_scale(x1, tau_scale, tau_ref)    # noqa: E731
     if val_mode not in ("single_pass", "full_recon"):
         raise ValueError(f"val_mode must be 'single_pass' or 'full_recon', got {val_mode!r}")
     if accum_steps < 1:
@@ -272,7 +282,8 @@ def train_i2sb_recon(
 
                 b = x0.shape[0]
                 step = torch.randint(0, interval, (b,), device=device)
-                x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
+                x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic,
+                                     noise_scale=kappa_fn(x1))
                 std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
                 pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
                                         guide=guide)
@@ -346,7 +357,8 @@ def train_i2sb_recon(
                     use_organ_mask=use_organ_mask, residual_gain=residual_gain,
                     kspace_type=val_kspace_type or kspace_type,
                     noise_std=noise_std if val_noise_std is None else val_noise_std,
-                    meas=meas, wandb=wandb, global_step=global_step, epoch=epoch)
+                    meas=meas, kappa_fn=kappa_fn, wandb=wandb, global_step=global_step,
+                    epoch=epoch)
                 if save_ckpt_fn and math.isfinite(val["psnr"]) and val["psnr"] > best_val_psnr:
                     best_val_psnr = val["psnr"]
                     # under the EMA context, so this is the averaged net -- the one validated
@@ -379,7 +391,7 @@ def _validate(net, bridge, val_loader, device, *, val_seed, **kws):
 
 def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, val_nfe,
                    deterministic, posterior, loss_fn, loss_type, use_organ_mask, residual_gain,
-                   kspace_type, noise_std, meas, wandb, global_step, epoch):
+                   kspace_type, noise_std, meas, kappa_fn, wandb, global_step, epoch):
     net.eval()
     keys = ("loss", "psnr", "ssim", "nrmse", "zf_psnr", "zf_ssim", "zf_nrmse")
     agg = {k: 0.0 for k in keys}
@@ -394,11 +406,13 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
         if val_mode == "full_recon":
             pred, _, _ = i2sb_recon_sample(net, y, E, bridge, sigma_n=sigma_n, x1=x1,
                                            nfe=val_nfe, deterministic=deterministic,
-                                           posterior=posterior, verbose=False, guide=guide)
+                                           posterior=posterior, verbose=False, guide=guide,
+                                           noise_scale=kappa_fn(x1))
             std_fwd = torch.zeros(bs, 1, 1, 1, device=device)
         else:
             step = torch.randint(0, interval, (bs,), generator=gen, device=device)
-            x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic)
+            x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic,
+                                 noise_scale=kappa_fn(x1))
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
             pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
                                     guide=guide)

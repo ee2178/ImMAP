@@ -448,6 +448,44 @@ def test_val_panel_shows_the_guides():
     assert tr.guide_display(TGVN(**TINY_TGVN), None, seen, 1) == []
 
 
+def test_intensity_relative_bridge_noise():
+    """kappa scales the injected noise and nothing else, forward and reverse; the slice scale is
+    scale-equivariant; a relative bridge without tau_ref is refused."""
+    from sb.base import build_schedule, bridge_coeffs, forward_sample, reverse_sample
+    from sb.i2sb_recon import bridge_noise_scale, slice_scale
+    sched = build_schedule(kind="brownian", tau=0.03, n_points=1000)
+    x0 = torch.randn(2, 1, 64, 64, dtype=torch.complex64)
+    step = torch.full((2,), 500, dtype=torch.long)
+    kappa = torch.tensor([0.5, 3.0])
+    torch.manual_seed(0)
+    xt = forward_sample(sched, step, x0, x0, noise_scale=kappa)
+    std = float(bridge_coeffs(sched)[2][500])
+    emp = (xt - x0).abs().pow(2).flatten(1).mean(1).sqrt()
+    assert torch.allclose(emp, kappa * std, rtol=0.03), (emp, kappa * std)
+    det = forward_sample(sched, step, x0, 2 * x0, deterministic=True, noise_scale=kappa)
+    assert torch.allclose(det, forward_sample(sched, step, x0, 2 * x0, deterministic=True))
+    # reverse: with a regressor that ignores x_t the state is linear in the injected noise, so
+    # (noisy - noise-free) scales by exactly kappa under the same seed
+    oracle = lambda x_t, n: x0                                              # noqa: E731
+    run = lambda **kw: reverse_sample(sched, oracle, 2 * x0, nfe=8, verbose=False, **kw)[0]
+    det = run(deterministic=True)
+    assert torch.allclose(det, run(deterministic=True, noise_scale=kappa))
+    torch.manual_seed(1)
+    noisy1 = run()
+    torch.manual_seed(1)
+    noisyk = run(noise_scale=kappa)
+    assert torch.allclose(noisyk - det, kappa.view(2, 1, 1, 1) * (noisy1 - det), atol=1e-5)
+    # slice scale
+    img = torch.zeros(2, 1, H, W, dtype=torch.complex64)
+    img[:, :, 8:24, 8:24] = 1.0 + 0.1 * torch.randn(2, 1, 16, 16)
+    s = slice_scale(img)
+    assert torch.allclose(slice_scale(3.0 * img), 3.0 * s, rtol=1e-4)
+    assert abs(float(s[0]) - 1.0) < 0.05                      # the foreground's RMS, not the frame's
+    assert bridge_noise_scale(img) is None
+    assert torch.allclose(bridge_noise_scale(img, "x1_rms", 2.0), s / 2.0)
+    raises(ValueError, lambda: bridge_noise_scale(img, "x1_rms", None), "tau_ref")
+
+
 def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
     from models.tgvn import BridgeTGVN
     from training.i2sb_recon import train_i2sb_recon
@@ -468,7 +506,8 @@ def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
                              kspace_type="measurement_awgn", online_smaps="espirit",
                              noise_std=(0.0, 0.01), val_noise_std=0.005, val_seed=0,
                              loss_type="complex-mse", tau=0.1, val_mode="full_recon",
-                             val_nfe=2, guide_R=2, save_dir=d, wandb=wb)
+                             val_nfe=2, guide_R=2, save_dir=d, wandb=wb,
+                             tau_scale="x1_rms", tau_ref=0.5)
         finally:
             osm.online_smaps = real
         assert len(spy.guides) >= 4                       # 2 train steps + val sampler calls
@@ -478,6 +517,9 @@ def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
         assert os.path.exists(os.path.join(d, "net_bestval.ckpt"))
         n, cap = panel_tiles(wb.last("val/recon_example"))
         assert n == 6 and "guide 2x zero-filled" in cap, (n, cap)   # + guide 2x, + full guide
+        raises(ValueError, lambda: train_i2sb_recon(
+            spy, torch.optim.Adam(spy.parameters()), None, "cpu", loader(), None, tau=0.1,
+            tau_scale="x1_rms", save_dir=d), "tau_ref")
 
 
 def main():

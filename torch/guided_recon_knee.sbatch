@@ -33,9 +33,11 @@
 # k-space. The guide is undersampled like TGVN's side scans: equispaced, no centre lines, a fresh
 # line phase per training step (offset 0 at validation).
 #
-# sbtgvn tau (make_guided_recon_configs.py TAU) = 0.0234, measured at R=8 with
+# sbtgvn bridge: tau = 0.03 (gap rule 0.0234 at R=8), INTENSITY-RELATIVE per slice --
+# tau_i = tau * s_i / tau_ref, s_i the RMS of the zero-filled image's foreground. tau_ref (the
+# median s) is UNMEASURED and the sbtgvn cells refuse to start without it:
 #     python scripts/calibrate_recon_bridge.py config/knee/guided/sbtgvn_R8_g1.json --slices 60
-# Re-measure before running another main R.
+# then set TAU_REF in scripts/make_guided_recon_configs.py.
 #
 # RESUME: a requeued cell continues from its run dir's config.json + net.ckpt; REGENERATE never
 # touches a started run. FORCE_RESTART=1 moves the old run aside and starts over.

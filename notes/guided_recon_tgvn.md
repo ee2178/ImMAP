@@ -58,7 +58,13 @@ The guide is FULLY SAMPLED for now (how far the side scan can be accelerated is 
     mode; upstream estimates its own, which a complex bridge cannot use), started at x_t, Phi
     conditioned on the bridge position (s_log) and sigma_n; complex-MSE loss; x0 in the operator's
     phase (x0_source "operator"); x1 = E^H y. No bridge-fidelity term yet (roadmap option 2).
-    tau = 0.0234 (calibrate_recon_bridge.py, R=8: RMS 0.0469, tail ceiling 0.060).
+    tau = 0.03 (gap rule 0.0234 from calibrate_recon_bridge.py at R=8, RMS 0.0469, tail
+    ceiling 0.060; raised slightly for margin), INTENSITY-RELATIVE per slice (decided
+    2026-11-05: slice intensities differ several-fold within a volume, so one absolute tau is
+    near-silent on bright slices; per-slice normalization of the data was rejected as unfair):
+    tau_i = tau * s_i / tau_ref, s_i = RMS of |x1| over its Otsu foreground, tau_ref = the
+    median s (to be measured). Only the bridge noise scales; the net's time conditioning and
+    the data stay in raw units.
   - Known asymmetry: plain TGVN learns its maps, BridgeTGVN uses online ESPIRiT. A
     TGVN(use_smaps=True) control exists if the comparison needs it.
 - Set 2 (later): longitudinal -- TGVN and SB-LGGS (the bridge data fidelity).

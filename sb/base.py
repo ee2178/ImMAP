@@ -149,20 +149,36 @@ def bridge_coeffs(sched):
 # ---------------------------------------------------------------------------
 # forward bridge (training)
 # ---------------------------------------------------------------------------
-def forward_sample(sched, step, x0, x1, deterministic=False):
+def forward_sample(sched, step, x0, x1, deterministic=False, noise_scale=None):
     """Training input: draw x_t on the x0 <-> x1 bridge at `step` (the "noisy convex combination"
     the network regresses from). `step` is a (B,) long index tensor.
 
-        x_t = mu_x0(step) * x0 + mu_x1(step) * x1 (+ std_sb(step) * noise)      (mu_x0 + mu_x1 = 1)
+        x_t = mu_x0(step) * x0 + mu_x1(step) * x1 (+ kappa * std_sb(step) * noise)  (mu_x0 + mu_x1 = 1)
 
-    `deterministic` drops the bridge noise (the OT-ODE limit)."""
+    `deterministic` drops the bridge noise (the OT-ODE limit). `noise_scale` (kappa, (B,) or a
+    scalar; None = 1) is a PER-SAMPLE temperature multiplier: on the Brownian bridge tau scales the
+    noise and nothing else (mu_x0 = 1 - t, mu_x1 = t), so kappa * tau is that sample's own tau on
+    the same time grid -- see sb/i2sb_recon.py::bridge_noise_scale."""
     assert x0.shape == x1.shape
     xdim = x0.shape[1:]
     mu_x0, mu_x1, std_sb = bridge_coeffs(sched)
     x_t = unsqueeze_xdim(mu_x0[step], xdim) * x0 + unsqueeze_xdim(mu_x1[step], xdim) * x1
     if not deterministic:
-        x_t = x_t + unsqueeze_xdim(std_sb[step], xdim) * torch.randn_like(x_t)
+        std = unsqueeze_xdim(std_sb[step], xdim)
+        if noise_scale is not None:
+            std = std * _per_sample(noise_scale, x0.shape[0], xdim, std)
+        x_t = x_t + std * torch.randn_like(x_t)
     return x_t.detach()
+
+
+def _per_sample(v, batch, xdim, like):
+    """A scalar or (B,) multiplier as a (B, 1, ...) tensor broadcastable against x."""
+    v = torch.as_tensor(v, device=like.device, dtype=like.dtype).reshape(-1)
+    if v.numel() == 1:
+        v = v.expand(batch)
+    if v.numel() != batch:
+        raise ValueError(f"noise_scale has {v.numel()} entries for a batch of {batch}")
+    return unsqueeze_xdim(v, xdim)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +220,7 @@ def predict_x0(net, xt, sigma, cond=None, target_channels=1, guide=None, dc=None
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def reverse_sample(sched, pred_x0_fn, x1, nfe=None, deterministic=False, posterior="ddpm",
-                   clip_denoise=False, log_count=1, verbose=True):
+                   clip_denoise=False, log_count=1, verbose=True, noise_scale=None):
     """Shared reverse loop for every SB variant (image or latent -- it only touches tensors).
 
     Walks the discrete bridge from the prior end (x1, t = 1) down to the target end (t = 0),
@@ -227,7 +243,9 @@ def reverse_sample(sched, pred_x0_fn, x1, nfe=None, deterministic=False, posteri
                                                              # deterministic or the final step
 
     `nfe` = number of function evaluations (default interval - 1, i.e. every step). `log_count`
-    intermediate states are recorded for diagnostics.
+    intermediate states are recorded for diagnostics. `noise_scale` (kappa, per sample) multiplies
+    the injected noise only, as in forward_sample: the ddpm mixing weights depend on RATIOS of
+    std_fwd, in which a per-sample temperature cancels.
 
     Returns
     -------
@@ -248,6 +266,8 @@ def reverse_sample(sched, pred_x0_fn, x1, nfe=None, deterministic=False, posteri
 
     x1 = x1.detach().to(device)
     x_t = x1.clone()                                       # start AT the prior (t = 1)
+    kappa = 1.0 if noise_scale is None else _per_sample(noise_scale, x1.shape[0],
+                                                         x1.shape[1:], x1.real)
     mu_x0, mu_x1, std_sb = bridge_coeffs(sched)            # only the interpolant posterior uses these
 
     xs, pred_x0s = [], []
@@ -267,11 +287,11 @@ def reverse_sample(sched, pred_x0_fn, x1, nfe=None, deterministic=False, posteri
             b = sp2 / sn2                                  # weight on x_t     (a + b = 1)
             x_t = a * x0_hat + b * x_t
             if not deterministic and n_prev > 0:
-                x_t = x_t + (sp2 * var_step / sn2).sqrt() * torch.randn_like(x_t)
+                x_t = x_t + kappa * (sp2 * var_step / sn2).sqrt() * torch.randn_like(x_t)
         else:                                              # convex combo of the FIXED prior x1 and x0_hat
             x_t = mu_x0[n_prev] * x0_hat + mu_x1[n_prev] * x1
             if not deterministic and n_prev > 0:
-                x_t = x_t + std_sb[n_prev] * torch.randn_like(x_t)
+                x_t = x_t + kappa * std_sb[n_prev] * torch.randn_like(x_t)
 
         if n_prev in log_steps:
             xs.append(x_t.detach().cpu())

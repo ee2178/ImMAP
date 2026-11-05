@@ -23,10 +23,43 @@ only; the unrolled nets will add data consistency through (y, E).
 
 import torch
 
+from physics.object_mask import otsu_threshold
 from sb.base import forward_std, reverse_sample
 
 
 X1_SOURCES = ("adjoint",)
+TAU_SCALES = ("none", "x1_rms")
+
+
+def slice_scale(x1):
+    """(B,) intensity of each zero-filled image: the RMS of |x1| over its Otsu foreground.
+
+    Taken from x1 = E^H y alone, so it exists at test time. The foreground keeps the background
+    out (an edge slice with less anatomy is not scored dimmer for its area), and it is a power, so
+    it tracks the noise power the bridge has to match."""
+    a = x1.abs().float()
+    a = a.reshape(a.shape[0], 1, *a.shape[-2:]) if a.dim() == 4 else a
+    fg = a > otsu_threshold(a)
+    n = fg.flatten(1).sum(1).clamp_min(1)
+    return ((a.pow(2) * fg).flatten(1).sum(1) / n).sqrt()
+
+
+def bridge_noise_scale(x1, tau_scale="none", tau_ref=None):
+    """Per-sample temperature multiplier kappa, or None for the absolute bridge.
+
+    "x1_rms": kappa_i = slice_scale(x1_i) / tau_ref, so sample i's bridge runs at
+    tau_i = tau * kappa_i -- the injected noise follows the slice's own intensity. With tau_ref
+    the MEDIAN slice scale of the training data (scripts/calibrate_recon_bridge.py measures it),
+    tau keeps its meaning: the absolute tau of a typical slice. The network's time conditioning
+    stays on the reference schedule; on the Brownian bridge tau moves only the noise."""
+    if tau_scale in (None, "none"):
+        return None
+    if tau_scale != "x1_rms":
+        raise ValueError(f"tau_scale {tau_scale!r} not in {TAU_SCALES}")
+    if not tau_ref or float(tau_ref) <= 0:
+        raise ValueError("tau_scale='x1_rms' needs tau_ref > 0: the median slice scale of the "
+                         "training data, from scripts/calibrate_recon_bridge.py")
+    return slice_scale(x1) / float(tau_ref)
 
 
 def bridge_start(y, E, source="adjoint"):
@@ -48,13 +81,14 @@ def predict_x0_recon(net, x_t, sigma, x1=None, y=None, E=None, sigma_n=None, gui
 @torch.no_grad()
 def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoint", nfe=None,
                       deterministic=False, posterior="ddpm", log_count=1, verbose=True,
-                      guide=None):
+                      guide=None, noise_scale=None):
     """Reconstruct x0 from (y, E) along the reverse bridge.
 
     `x1` defaults to bridge_start(y, E, x1_source); pass it to reuse one already built. y, E,
     sigma_n and the guide (side information) are held fixed along the whole trajectory.
-    Returns (recon, xs, pred_x0s), as sb.base.reverse_sample (no clip_denoise: a complex image
-    has no [-1, 1] box)."""
+    `noise_scale` is the per-sample temperature multiplier (bridge_noise_scale). Returns
+    (recon, xs, pred_x0s), as sb.base.reverse_sample (no clip_denoise: a complex image has no
+    [-1, 1] box)."""
     device = sched.std_fwd.device
     x1 = bridge_start(y, E, x1_source) if x1 is None else x1
     x1 = x1.to(device)
@@ -67,4 +101,4 @@ def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoin
 
     return reverse_sample(sched, pred_x0_fn, x1, nfe=nfe, deterministic=deterministic,
                           posterior=posterior, clip_denoise=False, log_count=log_count,
-                          verbose=verbose)
+                          verbose=verbose, noise_scale=noise_scale)
