@@ -67,11 +67,14 @@ class CondNormUnet(NormUnet):
                                f"before each forward")
         x = self.complex_to_chan_dim(x)
         x, mean, L = self.norm(x)
-        c = self.cond.to(x.dtype).clone()
+        c = self.cond.to(x.dtype)
         if self.noise_channels:
+            # Built OUT OF PLACE: scale depends on the input (through L), so autograd saves the
+            # numerator of each division; writing the result back into `c` would overwrite it
+            # (the "modified by an inplace operation" failure, seen 2026-11-05 on the cluster).
             scale = L.pow(2).sum(dim=(1, 2)).sqrt().clamp_min(1e-12)     # sqrt(tr(L L^T))
-            for i in self.noise_channels:
-                c[:, i] = c[:, i] / scale
+            c = torch.stack([c[:, i] / scale if i in self.noise_channels else c[:, i]
+                             for i in range(self.n_cond)], dim=1)
         x, pad_sizes = self.pad(x)
         planes = c[:, :, None, None].expand(-1, -1, *x.shape[-2:])
         x = self.unet(torch.cat([x, planes], dim=1))

@@ -16,7 +16,9 @@ Pinned:
   * the generator's LGGS point equals lggs_defaults(), and every config key reaches train_recon.
 
 Runs locally on torch 1.12 with stubs (no flex attention / torchvision / wandb, and no LAPACK --
-TGVN's Cholesky normalization then goes through numpy, forward-exact but not differentiated).
+TGVN's Cholesky normalization of its (B, 2, 2) covariances then uses the closed-form 2x2 factor,
+which is DIFFERENTIABLE like the real one: a numpy stand-in hid an autograd bug once, see
+test_cond_plane_backward).
 """
 import inspect
 import json
@@ -85,8 +87,22 @@ except Exception:                       # noqa: BLE001
 try:                                    # local torch builds without LAPACK
     torch.linalg.cholesky(torch.eye(2).expand(1, 2, 2))
 except RuntimeError:
-    torch.linalg.cholesky = lambda A: torch.from_numpy(np.linalg.cholesky(A.detach().cpu().numpy())).to(A)
-    torch.linalg.inv = lambda A: torch.from_numpy(np.linalg.inv(A.detach().cpu().numpy())).to(A)
+    def _chol(A):
+        if A.shape[-2:] != (2, 2):
+            return torch.from_numpy(np.linalg.cholesky(A.detach().cpu().numpy())).to(A)
+        l11 = A[..., 0, 0].sqrt()                 # closed form, differentiable, as LAPACK's is
+        l21 = A[..., 1, 0] / l11
+        l22 = (A[..., 1, 1] - l21 ** 2).sqrt()
+        z = torch.zeros_like(l11)
+        return torch.stack([torch.stack([l11, z], -1), torch.stack([l21, l22], -1)], -2)
+
+    def _inv(A):
+        if A.shape[-2:] != (2, 2):
+            return torch.from_numpy(np.linalg.inv(A.detach().cpu().numpy())).to(A)
+        a, b, c, d = A[..., 0, 0], A[..., 0, 1], A[..., 1, 0], A[..., 1, 1]
+        det = a * d - b * c
+        return torch.stack([torch.stack([d, -b], -1), torch.stack([-c, a], -1)], -2)             / det[..., None, None]
+    torch.linalg.cholesky, torch.linalg.inv = _chol, _inv
     def _qr(A, mode="reduced"):
         q, r = np.linalg.qr(A.detach().cpu().numpy(), mode=mode)
         return torch.from_numpy(q).to(A), torch.from_numpy(r).to(A)
@@ -432,6 +448,20 @@ def test_guide_undersampling():
     k = tr._guide(TGVN(**TINY_TGVN), side, sm, Truncate((H, W), (H, W)), "cpu", 2, 0,
                   "uniform", 0)
     assert torch.equal(k, g)
+
+
+def test_cond_plane_backward():
+    """Backward through a noise-conditioned plane, with the scale DEPENDING on the input (as it
+    does through a real Cholesky). An in-place rescale of the plane failed exactly here on the
+    cluster: "modified by an inplace operation ... AsStridedBackward0"."""
+    from models.tgvn import CondNormUnet
+    torch.manual_seed(0)
+    u = CondNormUnet(4, 2, n_cond=2, noise_channels=(1,))
+    x = torch.randn(1, 1, H, W, 2, requires_grad=True)
+    u.cond = torch.tensor([[0.3, 0.05]])
+    u(x).pow(2).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert all(p.grad is not None for p in u.parameters() if p.requires_grad)
 
 
 def test_cond_plane_is_scale_equivariant():
