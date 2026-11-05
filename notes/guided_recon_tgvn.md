@@ -58,7 +58,7 @@ The guide is FULLY SAMPLED for now (how far the side scan can be accelerated is 
     mode; upstream estimates its own, which a complex bridge cannot use), started at x_t, Phi
     conditioned on the bridge position (s_log) and sigma_n; complex-MSE loss; x0 in the operator's
     phase (x0_source "operator"); x1 = E^H y. No bridge-fidelity term yet (roadmap option 2).
-    tau is an unmeasured 0.1 -- run `scripts/calibrate_recon_bridge.py` on the cluster first.
+    tau = 0.0234 (calibrate_recon_bridge.py, R=8: RMS 0.0469, tail ceiling 0.060).
   - Known asymmetry: plain TGVN learns its maps, BridgeTGVN uses online ESPIRiT. A
     TGVN(use_smaps=True) control exists if the comparison needs it.
 - Set 2 (later): longitudinal -- TGVN and SB-LGGS (the bridge data fidelity).

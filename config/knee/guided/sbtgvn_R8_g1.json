@@ -14,7 +14,7 @@
             "chans": 18,
             "pools": 4,
             "kind": "brownian",
-            "tau": 0.1,
+            "tau": 0.0234,
             "n_points": 1000,
             "beta_max": 0.3
         }
@@ -110,7 +110,7 @@
     },
     "i2sb": {
         "kind": "brownian",
-        "tau": 0.1,
+        "tau": 0.0234,
         "n_points": 1000,
         "beta_max": 0.3,
         "deterministic": false,

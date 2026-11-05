@@ -35,7 +35,7 @@ What is set here:
     i2sb-TGVN    BridgeTGVN: the same TGVN, on the operator's (online ESPIRiT) maps, started at
                  x_t, conditioned on the bridge position and sigma_n; complex-MSE loss (the
                  bridge state is complex; the grid's magnitude NL1+NL2 cannot train it). Its
-                 tau is TAU below -- run scripts/calibrate_recon_bridge.py on the cluster first.
+                 tau is TAU below, measured at R=8 with scripts/calibrate_recon_bridge.py.
 
     python scripts/make_guided_recon_configs.py                  # the five default cells
     python scripts/make_guided_recon_configs.py --guide-accels 1 2 4 --models tgvn
@@ -61,9 +61,11 @@ KSPACE_ROOTS = ["../datasets/fastmri/knee/multicoil_train",
                 "../datasets/fastmri/knee/multicoil_val"]
 
 # Brownian-bridge temperature for i2sb-TGVN, tau = RMS(x0 - x1)/2 inside the object at the main
-# R. UNMEASURED for knee PDFS: run scripts/calibrate_recon_bridge.py on a generated sbtgvn config
-# and put the value here (it is written to BOTH i2sb and model.params).
-TAU = 0.1
+# R (written to BOTH i2sb and model.params). Measured 2026-11-05 with
+# scripts/calibrate_recon_bridge.py on sbtgvn_R8_g1 (knee PDFS, R=8, measured protocol, 60 train
+# slices): RMS 0.0469 -> tau 0.0234; per-slice median 0.043, range [0.027, 0.125]; top-10% tail
+# 0.121 -> tau 0.060 (ceiling). Re-measure for another main R.
+TAU = 0.0234
 SCHEDULE = dict(kind="brownian", tau=TAU, n_points=1000, beta_max=0.3)
 
 TGVN_SIZE = dict(num_cascades=12, sens_chans=8, sens_pools=4, chans=18, pools=4)
