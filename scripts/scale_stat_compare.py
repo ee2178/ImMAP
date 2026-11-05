@@ -22,6 +22,9 @@ val sigma):
   mu        |sum(E^H y) / sum(E^H E 1)|: the least-squares constant image, the DC that
             preprocessing/kspace.py already removes
   mu_mag    sum|E^H y| / sum(E^H E 1): mu without the phase, so it cannot cancel
+  adj_p99   99th percentile of |E^H y| / mean(E^H E 1): how BRIGHT the tissue is rather than
+            how much of it there is (the FOV means above scale with object coverage)
+  acs_p99   the same on the fully sampled centre lines only: no aliasing, lower resolution
 Truth, from the reference and the stored-map organ mask:
   tissue    mean |reference| inside the organ mask
   tissue99  99th percentile of |reference| inside it (the bright-edge scale)
@@ -55,7 +58,7 @@ from datasets.registry import build_loader                      # noqa: E402
 from evaluation.tasks import build_adapter, default_sigma, force_organ_mask  # noqa: E402
 from models.cg_init import ram_signal_level                      # noqa: E402
 
-CANDIDATES = ("ram", "ksp_rms", "mu", "mu_mag")
+CANDIDATES = ("ram", "ksp_rms", "mu", "mu_mag", "adj_p99", "acs_p99")
 TRUTHS = ("tissue", "tissue99")
 
 
@@ -69,6 +72,33 @@ class _Probe(nn.Module):
         self.dummy = nn.Parameter(torch.zeros(1))
 
 
+def acs_mask(mask):
+    """The fully sampled centre block of a Cartesian mask (lines along the last axis):
+    the run of sampled columns through the centre."""
+    m = (mask.abs() > 0)
+    cols = m.reshape(-1, m.shape[-1]).any(0)
+    c = cols.shape[0] // 2
+    if not cols[c]:
+        return None
+    lo, hi = c, c
+    while lo > 0 and cols[lo - 1]:
+        lo -= 1
+    while hi < cols.shape[0] - 1 and cols[hi + 1]:
+        hi += 1
+    out = torch.zeros_like(mask)
+    out[..., lo:hi + 1] = mask[..., lo:hi + 1]
+    return out
+
+
+def p99_adjusted(y, E, q=0.99):
+    """q-quantile of |E^H y| over the image, divided by mean(E^H E 1): a bright-tissue
+    level that the sampled fraction does not change and object coverage barely does."""
+    B = y.shape[0]
+    xa = E.adjoint(y).abs().reshape(B, -1).float()
+    g = E.adjoint(E(torch.ones_like(E.adjoint(y)))).real.reshape(B, -1).mean(1)
+    return torch.quantile(xa, q, dim=1) / g
+
+
 @torch.no_grad()
 def statistics(y, E):
     B = y.shape[0]
@@ -80,12 +110,38 @@ def statistics(y, E):
         "ksp_rms": (y.abs().pow(2).reshape(B, -1).sum(1) / sampled).sqrt(),
         "mu": (xa.reshape(B, -1).sum(1) / den).abs(),
         "mu_mag": xa.abs().reshape(B, -1).sum(1) / den,
+        "adj_p99": p99_adjusted(y, E),
+        "acs_p99": _acs_p99(y, E),
     }
 
 
-def run_config(path, a, device):
+def _acs_p99(y, E):
+    """`p99_adjusted` on the centre block only: the unaliased low-resolution image."""
+    from operators.accessors import get_mask, set_mask
+    m = acs_mask(get_mask(E))
+    if m is None:
+        return torch.full((y.shape[0],), float("nan"), device=y.device)
+    E_acs = set_mask(E, m)
+    return p99_adjusted(y * (m.abs() > 0) if m.shape[-2:] == y.shape[-2:] else y, E_acs)
+
+
+def at_accel(cfg, R):
+    """`cfg` with its mask moved to acceleration R. Only the mask matters to these
+    statistics, so no net trained at R is needed. A cf32-style config (center_frac set,
+    adjust_accel off) keeps center_frac * R fixed, as make_mg_recon_configs.py does."""
+    mri = dict(cfg["mri"])
+    R0 = mri.get("R")
+    if mri.get("center_frac") and not mri.get("adjust_accel", False) and R0:
+        mri["center_frac"] = float(mri["center_frac"]) * float(R0) / float(R)
+    mri["R"] = R
+    return dict(cfg, mri=mri)
+
+
+def run_config(path, a, device, R=None):
     with open(path) as f:
         cfg = json.load(f)
+    if R is not None:
+        cfg = at_accel(cfg, R)
     force_organ_mask(cfg)
     cfg.setdefault("training", {})["val_kspace_type"] = a.val_kspace_type
     sigma = a.sigma if a.sigma is not None else default_sigma(cfg)
@@ -121,7 +177,8 @@ def run_config(path, a, device):
         mag = gt.abs()[organ.expand_as(gt)]
         if mag.numel() < 100:
             continue
-        r = dict(config=os.path.basename(os.path.dirname(os.path.abspath(path))), R=R,
+        name = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        r = dict(config=f"{name}@R{R}" if a.accels else name, R=R,
                  volume=vol, slice=int(sl),
                  tissue=float(mag.mean()), tissue99=float(torch.quantile(mag.float(), 0.99)))
         r.update({c: float(got[c].reshape(-1)[0]) for c in CANDIDATES})
@@ -206,6 +263,9 @@ def plot(rows, path):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--accels", type=int, nargs="*",
+                   help="run each config at these R instead of its own (the mask is all the "
+                        "statistics need); two values also report the mask dependence")
     p.add_argument("--configs", nargs="+", required=True,
                    help="run config.json files (their val data, mask, maps and sigma); two at "
                         "different R also report the mask dependence")
@@ -224,10 +284,15 @@ def main(argv=None):
     os.makedirs(a.out, exist_ok=True)
 
     rows = []
+    missing = [c for c in a.configs if not os.path.isfile(c)]
+    if missing:
+        raise SystemExit(f"no such config: {' '.join(missing)}  (use --accels to run one "
+                         f"config at several R)")
     for path in a.configs:
-        r, sigma = run_config(path, a, device)
-        print(f"  {path}: {len(r)} slices at sigma {sigma:g}")
-        rows += r
+        for R in (a.accels or [None]):
+            r, sigma = run_config(path, a, device, R)
+            print(f"  {path}{'' if R is None else f' at R={R}'}: {len(r)} slices at sigma {sigma:g}")
+            rows += r
     if not rows:
         raise SystemExit("no slices")
     with open(os.path.join(a.out, "stats.csv"), "w", newline="") as f:
