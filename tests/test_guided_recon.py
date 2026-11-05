@@ -176,6 +176,34 @@ class Spy(torch.nn.Module):
             self.net(y, E=E, sigma=sigma, guide=guide)
 
 
+class FakeWandb:
+    """Records every wandb.log call; images arrive through the module stub (or real wandb)."""
+    def __init__(self):
+        self.calls = []
+
+    def log(self, d, step=None):
+        self.calls.append(d)
+
+    def last(self, key):
+        return [c[key] for c in self.calls if key in c][-1]
+
+
+def _raw_image(data, caption=None, **_):
+    """Stands in for visualization.wandb_image.wandb_image: keeps the panel and caption."""
+    return data, caption
+
+
+tr.wandb_image = _raw_image             # both loops log panels through their own import
+import training.i2sb_recon as _tir      # noqa: E402
+_tir.wandb_image = _raw_image
+
+
+def panel_tiles(img):
+    """(tiles, caption) of a logged recon_panel strip: W-wide tiles, 2-px separators."""
+    panel, caption = img
+    return (panel.shape[-1] + 2) // (W + 2), caption
+
+
 def run_recon(net, csv, root, d, **mri):
     loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,
                                             drop_last=False, scale_fac=1.0, start_slice=1,
@@ -185,7 +213,9 @@ def run_recon(net, csv, root, d, **mri):
               val_noise_std=0.005, val_seed=0, loss_type="magnitude-nl1-nl2", num_epochs=1,
               steps_per_epoch=2, val_every_epochs=1, save_dir=d)
     kw.update(mri)
-    return tr.train_recon(net, opt, None, loader(), loader(), "cpu", **kw)
+    wb = FakeWandb()
+    tr.train_recon(net, opt, None, loader(), loader(), "cpu", wandb=wb, **kw)
+    return wb
 
 
 # ---------------------------------------------------------------------------------------------
@@ -399,6 +429,25 @@ class BridgeSpy(torch.nn.Module):
         return self.net(x_t, sigma=sigma, x1=x1, y=y, E=E, sigma_n=sigma_n, guide=guide)
 
 
+def test_val_panel_shows_the_guides():
+    """val/recon_example = zf | recon | gt | residual, + the guide as seen, + the fully-sampled
+    guide when it was accelerated; nothing extra for an unguided net."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        for net, extra, tiles in ((TGVN(**TINY_TGVN), {}, 5),
+                                  (TGVN(**TINY_TGVN), {"guide_R": 2}, 6),
+                                  (TGVN(guided=False, **TINY_TGVN), {}, 4)):
+            wb = run_recon(net, csv, root, d, **extra)
+            n, cap = panel_tiles(wb.last("val/recon_example"))
+            assert n == tiles, (extra, n, tiles)
+            assert ("guide" in cap) == (tiles > 4), cap
+    seen = torch.randn(1, C, H, W, dtype=torch.complex64)
+    tl = tr.guide_display(TGVN(**TINY_TGVN), seen, seen, 1)
+    assert [l for l, _ in tl] == ["guide"] and tl[0][1].shape == (1, 1, H, W)
+    assert torch.allclose(tl[0][1], ifftc(seen).abs().pow(2).sum(1, keepdim=True).sqrt())
+    assert tr.guide_display(TGVN(**TINY_TGVN), None, seen, 1) == []
+
+
 def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
     from models.tgvn import BridgeTGVN
     from training.i2sb_recon import train_i2sb_recon
@@ -409,6 +458,7 @@ def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
                                                 drop_last=False, scale_fac=1.0, start_slice=1,
                                                 end_slice=3, num_workers=0)
         spy = BridgeSpy(BridgeTGVN(tau=0.1, **TINY_TGVN))
+        wb = FakeWandb()
         real = osm.online_smaps
         osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
         try:
@@ -418,7 +468,7 @@ def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
                              kspace_type="measurement_awgn", online_smaps="espirit",
                              noise_std=(0.0, 0.01), val_noise_std=0.005, val_seed=0,
                              loss_type="complex-mse", tau=0.1, val_mode="full_recon",
-                             val_nfe=2, guide_R=2, save_dir=d)
+                             val_nfe=2, guide_R=2, save_dir=d, wandb=wb)
         finally:
             osm.online_smaps = real
         assert len(spy.guides) >= 4                       # 2 train steps + val sampler calls
@@ -426,6 +476,8 @@ def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
             cols = (g[0, 0] != 0).any(dim=0)
             assert int(cols.sum()) == W // 2, int(cols.sum())          # half the lines
         assert os.path.exists(os.path.join(d, "net_bestval.ckpt"))
+        n, cap = panel_tiles(wb.last("val/recon_example"))
+        assert n == 6 and "guide 2x zero-filled" in cap, (n, cap)   # + guide 2x, + full guide
 
 
 def main():

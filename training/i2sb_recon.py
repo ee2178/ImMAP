@@ -68,7 +68,7 @@ from training.common import backtrack as do_backtrack, resync_schedule
 from training.i2sb import _bridge_loss
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
-from training.recon import _check_paired, _ckpt_field, _guide, _unpack
+from training.recon import _check_paired, _ckpt_field, _guide, _unpack, guide_display
 from visualization.image import recon_panel
 from visualization.params import get_param_logs
 from visualization.wandb_image import wandb_image
@@ -414,18 +414,22 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
             agg[k] += float(m[k]) * bs
             agg[f"zf_{k}"] += float(mz[k]) * bs
         n += bs
-        last = (gt, pred, x1, mmask, sigma_n)
+        last = (gt, pred, x1, mmask, sigma_n, guide, _unpack(batch)[5])
 
     mean = {k: v / max(n, 1) for k, v in agg.items()}
 
     if wandb and last is not None:
-        x0, pred, x1, mmask, sigma_n = last
+        x0, pred, x1, mmask, sigma_n, guide, side = last
         img, rec, zf = (x0, pred, x1) if mmask is None else (x0 * mmask, pred * mmask, x1 * mmask)
-        panel, pstats = recon_panel(img[:1], rec[:1], zero_filled=zf[:1], gain=residual_gain)
+        gtiles = guide_display(net, guide, side, meas.get("guide_R", 1))
+        gimgs = [(g if mmask is None else g * mmask)[:1] for _, g in gtiles]
+        panel, pstats = recon_panel(img[:1], rec[:1], zero_filled=zf[:1], gain=residual_gain,
+                                    guides=gimgs)
         how = f"I2SB recon, nfe={val_nfe}" if val_mode == "full_recon" else "single-pass x0_hat"
         caption = (f"epoch {epoch} | zero-filled x1 | {how} | ground truth | "
-                   f"|residual| x{pstats['gain']:g}  (sigma_n="
-                   f"{float(sigma_n.reshape(-1)[0]):.4f})")
+                   f"|residual| x{pstats['gain']:g}"
+                   + "".join(f" | {lab} (own scale)" for lab, _ in gtiles)
+                   + f"  (sigma_n={float(sigma_n.reshape(-1)[0]):.4f})")
         wandb.log({"val/recon_example": wandb_image(panel, caption=caption),
                    **{f"val/{k}": v for k, v in mean.items()}}, step=global_step)
         try:

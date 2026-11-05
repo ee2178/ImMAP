@@ -871,8 +871,8 @@ def _to_mag(x):
     return x.abs().detach().float().cpu()
 
 
-def recon_panel(gt, recon, zero_filled=None, gain=4.0, eps=1e-12):
-    """Side-by-side [zero-filled | recon | ground truth | |residual| x gain].
+def recon_panel(gt, recon, zero_filled=None, gain=4.0, eps=1e-12, guides=()):
+    """Side-by-side [zero-filled | recon | ground truth | |residual| x gain | guides...].
 
     The three IMAGE panels share one intensity scale (the ground truth's max),
     so they are directly comparable and an over/under-shooting reconstruction
@@ -883,6 +883,10 @@ def recon_panel(gt, recon, zero_filled=None, gain=4.0, eps=1e-12):
 
     Returns `(panel, stats)`; `stats` carries the numbers worth putting in a
     caption (`res_max`, `res_rms`, both relative to the ground-truth max).
+
+    `guides` (guided reconstruction) are appended after the residual, EACH scaled
+    by its own max: a guide is another contrast, so the ground truth's scale would
+    saturate or bury it, and only its structure is meant to be compared.
     """
     gt_m, rec_m = _to_mag(gt), _to_mag(recon)
     ref = gt_m.max().clamp_min(eps)
@@ -898,6 +902,9 @@ def recon_panel(gt, recon, zero_filled=None, gain=4.0, eps=1e-12):
     panels += [(rec_m / ref).clamp(0, 1),
                (gt_m / ref).clamp(0, 1),
                (res * gain / ref).clamp(0, 1)]
+    for g in guides:
+        g_m = _to_mag(g)
+        panels.append((g_m / g_m.max().clamp_min(eps)).clamp(0, 1))
 
     # Built with plain torch rather than make_grid: one strip, explicit
     # separators, and no renormalisation behind our back (make_grid's

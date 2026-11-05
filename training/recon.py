@@ -273,6 +273,24 @@ def _guide(net, side, smaps, T, device, guide_R=1, guide_acs_lines=0, guide_mask
     return g if T.is_identity else T.adjoint(g)
 
 
+def guide_display(net, guide, side, guide_R, T=None):
+    """[(label, image)] of the guide for the val panel: what `net` was given -- zero-filled when
+    the guide is accelerated -- and, when it is, the fully-sampled side scan for reference.
+    K-space guides are shown as their coil RSS (no maps needed); image guides as |g|, cropped
+    back from the embedded grid by T. Empty when the net took no guide."""
+    if guide is None:
+        return []
+    rss = lambda k: ifftc(k).abs().pow(2).sum(dim=1, keepdim=True).sqrt()
+    if getattr(net, "guide_domain", "image") == "kspace":
+        seen = rss(guide)
+    else:
+        seen = guide if T is None or T.is_identity else T.forward(guide)
+    if float(guide_R) == 1:
+        return [("guide", seen)]
+    return [(f"guide {guide_R:g}x zero-filled", seen),
+            ("guide fully sampled", rss(side.to(seen.device)))]
+
+
 def _forward(net, y, E, sigma, guide):
     """net(y, E, sigma), plus `guide` only when there is one (unguided nets take no such arg)."""
     if guide is None:
@@ -811,8 +829,14 @@ def train_recon(
                         (image_v, recon_v, zf_v) if p_mask is None else
                         (image_v * p_mask, recon_v * p_mask, zf_v * p_mask))
 
+                    # The guide(s) as the net saw them, after the residual; see
+                    # guide_display. Masked like the other tiles.
+                    gtiles = guide_display(net, guide_v, side_v, guide_R, T_v)
+                    gimgs = [g if p_mask is None else g * p_mask for _, g in gtiles]
+
                     panel, pstats = recon_panel(
                         img_p, rec_p, zero_filled=zf_p, gain=residual_gain,
+                        guides=gimgs,
                     )
 
                     # metrics of the DISPLAYED slice, not the val-set mean --
@@ -825,7 +849,8 @@ def train_recon(
 
                     caption = (
                         f"epoch {epoch} | zero-filled | recon | ground truth | "
-                        f"|residual| x{pstats['gain']:g}\n"
+                        f"|residual| x{pstats['gain']:g}"
+                        + "".join(f" | {lab} (own scale)" for lab, _ in gtiles) + "\n"
                         f"R={R} acs={resolve_acs_lines(image_v.shape[-1], acs_lines, center_frac)} "
                         f"mask={mask_dist} sigma={sig:.4f} "
                         f"| this slice{' [organ mask]' if p_mask is not None else ''}: "
