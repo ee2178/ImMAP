@@ -69,7 +69,8 @@ from training.common import backtrack as do_backtrack, resync_schedule
 from training.i2sb import _bridge_loss
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
-from training.recon import _check_paired, _ckpt_field, _guide, _unpack, guide_display
+from training.recon import (_check_paired, _ckpt_field, _guide, _unpack, guide_display,
+                            undersample_guide)
 from visualization.image import recon_panel
 from visualization.params import get_param_logs
 from visualization.wandb_image import wandb_image
@@ -118,7 +119,20 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
             f"{type(net).__name__} needs the image-domain embedding (pad_stride="
             f"{getattr(net, 'pad_stride', 1)}); bridge regressors run on the measured grid. "
             f"Set data.*.pad_multiple to 1.")
-    x1 = bridge_start(y, E, x1_source)
+    guide_img = None
+    if guide_offset == "random" and float(guide_R) > 1:
+        # ONE line phase for this batch, shared by the bridge start and the net's guide below
+        guide_offset = int(torch.randint(int(round(float(guide_R))), (1,), generator=generator,
+                                         device=generator.device if generator else "cpu"))
+    if x1_source == "guide":
+        # the side scan as an IMAGE on the measured grid, whatever domain the net takes its
+        # guide in: same undersampling (and offset) as the net's guide, the operator's maps
+        if side is None:
+            raise ValueError("x1_source='guide' needs a paired loader (side k-space)")
+        g = undersample_guide(side.to(device, non_blocking=True), guide_R, guide_acs_lines,
+                              guide_mask_dist, guide_offset)
+        guide_img = Sense(extra["smaps"]).adjoint(ifftc(g))
+    x1 = bridge_start(y, E, x1_source, guide_image=guide_img)
     x0 = image
     if x0_source == "operator" and online_smaps and kspace_type != "simulated":
         x0 = Sense(extra["smaps"]).adjoint(ifftc(kspace))

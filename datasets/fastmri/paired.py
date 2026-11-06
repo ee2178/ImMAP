@@ -26,6 +26,16 @@ refuses paired data with simulated k-space or with an operator-map model and no 
            into whatever the model consumes (models with guide_domain "kspace", e.g. TGVN, take
            it as is; image-guided models get its coil combination under the operator's maps).
 
+INTENSITY (`scale_fac` / `side_scale_fac`, or `volume_scales`):
+  fixed     every volume times one factor per contrast (scale_fac main, side_scale_fac guide)
+  volume    `volume_scales` = scripts/volume_scale_stats.py's JSON: each VOLUME is divided by its
+            own statistic -- main by `volume_stat` (default "acs_p95": foreground p95 of the
+            ACS-only image, which the measurement itself contains), guide by `side_volume_stat`
+            (default "full_p95": the guide is given fully sampled) -- and multiplied by
+            `volume_target`. Replaces scale_fac / side_scale_fac. Between-volume level
+            differences are most of the slice-to-slice spread; this removes them, so a fixed
+            noise range and an absolute bridge tau mean the same on every volume.
+
 Each item is the recon loader's 5-tuple plus the side k-space:
 
     (kspace, smaps, image, organ_mask, pad_hw, side_kspace)
@@ -35,6 +45,7 @@ end_slice) at __getitem__, or every slice with `enumerate_slices`.
 """
 
 import csv
+import json
 import os
 import random
 
@@ -63,7 +74,9 @@ class PairedKneeDataset(Dataset):
     def __init__(self, split_csv, kspace_roots, scale_fac=5e3, side_scale_fac=None,
                  start_slice=0, end_slice=None,
                  enumerate_slices=False, pad_multiple=1, organ_mask_source="none",
-                 organ_mask_kws=None, check_acquisition=True, target="rss", smap_root=None):
+                 organ_mask_kws=None, check_acquisition=True, target="rss", smap_root=None,
+                 volume_scales=None, volume_stat="acs_p95", side_volume_stat="full_p95",
+                 volume_target=1.0):
         if target not in ("rss", "sense"):
             raise ValueError(f"target must be 'rss' or 'sense', got {target!r}")
         if target == "sense" and not smap_root:
@@ -112,6 +125,23 @@ class PairedKneeDataset(Dataset):
                 f"{len(missing)} PDFS volume(s) of {os.path.basename(split_csv)} have no offline "
                 f"maps in {smap_root}, e.g. {missing[:3]}: run torch/espirit_knee_pairs.sbatch")
         self.dropped = dropped
+        self.volume_scales = None
+        if volume_scales:
+            with open(volume_scales) as f:
+                vols = json.load(f)["volumes"]
+            scales, absent = [], []
+            for pd_path, pdfs_path, _, _ in self.pairs:
+                a, b = os.path.basename(pdfs_path), os.path.basename(pd_path)
+                if a not in vols or b not in vols:
+                    absent.append(a if a not in vols else b)
+                    continue
+                scales.append((float(volume_target) / vols[a][volume_stat],
+                               float(volume_target) / vols[b][side_volume_stat]))
+            if absent:
+                raise KeyError(f"{len(absent)} volume(s) of {os.path.basename(split_csv)} are not "
+                               f"in {volume_scales}, e.g. {absent[:3]}: rerun "
+                               f"scripts/volume_scale_stats.py over this split")
+            self.volume_scales = scales                     # [(main, side)] per pair
         if dropped:
             print(f"[fastmri_paired] {os.path.basename(split_csv)}: dropped {len(dropped)} of "
                   f"{len(dropped) + len(self.pairs)} pairs whose PD/PDFS k-space shapes differ "
@@ -151,17 +181,19 @@ class PairedKneeDataset(Dataset):
         i, sl = self.index[idx]
         pd_path, pdfs_path, n, map_path = self.pairs[i]
         sl = self._slice(n) if sl is None else sl
+        main_fac, side_fac = (self.scale_fac, self.side_scale_fac) \
+            if self.volume_scales is None else self.volume_scales[i]
         with h5py.File(pdfs_path, "r") as f:
-            kspace = torch.from_numpy(f["kspace"][sl]) * self.scale_fac
+            kspace = torch.from_numpy(f["kspace"][sl]) * main_fac
         with h5py.File(pd_path, "r") as f:
-            side = torch.from_numpy(f["kspace"][sl]) * self.side_scale_fac
+            side = torch.from_numpy(f["kspace"][sl]) * side_fac
 
         C, H, W = kspace.shape
         rss = ifftc(kspace).abs().pow(2).sum(dim=0, keepdim=True).sqrt()      # (1, H, W)
         if self.target == "sense":
             with h5py.File(map_path, "r") as f:
                 smaps = torch.from_numpy(f["smaps"][sl]).to(torch.complex64)
-                image = (torch.from_numpy(f["image"][sl])[None] * self.scale_fac
+                image = (torch.from_numpy(f["image"][sl])[None] * main_fac
                          ).to(torch.complex64)
         else:
             image = rss.to(torch.complex64)
@@ -182,7 +214,8 @@ def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, 
                            enumerate_slices=False,
                            pad_multiple=1, organ_mask_source="none", organ_mask_kws=None,
                            check_acquisition=True, num_workers=8, task="recon", target="rss",
-                           smap_root=None):
+                           smap_root=None, volume_scales=None, volume_stat="acs_p95",
+                           side_volume_stat="full_p95", volume_target=1.0):
     """`task` is accepted (the recon configs carry it) and must be "recon"."""
     if task != "recon":
         raise ValueError(f"fastmri_paired serves recon batches only, got task={task!r}")
@@ -191,7 +224,9 @@ def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, 
                            enumerate_slices=enumerate_slices, pad_multiple=pad_multiple,
                            organ_mask_source=organ_mask_source, organ_mask_kws=organ_mask_kws,
                            check_acquisition=check_acquisition, target=target,
-                           smap_root=smap_root)
+                           smap_root=smap_root, volume_scales=volume_scales,
+                           volume_stat=volume_stat, side_volume_stat=side_volume_stat,
+                           volume_target=volume_target)
     num_workers = int(num_workers)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
                       num_workers=num_workers, pin_memory=True,

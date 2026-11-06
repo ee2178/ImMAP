@@ -5,6 +5,11 @@ sb/i2sb_recon.py -- I2SB for accelerated MRI RECONSTRUCTION.
     x1 = bridge start, built from the measurement y alone:
              "adjoint"   x1 = E^H y, the zero-filled SENSE adjoint (the default; I2SB's
                          restoration setup -- the degraded image IS the prior endpoint)
+             "guide"     x1 = the GUIDE contrast itself (the side scan, e.g. PD for a PDFS
+                         target, coil-combined under the operator's maps, undersampled per
+                         guide_R): I2SB-Inversion's setup (Wang et al., arXiv 2411.14269), a
+                         contrast translation. Needs a paired loader; both contrasts are scaled
+                         to fg p95 ~ 1 (per-contrast scale_fac), so the pair is comparable.
              "acs"       x1 = E^H (A y): only the CONTIGUOUS fully-sampled block of phase-encode
                          lines around the k-space centre, zero-padded -- an alias-free low-pass
                          image. The bridge then DEBLURS (adds structure, which the guide can
@@ -14,14 +19,6 @@ sb/i2sb_recon.py -- I2SB for accelerated MRI RECONSTRUCTION.
                          and the sampler's data consistency. Its width is the MASK's centre block
                          (center_frac / acs_lines): ~15 lines at knee R8 center_frac 0.04, so a
                          sharper start needs a wider centre in the mask, not a change here.
-             "acs_box"   as "acs", but ALSO low-passed along the readout to the SAME fraction of
-                         k-space: a centred box of round(f * H) rows (forced odd) x the ACS's
-                         f * W lines, f = ACS lines / W -- with a center_frac mask, exactly
-                         center_frac * W x center_frac * H. The start is then blurred equally (in
-                         k-space fraction) in both directions rather than only along phase
-                         encode, so the bridge's job is an isotropic deblur. The readout
-                         frequencies it drops are still in y. Hard box: Gibbs ringing in both
-                         directions instead of one.
 
 The bridge is the ordinary sb/base.py one, run on COMPLEX tensors. Nothing in forward_sample or
 reverse_sample is real-specific except the noise: `torch.randn_like` on a complex tensor draws
@@ -58,7 +55,7 @@ from sb.base import forward_std, reverse_sample
 from solvers.cg import batched_cg
 
 
-X1_SOURCES = ("adjoint", "acs", "acs_box")
+X1_SOURCES = ("adjoint", "acs", "guide")
 TAU_SCALES = ("none", "x1_rms")
 
 
@@ -131,32 +128,22 @@ def acs_lines_mask(y, E):
     return out[:, None, None, :].to(y.device)
 
 
-def acs_box_mask(y, E):
-    """(N, 1, H, W) bool: the ACS lines (acs_lines_mask) restricted to the centred block of
-    round(f * H) readout rows, forced odd, f = (number of ACS lines) / W -- the same k-space
-    fraction along both axes. Centred on row H // 2, where ifftc puts DC."""
-    lines = acs_lines_mask(y, E)                                       # (N, 1, 1, W)
-    H, W = y.shape[-2], y.shape[-1]
-    n = lines.reshape(lines.shape[0], W).sum(1)                         # ACS width per row
-    rows = torch.zeros(lines.shape[0], 1, H, 1, dtype=torch.bool, device=y.device)
-    for i, ni in enumerate(n.tolist()):
-        r = max(1, int(round(ni * H / W)))
-        r += (r % 2 == 0)                                               # odd, like the lines
-        r = min(r, H - (H % 2 == 0))
-        lo = H // 2 - r // 2
-        rows[i, :, lo:lo + r] = True
-    return rows & lines
-
-
-def bridge_start(y, E, source="adjoint"):
-    """The prior endpoint x1 from the measurement. Deterministic in y, so it is the same at
-    train and test time."""
+def bridge_start(y, E, source="adjoint", guide_image=None):
+    """The prior endpoint x1. Deterministic in (y, guide), so it is the same at train and test
+    time. "guide" needs `guide_image`: the side (other-contrast) scan's coil combination under
+    E's maps, (B, 1, H, W) -- training/i2sb_recon.py::_measure builds it."""
+    if source == "guide":
+        if guide_image is None:
+            raise ValueError("x1_source='guide' needs the guide image (a paired loader's side "
+                             "scan, combined under the operator's maps)")
+        if guide_image.shape != (y.shape[0], 1, *y.shape[-2:]):
+            raise ValueError(f"guide image {tuple(guide_image.shape)} is not (B, 1, H, W) on "
+                             f"the measured grid {tuple(y.shape[-2:])}")
+        return guide_image
     if source == "adjoint":
         return E.adjoint(y)
     if source == "acs":
         return E.adjoint(y * acs_lines_mask(y, E))
-    if source == "acs_box":
-        return E.adjoint(y * acs_box_mask(y, E))
     raise ValueError(f"x1_source {source!r} not supported; use one of {X1_SOURCES}")
 
 

@@ -13,53 +13,49 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-4           # MUST equal the cell count; checked at runtime
+#SBATCH --array=0-5           # MUST equal the cell count; checked at runtime
 #
-# GUIDED RECONSTRUCTION, fastMRI knee: PDFS main contrast, PD guide (set 1 of
-# notes/guided_recon_tgvn.md). A cell is (main R, model, guide R):
+# THE KNEE R8 SWEEP: PDFS main contrast, PD guide (fully sampled). One training budget for every
+# cell. A cell is (main R, model, guide R):
 #
 #     python scripts/make_guided_recon_configs.py --list-cells
-#     0 tgvn_R8_g1     TGVN, fully-sampled guide                 task recon
-#     1 tgvn_R8_g2     TGVN, 2x guide                            task recon
-#     2 sbtgvn_R8_g1   i2sb-TGVN (BridgeTGVN), fully-sampled     task i2sb_recon
-#     3 sbtgvn_R8_g2   i2sb-TGVN, 2x guide                       task i2sb_recon
-#     4 lpdsnet_R8     LPDSNet, no guide                         task recon
+#     0 lpdsnet_R8        LPDSNet, NO guide (unguided baseline)          task recon
+#     1 lggs_R8_g1        LGGS, Sljiva's grid point, pidistance (triton)  task recon
+#     2 tgvn_c12_R8_g1    TGVN, 12 cascades (E2E-VarNet width)           task recon
+#     3 tgvn_c10_R8_g1    TGVN, 10 cascades                              task recon
+#     4 tgvn_c8_R8_g1     TGVN,  8 cascades                              task recon
+#     5 tgvn_c6_R8_g1     TGVN,  6 cascades                              task recon
+#
+# Runs land in trained_nets/guided_recon/knee/s3/<cell> (RUN_TAG "s3" in the generator): earlier
+# sets' run dirs (s1 shared 5e3 scale + eig-0.95 maps; s2 fixed per-contrast scale) are NOT resumed. Bridge starting points for i2sb-TGVN
+# have their own launcher, torch/bridge_start_knee.sbatch, once the TGVN depth is settled.
 #
 # SAME SETTINGS AS THE ONE-SHOT RECON GRID, NOT TGVN'S RECIPE: the configs are regenerated on every
 # launch from scripts/make_mg_recon_configs.py's knee cells (measured k-space + AWGN, online
 # ESPIRiT, center_frac 0.04 uniform mask, sigma ~ U[0.01, 0.02], Adam + cosine over 300k steps,
-# clip 0.05; magnitude NL1+NL2, except complex-MSE for the complex bridge). Splits are TGVN's
-# patient-level PD/PDFS pairs (config/knee/guided/splits/); the target is the offline SENSE image
-# of the PDFS k-space (ESPIRiT, ACS 32). Val PSNR/SSIM use each slice's own peak (metric_range). The guide is undersampled like TGVN's side scans: equispaced, no centre lines, a fresh
-# line phase per training step (offset 0 at validation).
-#
-# Intensity: PER-CONTRAST scale_fac, PDFS 1.5e4 and PD (guide) 2.9e3, each putting its foreground
-# p95 near 1 (scripts/contrast_histograms.py); the measurement noise range is unchanged.
-#
-# sbtgvn bridge: tau = 0.09 (0.03 at the old shared scale_fac 5e3; gap rule 0.0234 there),
-# INTENSITY-RELATIVE per slice -- tau_i = tau * s_i / tau_ref, s_i the RMS of the zero-filled
-# image's foreground; tau_ref = 0.4443 (0.1481 at 5e3), the median s over 60 train slices at R=8,
-# from
-#     python scripts/calibrate_recon_bridge.py config/knee/guided/sbtgvn_R8_g1.json --slices 60
-# (TAU_REF in scripts/make_guided_recon_configs.py; re-measure for another main R).
+# clip 0.05; magnitude NL1+NL2). LR: the grid's (LGGS: its group-attention LR). Splits are TGVN's
+# patient-level PD/PDFS pairs (config/knee/guided/splits/). Target: the offline SENSE image of the
+# PDFS k-space (ESPIRiT, ACS 32, thresh_eig 0.9 -- torch/espirit_knee_pairs.sbatch MUST have
+# finished; a cell refuses to start without the maps). Intensity: PER-VOLUME normalization --
+# each volume divided by its own foreground p95, the target by its ACS-only image's, the guide by
+# its full image's (config/knee/guided/volume_scales.json from torch/volume_scales_knee.sbatch,
+# which MUST have finished too). Val PSNR/SSIM against each slice's own peak.
 #
 # RESUME: a requeued cell continues from its run dir's config.json + net.ckpt; REGENERATE never
 # touches a started run. FORCE_RESTART=1 moves the old run aside and starts over.
 #
-# Submit:          sbatch torch/guided_recon_knee.sbatch
-# One cell:        sbatch --array=0 torch/guided_recon_knee.sbatch          (tgvn_R8_g1)
-# Guide sweep:     GUIDE_ACCELS="1 2 4" MODELS="tgvn" sbatch --array=0-2 --export=ALL torch/guided_recon_knee.sbatch
-# TGVN depth sweep (E2E-VarNet width, 10/8/6 cascades) + LGGS, fully-sampled guide:
-#                  MODELS="tgvn_c10 tgvn_c8 tgvn_c6 lggs" GUIDE_ACCELS=1 sbatch --array=0-3 --export=ALL torch/guided_recon_knee.sbatch
-#                  (0 tgvn_c10, 1 tgvn_c8, 2 tgvn_c6, 3 lggs; scripts/time_guided_nets.py times them)
+# Order:           MAPS=$(sbatch --parsable torch/espirit_knee_pairs.sbatch)
+#                  VOLS=$(sbatch --parsable torch/volume_scales_knee.sbatch)
+#                  sbatch --dependency=afterok:${MAPS}:${VOLS} torch/guided_recon_knee.sbatch
+# One cell:        sbatch --array=1 torch/guided_recon_knee.sbatch          (lggs_R8_g1)
+# Other cells:     MODELS="tgvn_c8" GUIDE_ACCELS="1 2 4" sbatch --array=0-2 --export=ALL torch/guided_recon_knee.sbatch
 # Smoke test:      sbatch --array=0 --time=00:30:00 torch/guided_recon_knee.sbatch
-#                  (a wrong data root or a PD/PDFS file missing from both roots fails at loader
-#                  construction, within a minute)
+# Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
 ACCELS="${ACCELS:-8}"
-MODELS="${MODELS:-tgvn sbtgvn lpdsnet}"
-GUIDE_ACCELS="${GUIDE_ACCELS:-1 2}"
+MODELS="${MODELS:-lpdsnet lggs tgvn_c12 tgvn_c10 tgvn_c8 tgvn_c6}"
+GUIDE_ACCELS="${GUIDE_ACCELS:-1}"
 REGENERATE="${REGENERATE:-1}"
 FORCE_RESTART="${FORCE_RESTART:-}"
 
@@ -90,9 +86,29 @@ BASE_CONFIG="config/knee/guided/${NAME}.json"
 echo "[guided] task ${SLURM_ARRAY_TASK_ID}/$((N_TOTAL - 1)): knee ${NAME}"
 
 if [ "${REGENERATE}" = "1" ]; then
-    "${GEN[@]}"
+    # every array task regenerates at once: write into a private dir, then move THIS cell's
+    # config into place, so no task reads a config another one is half-way through writing
+    TMP_CFG="$(mktemp -d)"
+    "${GEN[@]}" --out "${TMP_CFG}" > /dev/null
+    mkdir -p config/knee/guided
+    mv -f "${TMP_CFG}/knee/guided/${NAME}.json" "${BASE_CONFIG}"
+    rm -rf "${TMP_CFG}"
 fi
 [ -f "${BASE_CONFIG}" ] || { echo "[guided] missing ${BASE_CONFIG}" >&2; exit 1; }
+
+# the offline target maps must exist (torch/espirit_knee_pairs.sbatch); fail now, not at step 0
+python - "${BASE_CONFIG}" <<'PY'
+import json, os, sys
+d = json.load(open(sys.argv[1]))["data"]["train"]
+root = d.get("smap_root")
+if d.get("target") == "sense" and (not root or not os.path.isdir(root) or not os.listdir(root)):
+    sys.exit(f"[guided] offline maps missing or empty: {root}\n"
+             f"         run torch/espirit_knee_pairs.sbatch first (or submit with "
+             f"--dependency=afterok:<its job id>)")
+vs = d.get("volume_scales")
+if vs and not os.path.isfile(vs):
+    sys.exit(f"[guided] per-volume scales missing: {vs} -- run torch/volume_scales_knee.sbatch")
+PY
 
 RUN_DIR="$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['paths']['save_dir'])" "${BASE_CONFIG}")"
 if [ "${FORCE_RESTART}" = "1" ] && [ -d "${RUN_DIR}" ]; then

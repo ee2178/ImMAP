@@ -2,21 +2,32 @@
 """
 Configs for GUIDED reconstruction on fastMRI knee: PDFS main contrast, PD guide (TGVN's setup).
 
-Set 1 of notes/guided_recon_tgvn.md, trained under the SAME settings as the one-shot recon grid --
-not TGVN's own recipe -- so the comparison is like for like at the grid's compute. A cell is
-(main R, model, guide R); guide R = 1 is a fully-sampled guide, and unguided models get only that
-cell. The default cells are the first five experiments:
+Trained under the SAME settings as the one-shot recon grid -- not TGVN's own recipe -- so the
+comparison is like for like at the grid's compute (one training budget for every cell). A cell
+is (main R, model, guide R); guide R = 1 is a fully-sampled guide, and unguided models get only
+that cell. Runs land in trained_nets/guided_recon/knee/<RUN_TAG>/<cell>.
 
-    tgvn_R8_g1     TGVN, fully-sampled guide                 task recon
-    tgvn_R8_g2     TGVN, 2x guide                            task recon
-    sbtgvn_R8_g1   i2sb-TGVN (BridgeTGVN), fully-sampled     task i2sb_recon
-    sbtgvn_R8_g2   i2sb-TGVN, 2x guide                       task i2sb_recon
-    lpdsnet_R8     LPDSNet, no guide (on the same PDFS data) task recon
+THE R8 SWEEP (the default cells; torch/guided_recon_knee.sbatch):
 
-Optional models: varnet_img (TGVN's matched no-guide E2E-VarNet), lggs (LGGSNet), and the TGVN
-depth sweep tgvn_c10 / tgvn_c8 / tgvn_c6 (E2E-VarNet width, 10 / 8 / 6 cascades):
+    lpdsnet_R8          LPDSNet, NO guide (the unguided baseline, on the same PDFS data)
+    lggs_R8_g1          LGGS at Sljiva's grid point, phase-invariant similarity (triton)
+    tgvn_c12_R8_g1      TGVN, E2E-VarNet width, 12 / 10 / 8 / 6 cascades,
+    tgvn_c10_R8_g1        fully-sampled guide
+    tgvn_c8_R8_g1
+    tgvn_c6_R8_g1
 
-    python scripts/make_guided_recon_configs.py --models tgvn_c10 tgvn_c8 tgvn_c6 lggs         --guide-accels 1
+BRIDGE STARTS (after the TGVN depth is settled; torch/bridge_start_knee.sbatch): i2sb-TGVN at
+one depth N from each starting point,
+
+    sbtgvn_cN_guide_R8_g1     x1 = the guide (PD) image: contrast translation
+    sbtgvn_cN_adjoint_R8_g1   x1 = zero-filled E^H y
+    sbtgvn_cN_acs_R8_g1       x1 = the mask's centre lines only (alias-free low-pass)
+
+each with its own tau from config/knee/guided/bridge_tau/<start>_R<R>_<NORMALIZATION>.json
+(scripts/calibrate_recon_bridge.py --json; the launcher writes it on first use).
+
+Also available: tgvn / sbtgvn (12 cascades, the first set's names), varnet_img (TGVN's matched
+no-guide E2E-VarNet).
 
 What is inherited, from what scripts/make_mg_recon_configs.py writes TODAY for knee at that R:
     mri          the measured protocol: measured k-space + AWGN, online ESPIRiT, center_frac,
@@ -49,8 +60,9 @@ What is set here:
                  tau is TAU below, intensity-relative per slice (TAU_SCALE / TAU_REF);
                  calibrate with scripts/calibrate_recon_bridge.py.
 
-    python scripts/make_guided_recon_configs.py                  # the five default cells
-    python scripts/make_guided_recon_configs.py --guide-accels 1 2 4 --models tgvn
+    python scripts/make_guided_recon_configs.py                  # the R8 sweep
+    python scripts/make_guided_recon_configs.py --models sbtgvn_c8_guide sbtgvn_c8_acs
+    python scripts/make_guided_recon_configs.py --guide-accels 1 2 4 --models tgvn_c8
     python scripts/make_guided_recon_configs.py --list-cells
 """
 
@@ -66,8 +78,12 @@ sys.path.insert(0, REPO)
 
 ANATOMY = "knee"
 ACCELS = (8,)
-GUIDE_ACCELS = (1, 2)
-DEFAULT_MODELS = ("tgvn", "sbtgvn", "lpdsnet")
+GUIDE_ACCELS = (1,)
+DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c12", "tgvn_c10", "tgvn_c8", "tgvn_c6")
+# Run namespace. "s3" = PER-VOLUME normalization + eig-0.9 offline maps (2026-11-06; "s2" was the
+# per-contrast fixed scale_fac). A new tag means new run directories: the launchers RESUME any run
+# dir that has a checkpoint, so reusing an earlier set's would silently continue those runs.
+RUN_TAG = "s3"
 SPLITS = "config/knee/guided/splits"
 KSPACE_ROOTS = ["../datasets/fastmri/knee/multicoil_train",
                 "../datasets/fastmri/knee/multicoil_val"]
@@ -93,6 +109,17 @@ PDFS_SCALE_FAC = 1.5e4
 PD_SCALE_FAC = 2.9e3
 _OLD_SCALE_FAC = 5e3                # what TAU / TAU_REF below were measured at
 
+# NORMALIZATION (2026-11-06, the current setting): "volume" divides each VOLUME by its own
+# foreground p95, per contrast -- the between-volume part is most of the slice-to-slice level
+# spread (76% PDFS / 86% PD of the log-variance; within a volume ~15% sd), so after it one noise
+# range and one ABSOLUTE bridge tau mean the same on every volume. Statistics from
+# scripts/volume_scale_stats.py (VOLUME_SCALES): the TARGET by its ACS-only image's p95 (the
+# measurement contains those lines, so a test-time pipeline can compute it), the fully-sampled
+# GUIDE by its own full p95. "fixed" = PDFS_SCALE_FAC / PD_SCALE_FAC above (set s2).
+NORMALIZATION = "volume"
+VOLUME_SCALES = "config/knee/guided/volume_scales.json"
+VOLUME_STAT, SIDE_VOLUME_STAT = "acs_p95", "full_p95"
+
 TAU = 0.03 * PDFS_SCALE_FAC / _OLD_SCALE_FAC
 # sampling-time CG data consistency (I2SB-Recon, arXiv 2411.14269; sb/i2sb_recon.py): the
 # paper's defaults. Validation only -- val/* is WITH it, val/nodc_* the plain sampler on the same
@@ -100,9 +127,9 @@ TAU = 0.03 * PDFS_SCALE_FAC / _OLD_SCALE_FAC
 I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
 # Bridge start (sb/i2sb_recon.py): "adjoint" = zero-filled E^H y (aliased); "acs" = only the
 # mask's contiguous centre block, an alias-free low-pass image -- the bridge then deblurs, with
-# the guide supplying structure. Its width is the mask's centre (center_frac). "acs_box" = the
-# same block cut to center_frac * H readout rows too (center_frac*W x center_frac*H): an
-# isotropic low-pass start, the planned choice once starting points are explored. Starting points
+# the guide supplying structure. Its width is the mask's centre (center_frac). Uniform
+# masks always sample whole lines, so "acs" keeps the full readout (a centre box cut to
+# center_frac * H rows was tried and dropped: ~4% of the samples, far blurrier). Starting points
 # are explored after the architecture is settled; tau / tau_ref must be re-calibrated per start.
 X1_SOURCE = "adjoint"
 # INTENSITY-RELATIVE bridge: slice i runs at tau_i = TAU * s_i / TAU_REF, s_i the RMS of its
@@ -113,7 +140,7 @@ X1_SOURCE = "adjoint"
 # 0.1481, range [0.082, 0.306]; the gap rule in these units gives tau 0.0212 (absolute: 0.0234).
 # The per-slice GAP spread barely moves under the scaling (std/mean 0.45 -> 0.44): intensity sets
 # how visible the noise is, but not how large the aliasing gap is. Re-measure for another main R.
-TAU_SCALE = "x1_rms"
+TAU_SCALE = "x1_rms" if NORMALIZATION == "fixed" else "none"   # volume norm: ABSOLUTE tau
 TAU_REF = 0.1481 * PDFS_SCALE_FAC / _OLD_SCALE_FAC
 # Both scaled by the same factor, so the bridge is UNCHANGED relative to each slice (tau_i =
 # TAU * s_i / TAU_REF, s_i scales with the data) and TAU keeps its meaning, the tau of a typical
@@ -123,13 +150,16 @@ SCHEDULE = dict(kind="brownian", tau=TAU, n_points=1000, beta_max=0.3)
 
 TGVN_SIZE = dict(num_cascades=12, sens_chans=8, sens_pools=4, chans=18, pools=4)
 
-# The published LGGS point, models/guided_lpds.py::lggs_defaults(), with the grid's attention
-# backend. Written out rather than imported so this script needs no torch model stack;
-# tests/test_guided_recon.py pins it to lggs_defaults().
+# Sljiva's LGGS grid point (scripts/makeconfigs_longi.jl), models/guided_lpds.py::lggs_defaults(),
+# with the PHASE-INVARIANT similarity pidistance, |<q,k>| - 1/2||k||^2. On complex features that
+# needs attn_backend "triton" (models/circulant_triton.py): flex scores Re<q,k> only, so flex +
+# pidistance is wrong on complex data (the fused-vs-gather self-check refuses it at the first
+# forward). Written out rather than imported so this script needs no torch model stack;
+# tests/test_guided_recon.py pins it to lggs_defaults(attn_backend="triton").
 LGGS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
                    joint_softmax=True, sim_fun="pidistance", lam0=1e-3, tau0=0.5, theta0=0.0,
                    dK=5, nheads=1, init_strategy="semi_orthogonal", is_complex=True,
-                   preproc="kspace", attn_backend="flex")
+                   preproc="kspace", attn_backend="triton")
 
 MODELS = {
     "tgvn": dict(task="recon", guided=True, grid_base="varnet", pad_multiple=1,
@@ -151,12 +181,51 @@ MODELS = {
 # sens_chans 8 -- the grid's varnet cell), cascades cut. Per forward at knee R8 with a
 # fully-sampled guide, one cascade costs ~64 GFLOP (two 18-chan U-Nets + the CG trust projector),
 # so 10 / 8 / 6 cascades are ~640 / 511 / 383 GFLOP against LGGS's ~677 (12: ~768).
-TGVN_CASCADE_SWEEP = (10, 8, 6)
+TGVN_CASCADE_SWEEP = (12, 10, 8, 6)
 for _n in TGVN_CASCADE_SWEEP:
     MODELS[f"tgvn_c{_n}"] = dict(
         task="recon", guided=True, grid_base="varnet", pad_multiple=1,
         model=dict(type="TGVN", params=dict(guided=True, cond_sigma=True, use_smaps=True,
                                             **dict(TGVN_SIZE, num_cascades=_n))))
+
+# Bridge starting points for i2sb-TGVN (sb/i2sb_recon.py::bridge_start), at every sweep depth so
+# the launcher can pick the settled one: sbtgvn_c<N>_<start>.
+BRIDGE_STARTS = ("guide", "adjoint", "acs")
+for _n in TGVN_CASCADE_SWEEP:
+    for _src in BRIDGE_STARTS:
+        MODELS[f"sbtgvn_c{_n}_{_src}"] = dict(
+            task="i2sb_recon", guided=True, grid_base="varnet", pad_multiple=1, x1_source=_src,
+            model=dict(type="BridgeTGVN", params=dict(guided=True, cond_sigma=True,
+                                                      **dict(TGVN_SIZE, num_cascades=_n),
+                                                      **SCHEDULE)))
+
+# Per-start bridge temperature. The gap x0 - x1 differs completely between starts (aliasing for
+# "adjoint", blur for "acs", CONTRAST for "guide"), so each gets its own calibration, written by
+# `scripts/calibrate_recon_bridge.py <config> --json BRIDGE_TAU_DIR/<start>_R<R>.json` (the bridge
+# launcher does it on first use). tau = TAU_MARGIN x the intensity-relative gap rule: the margin is
+# the user's 2026-11-05 call on the zero-filled start (0.03 against a relative gap rule of 0.0212,
+# "a slightly wider ladder is the safer side"), kept for every start. Without a file a start falls
+# back to TAU / TAU_REF above (the zero-filled calibration).
+BRIDGE_TAU_DIR = "config/knee/guided/bridge_tau"
+TAU_MARGIN = 0.03 / 0.0212          # on the intensity-relative gap rule (tau_scale "x1_rms")
+TAU_MARGIN_ABS = 0.03 / 0.0234      # on the absolute gap rule (tau_scale "none")
+# The calibration files are keyed by NORMALIZATION too: a gap measured under one intensity
+# convention is not the gap under another.
+
+
+def bridge_tau(start, r, root=REPO, normalization=None):
+    """(tau, tau_ref, calibrated) for bridge start `start` at main R `r`. tau_ref is None for an
+    absolute tau (tau_scale "none"). No file -> the zero-filled fallback TAU / TAU_REF."""
+    norm = normalization or NORMALIZATION
+    absolute = norm != "fixed"
+    p = os.path.join(root, BRIDGE_TAU_DIR, f"{start}_R{r}_{norm}.json")
+    if not os.path.exists(p):
+        return TAU, (None if absolute else TAU_REF), False
+    with open(p) as f:
+        cal = json.load(f)
+    if absolute:
+        return float(f"{TAU_MARGIN_ABS * cal['tau_abs']:.4g}"), None, True
+    return (float(f"{TAU_MARGIN * cal['tau_rel']:.4g}"), float(f"{cal['tau_ref']:.4g}"), True)
 
 # PSNR / SSIM against each slice's own peak |gt| (training/metrics.py). The paired loader only
 # multiplies by a fixed scale_fac, so slice peaks sit well below 1 and vary across a volume:
@@ -184,12 +253,22 @@ def _data(split, base_split, pad_multiple):
             "split_csv": f"{SPLITS}/{split}.csv",
             "kspace_roots": list(KSPACE_ROOTS),
             **{k: base_split[k] for k in keep if k in base_split},
-            "scale_fac": PDFS_SCALE_FAC,
-            "side_scale_fac": PD_SCALE_FAC,
+            **({"scale_fac": PDFS_SCALE_FAC, "side_scale_fac": PD_SCALE_FAC}
+               if NORMALIZATION == "fixed" else
+               {"volume_scales": VOLUME_SCALES, "volume_stat": VOLUME_STAT,
+                "side_volume_stat": SIDE_VOLUME_STAT, "volume_target": 1.0}),
             "target": TARGET,
             "smap_root": PDFS_MAPS,
             "pad_multiple": pad_multiple,
             "num_workers": 8}
+
+
+def bridge_tau_path(r, model):
+    """Where a bridge cell's start-point calibration lives, else None."""
+    spec = MODELS[model]
+    if spec["task"] != "i2sb_recon":
+        return None
+    return f"{BRIDGE_TAU_DIR}/{spec.get('x1_source', X1_SOURCE)}_R{r}_{NORMALIZATION}.json"
 
 
 def cell_name(r, model, g):
@@ -207,11 +286,13 @@ def make_config(r, model, g, grid):
     mri = dict(grid["lpdsnet"]["mri"], guide_R=int(g), guide_acs_lines=0,
                guide_mask_dist="uniform")
     name = cell_name(r, model, g)
+    run = f"{ANATOMY}_PDFS_from_PD_{name}" if spec["guided"] else f"{ANATOMY}_PDFS_{name}"
     cfg = {
         "task": spec["task"],
-        "experiment": {"name": f"guided_{ANATOMY}_PDFS_from_PD_{name}"},
+        "experiment": {"name": f"{run}_{RUN_TAG}"},
         "model": json.loads(json.dumps(model_block)),
-        "paths": {"save_dir": f"trained_nets/guided_recon/{ANATOMY}/{name}", "ckpt": None},
+        "paths": {"save_dir": f"trained_nets/guided_recon/{ANATOMY}/{RUN_TAG}/{name}",
+                  "ckpt": None},
         "data": {"train": _data("train", base["data"]["train"], pad),
                  "val": _data("val", base["data"]["val"], pad)},
         "training": training,
@@ -221,10 +302,13 @@ def make_config(r, model, g, grid):
         "wandb": {"project": "guided_recon", "id": None},
     }
     if spec["task"] == "i2sb_recon":
+        start = spec.get("x1_source", X1_SOURCE)
+        tau, tau_ref, _ = bridge_tau(start, r)
+        cfg["model"]["params"]["tau"] = tau             # BridgeTGVN checks it matches i2sb
         cfg["training"]["loss_type"] = "complex-mse"
-        cfg["i2sb"] = {**SCHEDULE, "deterministic": False, "posterior": "ddpm",
-                       "x1_source": X1_SOURCE, "x0_source": "operator",
-                       "tau_scale": TAU_SCALE, "tau_ref": TAU_REF,
+        cfg["i2sb"] = {**SCHEDULE, "tau": tau, "deterministic": False, "posterior": "ddpm",
+                       "x1_source": start, "x0_source": "operator",
+                       "tau_scale": TAU_SCALE, "tau_ref": tau_ref,
                        "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC}
     return cfg
 
@@ -266,14 +350,16 @@ def main():
     p.add_argument("--guide-accels", nargs="*", type=int, default=list(GUIDE_ACCELS),
                    help="guide (PD) accelerations for the guided models; 1 = fully sampled")
     p.add_argument("--list-cells", action="store_true",
-                   help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name' and exit")
+                   help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name<TAB>tau file' "
+                        "and exit (tau file: a bridge cell's calibration path, else '-')")
     args = p.parse_args()
     write_config = _write_config()
 
     todo = cells(args.accels, args.models, args.guide_accels)
     if args.list_cells:
         for i, (r, m, g) in enumerate(todo):
-            print(f"{i}\tR{r}\t{m}\tg{g}\t{cell_name(r, m, g)}")
+            print(f"{i}\tR{r}\t{m}\tg{g}\t{cell_name(r, m, g)}\t"
+                  f"{bridge_tau_path(r, m) or '-'}")
         return
     for r in sorted({c[0] for c in todo}):
         grid = grid_cells(r, [MODELS[m]["grid_base"] for _, m, _ in todo])
@@ -284,8 +370,14 @@ def main():
             path = config_path(args.out, r, m, g)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             write_config(cfg, path)
+            extra = ""
+            if cfg["task"] == "i2sb_recon":
+                cal = bridge_tau(cfg["i2sb"]["x1_source"], r)[2]
+                extra = (f" x1={cfg['i2sb']['x1_source']} tau={cfg['i2sb']['tau']:g} "
+                         f"tau_scale={cfg['i2sb']['tau_scale']} tau_ref={cfg['i2sb']['tau_ref']}"
+                         + ("" if cal else " (UNCALIBRATED: zero-filled fallback)"))
             print(f"{path}: {cfg['task']} {cfg['model']['type']} R={r} guide_R={g} "
-                  f"lr={cfg['optimizer']['params']['lr']}")
+                  f"lr={cfg['optimizer']['params']['lr']}{extra}")
 
 
 if __name__ == "__main__":

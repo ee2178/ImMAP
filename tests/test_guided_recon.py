@@ -24,6 +24,7 @@ import inspect
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -443,44 +444,132 @@ def test_gt_max_metrics_are_per_slice_and_scale_free():
 
 
 def test_generator_cells_and_config_keys():
+    """The R8 sweep and the bridge-start cells: names, run dirs, and every config key reaches
+    its training loop (configs generated fresh into a temp dir, read as train.py reads them)."""
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import make_guided_recon_configs as gen
     from models.guided_lpds import lggs_defaults
     from training.i2sb_recon import train_i2sb_recon
-    assert gen.LGGS_PARAMS == lggs_defaults(attn_backend="flex")[0]
+    assert gen.LGGS_PARAMS == lggs_defaults(attn_backend="triton")[0]
+    assert gen.LGGS_PARAMS["sim_fun"] == "pidistance"
     names = [gen.cell_name(*c) for c in gen.cells()]
-    assert names == ["tgvn_R8_g1", "tgvn_R8_g2", "sbtgvn_R8_g1", "sbtgvn_R8_g2", "lpdsnet_R8"]
-    root = os.path.join(REPO, "config", "knee", "guided")
-    if not os.path.exists(os.path.join(root, "tgvn_R8_g1.json")):
-        print("    (skipped key check: run scripts/make_guided_recon_configs.py first)")
-        return
-    loops = {"recon": (("training", "mri", "paths"), tr.train_recon),
-             "i2sb_recon": (("training", "mri", "i2sb", "paths"), train_i2sb_recon)}
-    import yaml
-    for name in names:
-        with open(os.path.join(root, f"{name}.json")) as f:
-            cfg = yaml.safe_load(f)                 # how train.py reads it: 1e-06 is a STRING
-        assert isinstance(cfg["scheduler"]["params"]["eta_min"], float),             f"{name}: eta_min loads as {cfg['scheduler']['params']['eta_min']!r}"
-        blocks, fn = loops[cfg["task"]]
-        params = inspect.signature(fn).parameters
-        seen = set()
-        for block in blocks:
-            for k in cfg[block]:
-                assert k in params, f"{name}: {block}.{k} is not a {fn.__name__} argument"
-                assert k not in seen, f"{name}: {k} in two blocks"
-                seen.add(k)
-        assert cfg["data"]["train"]["name"] == "fastmri_paired"
-        assert set(inspect.signature(get_paired_knee_loader).parameters) >=             set(cfg["data"]["train"]) - {"name"}
-        if cfg["task"] == "i2sb_recon":
-            for k in ("kind", "tau", "n_points", "beta_max"):
-                assert cfg["model"]["params"][k] == cfg["i2sb"][k], (name, k)
-            assert isinstance(cfg["i2sb"]["dc_lam"], float), (name, cfg["i2sb"]["dc_lam"])
-            assert cfg["i2sb"]["dc_iters"] > 0, name
-        assert cfg["mri"]["guide_R"] == (2 if name.endswith("_g2") else 1)
-        assert cfg["training"]["metric_range"] == "gt_max", name
+    assert names == ["lpdsnet_R8", "lggs_R8_g1", "tgvn_c12_R8_g1", "tgvn_c10_R8_g1",
+                     "tgvn_c8_R8_g1", "tgvn_c6_R8_g1"], names
+    bridge = [f"sbtgvn_c8_{s}" for s in gen.BRIDGE_STARTS]
+    assert [gen.cell_name(8, m, 1) for m in bridge] == [
+        "sbtgvn_c8_guide_R8_g1", "sbtgvn_c8_adjoint_R8_g1", "sbtgvn_c8_acs_R8_g1"]
     for n in gen.TGVN_CASCADE_SWEEP:
         p = gen.MODELS[f"tgvn_c{n}"]["model"]["params"]
         assert p["num_cascades"] == n and p["chans"] == 18 and p["sens_chans"] == 8
+    try:
+        import yaml
+    except ImportError:
+        print("    (skipped key check: no yaml here)")
+        return
+    loops = {"recon": (("training", "mri", "paths"), tr.train_recon),
+             "i2sb_recon": (("training", "mri", "i2sb", "paths"), train_i2sb_recon)}
+    with tempfile.TemporaryDirectory() as out:
+        for models in (list(gen.DEFAULT_MODELS), bridge):
+            subprocess.run([sys.executable, os.path.join(REPO, "scripts",
+                                                         "make_guided_recon_configs.py"),
+                            "--out", out, "--models", *models], check=True, cwd=REPO,
+                           stdout=subprocess.DEVNULL)
+        for name in names + [gen.cell_name(8, m, 1) for m in bridge]:
+            with open(os.path.join(out, "knee", "guided", f"{name}.json")) as f:
+                cfg = yaml.safe_load(f)             # how train.py reads it: 1e-06 is a STRING
+            assert isinstance(cfg["scheduler"]["params"]["eta_min"], float), name
+            blocks, fn = loops[cfg["task"]]
+            params = inspect.signature(fn).parameters
+            seen = set()
+            for block in blocks:
+                for k in cfg[block]:
+                    assert k in params, f"{name}: {block}.{k} is not a {fn.__name__} argument"
+                    assert k not in seen, f"{name}: {k} in two blocks"
+                    seen.add(k)
+            d = cfg["data"]["train"]
+            assert d["name"] == "fastmri_paired"
+            assert set(inspect.signature(get_paired_knee_loader).parameters) >= set(d) - {"name"}
+            if gen.NORMALIZATION == "volume":
+                assert "scale_fac" not in d and d["volume_scales"] == gen.VOLUME_SCALES
+                assert (d["volume_stat"], d["side_volume_stat"]) == ("acs_p95", "full_p95")
+            else:
+                assert (d["scale_fac"], d["side_scale_fac"]) == (gen.PDFS_SCALE_FAC,
+                                                                 gen.PD_SCALE_FAC)
+            assert cfg["paths"]["save_dir"] == f"trained_nets/guided_recon/knee/{gen.RUN_TAG}/{name}"
+            guided = gen.MODELS[name.split("_R")[0]]["guided"]
+            assert ("from_PD" in cfg["experiment"]["name"]) == guided, cfg["experiment"]["name"]
+            if cfg["task"] == "i2sb_recon":
+                for k in ("kind", "tau", "n_points", "beta_max"):
+                    assert cfg["model"]["params"][k] == cfg["i2sb"][k], (name, k)
+                assert cfg["i2sb"]["x1_source"] == name.split("_")[2], name
+                assert cfg["i2sb"]["tau_scale"] == gen.TAU_SCALE, name
+                assert (gen.TAU_SCALE == "none") == (gen.NORMALIZATION == "volume")
+                assert isinstance(cfg["i2sb"]["dc_lam"], float), (name, cfg["i2sb"]["dc_lam"])
+                assert cfg["i2sb"]["dc_iters"] > 0, name
+            assert cfg["mri"]["guide_R"] == 1
+            assert cfg["training"]["metric_range"] == "gt_max", name
+
+
+def test_bridge_tau_is_read_per_start_and_normalization():
+    """Volume norm: tau = TAU_MARGIN_ABS x the absolute gap rule, no tau_ref. Fixed norm:
+    TAU_MARGIN x the relative gap rule, tau_ref calibrated. Files keyed by start, R and
+    normalization; no file -> the zero-filled fallback, flagged uncalibrated."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    with tempfile.TemporaryDirectory() as root:
+        assert gen.bridge_tau("guide", 8, root=root, normalization="volume") == \
+            (gen.TAU, None, False)
+        assert gen.bridge_tau("guide", 8, root=root, normalization="fixed") == \
+            (gen.TAU, gen.TAU_REF, False)
+        os.makedirs(os.path.join(root, gen.BRIDGE_TAU_DIR))
+        cal = {"tau_abs": 0.1, "tau_rel": 0.2, "tau_ref": 0.9}
+        for norm in ("volume", "fixed"):
+            with open(os.path.join(root, gen.BRIDGE_TAU_DIR, f"guide_R8_{norm}.json"), "w") as f:
+                json.dump(cal, f)
+        tau, tau_ref, ok = gen.bridge_tau("guide", 8, root=root, normalization="volume")
+        assert ok and abs(tau - gen.TAU_MARGIN_ABS * 0.1) < 1e-3 and tau_ref is None
+        tau, tau_ref, ok = gen.bridge_tau("guide", 8, root=root, normalization="fixed")
+        assert ok and abs(tau - gen.TAU_MARGIN * 0.2) < 1e-3 and tau_ref == 0.9
+        assert gen.bridge_tau("acs", 8, root=root, normalization="volume")[2] is False
+    assert gen.bridge_tau_path(8, "sbtgvn_c8_acs") == \
+        f"{gen.BRIDGE_TAU_DIR}/acs_R8_{gen.NORMALIZATION}.json"
+    assert gen.bridge_tau_path(8, "tgvn_c8") is None
+
+
+def test_volume_stats_and_per_volume_loader_scaling():
+    """scripts/volume_scale_stats.py writes per-volume foreground percentiles (full and
+    ACS-only); the loader divides each volume -- main and guide separately -- by its own."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import volume_scale_stats as vss
+    with tempfile.TemporaryDirectory() as root:
+        csv, _ = make_data(root)
+        out = os.path.join(root, "vs.json")
+        argv = sys.argv
+        sys.argv = ["volume_scale_stats.py", "--splits", csv, "--kspace-roots", root,
+                    "--stride", "1", "--center-frac", "0.25", "--out", out]
+        try:
+            vss.main()
+        finally:
+            sys.argv = argv
+        vols = json.load(open(out))["volumes"]
+        assert {"pdfs0.h5", "pd0.h5"} <= set(vols)
+        v = vols["pdfs0.h5"]
+        assert v["contrast"] == "pdfs" and v["acs_p95"] > 0 and v["full_p95"] > 0
+        assert v["full_p90"] <= v["full_p95"] <= v["full_p99"]
+        kw = dict(start_slice=1, end_slice=3, enumerate_slices=True)
+        base = PairedKneeDataset(csv, root, scale_fac=1.0, **kw)
+        vol = PairedKneeDataset(csv, root, volume_scales=out, volume_target=2.0, **kw)
+        for idx in (0, 3):
+            b, w = base[idx], vol[idx]
+            i = base.index[idx][0]
+            pd_path, fs_path = base.pairs[i][:2]
+            main = 2.0 / vols[os.path.basename(fs_path)]["acs_p95"]
+            side = 2.0 / vols[os.path.basename(pd_path)]["full_p95"]
+            assert torch.allclose(w[0], main * b[0], rtol=1e-4, atol=1e-6)
+            assert torch.allclose(w[5], side * b[5], rtol=1e-4, atol=1e-6)
+        del vols["pd0.h5"]
+        json.dump({"volumes": vols}, open(out, "w"))
+        raises(KeyError, lambda: PairedKneeDataset(csv, root, volume_scales=out), "pd0.h5")
 
 
 def test_guide_undersampling():
@@ -673,6 +762,53 @@ def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
         raises(ValueError, lambda: train_i2sb_recon(
             spy, torch.optim.Adam(spy.parameters()), None, "cpu", loader(), None, tau=0.1,
             tau_scale="x1_rms", save_dir=d), "tau_ref")
+
+
+def test_guide_bridge_start_is_the_side_image_with_the_nets_guide_lines():
+    """x1_source="guide": x1 is the side scan under the operator's maps, undersampled with the
+    SAME line phase as the guide the net receives; and a short run trains from it."""
+    from models.tgvn import BridgeTGVN
+    import training.i2sb_recon as tir
+    import physics.online_smaps as osm
+    real = osm.online_smaps
+    osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
+    try:
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+            csv, _ = make_data(root)
+            loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,  # noqa: E731
+                                                    drop_last=False, scale_fac=1.0,
+                                                    side_scale_fac=2.0, start_slice=1,
+                                                    end_slice=3, num_workers=0)
+            net = BridgeTGVN(tau=0.1, **TINY_TGVN)
+            batch = next(iter(loader()))
+            meas = dict(R=4, acs_lines=4, mask_dist="uniform", mask_offset=0, center_frac=None,
+                        adjust_accel=False, kspace_type="measurement_awgn", noise_std=0.0,
+                        noise_dist="uniform", online_smaps="espirit", online_smaps_kws=None,
+                        x1_source="guide", guide_R=2)
+            x0, x1, y, E, sigma_n, organ, gt, guide = tir._measure(
+                batch, net, "cpu", guide_offset="random", **meas)
+            side = batch[5]
+            assert guide is not None and guide.shape[1] == side.shape[1]   # TGVN: k-space guide
+            want = Sense(torch.from_numpy(MAPS)[None]).adjoint(ifftc(guide))
+            assert torch.allclose(x1, want, atol=1e-5)                    # same lines as the net's
+            cols = (guide[0, 0] != 0).any(dim=0)
+            assert int(cols.sum()) == W // 2
+            full = Sense(torch.from_numpy(MAPS)[None]).adjoint(ifftc(side))
+            x1_full = tir._measure(batch, net, "cpu", guide_offset=0,
+                                   **dict(meas, guide_R=1))[1]
+            assert torch.allclose(x1_full, full, atol=1e-5)
+            wb = FakeWandb()
+            tir.train_i2sb_recon(net, torch.optim.Adam(net.parameters(), lr=1e-4), None, "cpu",
+                                 loader(), loader(), num_epochs=1, steps_per_epoch=2,
+                                 val_every_epochs=1, R=4, acs_lines=4,
+                                 kspace_type="measurement_awgn", online_smaps="espirit",
+                                 noise_std=(0.0, 0.01), val_noise_std=0.005, val_seed=0,
+                                 loss_type="complex-mse", tau=0.1, val_mode="full_recon",
+                                 val_nfe=2, guide_R=1, save_dir=d, wandb=wb,
+                                 x1_source="guide", tau_scale="x1_rms", tau_ref=0.5)
+            assert any("val/psnr" in c for c in wb.calls)
+    finally:
+        osm.online_smaps = real
 
 
 def main():

@@ -38,8 +38,8 @@ from physics.mask import get_mask_cached, resolve_acs_lines           # noqa: E4
 from training.common import embed_for_net, prepare_measurement        # noqa: E402
 from training.recon import _forward, _guide                           # noqa: E402
 
-DEFAULT_CELLS = ("tgvn_c10_R8_g1", "tgvn_c8_R8_g1", "tgvn_c6_R8_g1", "tgvn_R8_g1",
-                 "lggs_R8_g1", "sbtgvn_R8_g1", "lpdsnet_R8")
+DEFAULT_CELLS = ("tgvn_c12_R8_g1", "tgvn_c10_R8_g1", "tgvn_c8_R8_g1", "tgvn_c6_R8_g1",
+                 "lggs_R8_g1", "lpdsnet_R8", "sbtgvn_c8_adjoint_R8_g1")
 H, W, NC = 640, 368, 15
 
 

@@ -1,7 +1,7 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "guided_knee_PDFS_from_PD_tgvn_c8_R8_g1"
+        "name": "knee_PDFS_from_PD_tgvn_c8_R8_g1_s3"
     },
     "model": {
         "type": "TGVN",
@@ -17,7 +17,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/guided_recon/knee/tgvn_c8_R8_g1",
+        "save_dir": "trained_nets/guided_recon/knee/s3/tgvn_c8_R8_g1",
         "ckpt": null
     },
     "data": {
@@ -32,8 +32,10 @@
             "start_slice": 12,
             "end_slice": 25,
             "organ_mask_source": "none",
-            "scale_fac": 15000.0,
-            "side_scale_fac": 2900.0,
+            "volume_scales": "config/knee/guided/volume_scales.json",
+            "volume_stat": "acs_p95",
+            "side_volume_stat": "full_p95",
+            "volume_target": 1.0,
             "target": "sense",
             "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9",
             "pad_multiple": 1,
@@ -50,8 +52,10 @@
             "start_slice": 12,
             "end_slice": 13,
             "organ_mask_source": "none",
-            "scale_fac": 15000.0,
-            "side_scale_fac": 2900.0,
+            "volume_scales": "config/knee/guided/volume_scales.json",
+            "volume_stat": "acs_p95",
+            "side_volume_stat": "full_p95",
+            "volume_target": 1.0,
             "target": "sense",
             "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9",
             "pad_multiple": 1,

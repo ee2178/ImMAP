@@ -17,13 +17,17 @@ tau_i = tau * s_i / tau_ref. The script always reports the median s over these s
 those units: RMS of (x0 - x1) / kappa_i, kappa_i = s_i / tau_ref. Compare the per-slice spread of
 the two gaps to see how much of it was intensity.
 
-Nothing is written; put the values in the generator (e.g. scripts/make_guided_recon_configs.py
-TAU and TAU_REF), which writes tau to BOTH cfg["i2sb"] and model.params.
+With --json PATH the numbers are also written there ({"tau_abs", "tau_rel", "tau_ref", ...}):
+scripts/make_guided_recon_configs.py reads config/knee/guided/bridge_tau/<start>_R<R>.json per
+bridge start (tau = TAU_MARGIN x tau_rel) and writes tau to BOTH cfg["i2sb"] and model.params;
+torch/bridge_start_knee.sbatch runs this to create the file on first use. The calibration does
+not depend on the config's own tau, so a config made before the file exists is a valid input.
 
     python scripts/calibrate_recon_bridge.py config/knee/guided/sbtgvn_R8_g1.json --slices 60
 """
 
 import argparse
+import json
 import os
 import sys
 import types
@@ -48,6 +52,8 @@ def main():
     p.add_argument("--slices", type=int, default=60)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--json", default=None,
+                   help="also write the calibration here (atomically: .partial + rename)")
     args = p.parse_args()
 
     with open(args.config) as f:
@@ -128,6 +134,18 @@ def main():
           f"spread of gap / s^b = {cv(res):.2f}")
     print(f"  config's current tau: {i2sb.get('tau')}, tau_scale: "
           f"{i2sb.get('tau_scale', 'none')}, tau_ref: {i2sb.get('tau_ref')}")
+    if args.json:
+        out = dict(config=args.config, split=args.split, slices=len(per), R=mri["R"],
+                   x1_source=i2sb.get("x1_source", "adjoint"),
+                   x0_source=i2sb.get("x0_source", "operator"),
+                   tau_abs=vs / 2, tau_rel=vs_rel / 2, tau_ref=s_ref, tau_tail=tail / 2,
+                   gap_vs_scale_exponent=b)
+        os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
+        tmp = args.json + ".partial"
+        with open(tmp, "w") as f:
+            json.dump(out, f, indent=2)
+        os.replace(tmp, args.json)
+        print(f"  wrote {args.json}")
 
 
 if __name__ == "__main__":
