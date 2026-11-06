@@ -43,7 +43,9 @@
         "x1_source": "adjoint",
         "x0_source": "operator",
         "val_mode": "full_recon",
-        "val_nfe": 20
+        "val_nfe": 20,
+        "dc_iters": 7,
+        "dc_lam": 7.0e-5
     },
     "data": {
         "train": {

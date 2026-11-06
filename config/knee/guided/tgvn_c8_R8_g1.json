@@ -1,0 +1,113 @@
+{
+    "task": "recon",
+    "experiment": {
+        "name": "guided_knee_PDFS_from_PD_tgvn_c8_R8_g1"
+    },
+    "model": {
+        "type": "TGVN",
+        "params": {
+            "guided": true,
+            "cond_sigma": true,
+            "use_smaps": true,
+            "num_cascades": 8,
+            "sens_chans": 8,
+            "sens_pools": 4,
+            "chans": 18,
+            "pools": 4
+        }
+    },
+    "paths": {
+        "save_dir": "trained_nets/guided_recon/knee/tgvn_c8_R8_g1",
+        "ckpt": null
+    },
+    "data": {
+        "train": {
+            "name": "fastmri_paired",
+            "split_csv": "config/knee/guided/splits/train.csv",
+            "kspace_roots": [
+                "../datasets/fastmri/knee/multicoil_train",
+                "../datasets/fastmri/knee/multicoil_val"
+            ],
+            "batch_size": 1,
+            "start_slice": 12,
+            "end_slice": 25,
+            "scale_fac": 5000.0,
+            "organ_mask_source": "none",
+            "target": "sense",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9",
+            "pad_multiple": 1,
+            "num_workers": 8
+        },
+        "val": {
+            "name": "fastmri_paired",
+            "split_csv": "config/knee/guided/splits/val.csv",
+            "kspace_roots": [
+                "../datasets/fastmri/knee/multicoil_train",
+                "../datasets/fastmri/knee/multicoil_val"
+            ],
+            "batch_size": 1,
+            "start_slice": 12,
+            "end_slice": 13,
+            "scale_fac": 5000.0,
+            "organ_mask_source": "none",
+            "target": "sense",
+            "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9",
+            "pad_multiple": 1,
+            "num_workers": 8
+        }
+    },
+    "training": {
+        "num_epochs": 6000,
+        "steps_per_epoch": 50,
+        "val_every_epochs": 100,
+        "noise_std": [
+            0.01,
+            0.02
+        ],
+        "noise_dist": "uniform",
+        "val_noise_std": 0.015,
+        "val_seed": 1234,
+        "loss_type": "magnitude-nl1-nl2",
+        "clip_grad": 0.05,
+        "use_organ_mask": false,
+        "backtrack_thresh": null,
+        "backtrack_factor": 0.9,
+        "metric_range": "gt_max"
+    },
+    "mri": {
+        "R": 8,
+        "acs_lines": null,
+        "mask_dist": "uniform",
+        "mask_offset": 0,
+        "kspace_type": "measurement_awgn",
+        "whiten_kspace": false,
+        "center_frac": 0.04,
+        "adjust_accel": true,
+        "online_smaps": "espirit",
+        "online_smaps_kws": {
+            "thresh_eig": 0.0,
+            "kernel_size": 4,
+            "maxit": 10
+        },
+        "guide_R": 1,
+        "guide_acs_lines": 0,
+        "guide_mask_dist": "uniform"
+    },
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0005
+        }
+    },
+    "scheduler": {
+        "type": "CosineAnnealingLR",
+        "params": {
+            "eta_min": 1.0e-6,
+            "T_max": 300000
+        }
+    },
+    "wandb": {
+        "project": "guided_recon",
+        "id": null
+    }
+}

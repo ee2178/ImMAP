@@ -29,8 +29,8 @@
 # launch from scripts/make_mg_recon_configs.py's knee cells (measured k-space + AWGN, online
 # ESPIRiT, center_frac 0.04 uniform mask, sigma ~ U[0.01, 0.02], Adam + cosine over 300k steps,
 # clip 0.05; magnitude NL1+NL2, except complex-MSE for the complex bridge). Splits are TGVN's
-# patient-level PD/PDFS pairs (config/knee/guided/splits/); the target is the RSS of the PDFS
-# k-space. The guide is undersampled like TGVN's side scans: equispaced, no centre lines, a fresh
+# patient-level PD/PDFS pairs (config/knee/guided/splits/); the target is the offline SENSE image
+# of the PDFS k-space (ESPIRiT, ACS 32). Val PSNR/SSIM use each slice's own peak (metric_range). The guide is undersampled like TGVN's side scans: equispaced, no centre lines, a fresh
 # line phase per training step (offset 0 at validation).
 #
 # sbtgvn bridge: tau = 0.03 (gap rule 0.0234 at R=8), INTENSITY-RELATIVE per slice --
@@ -45,6 +45,9 @@
 # Submit:          sbatch torch/guided_recon_knee.sbatch
 # One cell:        sbatch --array=0 torch/guided_recon_knee.sbatch          (tgvn_R8_g1)
 # Guide sweep:     GUIDE_ACCELS="1 2 4" MODELS="tgvn" sbatch --array=0-2 --export=ALL torch/guided_recon_knee.sbatch
+# TGVN depth sweep (E2E-VarNet width, 10/8/6 cascades) + LGGS, fully-sampled guide:
+#                  MODELS="tgvn_c10 tgvn_c8 tgvn_c6 lggs" GUIDE_ACCELS=1 sbatch --array=0-3 --export=ALL torch/guided_recon_knee.sbatch
+#                  (0 tgvn_c10, 1 tgvn_c8, 2 tgvn_c6, 3 lggs; scripts/time_guided_nets.py times them)
 # Smoke test:      sbatch --array=0 --time=00:30:00 torch/guided_recon_knee.sbatch
 #                  (a wrong data root or a PD/PDFS file missing from both roots fails at loader
 #                  construction, within a minute)

@@ -19,12 +19,26 @@ Regressor contract (every net trained by training/i2sb_recon.py):
 `sigma` is the bridge position (std_fwd at the step), `sigma_n` the measurement noise std. A net
 is free to ignore what it does not use: SBReconUnet (models/sb_recon_unet.py) reads x_t and x1
 only; the unrolled nets will add data consistency through (y, E).
+
+Sampling-time data consistency (I2SB-Recon, Wang et al., arXiv 2411.14269, Alg. 2): after every
+x0 prediction and BEFORE the posterior step, x0_hat is replaced by
+
+    x0_bar = argmin_x ||y - E x||^2 + lam ||x - x0_hat||^2
+           = CG on (E^H E + lam I) x = E^H y + lam x0_hat,   warm-started at x0_hat
+
+with a FIXED number of iterations (their code: lam = 7e-5, 7 iterations, every step including
+the last). Training is untouched -- any trained regressor can be sampled with it. lam is
+scale-free: both terms scale with intensity^2, and E (ortho FFT, unit-norm maps) has
+||E^H E|| <= 1, as in their implementation. Small lam + few warm-started iterations is a partial
+pull toward the data, not an exact solve: CG-SENSE at R8 amplifies the measurement noise if run
+to convergence with lam -> 0, so `dc_iters` is the effective regularizer as much as lam.
 """
 
 import torch
 
 from physics.object_mask import otsu_threshold
 from sb.base import forward_std, reverse_sample
+from solvers.cg import batched_cg
 
 
 X1_SOURCES = ("adjoint",)
@@ -78,15 +92,33 @@ def predict_x0_recon(net, x_t, sigma, x1=None, y=None, E=None, sigma_n=None, gui
     return out
 
 
+DC_LAM, DC_ITERS = 7e-5, 7          # I2SB-Inversion's sample.py defaults (cg_weight, cg_iter)
+
+
+def cg_data_consistency(x0_hat, y, E, lam=DC_LAM, iters=DC_ITERS):
+    """argmin_x ||y - E x||^2 + lam ||x - x0_hat||^2 by `iters` CG steps from x0_hat.
+
+    Batched CG (per-slice step sizes; their reference code uses one global alpha for the
+    batch), no early stop: the iteration count is part of the method."""
+    if iters <= 0:
+        return x0_hat
+    lam = float(lam)
+    b = E.adjoint(y) + lam * x0_hat
+    return batched_cg(lambda v: E.adjoint(E.forward(v)) + lam * v, b, x0=x0_hat,
+                      tol=0.0, max_iter=int(iters), stop="rhs")
+
+
 @torch.no_grad()
 def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoint", nfe=None,
                       deterministic=False, posterior="ddpm", log_count=1, verbose=True,
-                      guide=None, noise_scale=None):
+                      guide=None, noise_scale=None, dc_iters=0, dc_lam=DC_LAM):
     """Reconstruct x0 from (y, E) along the reverse bridge.
 
     `x1` defaults to bridge_start(y, E, x1_source); pass it to reuse one already built. y, E,
     sigma_n and the guide (side information) are held fixed along the whole trajectory.
-    `noise_scale` is the per-sample temperature multiplier (bridge_noise_scale). Returns
+    `noise_scale` is the per-sample temperature multiplier (bridge_noise_scale). `dc_iters` > 0
+    applies cg_data_consistency(x0_hat, y, E, dc_lam, dc_iters) to every prediction before the
+    posterior step (I2SB-Recon; module doc); 0 is the plain sampler. Returns
     (recon, xs, pred_x0s), as sb.base.reverse_sample (no clip_denoise: a complex image has no
     [-1, 1] box)."""
     device = sched.std_fwd.device
@@ -96,8 +128,9 @@ def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoin
     def pred_x0_fn(x_t, step):
         step_t = torch.full((x_t.shape[0],), step, device=device, dtype=torch.long)
         sigma = forward_std(sched, step_t, xdim=x_t.shape[1:])
-        return predict_x0_recon(net, x_t, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n,
-                                guide=guide)
+        x0_hat = predict_x0_recon(net, x_t, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n,
+                                  guide=guide)
+        return cg_data_consistency(x0_hat, y, E, dc_lam, dc_iters)
 
     return reverse_sample(sched, pred_x0_fn, x1, nfe=nfe, deterministic=deterministic,
                           posterior=posterior, clip_denoise=False, log_count=log_count,

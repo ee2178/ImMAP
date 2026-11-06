@@ -142,7 +142,14 @@ def espirit(
     maxit: int = 100,
     block_size: int = 8192,
     method = "eigdecomp",
+    return_lam: bool = False,
 ):
+    """ESPIRiT maps (B, C, Nx, Ny), zero where the top eigenvalue lam <= thresh_eig.
+
+    lam is in [0, 1] and scale-free (the row-space cut is relative to the largest singular
+    value), so the support depends on thresh_eig / thresh_rowspace, never on the k-space scale.
+    `return_lam=True` also returns lam (B, Nx, Ny): the support at ANY threshold is lam > t, so
+    one call can be re-thresholded (scripts/check_espirit_support.py)."""
     B, C, Nx, Ny = kspace.shape
     ks = kernel_size
     device, dtype = kspace.device, kspace.dtype
@@ -298,6 +305,8 @@ def espirit(
     smaps = smaps * (ref / (ref.abs() + 1e-12)).conj()
     # A product of conj views can come back as a lazy conj view on torch 2.x,
     # and view_as_real refuses those (E2EVarNet's given-maps path).
+    if return_lam:
+        return smaps.resolve_conj(), lam
     return smaps.resolve_conj()
 
 def espirit_soft(

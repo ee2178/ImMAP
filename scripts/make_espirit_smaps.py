@@ -47,7 +47,7 @@ volumes have none -- and `--contrast` picks the column. Those splits draw from f
 val folders, so every file is looked up in each of `--kspace-roots`. `--out` is required, and
 --anatomy / --split only label the log:
 
-    python scripts/make_espirit_smaps.py --anatomy knee         --pairs-csv config/knee/guided/splits/{train,val,test}.csv --contrast pdfs         --kspace-roots ../datasets/fastmri/knee/multicoil_train                        ../datasets/fastmri/knee/multicoil_val         --out ../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32 --acs 32
+    python scripts/make_espirit_smaps.py --anatomy knee         --pairs-csv config/knee/guided/splits/{train,val,test}.csv --contrast pdfs         --kspace-roots ../datasets/fastmri/knee/multicoil_train                        ../datasets/fastmri/knee/multicoil_val         --out ../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9 --acs 32 --thresh-eig 0.9
 """
 
 from __future__ import annotations

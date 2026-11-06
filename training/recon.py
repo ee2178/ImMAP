@@ -2,6 +2,8 @@ import os
 import math
 import time
 import numpy as np
+from functools import partial
+
 import torch
 from visualization.wandb_image import wandb_image
 import torch.nn as nn
@@ -358,6 +360,8 @@ def train_recon(
     # Off by default: turning it on changes what every metric MEANS, so runs
     # either side of the switch are not comparable.
     use_organ_mask=False,
+    metric_range=1.0,                # PSNR/SSIM data range: a number, or "gt_max" (each slice
+                                     # against its own peak; training/metrics.py::compute_metrics)
     ### Fit (epoch-based)
     num_epochs=1000,          # total epochs (was: max_steps)
     steps_per_epoch=100,      # an "epoch" == this many gradient steps
@@ -438,6 +442,8 @@ def train_recon(
             best_val_loss = min(best_val_loss, float(v))
             print(f"resuming with best validation loss {best_val_loss:.4e} "
                   f"({BESTVAL_CKPT})")
+
+    metrics = partial(compute_metrics, data_range=metric_range)
 
     def metric_mask(m):
         """The mask to hand `compute_metrics` / the panel, or None when off.
@@ -639,7 +645,7 @@ def train_recon(
         if last_ok is not None:
             image_m, recon_m, organ_mask_m = last_ok
             with torch.no_grad():
-                train_metrics = compute_metrics(
+                train_metrics = metrics(
                     image_m.abs(), recon_m.abs(), mask=metric_mask(organ_mask_m))
             train_metrics = {k: float(v.detach()) for k, v in train_metrics.items()}
 
@@ -789,7 +795,7 @@ def train_recon(
                     if whiten_kspace and "Zinv" in extra_v:
                         recon_v = extra_v["Zinv"] * recon_v
 
-                    m = compute_metrics(
+                    m = metrics(
                         image_v.abs(), recon_v.abs(),
                         mask=metric_mask(organ_mask_v))
 
@@ -842,7 +848,7 @@ def train_recon(
                     # metrics of the DISPLAYED slice, not the val-set mean --
                     # a caption quoting the set mean next to one image is a
                     # standing invitation to misread the picture.
-                    m1 = compute_metrics(
+                    m1 = metrics(
                         image_v[:1].abs(), recon_v[:1].abs(),
                         mask=None if p_mask is None else p_mask[:1])
                     sig = float(torch.as_tensor(sigma_v).reshape(-1)[0])

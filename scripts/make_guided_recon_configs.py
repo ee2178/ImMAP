@@ -13,7 +13,10 @@ cell. The default cells are the first five experiments:
     sbtgvn_R8_g2   i2sb-TGVN, 2x guide                       task i2sb_recon
     lpdsnet_R8     LPDSNet, no guide (on the same PDFS data) task recon
 
-Optional models: varnet_img (TGVN's matched no-guide E2E-VarNet) and lggs (LGGSNet).
+Optional models: varnet_img (TGVN's matched no-guide E2E-VarNet), lggs (LGGSNet), and the TGVN
+depth sweep tgvn_c10 / tgvn_c8 / tgvn_c6 (E2E-VarNet width, 10 / 8 / 6 cascades):
+
+    python scripts/make_guided_recon_configs.py --models tgvn_c10 tgvn_c8 tgvn_c6 lggs         --guide-accels 1
 
 What is inherited, from what scripts/make_mg_recon_configs.py writes TODAY for knee at that R:
     mri          the measured protocol: measured k-space + AWGN, online ESPIRiT, center_frac,
@@ -69,7 +72,8 @@ SPLITS = "config/knee/guided/splits"
 KSPACE_ROOTS = ["../datasets/fastmri/knee/multicoil_train",
                 "../datasets/fastmri/knee/multicoil_val"]
 # Offline ESPIRiT maps + SENSE images of the PDFS (target) volumes: torch/espirit_knee_pairs.sbatch
-PDFS_MAPS = "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32"
+# at thresh_eig 0.9 (the 0.95 maps in .../pdfs_espirit_acs32 cut into the anatomy).
+PDFS_MAPS = "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9"
 TARGET = "sense"
 
 # Brownian-bridge temperature for i2sb-TGVN, tau = RMS(x0 - x1)/2 inside the object at the main
@@ -80,6 +84,10 @@ TARGET = "sense"
 # gap rule, on the user's call: the measurement noise is real even where coil combination hides
 # it in the image, and a slightly wider ladder is the safer side.
 TAU = 0.03
+# sampling-time CG data consistency (I2SB-Recon, arXiv 2411.14269; sb/i2sb_recon.py): the
+# paper's defaults. Validation only -- val/* is WITH it, val/nodc_* the plain sampler on the same
+# noise draws (val cost x2). dc_iters 0 turns it off.
+I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
 # INTENSITY-RELATIVE bridge: slice i runs at tau_i = TAU * s_i / TAU_REF, s_i the RMS of its
 # zero-filled image over its Otsu foreground (sb/i2sb_recon.py::bridge_noise_scale) -- slices of
 # one volume differ several-fold in intensity, and one absolute tau is near-silent on the bright
@@ -117,6 +125,22 @@ MODELS = {
     "lggs": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
                  model=dict(type="LGGS", params=LGGS_PARAMS)),
 }
+
+# Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,
+# sens_chans 8 -- the grid's varnet cell), cascades cut. Per forward at knee R8 with a
+# fully-sampled guide, one cascade costs ~64 GFLOP (two 18-chan U-Nets + the CG trust projector),
+# so 10 / 8 / 6 cascades are ~640 / 511 / 383 GFLOP against LGGS's ~677 (12: ~768).
+TGVN_CASCADE_SWEEP = (10, 8, 6)
+for _n in TGVN_CASCADE_SWEEP:
+    MODELS[f"tgvn_c{_n}"] = dict(
+        task="recon", guided=True, grid_base="varnet", pad_multiple=1,
+        model=dict(type="TGVN", params=dict(guided=True, cond_sigma=True, use_smaps=True,
+                                            **dict(TGVN_SIZE, num_cascades=_n))))
+
+# PSNR / SSIM against each slice's own peak |gt| (training/metrics.py). The paired loader only
+# multiplies by a fixed scale_fac, so slice peaks sit well below 1 and vary across a volume:
+# the default data_range=1 inflated PSNR by -20 log10(peak) dB, most on the dimmest slices.
+METRIC_RANGE = "gt_max"
 
 
 def grid_cells(r, tags):
@@ -156,6 +180,7 @@ def make_config(r, model, g, grid):
     pad = (spec["pad_multiple"] if spec["pad_multiple"] is not None
            else base["data"]["train"]["pad_multiple"])
     training = {k: v for k, v in base["training"].items() if k != "log_levels"}
+    training["metric_range"] = METRIC_RANGE
     mri = dict(grid["lpdsnet"]["mri"], guide_R=int(g), guide_acs_lines=0,
                guide_mask_dist="uniform")
     name = cell_name(r, model, g)
@@ -177,7 +202,7 @@ def make_config(r, model, g, grid):
         cfg["i2sb"] = {**SCHEDULE, "deterministic": False, "posterior": "ddpm",
                        "x1_source": "adjoint", "x0_source": "operator",
                        "tau_scale": TAU_SCALE, "tau_ref": TAU_REF,
-                       "val_mode": "full_recon", "val_nfe": 20}
+                       "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC}
     return cfg
 
 

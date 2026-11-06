@@ -81,7 +81,7 @@ except Exception:                       # noqa: BLE001
 from operators import Mask, FFT2D, Sense                                   # noqa: E402
 from physics.mask import get_mask_cached                                   # noqa: E402
 from sb.base import build_schedule, forward_sample                         # noqa: E402
-from sb.i2sb_recon import bridge_start, i2sb_recon_sample                  # noqa: E402
+from sb.i2sb_recon import bridge_start, cg_data_consistency, i2sb_recon_sample  # noqa: E402
 from models.sb_recon_unet import SBReconUnet, to_planar, from_planar       # noqa: E402
 from training.i2sb_recon import train_i2sb_recon                           # noqa: E402
 
@@ -302,6 +302,76 @@ def test_shipped_configs_reach_the_loop_and_build():
         assert isinstance(net, SBReconUnet)
         net.assert_schedule_matches(build_schedule(
             **{k: cfg["i2sb"][k] for k in ("kind", "tau", "n_points", "beta_max")}))
+
+
+def _rel_res(x, y, E):
+    return float((y - E(x)).abs().pow(2).sum().sqrt() / y.abs().pow(2).sum().sqrt())
+
+
+def test_cg_data_consistency_solves_the_tikhonov_problem():
+    """x_bar = argmin ||y - E x||^2 + lam ||x - x_hat||^2: the normal equations hold, 0 iters is
+    the identity, and a hallucinating x_hat is pulled toward the data."""
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    g = torch.Generator().manual_seed(1)
+    x_hat = image + 0.3 * torch.randn(image.shape, generator=g, dtype=torch.complex64)
+    assert cg_data_consistency(x_hat, y, E, 1e-2, 0) is x_hat
+    lam = 1e-2
+    x = cg_data_consistency(x_hat, y, E, lam, 200)
+    normal = E.adjoint(E(x) - y) + lam * (x - x_hat)
+    assert float(normal.abs().max()) < 1e-4, float(normal.abs().max())
+    assert _rel_res(x, y, E) < 0.1 * _rel_res(x_hat, y, E)
+    # few iterations from the warm start already cut the data residual, per slice
+    x7 = cg_data_consistency(x_hat, y, E, 7e-5, 7)
+    for b in range(2):
+        Eb = _slice_op(smaps, image, b)
+        assert _rel_res(x7[b:b + 1], y[b:b + 1], Eb) < 0.5 * _rel_res(x_hat[b:b + 1],
+                                                                      y[b:b + 1], Eb)
+
+
+def _slice_op(smaps, image, b):
+    return operator(smaps[b:b + 1], image[b:b + 1])
+
+
+def test_dc_sampler_corrects_a_hallucinating_regressor():
+    """A regressor that adds a structure the data rules out: the plain sampler keeps it, the
+    CG-corrected sampler (I2SB-Recon) removes most of it. dc_iters=0 is the plain sampler."""
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    blob = torch.zeros_like(image)
+    blob[..., 10:14, 10:14] = 0.5
+
+    def hallucinator(x_t, sigma=None, **_):
+        return image + blob, None
+
+    out = {}
+    for it in (0, 7):
+        torch.manual_seed(0)
+        out[it] = i2sb_recon_sample(hallucinator, y, E, sched, nfe=10, verbose=False,
+                                    dc_iters=it, dc_lam=7e-5)[0]
+    torch.manual_seed(0)
+    plain = i2sb_recon_sample(hallucinator, y, E, sched, nfe=10, verbose=False)[0]
+    assert torch.equal(plain, out[0])
+    err = {k: float((v - image).abs().pow(2).sum().sqrt()) for k, v in out.items()}
+    assert err[7] < 0.5 * err[0], err
+    assert _rel_res(out[7], y, E) < 0.5 * _rel_res(out[0], y, E)
+
+
+def test_dc_validation_logs_both_samplers():
+    with tempfile.TemporaryDirectory() as d:
+        wb = FakeWandb()
+        run(make_net(), d, num_epochs=1, wandb=wb, dc_iters=3, dc_lam=1e-3)
+        keys = wb.keys()
+        for k in ("val/psnr", "val/nodc_psnr", "val/nodc_ssim", "val/nodc_nrmse"):
+            assert k in keys, (k, sorted(keys))
+        raises(ValueError, lambda: run(make_net(), d, dc_iters=-1), "dc_iters")
+    with tempfile.TemporaryDirectory() as d:
+        wb = FakeWandb()
+        run(make_net(), d, num_epochs=1, wandb=wb)
+        assert "val/nodc_psnr" not in wb.keys()
 
 
 def main():

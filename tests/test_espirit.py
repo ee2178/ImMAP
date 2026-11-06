@@ -217,13 +217,33 @@ def test_eigh_sub_batches_are_exact():
         check("non-finite input is named", "NaN/Inf" in str(e))
 
 
+def test_lam_rethresholds_the_support_and_is_scale_free():
+    """return_lam: the maps are unchanged, their support is exactly lam > thresh_eig, a lower
+    threshold only grows it, and scaling the k-space moves neither lam nor the support
+    (scripts/check_espirit_support.py relies on all three)."""
+    k = coil_phantom(noise=0.02, seed=3)
+    kw = dict(acs_size=(16, 16), kernel_size=4, thresh_eig=0.9, maxit=200)
+    plain = espirit(k, **kw)
+    sm, lam = espirit(k, return_lam=True, **kw)
+    check("return_lam leaves the maps unchanged", maps_equal(plain, sm))
+    sup = sm.abs().sum(1) > 0
+    check("support == lam > thresh_eig", bool(torch.equal(sup, lam > 0.9)))
+    check("lam in [0, 1]", bool((lam >= -1e-4).all() and (lam <= 1 + 1e-4).all()),
+          f"range [{float(lam.min()):.4f}, {float(lam.max()):.4f}]")
+    check("a lower threshold only grows the support", bool(((lam > 0.95) <= (lam > 0.8)).all()))
+    _, lam_s = espirit(1e-4 * k, return_lam=True, **kw)
+    check("lam is scale-free", bool(torch.allclose(lam, lam_s, atol=1e-3)),
+          f"max diff {float((lam - lam_s).abs().max()):.2e}")
+
+
 def main():
     if not have_lapack():
         return 0
     for fn in (test_eigh_sub_batches_are_exact,
                test_batch_does_not_change_a_slice, test_batch_order_does_not_matter,
                test_soft_maps_are_batch_independent,
-               test_phase_reference_is_the_strongest_coil, test_maps_explain_the_data):
+               test_phase_reference_is_the_strongest_coil, test_maps_explain_the_data,
+               test_lam_rethresholds_the_support_and_is_scale_free):
         print(f"\n--- {fn.__name__}")
         fn()
     print(f"\n{'FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed'}")

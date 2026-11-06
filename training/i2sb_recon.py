@@ -61,7 +61,7 @@ from operators import Mask, FFT2D, Sense
 from operators.fourier import ifftc
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from sb.base import build_schedule, n_steps, forward_sample, forward_std
-from sb.i2sb_recon import (TAU_SCALES, X1_SOURCES, bridge_noise_scale, bridge_start,
+from sb.i2sb_recon import (DC_LAM, TAU_SCALES, X1_SOURCES, bridge_noise_scale, bridge_start,
                            predict_x0_recon, i2sb_recon_sample)
 from training.common import (EMA, POSTFIX_EVERY, apply_loss_mask, embed_for_net, get_lr,
                              load_ckpt, prepare_measurement, save_ckpt, save_ema_ckpt)
@@ -146,6 +146,7 @@ def train_i2sb_recon(
     loss_weight="uniform",           # per-sample t-weighting: "uniform" | "snr" | "t1"
     loss_weight_max=None,
     use_organ_mask=False,            # mask the loss AND the metrics/panel, as train_recon does
+    metric_range=1.0,                # PSNR/SSIM data range: a number, or "gt_max" (per slice)
     accum_steps=1,
     ema_decay=None,
     ema_warmup=True,
@@ -184,6 +185,10 @@ def train_i2sb_recon(
                                      # see sb/i2sb_recon.py::bridge_noise_scale
     val_mode="full_recon",
     val_nfe=20,
+    dc_iters=0,                      # sampling-time CG data consistency on every x0_hat
+    dc_lam=DC_LAM,                   # (I2SB-Recon, arXiv 2411.14269); full_recon val only, see
+                                     # sb/i2sb_recon.py::cg_data_consistency. With dc_iters > 0
+                                     # the val metrics are WITH it and val/nodc_* without it
     # ---- paths (cfg["paths"]) ----
     save_dir=None,
     ckpt=None,
@@ -212,6 +217,8 @@ def train_i2sb_recon(
         raise ValueError(f"val_mode must be 'single_pass' or 'full_recon', got {val_mode!r}")
     if accum_steps < 1:
         raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
+    if int(dc_iters) < 0 or float(dc_lam) < 0:
+        raise ValueError(f"need dc_iters >= 0 and dc_lam >= 0, got {dc_iters}, {dc_lam}")
 
     bridge = build_schedule(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max,
                             device=device)
@@ -316,7 +323,7 @@ def train_i2sb_recon(
         with torch.no_grad():
             x0_m, pred_m = apply_loss_mask(gt, pred, organ_mask, use_organ_mask)
             train_metrics = {k: float(v) for k, v in compute_metrics(
-                x0_m.abs(), pred_m.abs(),
+                x0_m.abs(), pred_m.abs(), data_range=metric_range,
                 mask=organ_mask if use_organ_mask else None).items()}
 
         over = backtrack_thresh is not None and avg_loss > best_loss + backtrack_thresh
@@ -357,8 +364,9 @@ def train_i2sb_recon(
                     use_organ_mask=use_organ_mask, residual_gain=residual_gain,
                     kspace_type=val_kspace_type or kspace_type,
                     noise_std=noise_std if val_noise_std is None else val_noise_std,
-                    meas=meas, kappa_fn=kappa_fn, wandb=wandb, global_step=global_step,
-                    epoch=epoch)
+                    meas=meas, kappa_fn=kappa_fn, dc_iters=int(dc_iters), dc_lam=float(dc_lam),
+                    metric_range=metric_range,
+                    wandb=wandb, global_step=global_step, epoch=epoch)
                 if save_ckpt_fn and math.isfinite(val["psnr"]) and val["psnr"] > best_val_psnr:
                     best_val_psnr = val["psnr"]
                     # under the EMA context, so this is the averaged net -- the one validated
@@ -391,9 +399,13 @@ def _validate(net, bridge, val_loader, device, *, val_seed, **kws):
 
 def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, val_nfe,
                    deterministic, posterior, loss_fn, loss_type, use_organ_mask, residual_gain,
-                   kspace_type, noise_std, meas, kappa_fn, wandb, global_step, epoch):
+                   kspace_type, noise_std, meas, kappa_fn, wandb, global_step, epoch,
+                   dc_iters=0, dc_lam=DC_LAM, metric_range=1.0):
     net.eval()
+    compare = val_mode == "full_recon" and dc_iters > 0
     keys = ("loss", "psnr", "ssim", "nrmse", "zf_psnr", "zf_ssim", "zf_nrmse")
+    if compare:
+        keys += ("nodc_psnr", "nodc_ssim", "nodc_nrmse")
     agg = {k: 0.0 for k in keys}
     n = 0
     last = None
@@ -404,10 +416,15 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
             guide_offset=0, **meas)
         bs = x0.shape[0]
         if val_mode == "full_recon":
-            pred, _, _ = i2sb_recon_sample(net, y, E, bridge, sigma_n=sigma_n, x1=x1,
-                                           nfe=val_nfe, deterministic=deterministic,
-                                           posterior=posterior, verbose=False, guide=guide,
-                                           noise_scale=kappa_fn(x1))
+            sample = lambda dc: i2sb_recon_sample(                       # noqa: E731
+                net, y, E, bridge, sigma_n=sigma_n, x1=x1, nfe=val_nfe,
+                deterministic=deterministic, posterior=posterior, verbose=False, guide=guide,
+                noise_scale=kappa_fn(x1), dc_iters=dc, dc_lam=dc_lam)[0]
+            if compare:                     # the plain sampler on the SAME noise draws
+                devs = [device] if torch.device(device).type == "cuda" else []
+                with torch.random.fork_rng(devices=devs):
+                    nodc = sample(0)
+            pred = sample(dc_iters)
             std_fwd = torch.zeros(bs, 1, 1, 1, device=device)
         else:
             step = torch.randint(0, interval, (bs,), generator=gen, device=device)
@@ -421,8 +438,12 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
                             None, 1.0, std_fwd, "uniform")
 
         mmask = organ_mask if use_organ_mask else None
-        m = compute_metrics(gt.abs(), pred.abs(), mask=mmask)
-        mz = compute_metrics(gt.abs(), x1.abs(), mask=mmask)
+        m = compute_metrics(gt.abs(), pred.abs(), mask=mmask, data_range=metric_range)
+        mz = compute_metrics(gt.abs(), x1.abs(), mask=mmask, data_range=metric_range)
+        if compare:
+            mn = compute_metrics(gt.abs(), nodc.abs(), mask=mmask, data_range=metric_range)
+            for k in ("psnr", "ssim", "nrmse"):
+                agg[f"nodc_{k}"] += float(mn[k]) * bs
         agg["loss"] += float(loss) * bs
         for k in ("psnr", "ssim", "nrmse"):
             agg[k] += float(m[k]) * bs
@@ -439,7 +460,8 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
         gimgs = [(g if mmask is None else g * mmask)[:1] for _, g in gtiles]
         panel, pstats = recon_panel(img[:1], rec[:1], zero_filled=zf[:1], gain=residual_gain,
                                     guides=gimgs)
-        how = f"I2SB recon, nfe={val_nfe}" if val_mode == "full_recon" else "single-pass x0_hat"
+        dc = f", CG-DC {dc_iters} it lam={dc_lam:g}" if dc_iters > 0 else ""
+        how = f"I2SB recon, nfe={val_nfe}{dc}" if val_mode == "full_recon" else "single-pass x0_hat"
         caption = (f"epoch {epoch} | zero-filled x1 | {how} | ground truth | "
                    f"|residual| x{pstats['gain']:g}"
                    + "".join(f" | {lab} (own scale)" for lab, _ in gtiles)

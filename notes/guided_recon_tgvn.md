@@ -51,7 +51,7 @@ The guide is FULLY SAMPLED for now (how far the side scan can be accelerated is 
   Optional: varnet_img, lggs. Loader `fastmri_paired`.
   - TARGET (decided 2026-11-05): the OFFLINE SENSE image of each PDFS volume, ESPIRiT at ACS 32
     from the fully-sampled k-space (torch/espirit_knee_pairs.sbatch ->
-    knee_coil_combined/pdfs_espirit_acs32), not TGVN's RSS. TGVN's own pipeline is a SENSE
+    knee_coil_combined/pdfs_espirit_acs32_eig0.9; thresh_eig 0.9 -- 0.95 cut into the anatomy), not TGVN's RSS. TGVN's own pipeline is a SENSE
     combination under LEARNED maps, magnitude, scored against RSS; with a fixed SENSE target all
     models share one complex-derived ground truth. i2sb-TGVN still bridges to the online-map
     combination (x0_source "operator": the offline maps' phase reference is not the operator's)

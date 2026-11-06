@@ -363,6 +363,36 @@ def ssim(
     )
 
 
+DATA_RANGES = ("gt_max",)
+
+
+def _per_sample_metrics(gt, recon, psnr_only, mask, eps=1e-12):
+    """data_range="gt_max": every slice scored against ITS OWN peak, max |gt| (inside the mask
+    when there is one), then averaged over the batch -- the per-slice form of the fastMRI
+    convention (which takes the max over the volume). Needed whenever the data are not
+    normalized to a known range: with a fixed scale_fac the peak varies slice to slice, and a
+    fixed data_range=1 inflates PSNR by -20 log10(peak) dB (and loosens SSIM's constants)."""
+    B = gt.shape[0]
+    a = gt.abs()
+    w = _as_weight(mask, a)
+    peak = (a if w is None else a * w).reshape(B, -1).amax(1).clamp_min(eps)      # (B,)
+    se = (gt - recon).abs() ** 2
+    if w is None:
+        mse = se.reshape(B, -1).mean(1)
+        area = torch.ones_like(mse)
+    else:
+        area = w.reshape(B, -1).sum(1)
+        mse = (se * w).reshape(B, -1).sum(1) / area.clamp_min(1)
+    p = _nan_if_empty(10 * torch.log10(peak ** 2 / (mse + eps)), area)
+    out = {"psnr": p.nanmean()}
+    if psnr_only:
+        return out
+    dr = peak.reshape(B, *([1] * (gt.dim() - 1)))
+    s = ssim(gt, recon, C1=(1e-2 * dr) ** 2, C2=(3e-2 * dr) ** 2, mask=mask)
+    out.update(nrmse=nrmse(gt, recon, mask=mask), ssim=s.nanmean())
+    return out
+
+
 def compute_metrics(gt, recon, psnr_only=False, data_range=1.0, mask=None):
     """PSNR / NRMSE / SSIM. `data_range` is the signal's peak-to-peak range and feeds
     PSNR and SSIM (NRMSE is scale-free -- see nrmse). Default 1.0 keeps every
@@ -376,7 +406,15 @@ def compute_metrics(gt, recon, psnr_only=False, data_range=1.0, mask=None):
     bit-identical to before.
 
     Masked and unmasked numbers are NOT interchangeable. Do not compare a run
-    trained and scored with the mask on against one scored without it."""
+    trained and scored with the mask on against one scored without it.
+
+    data_range="gt_max" scores each slice against its own peak |gt| and averages the per-slice
+    PSNR / SSIM over the batch (see _per_sample_metrics); a number is a fixed range for the
+    whole batch, pooled as before."""
+    if isinstance(data_range, str):
+        if data_range not in DATA_RANGES:
+            raise ValueError(f"data_range {data_range!r}: a number or one of {DATA_RANGES}")
+        return _per_sample_metrics(gt, recon, psnr_only, mask)
     if psnr_only:
         return {
             "psnr": psnr(gt, recon, data_range=data_range, mask=mask),

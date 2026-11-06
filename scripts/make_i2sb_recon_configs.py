@@ -42,6 +42,10 @@ MODELS = ("unet",)
 # the measured protocol at R=8 -- RMS 0.217 inside the head, per-slice 0.18-0.24, insensitive to
 # sigma_n. Knee: UNMEASURED placeholder. Re-measure for other accelerations.
 TAU = {"brain": 0.11, "knee": 0.1}
+# sampling-time CG data consistency (I2SB-Recon, arXiv 2411.14269; sb/i2sb_recon.py): the
+# paper's defaults. Validation only -- val/* is WITH it, val/nodc_* the plain sampler on the same
+# noise draws (val cost x2). dc_iters 0 turns it off.
+I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
 
 # Inherited from the mg grid's training block, in addition to the whole data / mri blocks.
 TRAINING_KEYS = ("noise_std", "noise_dist", "val_noise_std", "val_seed", "use_organ_mask",
@@ -89,7 +93,7 @@ def make_config(anatomy, r, model, tau=None):
         "model": {"type": "SBReconUnet", "params": {**UNET, **sched}},
         "i2sb": {**sched, "deterministic": False, "posterior": "ddpm",
                  "x1_source": "adjoint", "x0_source": "operator",
-                 "val_mode": "full_recon", "val_nfe": 20},
+                 "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC},
         "data": data,
         "mri": base["mri"],
         "training": {

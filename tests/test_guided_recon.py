@@ -22,6 +22,7 @@ test_cond_plane_backward).
 """
 import inspect
 import json
+import math
 import os
 import sys
 import tempfile
@@ -399,6 +400,34 @@ def test_train_recon_end_to_end_lggs_gets_the_side_image():
         assert spy.guides and all(g == (1, 1, H, W) for g in spy.guides), spy.guides
 
 
+def test_gt_max_metrics_are_per_slice_and_scale_free():
+    """metric_range "gt_max": PSNR against each slice's own peak, averaged over slices, so a
+    global intensity scale (scale_fac) cannot move it; the fixed range-1 PSNR moves by
+    -20 log10(scale)."""
+    from training.metrics import compute_metrics
+    g = torch.Generator().manual_seed(0)
+    gt = torch.rand(3, 1, 32, 32, generator=g) * torch.tensor([0.2, 0.5, 1.0]).view(3, 1, 1, 1)
+    pred = gt + 0.01 * torch.randn(gt.shape, generator=g)
+    m = compute_metrics(gt, pred, data_range="gt_max")
+    want = sum(float(10 * torch.log10(gt[b].max() ** 2 / (gt[b] - pred[b]).pow(2).mean()))
+               for b in range(3)) / 3
+    assert abs(float(m["psnr"]) - want) < 1e-3, (float(m["psnr"]), want)
+    m3 = compute_metrics(3 * gt, 3 * pred, data_range="gt_max")
+    for k in ("psnr", "ssim", "nrmse"):
+        assert abs(float(m[k]) - float(m3[k])) < 1e-4, k
+    f1, f3 = compute_metrics(gt, pred)["psnr"], compute_metrics(3 * gt, 3 * pred)["psnr"]
+    assert abs(float(f1 - f3) - 20 * math.log10(3)) < 1e-3
+    mask = torch.zeros(3, 1, 32, 32, dtype=torch.bool)
+    mask[..., 4:28, 4:28] = True
+    assert torch.isfinite(compute_metrics(gt, pred, data_range="gt_max", mask=mask)["psnr"])
+    try:
+        compute_metrics(gt, pred, data_range="volume_max")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown data_range accepted")
+
+
 def test_generator_cells_and_config_keys():
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import make_guided_recon_configs as gen
@@ -431,7 +460,13 @@ def test_generator_cells_and_config_keys():
         if cfg["task"] == "i2sb_recon":
             for k in ("kind", "tau", "n_points", "beta_max"):
                 assert cfg["model"]["params"][k] == cfg["i2sb"][k], (name, k)
+            assert isinstance(cfg["i2sb"]["dc_lam"], float), (name, cfg["i2sb"]["dc_lam"])
+            assert cfg["i2sb"]["dc_iters"] > 0, name
         assert cfg["mri"]["guide_R"] == (2 if name.endswith("_g2") else 1)
+        assert cfg["training"]["metric_range"] == "gt_max", name
+    for n in gen.TGVN_CASCADE_SWEEP:
+        p = gen.MODELS[f"tgvn_c{n}"]["model"]["params"]
+        assert p["num_cascades"] == n and p["chans"] == 18 and p["sens_chans"] == 8
 
 
 def test_guide_undersampling():

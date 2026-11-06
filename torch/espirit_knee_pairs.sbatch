@@ -23,10 +23,17 @@
 #   ACS=32                             square calibration region, from the FULL k-space -- larger
 #                                      than the brain run's 20 (and far larger than the 13-line
 #                                      ACS the online maps get at R=8)
-#   KERNEL=8, THRESH_EIG=0.95          as the brain maps (notebooks/espirit_brain.ipynb); 0.95
-#                                      gives the maps a hard support, zero outside the anatomy
+#   KERNEL=8, THRESH_EIG=0.9           hard support, zero where ESPIRiT's top eigenvalue
+#                                      <= THRESH_EIG. 0.9, not the brain maps' 0.95: at 0.95 the
+#                                      knee support cut into the anatomy, and an OVERestimated
+#                                      support costs little (background noise in the target)
+#                                      where an underestimated one zeroes tissue in the ground
+#                                      truth. lam is scale-free, so scale_fac does not move it.
+#                                      Check a threshold first (minutes, one GPU):
+#                                        python scripts/check_espirit_support.py
+#                                      The 0.95 maps stay in .../pdfs_espirit_acs32.
 #
-# Output: ../datasets/fastmri_preprocessed/knee_coil_combined/${CONTRAST}_espirit_acs${ACS}/,
+# Output: ../datasets/fastmri_preprocessed/knee_coil_combined/${CONTRAST}_espirit_acs${ACS}_eig${THRESH_EIG}/,
 # one h5 per volume with `smaps` (S, C, H, W) and `image` (S, H, W) = sum_c conj(s_c) c_c --
 # the layout datasets/fastmri/loader.py reads. The splits draw from fastMRI multicoil train AND
 # val, so each file is looked up in both raw roots.
@@ -39,7 +46,7 @@
 #     python scripts/make_espirit_smaps.py --anatomy knee \
 #         --pairs-csv config/knee/guided/splits/{train,val,test}.csv --contrast pdfs \
 #         --kspace-roots ../datasets/fastmri/knee/multicoil_train ../datasets/fastmri/knee/multicoil_val \
-#         --out ../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32 --dry-run
+#         --out ../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9 --dry-run
 #
 # Submit from the repo root:   sbatch torch/espirit_knee_pairs.sbatch
 # PD side scans as well:       CONTRAST=pd sbatch --export=ALL torch/espirit_knee_pairs.sbatch
@@ -48,10 +55,10 @@
 CONTRAST="${CONTRAST:-pdfs}"
 ACS="${ACS:-32}"
 KERNEL="${KERNEL:-8}"
-THRESH_EIG="${THRESH_EIG:-0.95}"
+THRESH_EIG="${THRESH_EIG:-0.9}"
 CHUNK="${CHUNK:-4}"
 N_SHARDS=8
-OUT="../datasets/fastmri_preprocessed/knee_coil_combined/${CONTRAST}_espirit_acs${ACS}"
+OUT="../datasets/fastmri_preprocessed/knee_coil_combined/${CONTRAST}_espirit_acs${ACS}_eig${THRESH_EIG}"
 
 for _c in "${IMMAP_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "$HOME/scratch/ee2178/ImMAP"; do
     if [ -n "${_c}" ] && [ -f "${_c}/scripts/make_espirit_smaps.py" ]; then
