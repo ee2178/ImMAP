@@ -24,7 +24,7 @@ What is inherited, from what scripts/make_mg_recon_configs.py writes TODAY for k
     training     steps, epochs, val cadence, noise range, val noise / seed, loss, clip
     optimizer    Adam at the grid LR (LGGS: the grid's group-attention LR, from mggrouplpds)
     scheduler    cosine over the grid's step count
-    data         scale_fac, slice ranges, organ_mask_source
+    data         slice ranges, organ_mask_source (NOT scale_fac: per contrast, set below)
     lpdsnet      its whole model block, from the grid's lpdsnet cell
 
 What is set here:
@@ -83,11 +83,28 @@ TARGET = "sense"
 # 0.121 -> tau 0.060 (ceiling). Re-measure for another main R. Set to 0.03, a little above the
 # gap rule, on the user's call: the measurement noise is real even where coil combination hides
 # it in the image, and a slightly wider ladder is the safer side.
-TAU = 0.03
+# PER-CONTRAST INTENSITY SCALE (2026-11-06): each contrast's raw k-space times the factor that puts
+# its pooled FOREGROUND 95th percentile at ~1 (scripts/contrast_histograms.py, notebooks/
+# knee_scale_and_espirit.ipynb; train split: PDFS RSS fg p95 6.61e-5 -> 1.51e4, PD 3.42e-4 ->
+# 2.92e3). Before, both shared the grid's 5e3, leaving the PDFS target at fg p95 ~0.33 and the PD
+# guide at ~1.7. The measurement noise range is NOT rescaled: it is calibrated for [0, 1] images.
+# Per-slice fg p95 still spreads ~2x (PDFS) / ~3x (PD) p10->p90, mostly between volumes.
+PDFS_SCALE_FAC = 1.5e4
+PD_SCALE_FAC = 2.9e3
+_OLD_SCALE_FAC = 5e3                # what TAU / TAU_REF below were measured at
+
+TAU = 0.03 * PDFS_SCALE_FAC / _OLD_SCALE_FAC
 # sampling-time CG data consistency (I2SB-Recon, arXiv 2411.14269; sb/i2sb_recon.py): the
 # paper's defaults. Validation only -- val/* is WITH it, val/nodc_* the plain sampler on the same
 # noise draws (val cost x2). dc_iters 0 turns it off.
 I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
+# Bridge start (sb/i2sb_recon.py): "adjoint" = zero-filled E^H y (aliased); "acs" = only the
+# mask's contiguous centre block, an alias-free low-pass image -- the bridge then deblurs, with
+# the guide supplying structure. Its width is the mask's centre (center_frac). "acs_box" = the
+# same block cut to center_frac * H readout rows too (center_frac*W x center_frac*H): an
+# isotropic low-pass start, the planned choice once starting points are explored. Starting points
+# are explored after the architecture is settled; tau / tau_ref must be re-calibrated per start.
+X1_SOURCE = "adjoint"
 # INTENSITY-RELATIVE bridge: slice i runs at tau_i = TAU * s_i / TAU_REF, s_i the RMS of its
 # zero-filled image over its Otsu foreground (sb/i2sb_recon.py::bridge_noise_scale) -- slices of
 # one volume differ several-fold in intensity, and one absolute tau is near-silent on the bright
@@ -97,7 +114,11 @@ I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
 # The per-slice GAP spread barely moves under the scaling (std/mean 0.45 -> 0.44): intensity sets
 # how visible the noise is, but not how large the aliasing gap is. Re-measure for another main R.
 TAU_SCALE = "x1_rms"
-TAU_REF = 0.1481
+TAU_REF = 0.1481 * PDFS_SCALE_FAC / _OLD_SCALE_FAC
+# Both scaled by the same factor, so the bridge is UNCHANGED relative to each slice (tau_i =
+# TAU * s_i / TAU_REF, s_i scales with the data) and TAU keeps its meaning, the tau of a typical
+# slice: 0.03 and 0.1481 at scale_fac 5e3 are 0.09 and 0.4443 here. Re-measure both with
+# calibrate_recon_bridge.py once the eig-0.9 SENSE targets exist.
 SCHEDULE = dict(kind="brownian", tau=TAU, n_points=1000, beta_max=0.3)
 
 TGVN_SIZE = dict(num_cascades=12, sens_chans=8, sens_pools=4, chans=18, pools=4)
@@ -158,11 +179,13 @@ def grid_cells(r, tags):
 
 
 def _data(split, base_split, pad_multiple):
-    keep = ("batch_size", "start_slice", "end_slice", "scale_fac", "organ_mask_source")
+    keep = ("batch_size", "start_slice", "end_slice", "organ_mask_source")
     return {"name": "fastmri_paired",
             "split_csv": f"{SPLITS}/{split}.csv",
             "kspace_roots": list(KSPACE_ROOTS),
             **{k: base_split[k] for k in keep if k in base_split},
+            "scale_fac": PDFS_SCALE_FAC,
+            "side_scale_fac": PD_SCALE_FAC,
             "target": TARGET,
             "smap_root": PDFS_MAPS,
             "pad_multiple": pad_multiple,
@@ -200,7 +223,7 @@ def make_config(r, model, g, grid):
     if spec["task"] == "i2sb_recon":
         cfg["training"]["loss_type"] = "complex-mse"
         cfg["i2sb"] = {**SCHEDULE, "deterministic": False, "posterior": "ddpm",
-                       "x1_source": "adjoint", "x0_source": "operator",
+                       "x1_source": X1_SOURCE, "x0_source": "operator",
                        "tau_scale": TAU_SCALE, "tau_ref": TAU_REF,
                        "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC}
     return cfg

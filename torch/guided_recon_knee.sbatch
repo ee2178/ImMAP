@@ -33,9 +33,13 @@
 # of the PDFS k-space (ESPIRiT, ACS 32). Val PSNR/SSIM use each slice's own peak (metric_range). The guide is undersampled like TGVN's side scans: equispaced, no centre lines, a fresh
 # line phase per training step (offset 0 at validation).
 #
-# sbtgvn bridge: tau = 0.03 (gap rule 0.0234 at R=8), INTENSITY-RELATIVE per slice --
-# tau_i = tau * s_i / tau_ref, s_i the RMS of the zero-filled image's foreground; tau_ref = 0.1481,
-# the median s over 60 train slices at R=8, from
+# Intensity: PER-CONTRAST scale_fac, PDFS 1.5e4 and PD (guide) 2.9e3, each putting its foreground
+# p95 near 1 (scripts/contrast_histograms.py); the measurement noise range is unchanged.
+#
+# sbtgvn bridge: tau = 0.09 (0.03 at the old shared scale_fac 5e3; gap rule 0.0234 there),
+# INTENSITY-RELATIVE per slice -- tau_i = tau * s_i / tau_ref, s_i the RMS of the zero-filled
+# image's foreground; tau_ref = 0.4443 (0.1481 at 5e3), the median s over 60 train slices at R=8,
+# from
 #     python scripts/calibrate_recon_bridge.py config/knee/guided/sbtgvn_R8_g1.json --slices 60
 # (TAU_REF in scripts/make_guided_recon_configs.py; re-measure for another main R).
 #

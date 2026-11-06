@@ -81,7 +81,9 @@ except Exception:                       # noqa: BLE001
 from operators import Mask, FFT2D, Sense                                   # noqa: E402
 from physics.mask import get_mask_cached                                   # noqa: E402
 from sb.base import build_schedule, forward_sample                         # noqa: E402
-from sb.i2sb_recon import bridge_start, cg_data_consistency, i2sb_recon_sample  # noqa: E402
+from sb.i2sb_recon import (acs_box_mask, acs_lines_mask, bridge_start,  # noqa: E402
+                           cg_data_consistency,
+                           i2sb_recon_sample)
 from models.sb_recon_unet import SBReconUnet, to_planar, from_planar       # noqa: E402
 from training.i2sb_recon import train_i2sb_recon                           # noqa: E402
 
@@ -372,6 +374,72 @@ def test_dc_validation_logs_both_samplers():
         wb = FakeWandb()
         run(make_net(), d, num_epochs=1, wandb=wb)
         assert "val/nodc_psnr" not in wb.keys()
+
+
+def test_acs_bridge_start_is_the_centre_block_low_pass():
+    """x1_source="acs": E^H of y restricted to the contiguous sampled block around the centre
+    line -- exactly the coil-combined low-pass of the full k-space there, so no aliasing."""
+    from operators.fourier import ifftc as _ifftc
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    acs = acs_lines_mask(y, E)
+    lines = acs.reshape(-1, H)[0]
+    idx = torch.nonzero(lines).flatten()
+    assert bool(lines[H // 2]) and int(idx[-1] - idx[0] + 1) == int(lines.sum())   # contiguous
+    sampled = (E.ops[0].mask.abs() > 0).reshape(-1, H).any(0) if torch.is_tensor(
+        E.ops[0].mask) else None
+    if sampled is not None:
+        assert int(lines.sum()) < int(sampled.sum())                      # outer lines dropped
+        assert not bool(sampled[idx[0] - 1]) and not bool(sampled[idx[-1] + 1])  # maximal run
+    x1 = bridge_start(y, E, "acs")
+    full = Sense(smaps).forward(image)                                    # coil images
+    k = __import__("operators.fourier", fromlist=["fftc"]).fftc(full) * lines.view(1, 1, 1, H)
+    want = (smaps.conj() * _ifftc(k)).sum(1, keepdim=True)
+    assert torch.allclose(x1, want, atol=1e-5), float((x1 - want).abs().max())
+    # same from y's support alone (no Mask op to read)
+    class Bare:
+        pass
+    from_y = acs_lines_mask(y, Bare()).reshape(-1, H)                     # one row per slice
+    assert from_y.shape[0] == 2 and all(torch.equal(r, lines) for r in from_y)
+    raises(ValueError, lambda: acs_lines_mask(y * 0, Bare()), "centre line")
+
+
+def test_training_with_acs_bridge_start():
+    with tempfile.TemporaryDirectory() as d:
+        wb = FakeWandb()
+        run(make_net(), d, num_epochs=1, wandb=wb, x1_source="acs")
+        assert "val/psnr" in wb.keys()
+
+
+def test_acs_box_start_is_isotropic_in_kspace_fraction():
+    """x1_source="acs_box": the ACS lines cut to a centred, odd block of round(f * H) rows,
+    f = ACS lines / W -- and the start is the coil-combined 2D low-pass over that box."""
+    from operators.fourier import fftc as _fftc, ifftc as _ifftc
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    lines = acs_lines_mask(y, E).reshape(-1, H)[0]
+    box = acs_box_mask(y, E)[0, 0]                                       # (H, W)
+    rows = box.any(1)
+    nl, nr = int(lines.sum()), int(rows.sum())
+    want_r = int(round(nl * H / H))                                      # square phantom: H == W
+    want_r += want_r % 2 == 0
+    assert nr == want_r and bool(rows[H // 2])
+    ridx = torch.nonzero(rows).flatten()
+    assert int(ridx[-1] - ridx[0] + 1) == nr                             # contiguous rows
+    assert torch.equal(box, rows[:, None] & lines[None, :])
+    x1 = bridge_start(y, E, "acs_box")
+    k = _fftc(Sense(smaps).forward(image)) * box
+    want = (smaps.conj() * _ifftc(k)).sum(1, keepdim=True)
+    assert torch.allclose(x1, want, atol=1e-5), float((x1 - want).abs().max())
+    # a non-square grid keeps the k-space FRACTION: 4 lines of 32 -> round(4 * 64 / 32) = 8 -> 9
+    y2 = torch.zeros(1, NC, 64, H, dtype=torch.complex64)
+    y2[..., H // 2 - 2:H // 2 + 2] = 1
+
+    class Bare:
+        pass
+    assert int(acs_box_mask(y2, Bare())[0, 0].any(1).sum()) == 9
 
 
 def main():

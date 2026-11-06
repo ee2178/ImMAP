@@ -19,7 +19,10 @@ The TARGET (`target`):
 Either way the offline maps define only the GROUND TRUTH: under the measured protocol the
 operator's maps come from the measurement's own ACS (`mri.online_smaps`), and training/recon.py
 refuses paired data with simulated k-space or with an operator-map model and no online maps.
-  guide    the FULLY-SAMPLED side (PD) k-space, scaled like the main. The recon loop turns it
+  guide    the FULLY-SAMPLED side (PD) k-space, scaled by `side_scale_fac` (None: `scale_fac`,
+           the pre-2026-11-06 behaviour). PER-CONTRAST because PD is ~5x brighter than PDFS at
+           raw scale: one shared factor left the guide at ~1.7 while the target sat at ~0.33
+           (foreground p95; scripts/contrast_histograms.py). The recon loop turns it
            into whatever the model consumes (models with guide_domain "kspace", e.g. TGVN, take
            it as is; image-guided models get its coil combination under the operator's maps).
 
@@ -57,7 +60,8 @@ def read_pairs(csv_path):
 
 
 class PairedKneeDataset(Dataset):
-    def __init__(self, split_csv, kspace_roots, scale_fac=5e3, start_slice=0, end_slice=None,
+    def __init__(self, split_csv, kspace_roots, scale_fac=5e3, side_scale_fac=None,
+                 start_slice=0, end_slice=None,
                  enumerate_slices=False, pad_multiple=1, organ_mask_source="none",
                  organ_mask_kws=None, check_acquisition=True, target="rss", smap_root=None):
         if target not in ("rss", "sense"):
@@ -73,6 +77,7 @@ class PairedKneeDataset(Dataset):
         self.target, self.smap_root = target, smap_root
         self.roots = [kspace_roots] if isinstance(kspace_roots, str) else list(kspace_roots)
         self.scale_fac = float(scale_fac)
+        self.side_scale_fac = float(scale_fac if side_scale_fac is None else side_scale_fac)
         self.start_slice, self.end_slice = int(start_slice), end_slice
         self.pad_multiple = int(pad_multiple)
         self.organ_mask_source = organ_mask_source
@@ -149,7 +154,7 @@ class PairedKneeDataset(Dataset):
         with h5py.File(pdfs_path, "r") as f:
             kspace = torch.from_numpy(f["kspace"][sl]) * self.scale_fac
         with h5py.File(pd_path, "r") as f:
-            side = torch.from_numpy(f["kspace"][sl]) * self.scale_fac
+            side = torch.from_numpy(f["kspace"][sl]) * self.side_scale_fac
 
         C, H, W = kspace.shape
         rss = ifftc(kspace).abs().pow(2).sum(dim=0, keepdim=True).sqrt()      # (1, H, W)
@@ -173,7 +178,8 @@ class PairedKneeDataset(Dataset):
 
 @register_loader("fastmri_paired")
 def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, drop_last=True,
-                           scale_fac=5e3, start_slice=0, end_slice=None, enumerate_slices=False,
+                           scale_fac=5e3, side_scale_fac=None, start_slice=0, end_slice=None,
+                           enumerate_slices=False,
                            pad_multiple=1, organ_mask_source="none", organ_mask_kws=None,
                            check_acquisition=True, num_workers=8, task="recon", target="rss",
                            smap_root=None):
@@ -181,7 +187,7 @@ def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, 
     if task != "recon":
         raise ValueError(f"fastmri_paired serves recon batches only, got task={task!r}")
     ds = PairedKneeDataset(split_csv, kspace_roots, scale_fac=scale_fac,
-                           start_slice=start_slice, end_slice=end_slice,
+                           side_scale_fac=side_scale_fac, start_slice=start_slice, end_slice=end_slice,
                            enumerate_slices=enumerate_slices, pad_multiple=pad_multiple,
                            organ_mask_source=organ_mask_source, organ_mask_kws=organ_mask_kws,
                            check_acquisition=check_acquisition, target=target,

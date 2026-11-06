@@ -283,6 +283,20 @@ def test_loader_pairs_drops_and_checks():
         raises(ValueError, lambda: PairedKneeDataset(csv, root), "pd column = side")
 
 
+def test_loader_scales_each_contrast_by_its_own_factor():
+    """side_scale_fac scales the guide (PD) alone; None keeps the shared factor."""
+    with tempfile.TemporaryDirectory() as root:
+        csv, _ = make_data(root)
+        kw = dict(start_slice=1, end_slice=3, enumerate_slices=True)
+        base = PairedKneeDataset(csv, root, scale_fac=1.0, **kw)[1]
+        shared = PairedKneeDataset(csv, root, scale_fac=3.0, **kw)[1]
+        split = PairedKneeDataset(csv, root, scale_fac=3.0, side_scale_fac=0.5, **kw)[1]
+        close = lambda a, b: torch.allclose(a, b, atol=1e-5)               # noqa: E731
+        assert close(shared[0], 3 * base[0]) and close(shared[5], 3 * base[5])
+        assert close(split[0], 3 * base[0]) and close(split[2], 3 * base[2])
+        assert close(split[5], 0.5 * base[5])
+
+
 def test_loader_offline_sense_target():
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as mroot:
         csv, _ = make_data(root)

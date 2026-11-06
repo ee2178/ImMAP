@@ -5,6 +5,23 @@ sb/i2sb_recon.py -- I2SB for accelerated MRI RECONSTRUCTION.
     x1 = bridge start, built from the measurement y alone:
              "adjoint"   x1 = E^H y, the zero-filled SENSE adjoint (the default; I2SB's
                          restoration setup -- the degraded image IS the prior endpoint)
+             "acs"       x1 = E^H (A y): only the CONTIGUOUS fully-sampled block of phase-encode
+                         lines around the k-space centre, zero-padded -- an alias-free low-pass
+                         image. The bridge then DEBLURS (adds structure, which the guide can
+                         supply) instead of de-aliasing: a uniform-R zero-filled image is
+                         coherently aliased, and the bridge needs a large tau just to cover that
+                         floor. The outer lines are still in y, reaching the net through (y, E)
+                         and the sampler's data consistency. Its width is the MASK's centre block
+                         (center_frac / acs_lines): ~15 lines at knee R8 center_frac 0.04, so a
+                         sharper start needs a wider centre in the mask, not a change here.
+             "acs_box"   as "acs", but ALSO low-passed along the readout to the SAME fraction of
+                         k-space: a centred box of round(f * H) rows (forced odd) x the ACS's
+                         f * W lines, f = ACS lines / W -- with a center_frac mask, exactly
+                         center_frac * W x center_frac * H. The start is then blurred equally (in
+                         k-space fraction) in both directions rather than only along phase
+                         encode, so the bridge's job is an isotropic deblur. The readout
+                         frequencies it drops are still in y. Hard box: Gibbs ringing in both
+                         directions instead of one.
 
 The bridge is the ordinary sb/base.py one, run on COMPLEX tensors. Nothing in forward_sample or
 reverse_sample is real-specific except the noise: `torch.randn_like` on a complex tensor draws
@@ -41,7 +58,7 @@ from sb.base import forward_std, reverse_sample
 from solvers.cg import batched_cg
 
 
-X1_SOURCES = ("adjoint",)
+X1_SOURCES = ("adjoint", "acs", "acs_box")
 TAU_SCALES = ("none", "x1_rms")
 
 
@@ -76,11 +93,70 @@ def bridge_noise_scale(x1, tau_scale="none", tau_ref=None):
     return slice_scale(x1) / float(tau_ref)
 
 
+def _sampled_lines(y, E):
+    """(N, W) bool: which phase-encode lines (last axis) are sampled, from E's own k-space mask
+    (operators.Mask, OP_KIND "kspace_diag"), else from where y is non-zero. N = 1 for a mask
+    shared by the batch, else the batch size."""
+    m = None
+    for op in getattr(E, "ops", [E]):
+        if getattr(op, "OP_KIND", None) == "kspace_diag" and torch.is_tensor(op.mask):
+            m = op.mask
+            break
+    if m is None or m.shape[-1] != y.shape[-1]:
+        m = y
+    m = m.abs() > 0 if torch.is_complex(m) or m.dtype != torch.bool else m
+    while m.dim() < 3:
+        m = m.unsqueeze(0)
+    m = m.reshape(-1, *m.shape[-2:]) if m.dim() == 3 else m.reshape(m.shape[0], -1, m.shape[-1])
+    return m.any(dim=-2)
+
+
+def acs_lines_mask(y, E):
+    """(N, 1, 1, W) bool: the contiguous run of sampled lines containing the centre line W // 2
+    (where ifftc puts DC) -- the measurement's fully-sampled calibration block."""
+    lines = _sampled_lines(y, E).cpu()
+    W = lines.shape[-1]
+    c = W // 2
+    out = torch.zeros_like(lines)
+    for i, row in enumerate(lines):
+        if not bool(row[c]):
+            raise ValueError("x1_source='acs': the centre line is not sampled, so the mask has "
+                             "no calibration block to build a low-pass start from")
+        lo, hi = c, c
+        while lo > 0 and bool(row[lo - 1]):
+            lo -= 1
+        while hi < W - 1 and bool(row[hi + 1]):
+            hi += 1
+        out[i, lo:hi + 1] = True
+    return out[:, None, None, :].to(y.device)
+
+
+def acs_box_mask(y, E):
+    """(N, 1, H, W) bool: the ACS lines (acs_lines_mask) restricted to the centred block of
+    round(f * H) readout rows, forced odd, f = (number of ACS lines) / W -- the same k-space
+    fraction along both axes. Centred on row H // 2, where ifftc puts DC."""
+    lines = acs_lines_mask(y, E)                                       # (N, 1, 1, W)
+    H, W = y.shape[-2], y.shape[-1]
+    n = lines.reshape(lines.shape[0], W).sum(1)                         # ACS width per row
+    rows = torch.zeros(lines.shape[0], 1, H, 1, dtype=torch.bool, device=y.device)
+    for i, ni in enumerate(n.tolist()):
+        r = max(1, int(round(ni * H / W)))
+        r += (r % 2 == 0)                                               # odd, like the lines
+        r = min(r, H - (H % 2 == 0))
+        lo = H // 2 - r // 2
+        rows[i, :, lo:lo + r] = True
+    return rows & lines
+
+
 def bridge_start(y, E, source="adjoint"):
     """The prior endpoint x1 from the measurement. Deterministic in y, so it is the same at
     train and test time."""
     if source == "adjoint":
         return E.adjoint(y)
+    if source == "acs":
+        return E.adjoint(y * acs_lines_mask(y, E))
+    if source == "acs_box":
+        return E.adjoint(y * acs_box_mask(y, E))
     raise ValueError(f"x1_source {source!r} not supported; use one of {X1_SOURCES}")
 
 
