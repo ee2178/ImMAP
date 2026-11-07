@@ -550,9 +550,12 @@ class GroupThreshold(nn.Module):
     @staticmethod
     def _abs2_planar(x):
         """`|x|^2` of a planar map: channel m pairs with channel m + C."""
+        # A square and a sum over the PAIR axis, not `re*re + im*im` on two selected halves:
+        # the backward of a select zero-fills a full-size gradient for each half and then adds
+        # the two, which in an LGGS training step was the largest single cost of the backward
+        # (profiled, L40S). The backward of this sum is a broadcast.
         B, C2, H, W = x.shape
-        p = x.reshape(B, 2, C2 // 2, H, W)
-        return torch.addcmul(p[:, 1] * p[:, 1], p[:, 0], p[:, 0])
+        return (x * x).reshape(B, 2, C2 // 2, H, W).sum(dim=1)
 
     def _fused_envelope(self, za, Gamma):
         """`sqrt(Gamma |za|^2 + eps)` through the fused chain, or None.

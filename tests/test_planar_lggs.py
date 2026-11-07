@@ -79,7 +79,8 @@ def test_projected_guide_planar_is_the_planar_of_the_complex():
         for name in (planar_first, "phi" if planar_first == "alpha" else "alpha"):
             a, b = getattr(pp, name), getattr(pc, name)
             assert not a.is_complex()
-            assert torch.allclose(a, to_planar(b), rtol=0, atol=0)
+            # a different arrangement of the same products (one block-weight conv)
+            assert close(a, to_planar(b), 1e-13)
 
 
 # =============================================================================================

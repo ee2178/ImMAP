@@ -120,14 +120,17 @@ def merge_joint(outs, lses, nheads):
     Returns `sum_b softmax_b(lse)_b * outs_b`, the head's weight spread over its channels.
     """
     B, C, H, W = outs[0].shape
+    d = C // nheads
     L = torch.stack([l.reshape(B, nheads, H, W) for l in lses], dim=0)     # (nb, B, h, H, W)
-    pi = torch.softmax(L, dim=0)
-    if C != nheads:
-        pi = pi.repeat_interleave(C // nheads, dim=2)                      # heads are contiguous
-    e = pi[0] * outs[0]
-    for b in range(1, len(outs)):
-        e = e + pi[b] * outs[b]
-    return e
+    # Broadcast each branch's weight over its head's d channels (heads are contiguous) rather
+    # than repeating it to C channels, and take the branches with `unbind` (backward: a stack)
+    # rather than by indexing (backward: a zero-filled tensor per branch, then their sum).
+    pis = torch.softmax(L, dim=0).unsqueeze(3).unbind(0)                   # (B, h, 1, H, W)
+    e = None
+    for pi, o in zip(pis, outs):
+        t = pi * o.reshape(B, nheads, d, H, W)
+        e = t if e is None else e + t
+    return e.reshape(B, C, H, W)
 
 
 # One comparison against the gather backend per (backend, similarity, heads) per process:
@@ -232,7 +235,22 @@ class ProjectedGuide:
         x = self.w
         n = N // len(pixes)
         if a.complex:
-            wc = torch.cat([wr, torch.einsum("hm,mcpq->hcpq", Wp, a.conv_imag.weight)], 0)
+            wi = torch.einsum("hm,mcpq->hcpq", Wp, a.conv_imag.weight)
+            if self.planar:
+                # ONE conv whose output is already planar, map by map -- rows [re_m; im_m] from
+                # the block weight [[wr, -wi], [wi, wr]] on [xr; xi] -- so nothing is sliced out
+                # of an activation (each slice's backward zero-fills a full-size gradient; the
+                # weights are what gets cut here, and they are tiny).
+                blocks = []
+                for r_, i_ in zip(wr.split(n, dim=0), wi.split(n, dim=0)):
+                    if x.is_complex():
+                        blocks += [torch.cat((r_, -i_), dim=1), torch.cat((i_, r_), dim=1)]
+                    else:
+                        blocks += [r_, i_]
+                xin = torch.cat((x.real, x.imag), dim=1) if x.is_complex() else x
+                o = conv(xin, torch.cat(blocks, dim=0))
+                return list(o.split(2 * n, dim=1)) if len(pixes) > 1 else [o]
+            wc = torch.cat([wr, wi], 0)
             if x.is_complex():
                 # (xr + i xi)(wr + i wi): all four real products from ONE conv, with the
                 # real / imaginary halves stacked on the batch axis and the weights on the
