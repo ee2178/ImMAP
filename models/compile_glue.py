@@ -49,6 +49,22 @@ def set_mode(mode):
     return old
 
 
+def set_from_config(flag):
+    """A config's `training.guided_compile` (true / false / absent) -> the mode now in force.
+
+    The environment variable wins when it is set, so a run can be switched either way without
+    editing its saved config (as IMMAP_PLANAR_STATE does for `training.planar_state`). Absent
+    (None) leaves the default, off. Changes no parameter and, to fp roundoff, no output.
+    """
+    if os.environ.get("IMMAP_GUIDED_COMPILE", "").strip():
+        return MODE
+    if flag is not None:
+        if not isinstance(flag, bool):
+            raise ValueError(f"training.guided_compile must be true or false, got {flag!r}")
+        set_mode("inductor" if flag else None)
+    return MODE
+
+
 def enabled():
     return MODE is not None
 

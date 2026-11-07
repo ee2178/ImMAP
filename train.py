@@ -154,6 +154,13 @@ def main(config_path):
     _planar = set_planar_state(cfg.get("training", {}).get("planar_state"))
     if planar_state_override() is not None:
         cfg.setdefault("training", {})["planar_state"] = _planar
+    # Compiled glue of the guided nets (models/compile_glue.py): torch.compile'd pure pieces
+    # around LGGS's attention. Same map to fp roundoff; absent leaves it off;
+    # IMMAP_GUIDED_COMPILE overrides the config.
+    from models import compile_glue
+    _glue = compile_glue.set_from_config(cfg.get("training", {}).get("guided_compile"))
+    if _glue:
+        print(f"guided compiled glue: ON ({_glue})")
     # Init model from scratch if no ckpt provided
     model = build_model(cfg).to(device)
     if _planar:
@@ -291,7 +298,7 @@ def main(config_path):
     # `complex_conv` and `planar_state` -- but must not reach the train_* functions, none of which
     # take **kwargs. Filtered here rather than popped: a pop before save_config
     # would drop them from the file.
-    _TRAIN_PY_KEYS = ("complex_conv", "cudnn_benchmark", "planar_state")
+    _TRAIN_PY_KEYS = ("complex_conv", "cudnn_benchmark", "planar_state", "guided_compile")
     train_kws = {k: v for k, v in cfg["training"].items()
                  if k not in _TRAIN_PY_KEYS}
 

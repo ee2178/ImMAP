@@ -161,6 +161,18 @@ LGGS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
                    dK=5, nheads=1, init_strategy="semi_orthogonal", is_complex=True,
                    preproc="kspace", attn_backend="triton")
 
+# How LGGS RUNS, not what it is: each changes no parameter and, to fp roundoff, no output or
+# gradient (checked against the original triton path beside an fp32 noise floor:
+# scripts/bench_lggs_materialize.py). Kept apart from LGGS_PARAMS, which stays Sljiva's grid
+# point. Measured on an L40S, knee R8, one training step at K = 30: 739 -> 237 ms, 19.5 -> 12.4
+# GB peak (2026-11).
+#   triton_materialize  hold each guide window's softmax weights per refresh (circulant_window)
+#   planar_state        carry (x, z) as real [re; im] tensors (models/mg_lpds.py)
+#   complex_conv        the planar complex conv (models/components.py)
+#   guided_compile      torch.compile the glue around the attention (models/compile_glue.py)
+LGGS_SPEED_PARAMS = dict(triton_materialize=True)
+LGGS_SPEED_TRAINING = dict(planar_state=True, complex_conv="planar", guided_compile=True)
+
 MODELS = {
     "tgvn": dict(task="recon", guided=True, grid_base="varnet", pad_multiple=1,
                  model=dict(type="TGVN", params=dict(guided=True, cond_sigma=True,
@@ -174,7 +186,8 @@ MODELS = {
                        model=dict(type="TGVN", params=dict(guided=False, cond_sigma=True,
                                                            use_smaps=True, **TGVN_SIZE))),
     "lggs": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
-                 model=dict(type="LGGS", params=LGGS_PARAMS)),
+                 model=dict(type="LGGS", params=LGGS_PARAMS),
+                 speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING)),
 }
 
 # Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,
@@ -283,6 +296,8 @@ def make_config(r, model, g, grid):
            else base["data"]["train"]["pad_multiple"])
     training = {k: v for k, v in base["training"].items() if k != "log_levels"}
     training["metric_range"] = METRIC_RANGE
+    speed = spec.get("speed") or {}
+    training.update(speed.get("training", {}))
     mri = dict(grid["lpdsnet"]["mri"], guide_R=int(g), guide_acs_lines=0,
                guide_mask_dist="uniform")
     name = cell_name(r, model, g)
@@ -301,6 +316,8 @@ def make_config(r, model, g, grid):
         "scheduler": base["scheduler"],
         "wandb": {"project": "guided_recon", "id": None},
     }
+    if speed.get("params"):
+        cfg["model"]["params"].update(speed["params"])
     if spec["task"] == "i2sb_recon":
         start = spec.get("x1_source", X1_SOURCE)
         tau, tau_ref, _ = bridge_tau(start, r)

@@ -332,6 +332,7 @@ BUCKETS = [
     ("fused clip / envelope (triton)",
      r"^_clip_kernel|^_prox_kernel|^_prox_backward|^_scale_kernel|^_scale_backward"
      r"|^_abs2_seq|^_sqrt_img"),
+    ("compiled glue (inductor)", r"^triton_"),           # models/compile_glue.py's kernels
     ("conv (cuDNN, incl. its layout kernels)",
      r"conv|cudnn|winograd|implicit_gemm|xmma|cutlass|dgrad|wgrad|fprop|nchwtonhwc"
      r"|nhwctonchw|gemm|sm\d\d_"),

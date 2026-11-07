@@ -443,6 +443,23 @@ def test_gt_max_metrics_are_per_slice_and_scale_free():
         raise AssertionError("unknown data_range accepted")
 
 
+def _train_py_keys():
+    """`_TRAIN_PY_KEYS` -- the training keys train.py consumes itself and filters out before the
+    train_* call -- read from its source, since importing train.py pulls in wandb, the datasets
+    and lpips."""
+    import ast
+    with open(os.path.join(REPO, "train.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) == "_TRAIN_PY_KEYS"):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError("train.py defines no _TRAIN_PY_KEYS")
+
+
+TRAIN_PY_KEYS = _train_py_keys()
+
+
 def test_generator_cells_and_config_keys():
     """The R8 sweep and the bridge-start cells: names, run dirs, and every config key reaches
     its training loop (configs generated fresh into a temp dir, read as train.py reads them)."""
@@ -483,6 +500,8 @@ def test_generator_cells_and_config_keys():
             seen = set()
             for block in blocks:
                 for k in cfg[block]:
+                    if block == "training" and k in TRAIN_PY_KEYS:
+                        continue                  # consumed by train.py itself, filtered out
                     assert k in params, f"{name}: {block}.{k} is not a {fn.__name__} argument"
                     assert k not in seen, f"{name}: {k} in two blocks"
                     seen.add(k)
