@@ -418,9 +418,14 @@ def stage_profile(dev, a):
         restore()
 
     avg = prof.key_averages()
-    kern = [e for e in avg if getattr(e, "device_type", None) == DeviceType.CUDA and _dev_us(e) > 0]
+    # Kernels only. The record_function ranges ("forward", ...) also appear on the device
+    # timeline as user annotations spanning their kernels; counting them double-counts.
+    kern = [e for e in avg if getattr(e, "device_type", None) == DeviceType.CUDA
+            and _dev_us(e) > 0 and not getattr(e, "is_user_annotation", False)
+            and e.key not in ("forward", "backward", "optimizer")]
     if not kern:                                     # older profilers: device-only rows
-        kern = [e for e in avg if _dev_us(e) > 0 and getattr(e, "self_cpu_time_total", 0) == 0]
+        kern = [e for e in avg if _dev_us(e) > 0 and getattr(e, "self_cpu_time_total", 0) == 0
+                and e.key not in ("forward", "backward", "optimizer")]
     gpu_ms = sum(_dev_us(e) for e in kern) / 1e3 / n
     launches = sum(e.count for e in kern) / n
     busy = gpu_ms / ph["step"]
@@ -441,6 +446,22 @@ def stage_profile(dev, a):
     for label, (ms, cnt) in sorted(buckets.items(), key=lambda kv: -kv[1][0]):
         print(f"  {label:42s}{ms:10.1f}{100 * ms / gpu_ms:7.1f}%{cnt:10.0f}")
 
+    # The backward, charged to the forward op it differentiates: each autograd node's
+    # device_time_total is the GPU time of every kernel launched while evaluating it.
+    nodes = []
+    for e in avg:
+        if e.key.startswith("autograd::engine::evaluate_function:"):
+            us = float(getattr(e, "device_time_total", 0.0) or 0.0)
+            if us > 0:
+                nodes.append((us / 1e3 / n, e.count / n,
+                              e.key.split("evaluate_function:", 1)[1].strip()))
+    nodes.sort(reverse=True)
+    bwd_ms = sum(t for t, _, _ in nodes)
+    print(f"\n  backward by autograd node ({bwd_ms:.1f} ms/step of GPU time attributed):")
+    print(f"  {'node':60s}{'ms/step':>9s}{'share':>8s}{'calls':>7s}")
+    for t, c, k in nodes[:a.profile_top]:
+        print(f"  {k[:58]:60s}{t:9.2f}{100 * t / max(bwd_ms, 1e-9):7.1f}%{c:7.0f}")
+
     top = sorted(kern, key=lambda e: -_dev_us(e))[:a.profile_top]
     print(f"\n  top {len(top)} kernels:")
     print(f"  {'kernel':72s}{'ms/step':>9s}{'share':>8s}{'calls':>7s}  kind")
@@ -452,6 +473,8 @@ def stage_profile(dev, a):
         rows.append(dict(kernel=e.key, ms_per_step=ms, calls_per_step=e.count / n,
                          kind=_bucket(e.key)))
     return dict(arm=a.profile_arm, wall_ms=ph, gpu_busy_ms=gpu_ms, launches_per_step=launches,
+                backward_nodes=[dict(node=k, ms_per_step=t, calls_per_step=c)
+                                for t, c, k in nodes[:a.profile_top]],
                 fused_kernels=clip_triton.planar_kernel_report(),
                 buckets={k: dict(ms_per_step=v[0], launches=v[1]) for k, v in buckets.items()},
                 top=rows)
@@ -480,6 +503,12 @@ def main():
     ap.add_argument("--profile-steps", type=int, default=3, help="profile: steps recorded")
     ap.add_argument("--profile-top", type=int, default=25, help="profile: kernels listed")
     ap.add_argument("--trace", default=None, help="profile: write a chrome trace here")
+    ap.add_argument("--no-cudnn-benchmark", action="store_true",
+                    help="leave cuDNN on its heuristics. Default ON, as train.py runs "
+                         "(training.cudnn_benchmark, default true)")
+    ap.add_argument("--no-tf32", action="store_true",
+                    help="IEEE fp32 convs and matmuls (cudnn.allow_tf32 / matmul precision "
+                         "'highest'): is a gap down to TF32?")
     ap.add_argument("--no-planar", action="store_true",
                     help="stage 3: skip the planar-state + planar-conv arm")
     ap.add_argument("--config", default=os.path.join(REPO, "config/knee/guided/lggs_R8_g1.json"))
@@ -491,8 +520,16 @@ def main():
     if not (HAVE_TRITON and torch.cuda.is_available()):
         raise SystemExit("needs CUDA and triton (the Linux CUDA wheels ship it)")
     dev = torch.device("cuda")
+    # What train.py does: cuDNN autotunes each conv shape (the earlier runs of this script
+    # used its heuristics instead, so their conv times are not the training ones).
+    torch.backends.cudnn.benchmark = not a.no_cudnn_benchmark
+    if a.no_tf32:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
     print(f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}, "
-          f"matmul precision {torch.get_float32_matmul_precision()}")
+          f"matmul precision {torch.get_float32_matmul_precision()}, "
+          f"cudnn.benchmark {torch.backends.cudnn.benchmark}, "
+          f"cudnn.allow_tf32 {torch.backends.cudnn.allow_tf32}")
     gp._FUSED_JOINT_CHECKED.clear()
 
     out = {"device": torch.cuda.get_device_name(0), "args": vars(a)}
