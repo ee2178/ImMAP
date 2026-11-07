@@ -610,6 +610,12 @@ class GroupThreshold(nn.Module):
         if xi_a is None:
             xi_a = torch.sqrt(self.apply_gamma(Gamma, self._abs2_planar(za)) + self.eps)
         xi = self.beta_apply(xi_a) if self.grouped else xi_a
+        return self._scale_planar_code(z, xi, tau, dual), cache
+
+    def _scale_planar_code(self, z, xi, tau, dual):
+        """`z * relu(1 - q)` (shrink) or `z * min(1, q)` (clip), q = tau / (xi + eps), on a
+        PLANAR code: one fused kernel where expressible (models/clip_triton.py), else eager.
+        Shared with the guided prox's planar path."""
         if SoftThreshold.FUSED:
             if not torch.is_grad_enabled():
                 out = scale_planar(z, xi, tau, self.eps, dual)
@@ -618,11 +624,11 @@ class GroupThreshold(nn.Module):
             else:
                 out = None
             if out is not None:
-                return out, cache
+                return out
         q = tau / (xi + self.eps)
         s = q.clamp_max(1.0) if dual else F.relu(1.0 - q)
         B, C2, H, W = z.shape
-        return (z.reshape(B, 2, C2 // 2, H, W) * s.unsqueeze(1)).reshape(z.shape), cache
+        return (z.reshape(B, 2, C2 // 2, H, W) * s.unsqueeze(1)).reshape(z.shape)
 
     def fenchel(self, z, sigma=None, cache=None):
         """`prox_{g*}(z) = z - prox_g(z)`. Formed directly for a planar code

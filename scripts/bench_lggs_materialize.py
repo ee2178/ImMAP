@@ -12,8 +12,10 @@ that are wrong:
                with fresh values, backward -- implicit vs materialised: ms, peak memory, and
                the relative difference of the pooled energy and of dq / dk.
   3. net       a full LGGSNet training step (forward + backward + Adam) built from the LGGS
-               config, triton_materialize off vs on, same weights: ms / step, peak memory,
-               and the relative difference of the output and the gradients.
+               config, same weights: implicit, materialised, and materialised with the
+               planar state + planar convs (`--no-planar` skips it): ms / step, peak memory,
+               and the output / per-parameter gradient differences against implicit, beside
+               a noise floor (implicit with only the triton block size changed).
 
     python scripts/bench_lggs_materialize.py                       # all three, knee sizes
     python scripts/bench_lggs_materialize.py --stages branch net --iters 20
@@ -45,7 +47,9 @@ sys.modules.setdefault("nibabel", types.ModuleType("nibabel"))
 import models.circulant_window as cw                                  # noqa: E402
 import models.guided_prox as gp                                       # noqa: E402
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency      # noqa: E402
+from models.components import _GaussConvNd, set_complex_mode         # noqa: E402
 from models.guided_lpds import LGGSNet                                # noqa: E402
+from models.mg_lpds import MGLPDSNet                                  # noqa: E402
 
 
 def rel(a, b):
@@ -195,44 +199,62 @@ def stage_net(dev, a):
     y, guides = cplx(), [cplx() for _ in range(a.guides)]
     sigma = torch.full((a.batch, 1, 1, 1), 0.015, device=dev)
 
-    # Three nets from the same weights. "noise floor" is the implicit net with only the triton
+    # Nets from the same weights. "noise floor" is the implicit net with only the triton
     # kernel's query-block size changed -- which reorders its fp32 softmax reduction and nothing
     # else (GroupThreshold.triton_block_m) -- so its gap to "implicit" is what fp32 alone does
-    # to the gradients through K thresholded layers. Materialised is judged against THAT.
-    arms = [("implicit", False, a.block_m, True),
-            ("materialized", True, a.block_m, True),
-            ("noise floor", False, a.noise_block_m, False)]
+    # to the gradients through K thresholded layers. The other arms are judged against THAT.
+    # "mat + planar" adds the planar state and planar complex convs (training.planar_state /
+    # training.complex_conv: models/mg_lpds.py::set_planar_state, models/components.py).
+    arms = [dict(name="implicit", mat=False, bm=a.block_m, planar=False, time=True),
+            dict(name="materialized", mat=True, bm=a.block_m, planar=False, time=True)]
+    if not a.no_planar:
+        arms.append(dict(name="mat + planar", mat=True, bm=a.block_m, planar=True, time=True))
+    arms.append(dict(name="noise floor", mat=False, bm=a.noise_block_m, planar=False,
+                     time=False))
     res, ref = {}, {}
-    for name, mat, bm, time_it in arms:
-        net = LGGSNet(**params, triton_materialize=mat, spectral_init=False).to(dev).train()
-        net.load_state_dict(state)
-        for m in net.modules():
-            if hasattr(m, "triton_block_m"):
-                m.triton_block_m = int(bm)
-        opt = torch.optim.Adam(net.parameters(), lr=1e-5)
+    for arm in arms:
+        name = arm["name"]
+        keep = (MGLPDSNet.PLANAR_STATE, _GaussConvNd.COMPLEX_MODE)
+        MGLPDSNet.PLANAR_STATE = arm["planar"]
+        set_complex_mode("planar" if arm["planar"] else keep[1])
+        try:
+            net = LGGSNet(**params, triton_materialize=arm["mat"], spectral_init=False)
+            net = net.to(dev).train()
+            net.load_state_dict(state)
+            if arm["planar"] and not net.planar_state_active():
+                raise SystemExit("planar arm: LGGSNet.planar_state_active() is False")
+            for m in net.modules():
+                if hasattr(m, "triton_block_m"):
+                    m.triton_block_m = int(arm["bm"])
+            opt = torch.optim.Adam(net.parameters(), lr=1e-5)
 
-        def step(update=True):
-            opt.zero_grad(set_to_none=True)
-            xh, _ = net(y, guide=guides, sigma=sigma)
-            xh.abs().pow(2).mean().backward()
-            if update:
-                opt.step()
-            return xh
+            def step(update=True):
+                opt.zero_grad(set_to_none=True)
+                xh, _ = net(y, guide=guides, sigma=sigma)
+                xh.abs().pow(2).mean().backward()
+                if update:
+                    opt.step()
+                return xh
 
-        xh = step(update=False)                         # same weights for the comparison
-        ref[name] = (xh.detach(), {n: p.grad.detach().clone()
-                                   for n, p in net.named_parameters() if p.grad is not None})
-        if time_it:
-            ms, mb = timed(step, a.warmup, a.iters)
-            res[name] = dict(step_ms=ms, step_peak_mib=mb)
-            print(f"  {name:12s}  {ms:8.1f} ms / step   peak {mb:8.0f} MiB")
-        del net, opt
-        torch.cuda.empty_cache()
+            xh = step(update=False)                     # same weights for the comparison
+            ref[name] = (xh.detach(), {n: p.grad.detach().clone()
+                                       for n, p in net.named_parameters()
+                                       if p.grad is not None})
+            if arm["time"]:
+                ms, mb = timed(step, a.warmup, a.iters)
+                res[name] = dict(step_ms=ms, step_peak_mib=mb)
+                print(f"  {name:14s}{ms:8.1f} ms / step   peak {mb:8.0f} MiB")
+            del net, opt
+            torch.cuda.empty_cache()
+        finally:
+            MGLPDSNet.PLANAR_STATE = keep[0]
+            set_complex_mode(keep[1])
 
     base_out, base_g = ref["implicit"]
+    others = [arm["name"] for arm in arms[1:]]
     res["rel_err"] = {}
     rows = {}
-    for name in ("materialized", "noise floor"):
+    for name in others:
         out, gr = ref[name]
         assert gr.keys() == base_g.keys(), f"{name}: a different set of parameters got gradients"
         rows[name] = {n: (nrel(gr[n], base_g[n]), rel(gr[n], base_g[n])) for n in base_g}
@@ -247,18 +269,20 @@ def stage_net(dev, a):
         print(f"  {name:14s}{e['output']:10.1e}{e['grad_norm_rel_median']:10.1e}"
               f"{e['grad_norm_rel_worst']:10.1e}{e['grad_max_rel_worst']:15.1e}")
 
-    worst = sorted(base_g, key=lambda n: -rows["materialized"][n][0])[:a.top]
-    print(f"\n  the {len(worst)} worst tensors (materialized), with the noise floor beside them:")
-    print(f"  {'parameter':48s}{'||g||':>10s}{'mat':>10s}{'floor':>10s}")
+    judged = [n for n in others if n != "noise floor"]
+    worst = sorted(base_g, key=lambda n: -max(rows[k][n][0] for k in judged))[:a.top]
+    print(f"\n  the {len(worst)} worst tensors, with the noise floor beside them:")
+    print(f"  {'parameter':48s}{'||g||':>10s}" + "".join(f"{k:>14s}" for k in others))
     res["worst"] = []
     for n in worst:
         g = float(base_g[n].norm())
-        m, f = rows["materialized"][n][0], rows["noise floor"][n][0]
-        print(f"  {n:48s}{g:10.1e}{m:10.1e}{f:10.1e}")
-        res["worst"].append(dict(param=n, grad_norm=g, materialized=m, noise_floor=f))
+        print(f"  {n:48s}{g:10.1e}" + "".join(f"{rows[k][n][0]:14.1e}" for k in others))
+        res["worst"].append(dict(param=n, grad_norm=g, **{k: rows[k][n][0] for k in others}))
 
-    r = res["implicit"]["step_ms"] / res["materialized"]["step_ms"]
-    print(f"\n  speed-up per training step: {r:.2f}x")
+    print()
+    for name in judged:
+        r = res["implicit"]["step_ms"] / res[name]["step_ms"]
+        print(f"  speed-up per training step, {name}: {r:.2f}x")
     return res
 
 
@@ -278,6 +302,8 @@ def main():
     ap.add_argument("--noise-block-m", type=int, default=32,
                     help="block_m of stage 3's noise-floor arm (reorders fp32 only)")
     ap.add_argument("--top", type=int, default=8, help="stage 3: worst tensors to list")
+    ap.add_argument("--no-planar", action="store_true",
+                    help="stage 3: skip the planar-state + planar-conv arm")
     ap.add_argument("--config", default=os.path.join(REPO, "config/knee/guided/lggs_R8_g1.json"))
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--iters", type=int, default=10)

@@ -1148,13 +1148,15 @@ def set_planar_state(flag=None):
 
 def planar_state_report(model):
     """One line for a log: is the planar state on, and does `model` use it?"""
-    nets = [m for m in model.modules() if isinstance(m, MGLPDSNet)]
+    from models.guided_lpds import LGGSNet          # the guided net carries it too
+    nets = [m for m in model.modules() if isinstance(m, (MGLPDSNet, LGGSNet))]
     if not MGLPDSNet.PLANAR_STATE:
         return "planar state: off"
     if nets and all(m.planar_state_active() for m in nets):
         return "planar state: ON (iterates carried as real [re; im] tensors)"
-    why = ("this model has no MGLPDSNet" if not nets else
-           "not implemented for widen > 1, learned transfers or a guided prox")
+    why = ("this model has no MGLPDSNet or LGGSNet" if not nets else
+           "not implemented for widen > 1, learned transfers, a guided prox inside "
+           "MGLPDSNet, or a real-valued net")
     return f"planar state: requested but NOT in use -- {why}"
 
 

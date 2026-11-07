@@ -70,7 +70,8 @@ import torch.nn.functional as F
 from models.guided_prox import (GuidedGroupThreshold, ProjectedGuide,
                                 as_guide_list, build_guided_prox)
 from models.base import batched_projection
-from models.lpds import LPDSLayer, gram
+from models.components import to_complex, to_planar
+from models.lpds import LPDSLayer, _per_channel, gram
 from operators.identity import Identity
 from operators.padding import calc_pad_2d, unpad
 from preprocessing.image import post_process, pre_process
@@ -109,14 +110,16 @@ class GuidedLPDSLayer(LPDSLayer):
         """`[A w_g]` -- this layer's dictionary applied to each guide image."""
         return [self.analysis(w) for w in guides]
 
-    def guide_latents(self, guides):
+    def guide_latents(self, guides, planar=False):
         """What the prox gets for each guide: `A w`, as a `ProjectedGuide` where the composition
         with the prox's 1x1 transforms is expressible (always, for LGGS), else as the tensor.
-        Same values either way; the projected form never builds the M-channel latent."""
+        Same values either way; the projected form never builds the M-channel latent.
+        `planar`: in the planar state's [re; im] form, to match a planar code."""
         gt = self.prox.prox
         if ProjectedGuide.supported(guides[0], self.analysis, gt):
-            return [ProjectedGuide(w, self.analysis, gt) for w in guides]
-        return self.analyse_guides(guides)
+            return [ProjectedGuide(w, self.analysis, gt, planar=planar) for w in guides]
+        v = self.analyse_guides(guides)
+        return [to_planar(t) for t in v] if planar else v
 
     # -- forward ------------------------------------------------------------
     def forward(self, state, y_tilde, guide=None, E=None, sigma=None, pi=None,
@@ -132,7 +135,14 @@ class GuidedLPDSLayer(LPDSLayer):
         guides = as_guide_list(guide)
 
         hint = cache.pop("_gram_x", None)
-        v = self.guide_latents(guides) if guides else None
+        x0 = y_tilde if state is None else state[0]
+        # planar STATE (LGGSNet.planar_state_active): x, z arrive real, [re; im] stacked. The
+        # convs and the prox take that form as it is; only the data term and the guides adapt.
+        # Told apart by the channel count, not the dtype: a complex net is also fed REAL images
+        # (a magnitude estimate, the learned-DC path), and those have C channels, not 2C.
+        planar = (self.is_complex and not x0.is_complex()
+                  and x0.shape[1] == 2 * self.C)
+        v = self.guide_latents(guides, planar=planar) if guides else None
 
         if state is None:
             x = y_tilde
@@ -144,13 +154,15 @@ class GuidedLPDSLayer(LPDSLayer):
 
         tau = self.tau(sigma, ref=x)
         theta = self.theta(sigma, ref=x)
+        if planar:
+            tau, theta = _per_channel(tau, x), _per_channel(theta, x)
 
         if getattr(E, "nonlinear", False):
             # learned operator: the data gradient is ONE call at the current iterate,
             # J_E(x)^H (E(x) - y). `E^H E x - E^H y` would need a point-free adjoint it lacks.
-            data = E.grad(x)
+            data = to_planar(E.grad(to_complex(x))) if planar else E.grad(x)
         else:
-            Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x)
+            Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x, planar)
             data = Ex - y_tilde
         residual = data + self.synthesis(z)
         if pi_x is not None:
@@ -297,14 +309,34 @@ class LGGSNet(nn.Module):
                 post = lambda x, p: post_process(x, list(p))    # noqa: E731
 
         guides = self._prep_guides(guide, y_tilde)
+        x, z = self._sweeps(state, y_tilde, guides, E, sigma)
+        x_hat = x if params is None else post(x, params)
+        return x_hat, (x, z)
 
+    def _sweeps(self, state, y_tilde, guides, E, sigma):
+        """The K sweeps -> (x, z), complex in and out. Under the planar state the iterates are
+        carried as real [re; im] tensors in between (the guides stay complex images: their
+        projections come out planar, models/guided_prox.py::ProjectedGuide)."""
+        planar = self.planar_state_active() and torch.is_complex(y_tilde)
+        if planar:
+            y_tilde = to_planar(y_tilde)
+            if state is not None:
+                state = tuple(None if t is None else to_planar(t) for t in state)
         cache = {}
         for layer in self.layers:
             state, cache = layer(state, y_tilde, guide=guides, E=E,
                                  sigma=sigma, cache=cache)
         x, z = state
-        x_hat = x if params is None else post(x, params)
-        return x_hat, (x, z)
+        if planar:
+            x, z = to_complex(x), to_complex(z)
+        return x, z
+
+    def planar_state_active(self):
+        """Carry the iterates planar? The process-wide switch `MGLPDSNet.PLANAR_STATE`
+        (`training.planar_state`, `IMMAP_PLANAR_STATE`; models/mg_lpds.py::set_planar_state),
+        for a complex net. Changes no parameter and, to fp roundoff, no output or gradient."""
+        from models.mg_lpds import MGLPDSNet
+        return bool(MGLPDSNet.PLANAR_STATE and self.is_complex)
 
     def _forward_nonlinear(self, y, guide, E, sigma, state):
         """The same K guided sweeps with a LEARNED (nonlinear) data operator.
@@ -338,11 +370,7 @@ class LGGSNet(nn.Module):
 
         dc = _PaddedDataGrad(E, y, xmean, pad)
         guides = self._prep_guides(guide, y_tilde)
-        cache = {}
-        for layer in self.layers:
-            state, cache = layer(state, y_tilde, guide=guides, E=dc,
-                                 sigma=sigma, cache=cache)
-        x, z = state
+        x, z = self._sweeps(state, y_tilde, guides, dc, sigma)
         x_hat = x if params is None else post_process(x, list(params))
         return x_hat, (x, z)
 

@@ -108,6 +108,7 @@ import models.circulant_flex as circulant_flex
 from models.circulant_flex import FlexAdjacency, PointwiseAdjacency
 from models.circulant_triton import TritonAdjacency
 from models.circulant_window import WindowAdjacency
+from models.components import to_complex
 from models.prox import GroupThreshold, Polynomial
 
 
@@ -191,14 +192,17 @@ class ProjectedGuide:
     layer forms both maps in one conv, every other layer forms W_alpha v alone.
 
     `IMMAP_GUIDE_FUSED=0` (or `ProjectedGuide.FUSE = False`) restores `v = A w` as a tensor.
+
+    `planar=True` returns each map as a real `[re; im]` stack (the planar STATE's form) instead
+    of a complex tensor -- the conv produces the two halves anyway, so that costs nothing.
     """
 
     FUSE = os.environ.get("IMMAP_GUIDE_FUSED", "1") != "0"
 
-    __slots__ = ("w", "analysis", "prox", "_alpha", "_phi")
+    __slots__ = ("w", "analysis", "prox", "planar", "_alpha", "_phi")
 
-    def __init__(self, w, analysis, prox):
-        self.w, self.analysis, self.prox = w, analysis, prox
+    def __init__(self, w, analysis, prox, planar=False):
+        self.w, self.analysis, self.prox, self.planar = w, analysis, prox, bool(planar)
         self._alpha = self._phi = None
 
     @classmethod
@@ -226,6 +230,7 @@ class ProjectedGuide:
             return F.conv2d(x, W, stride=a.stride, padding=a.padding)
 
         x = self.w
+        n = N // len(pixes)
         if a.complex:
             wc = torch.cat([wr, torch.einsum("hm,mcpq->hcpq", Wp, a.conv_imag.weight)], 0)
             if x.is_complex():
@@ -234,15 +239,19 @@ class ProjectedGuide:
                 # output axis
                 B = x.shape[0]
                 o = conv(torch.cat([x.real, x.imag], dim=0), wc)
-                out = torch.complex(o[:B, :N] - o[B:, N:], o[:B, N:] + o[B:, :N])
+                re, im = o[:B, :N] - o[B:, N:], o[:B, N:] + o[B:, :N]
             else:
                 o = conv(x, wc)
-                out = torch.complex(o[:, :N], o[:, N:])
-        elif x.is_complex():
+                re, im = o[:, :N], o[:, N:]
+            pairs = zip(re.split(n, dim=1), im.split(n, dim=1))
+            if self.planar:
+                return [torch.cat((r, i), dim=1) for r, i in pairs]
+            return [torch.complex(r, i) for r, i in pairs]
+        if x.is_complex():
             out = torch.complex(conv(x.real, wr), conv(x.imag, wr))
         else:
             out = conv(x, wr)
-        return out.split(N // len(pixes), dim=1)
+        return list(out.split(n, dim=1))
 
     @property
     def alpha(self):
@@ -331,9 +340,17 @@ class GuidedGroupThreshold(GroupThreshold):
         """
         rho = self.rho(sigma, ref=z)
         sq = torch.sqrt(rho + self.eps)
+        planar = self._is_planar_state(z)
+        if planar and sq.shape[1] > 1:
+            sq = torch.cat((sq, sq), dim=1)            # planar q, k: one rho per PAIR
         q = self._rho_scale(self.Wtheta(z) if self.grouped else z, sq)
         k_self = self._rho_scale(self.Wphi(z) if self.grouped else z, sq)
         k_guides = [self._rho_scale(self._guide_phi(g), sq) for g in guides]
+        if planar:
+            # The attention backends take complex features (flex: [re; im] per head). At Mh
+            # channels, on a refresh only, converting here is cheap -- GroupThreshold does it too.
+            conv = self._heads_ri if self.attn_backend == "flex" else to_complex
+            q, k_self, k_guides = conv(q), conv(k_self), [conv(k) for k in k_guides]
         return q, k_self, k_guides
 
     # a guide is a latent tensor, or a `ProjectedGuide` that forms these maps directly
@@ -505,14 +522,22 @@ class GuidedGroupThreshold(GroupThreshold):
             or cache.get("gdupdate", 0) % self.dK == 0
         Phi, Omegas, cache = self.adjacencies_of(z, guides, sigma, cache)
 
+        # PLANAR code (the planar state): real, [re; im] stacked. The transforms act on each
+        # half; the energies pair them; the result is both halves scaled by one real factor.
+        planar = self._is_planar_state(z)
+        if planar and cross is not None:
+            raise NotImplementedError("the cross branch takes a complex code, not a planar one")
+        sq_mod = self._abs2_planar if planar else _abs2
+
         za = self.Walpha(z) if self.grouped else z
-        e_self = self.apply_gamma(Phi, _abs2(za))
-        terms = [self.apply_gamma(Om, _abs2(self._guide_alpha(g)))
+        e_self = self.apply_gamma(Phi, sq_mod(za))
+        terms = [self.apply_gamma(Om, sq_mod(self._guide_alpha(g)))
                  for Om, g in zip(Omegas, guides)]
 
         if self.joint_fused and terms:
             # the joint simplex, from each branch's own softmax and its log-sum-exp
-            self._check_fused_joint(z)
+            self._check_fused_joint(z if not planar else z.new_empty(
+                0, dtype=torch.complex128 if z.dtype == torch.float64 else torch.complex64))
             energy = merge_joint([e_self] + terms,
                                  [Phi._lse] + [Om._lse for Om in Omegas], self.nheads)
         else:
@@ -539,6 +564,9 @@ class GuidedGroupThreshold(GroupThreshold):
             xa = torch.sqrt(self.apply_gamma(cache["Xi"], _abs2(ga)) + self.eps)
             xi_x = self.beta_apply(xa) if self.grouped else xa
             xi = torch.sqrt(xi ** 2 + cross["weight"] * xi_x ** 2)
+        if planar:
+            # one fused kernel where expressible (models/clip_triton.py), as GroupThreshold
+            return self._scale_planar_code(z, xi, self.tau(sigma, ref=z), dual), cache
         q = self.tau(sigma, ref=z) / (xi + self.eps)
         if dual:
             # z - z relu(1 - q) = z min(1, q): the clip in one pass
