@@ -52,6 +52,7 @@ sys.path.insert(0, REPO)
 sys.modules.setdefault("nibabel", types.ModuleType("nibabel"))
 
 import models.circulant_window as cw                                  # noqa: E402
+from models import conv_gemm                                          # noqa: E402
 import models.guided_prox as gp                                       # noqa: E402
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency      # noqa: E402
 from models.components import _GaussConvNd, set_complex_mode         # noqa: E402
@@ -529,7 +530,8 @@ def main():
     print(f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}, "
           f"matmul precision {torch.get_float32_matmul_precision()}, "
           f"cudnn.benchmark {torch.backends.cudnn.benchmark}, "
-          f"cudnn.allow_tf32 {torch.backends.cudnn.allow_tf32}")
+          f"cudnn.allow_tf32 {torch.backends.cudnn.allow_tf32}, "
+          f"conv GEMM {conv_gemm.MODE or 'off'} (IMMAP_CONV_GEMM)")
     gp._FUSED_JOINT_CHECKED.clear()
 
     out = {"device": torch.cuda.get_device_name(0), "args": vars(a)}

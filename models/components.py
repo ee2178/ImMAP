@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models import conv_gemm
+
 
 # ============================================================
 # Nonlinearities
@@ -312,8 +314,9 @@ class Conv2d(_GaussConvNd):
                                    bias=bias, groups=self.groups) if complex else None
 
     def _op(self, x, weight, bias=None):
-        return F.conv2d(x, weight, bias=bias, stride=self.stride,
-                        padding=self.padding, groups=self.groups)
+        # unfold + GEMM for a narrow input side when IMMAP_CONV_GEMM is on (models/conv_gemm.py)
+        return conv_gemm.conv2d(x, weight, bias=bias, stride=self.stride,
+                                padding=self.padding, groups=self.groups)
 
 
 class ConvTranspose2d(_GaussConvNd):
@@ -337,7 +340,8 @@ class ConvTranspose2d(_GaussConvNd):
             groups=self.groups) if complex else None
 
     def _op(self, x, weight, bias=None):
-        return F.conv_transpose2d(x, weight, bias=bias, stride=self.stride,
+        # GEMM + fold for a narrow output side when IMMAP_CONV_GEMM is on (models/conv_gemm.py)
+        return conv_gemm.conv_transpose2d(x, weight, bias=bias, stride=self.stride,
             padding=self.padding, output_padding=self.output_padding,
             groups=self.groups)
 

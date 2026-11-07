@@ -108,6 +108,7 @@ import models.circulant_flex as circulant_flex
 from models.circulant_flex import FlexAdjacency, PointwiseAdjacency
 from models.circulant_triton import TritonAdjacency
 from models.circulant_window import WindowAdjacency
+from models import conv_gemm
 from models.components import to_complex
 from models.prox import GroupThreshold, Polynomial
 
@@ -230,7 +231,7 @@ class ProjectedGuide:
         N = wr.shape[0]
 
         def conv(x, W):
-            return F.conv2d(x, W, stride=a.stride, padding=a.padding)
+            return conv_gemm.conv2d(x, W, stride=a.stride, padding=a.padding)
 
         x = self.w
         n = N // len(pixes)
