@@ -49,7 +49,13 @@ from models.guided_lpds import LGGSNet                                # noqa: E4
 
 
 def rel(a, b):
+    """max |a - b| / max |b|: a single tensor's worst entry against its largest."""
     return float((a - b).abs().max() / b.abs().max().clamp_min(1e-30))
+
+
+def nrel(a, b):
+    """||a - b|| / ||b||: the whole tensor's relative difference."""
+    return float((a - b).norm() / b.norm().clamp_min(1e-30))
 
 
 def timed(fn, warmup, iters):
@@ -189,10 +195,20 @@ def stage_net(dev, a):
     y, guides = cplx(), [cplx() for _ in range(a.guides)]
     sigma = torch.full((a.batch, 1, 1, 1), 0.015, device=dev)
 
+    # Three nets from the same weights. "noise floor" is the implicit net with only the triton
+    # kernel's query-block size changed -- which reorders its fp32 softmax reduction and nothing
+    # else (GroupThreshold.triton_block_m) -- so its gap to "implicit" is what fp32 alone does
+    # to the gradients through K thresholded layers. Materialised is judged against THAT.
+    arms = [("implicit", False, a.block_m, True),
+            ("materialized", True, a.block_m, True),
+            ("noise floor", False, a.noise_block_m, False)]
     res, ref = {}, {}
-    for mat in (False, True):
+    for name, mat, bm, time_it in arms:
         net = LGGSNet(**params, triton_materialize=mat, spectral_init=False).to(dev).train()
         net.load_state_dict(state)
+        for m in net.modules():
+            if hasattr(m, "triton_block_m"):
+                m.triton_block_m = int(bm)
         opt = torch.optim.Adam(net.parameters(), lr=1e-5)
 
         def step(update=True):
@@ -204,20 +220,45 @@ def stage_net(dev, a):
             return xh
 
         xh = step(update=False)                         # same weights for the comparison
-        ref[mat] = (xh.detach(), {n: p.grad.detach().clone()
-                                  for n, p in net.named_parameters() if p.grad is not None})
-        ms, mb = timed(step, a.warmup, a.iters)
-        name = "materialized" if mat else "implicit"
-        res[name] = dict(step_ms=ms, step_peak_mib=mb)
-        print(f"  {name:12s}  {ms:8.1f} ms / step   peak {mb:8.0f} MiB")
+        ref[name] = (xh.detach(), {n: p.grad.detach().clone()
+                                   for n, p in net.named_parameters() if p.grad is not None})
+        if time_it:
+            ms, mb = timed(step, a.warmup, a.iters)
+            res[name] = dict(step_ms=ms, step_peak_mib=mb)
+            print(f"  {name:12s}  {ms:8.1f} ms / step   peak {mb:8.0f} MiB")
         del net, opt
         torch.cuda.empty_cache()
-    out_err = rel(ref[True][0], ref[False][0])
-    grad_err = max(rel(ref[True][1][n], ref[False][1][n]) for n in ref[False][1])
-    print(f"  difference: output {out_err:.1e}, worst parameter gradient {grad_err:.1e}")
+
+    base_out, base_g = ref["implicit"]
+    res["rel_err"] = {}
+    rows = {}
+    for name in ("materialized", "noise floor"):
+        out, gr = ref[name]
+        assert gr.keys() == base_g.keys(), f"{name}: a different set of parameters got gradients"
+        rows[name] = {n: (nrel(gr[n], base_g[n]), rel(gr[n], base_g[n])) for n in base_g}
+        res["rel_err"][name] = dict(
+            output=rel(out, base_out),
+            grad_norm_rel_median=statistics.median(v[0] for v in rows[name].values()),
+            grad_norm_rel_worst=max(v[0] for v in rows[name].values()),
+            grad_max_rel_worst=max(v[1] for v in rows[name].values()))
+    print("\n  gradient difference vs implicit, ||dg|| / ||g|| per parameter tensor:")
+    print(f"  {'':14s}{'output':>10s}{'median':>10s}{'worst':>10s}{'worst max-rel':>15s}")
+    for name, e in res["rel_err"].items():
+        print(f"  {name:14s}{e['output']:10.1e}{e['grad_norm_rel_median']:10.1e}"
+              f"{e['grad_norm_rel_worst']:10.1e}{e['grad_max_rel_worst']:15.1e}")
+
+    worst = sorted(base_g, key=lambda n: -rows["materialized"][n][0])[:a.top]
+    print(f"\n  the {len(worst)} worst tensors (materialized), with the noise floor beside them:")
+    print(f"  {'parameter':48s}{'||g||':>10s}{'mat':>10s}{'floor':>10s}")
+    res["worst"] = []
+    for n in worst:
+        g = float(base_g[n].norm())
+        m, f = rows["materialized"][n][0], rows["noise floor"][n][0]
+        print(f"  {n:48s}{g:10.1e}{m:10.1e}{f:10.1e}")
+        res["worst"].append(dict(param=n, grad_norm=g, materialized=m, noise_floor=f))
+
     r = res["implicit"]["step_ms"] / res["materialized"]["step_ms"]
-    print(f"  speed-up per training step: {r:.2f}x")
-    res["rel_err"] = dict(output=out_err, worst_grad=grad_err)
+    print(f"\n  speed-up per training step: {r:.2f}x")
     return res
 
 
@@ -234,6 +275,9 @@ def main():
     ap.add_argument("--dK", type=int, default=5)
     ap.add_argument("--K", type=int, default=None, help="override the config's K (stage 3)")
     ap.add_argument("--block-m", type=int, default=64, help="TritonAdjacency block_m")
+    ap.add_argument("--noise-block-m", type=int, default=32,
+                    help="block_m of stage 3's noise-floor arm (reorders fp32 only)")
+    ap.add_argument("--top", type=int, default=8, help="stage 3: worst tensors to list")
     ap.add_argument("--config", default=os.path.join(REPO, "config/knee/guided/lggs_R8_g1.json"))
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--iters", type=int, default=10)
