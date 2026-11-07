@@ -3,8 +3,8 @@ Benchmark LGGS's guide branch on the triton backend: implicit (`TritonAdjacency`
 attention re-run on every apply) vs materialised (`WindowAdjacency`, models/circulant_window.py:
 softmax weights built once per refresh, then one weighted window sum per apply).
 
-Three stages, in order; each stops the run if it fails, so no timing is printed for kernels
-that are wrong:
+Stages, in order; the first three run by default, and each stops the run if it fails, so
+no timing is printed for kernels that are wrong:
 
   1. kernels   each new triton kernel (scores fwd/bwd, apply fwd/bwd, transposed) against the
                torch reference, on small problems.
@@ -16,11 +16,18 @@ that are wrong:
                planar state + planar convs (`--no-planar` skips it): ms / step, peak memory,
                and the output / per-parameter gradient differences against implicit, beside
                a noise floor (implicit with only the triton block size changed).
+  4. profile   (only when asked for) one training step of one arm under torch.profiler:
+               forward / backward / optimizer wall time, GPU-busy vs wall (is the step
+               launch-bound?), kernel launches per step, GPU time by kind of kernel (convs,
+               attention, fused clip, elementwise, copies, reductions, optimizer) and the
+               top kernels; `--trace` also writes a chrome trace.
 
     python scripts/bench_lggs_materialize.py                       # all three, knee sizes
     python scripts/bench_lggs_materialize.py --stages branch net --iters 20
     python scripts/bench_lggs_materialize.py --H 320 --W 160 --batch 4 --guides 3
     python scripts/bench_lggs_materialize.py --json out.json       # also write the numbers
+    python scripts/bench_lggs_materialize.py --stages profile      # where a step's time goes
+    python scripts/bench_lggs_materialize.py --stages profile --profile-arm implicit --trace t.json
 
 `--H/--W` are the LATENT grid of stage 2 (knee: 640 x 368 image, s = 2 -> 320 x 184); stage 3
 uses twice that as the image. Stage 3 runs the net with preproc='image' and E = Identity:
@@ -286,10 +293,175 @@ def stage_net(dev, a):
     return res
 
 
+# =============================================================================================
+# 4. profile: where one training step's GPU time goes
+# =============================================================================================
+# First match wins; names lower-cased. The triton kernels show up under their @jit function
+# names (models/circulant_window.py, circulant_triton.py, clip_triton.py).
+BUCKETS = [
+    ("attention: window (materialized)", r"^_wscores|^_wapply|^_wdot"),
+    ("attention: triton (implicit)", r"^_fwd$|^_bwd_preprocess|^_bwd_dq|^_bwd_dkdv"),
+    ("fused clip / envelope (triton)",
+     r"^_clip_kernel|^_prox_kernel|^_prox_backward|^_scale_kernel|^_scale_backward"
+     r"|^_abs2_seq|^_sqrt_img"),
+    ("conv (cuDNN, incl. its layout kernels)",
+     r"conv|cudnn|winograd|implicit_gemm|xmma|cutlass|dgrad|wgrad|fprop|nchwtonhwc"
+     r"|nhwctonchw|gemm|sm\d\d_"),
+    ("copy / fill / layout", r"copy|catarray|memcpy|memset|transpose|permute|fill"),
+    ("reduction / softmax", r"reduce|softmax|logsumexp"),
+    ("optimizer", r"multi_tensor|adam|foreach"),
+    ("elementwise (other)", r"elementwise|vectorized|unrolled"),
+]
+
+
+def _bucket(name):
+    import re
+    n = name.lower()
+    for label, pat in BUCKETS:
+        if re.search(pat, n):
+            return label
+    return "other"
+
+
+def _dev_us(e):
+    v = getattr(e, "self_device_time_total", None)
+    return float(v if v is not None else getattr(e, "self_cuda_time_total", 0.0))
+
+
+def _build_arm(arm, params, state, dev):
+    """(net, restore): an LGGSNet for `arm` with the process switches it needs set."""
+    keep = (MGLPDSNet.PLANAR_STATE, _GaussConvNd.COMPLEX_MODE)
+    planar = arm == "planar"
+    MGLPDSNet.PLANAR_STATE = planar
+    set_complex_mode("planar" if planar else keep[1])
+    net = LGGSNet(**params, triton_materialize=arm != "implicit", spectral_init=False)
+    net = net.to(dev).train()
+    net.load_state_dict(state)
+
+    def restore():
+        MGLPDSNet.PLANAR_STATE = keep[0]
+        set_complex_mode(keep[1])
+    return net, restore
+
+
+def stage_profile(dev, a):
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile, record_function
+    import models.clip_triton as clip_triton
+
+    params = lggs_params(a.config)
+    if a.K:
+        params["K"] = a.K
+    Hi, Wi = 2 * a.H, 2 * a.W
+    print(f"\n== 4. profile: one LGGSNet training step, arm '{a.profile_arm}', {Hi}x{Wi} image, "
+          f"B={a.batch}, G={a.guides}, K={params['K']}, dK={params['dK']} ==")
+    torch.manual_seed(0)
+    state = LGGSNet(**params, spectral_init=False).state_dict()
+    g = torch.Generator(device=dev).manual_seed(1)
+    cplx = lambda: torch.complex(torch.randn(a.batch, 1, Hi, Wi, device=dev, generator=g),  # noqa: E731
+                                 torch.randn(a.batch, 1, Hi, Wi, device=dev, generator=g))
+    y, guides = cplx(), [cplx() for _ in range(a.guides)]
+    sigma = torch.full((a.batch, 1, 1, 1), 0.015, device=dev)
+
+    net, restore = _build_arm(a.profile_arm, params, state, dev)
+    try:
+        if a.profile_arm == "planar" and not net.planar_state_active():
+            raise SystemExit("planar arm: LGGSNet.planar_state_active() is False")
+        opt = torch.optim.Adam(net.parameters(), lr=1e-5)
+
+        def step(events=None):
+            if events:
+                events[0].record()
+            opt.zero_grad(set_to_none=True)
+            with record_function("forward"):
+                xh, _ = net(y, guide=guides, sigma=sigma)
+                loss = xh.abs().pow(2).mean()
+            if events:
+                events[1].record()
+            with record_function("backward"):
+                loss.backward()
+            if events:
+                events[2].record()
+            with record_function("optimizer"):
+                opt.step()
+            if events:
+                events[3].record()
+
+        for _ in range(max(a.warmup, 2)):                # compile triton, settle cuDNN
+            step()
+        torch.cuda.synchronize()
+
+        # unprofiled phase timings
+        phases = {"forward": [], "backward": [], "optimizer": [], "step": []}
+        for _ in range(a.iters):
+            ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            step(ev)
+            torch.cuda.synchronize()
+            phases["forward"].append(ev[0].elapsed_time(ev[1]))
+            phases["backward"].append(ev[1].elapsed_time(ev[2]))
+            phases["optimizer"].append(ev[2].elapsed_time(ev[3]))
+            phases["step"].append(ev[0].elapsed_time(ev[3]))
+        ph = {k: statistics.median(v) for k, v in phases.items()}
+        print(f"  wall (median of {a.iters}): step {ph['step']:.1f} ms = forward "
+              f"{ph['forward']:.1f} + backward {ph['backward']:.1f} + optimizer "
+              f"{ph['optimizer']:.1f}")
+
+        n = a.profile_steps
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            for _ in range(n):
+                step()
+            torch.cuda.synchronize()
+        if a.trace:
+            prof.export_chrome_trace(a.trace)
+            print(f"  chrome trace: {a.trace}  (open in chrome://tracing or ui.perfetto.dev)")
+    finally:
+        restore()
+
+    avg = prof.key_averages()
+    kern = [e for e in avg if getattr(e, "device_type", None) == DeviceType.CUDA and _dev_us(e) > 0]
+    if not kern:                                     # older profilers: device-only rows
+        kern = [e for e in avg if _dev_us(e) > 0 and getattr(e, "self_cpu_time_total", 0) == 0]
+    gpu_ms = sum(_dev_us(e) for e in kern) / 1e3 / n
+    launches = sum(e.count for e in kern) / n
+    busy = gpu_ms / ph["step"]
+    print(f"  GPU busy {gpu_ms:.1f} ms of a {ph['step']:.1f} ms step ({100 * busy:.0f}%), "
+          f"{launches:.0f} kernel launches / step "
+          f"({1e3 * ph['step'] / max(launches, 1):.1f} us of wall per launch)")
+    if busy < 0.85:
+        print("  -> the GPU idles for a sizeable part of the step: launch / host bound "
+              "(CUDA graphs, fewer kernels) before faster kernels")
+    print(f"  fused planar kernels: {clip_triton.planar_kernel_report()}")
+
+    buckets = {}
+    for e in kern:
+        b = buckets.setdefault(_bucket(e.key), [0.0, 0])
+        b[0] += _dev_us(e) / 1e3 / n
+        b[1] += e.count / n
+    print(f"\n  {'GPU time by kind':42s}{'ms/step':>10s}{'share':>8s}{'launches':>10s}")
+    for label, (ms, cnt) in sorted(buckets.items(), key=lambda kv: -kv[1][0]):
+        print(f"  {label:42s}{ms:10.1f}{100 * ms / gpu_ms:7.1f}%{cnt:10.0f}")
+
+    top = sorted(kern, key=lambda e: -_dev_us(e))[:a.profile_top]
+    print(f"\n  top {len(top)} kernels:")
+    print(f"  {'kernel':72s}{'ms/step':>9s}{'share':>8s}{'calls':>7s}  kind")
+    rows = []
+    for e in top:
+        ms = _dev_us(e) / 1e3 / n
+        name = e.key if len(e.key) <= 70 else e.key[:67] + "..."
+        print(f"  {name:72s}{ms:9.2f}{100 * ms / gpu_ms:7.1f}%{e.count / n:7.0f}  {_bucket(e.key)}")
+        rows.append(dict(kernel=e.key, ms_per_step=ms, calls_per_step=e.count / n,
+                         kind=_bucket(e.key)))
+    return dict(arm=a.profile_arm, wall_ms=ph, gpu_busy_ms=gpu_ms, launches_per_step=launches,
+                fused_kernels=clip_triton.planar_kernel_report(),
+                buckets={k: dict(ms_per_step=v[0], launches=v[1]) for k, v in buckets.items()},
+                top=rows)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--stages", nargs="+", default=["kernels", "branch", "net"],
-                    choices=["kernels", "branch", "net"])
+                    choices=["kernels", "branch", "net", "profile"],
+                    help="'profile' is not in the default set: ask for it")
     ap.add_argument("--H", type=int, default=320, help="latent rows (knee: 320)")
     ap.add_argument("--W", type=int, default=184, help="latent cols (knee: 184)")
     ap.add_argument("--batch", type=int, default=1)
@@ -302,6 +474,12 @@ def main():
     ap.add_argument("--noise-block-m", type=int, default=32,
                     help="block_m of stage 3's noise-floor arm (reorders fp32 only)")
     ap.add_argument("--top", type=int, default=8, help="stage 3: worst tensors to list")
+    ap.add_argument("--profile-arm", default="planar",
+                    choices=["implicit", "materialized", "planar"],
+                    help="profile: which net (planar = materialized + planar state + convs)")
+    ap.add_argument("--profile-steps", type=int, default=3, help="profile: steps recorded")
+    ap.add_argument("--profile-top", type=int, default=25, help="profile: kernels listed")
+    ap.add_argument("--trace", default=None, help="profile: write a chrome trace here")
     ap.add_argument("--no-planar", action="store_true",
                     help="stage 3: skip the planar-state + planar-conv arm")
     ap.add_argument("--config", default=os.path.join(REPO, "config/knee/guided/lggs_R8_g1.json"))
@@ -324,6 +502,8 @@ def main():
         out["branch"] = stage_branch(dev, a)
     if "net" in a.stages:
         out["net"] = stage_net(dev, a)
+    if "profile" in a.stages:
+        out["profile"] = stage_profile(dev, a)
     if a.json:
         with open(a.json, "w") as f:
             json.dump(out, f, indent=2)
