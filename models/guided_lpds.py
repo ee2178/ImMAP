@@ -67,8 +67,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.guided_prox import (GuidedGroupThreshold, as_guide_list,
-                                build_guided_prox)
+from models.guided_prox import (GuidedGroupThreshold, ProjectedGuide,
+                                as_guide_list, build_guided_prox)
 from models.base import batched_projection
 from models.lpds import LPDSLayer, gram
 from operators.identity import Identity
@@ -109,6 +109,15 @@ class GuidedLPDSLayer(LPDSLayer):
         """`[A w_g]` -- this layer's dictionary applied to each guide image."""
         return [self.analysis(w) for w in guides]
 
+    def guide_latents(self, guides):
+        """What the prox gets for each guide: `A w`, as a `ProjectedGuide` where the composition
+        with the prox's 1x1 transforms is expressible (always, for LGGS), else as the tensor.
+        Same values either way; the projected form never builds the M-channel latent."""
+        gt = self.prox.prox
+        if ProjectedGuide.supported(guides[0], self.analysis, gt):
+            return [ProjectedGuide(w, self.analysis, gt) for w in guides]
+        return self.analyse_guides(guides)
+
     # -- forward ------------------------------------------------------------
     def forward(self, state, y_tilde, guide=None, E=None, sigma=None, pi=None,
                 cache=None):
@@ -123,7 +132,7 @@ class GuidedLPDSLayer(LPDSLayer):
         guides = as_guide_list(guide)
 
         hint = cache.pop("_gram_x", None)
-        v = self.analyse_guides(guides) if guides else None
+        v = self.guide_latents(guides) if guides else None
 
         if state is None:
             x = y_tilde
@@ -208,7 +217,8 @@ class LGGSNet(nn.Module):
                  rho0=1.0, gamma0=0.8, rho_inv=True,
                  init_strategy="semi_orthogonal", attn_backend="gather",
                  flex_block_size=128, is_complex=True, preproc="kspace",
-                 spectral_init=True, guide_blend=None, guide_gain0=1.0):
+                 spectral_init=True, guide_blend=None, guide_gain0=1.0,
+                 triton_materialize=False):
         super().__init__()
         self.K, self.M, self.C, self.P, self.s = int(K), int(M), int(C), int(P), int(s)
         self.is_complex = bool(is_complex)
@@ -223,7 +233,8 @@ class LGGSNet(nn.Module):
         prox_kws = dict(nheads=nheads, dK=dK, sim_fun=sim_fun, rho0=rho0,
                         gamma0=gamma0, rho_inv=rho_inv,
                         init_strategy=init_strategy, attn_backend=attn_backend,
-                        flex_block_size=flex_block_size)
+                        flex_block_size=flex_block_size,
+                        triton_materialize=triton_materialize)
         if guide_blend is not None:            # "additive": models/guided_prox.py
             prox_kws.update(guide_blend=guide_blend, guide_gain0=guide_gain0)
         layer_kws = dict(P=P, stride=s, lam0=lam0, tau0=tau0, theta0=theta0,

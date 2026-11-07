@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Training-speed changes to the guided group threshold nets: same numbers, fewer kernels.
 
-Three changes, each pinned against what it replaced:
+Each change is pinned against what it replaced (4. -- the guide latent never built, the
+clip formed in one pass, the one-neighbour triton self branch -- is at the end of the file):
 
 1. PROJECTION. `project()` of LGGCDL, LGGS, SBGuidedGroupCDL and SBCDLNet now projects every
    filter of one shape in a single stacked norm (models/base.py::batched_projection), visits
@@ -399,3 +400,112 @@ def test_flex_branch_asks_for_its_own_window(monkeypatch):
                         lambda q, k, win, **kw: seen.update(win=win, mask=kw["block_mask"]) or "adj")
     p._fused_branch(ref, ref, p.guide_window)
     assert seen == {"win": 15, "mask": ("mask", 15)}, seen
+
+
+# =============================================================================================
+# 4. the guide latent never built; the clip in one pass; a one-neighbour triton self branch
+# =============================================================================================
+def _lggs(is_complex, nheads, K=6, dtype=torch.float64):
+    torch.manual_seed(0)
+    return LGGSNet(K=K, M=12, C=1, P=5, s=2, Mh=4, nheads=nheads, window=1, guide_window=5,
+                   dK=3, lam0=0.05, is_complex=is_complex, preproc="image",
+                   attn_backend="gather", spectral_init=False).to(dtype)
+
+
+@pytest.mark.parametrize("is_complex", [False, True])
+@pytest.mark.parametrize("cplx_guide", [False, True])
+@pytest.mark.parametrize("nheads", [1, 2])
+def test_projected_guide_is_the_transformed_guide_latent(is_complex, cplx_guide, nheads):
+    """W_alpha (A w) and W_phi (A w) from one conv of w with the composed weight."""
+    if cplx_guide and not is_complex:
+        pytest.skip("a real dictionary takes a real guide")
+    layer = _lggs(is_complex, nheads).layers[0]
+    gt = layer.prox.prox
+    w = torch.randn(2, 1, 14, 12, dtype=torch.float64)
+    if cplx_guide:
+        w = torch.complex(w, torch.randn_like(w))
+    assert gp.ProjectedGuide.supported(w, layer.analysis, gt)
+    v = layer.analysis(w)
+    pg = gp.ProjectedGuide(w, layer.analysis, gt)
+    assert torch.allclose(pg.phi, gt.Wphi(v), rtol=1e-10, atol=1e-12)      # both in one conv
+    assert torch.allclose(pg.alpha, gt.Walpha(v), rtol=1e-10, atol=1e-12)
+    pa = gp.ProjectedGuide(w, layer.analysis, gt)
+    assert torch.allclose(pa.alpha, gt.Walpha(v), rtol=1e-10, atol=1e-12)  # alpha alone first
+    assert torch.allclose(pa.phi, gt.Wphi(v), rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("is_complex", [False, True])
+@pytest.mark.parametrize("nheads", [1, 2])
+def test_lggs_with_projected_guides_matches_the_latent_path(is_complex, nheads, monkeypatch):
+    """Output, dual state and every gradient, with the guide latent built vs never built."""
+    dt = torch.complex128 if is_complex else torch.float64
+    g = torch.Generator().manual_seed(1)
+    y = torch.randn(2, 1, 16, 16, generator=g, dtype=torch.float64).to(dt)
+    guides = [torch.randn(2, 1, 16, 16, generator=g, dtype=torch.float64).to(dt) for _ in range(2)]
+    sigma = torch.full((2, 1, 1, 1), 0.05, dtype=torch.float64)
+    res = []
+    for fuse in (False, True):
+        monkeypatch.setattr(gp.ProjectedGuide, "FUSE", fuse)
+        net = _lggs(is_complex, nheads)
+        xh, (_, z) = net(y, guide=guides, sigma=sigma)
+        (xh.abs().pow(2).mean() + z.abs().pow(2).mean()).backward()
+        res.append((xh.detach(), z.detach(),
+                    {k: p.grad for k, p in net.named_parameters() if p.grad is not None}))
+    (x0, z0, g0), (x1, z1, g1) = res
+    assert torch.allclose(x1, x0, rtol=1e-10, atol=1e-12)
+    assert torch.allclose(z1, z0, rtol=1e-10, atol=1e-12)
+    assert g0.keys() == g1.keys()
+    for k in g0:
+        assert torch.allclose(g1[k], g0[k], rtol=1e-8, atol=1e-12), k
+
+
+@pytest.mark.parametrize("guided", [False, True])
+def test_dual_prox_is_the_moreau_complement(guided):
+    torch.manual_seed(0)
+    p = GuidedGroupThreshold(8, Mh=4, window=1, guide_window=5, attn_backend="gather",
+                             sim_fun="pidistance", dK=1).double()
+    z = torch.complex(torch.randn(2, 8, 9, 9), torch.randn(2, 8, 9, 9)).to(torch.complex128)
+    g = [torch.randn_like(z)] if guided else None
+    shrunk, _ = p(z, g, None, None)
+    clipped, _ = p(z, g, None, None, dual=True)
+    assert torch.allclose(clipped, z - shrunk, rtol=1e-12, atol=1e-14)
+
+
+@pytest.mark.parametrize("sim", ["distance", "pidistance", "pidot"])
+@pytest.mark.parametrize("heads", [1, 2])
+def test_complex_pointwise_self_branch_gives_the_gather_joint_energy(sim, heads):
+    """The triton self branch's stand-in: complex q / k, the true |<q,k>| score, and the
+    per-query -1/2||q||^2 left out exactly as the triton kernel leaves it out."""
+    torch.manual_seed(0)
+    B, M, n, gw = 2, 8, 9, 5
+    prox = GuidedGroupThreshold(M, Mh=4, nheads=heads, window=1, guide_window=gw,
+                                joint_softmax=True, sim_fun=sim, attn_backend="gather", dK=1)
+    c = lambda: torch.complex(torch.randn(B, M, n, n), torch.randn(B, M, n, n))   # noqa: E731
+    z, g = c(), c()
+    q, k_self, k_guides = prox._project_qk(z, [g], None)
+    vals = [prox_mod._abs2(prox.Walpha(t)) for t in (z, g)]
+    Phi, Omegas = prox._gather_adjacencies(q, k_self, k_guides, (n, n))
+    want = prox.apply_gamma(Phi, vals[0]) + prox.apply_gamma(Omegas[0], vals[1])
+
+    import models.circulant_flex as cf
+    sb = cf.PointwiseAdjacency(q, k_self, sim=sim, heads=heads)
+    qh = prox._to_heads(q)
+    qsq = 0.5 * prox_mod._abs2(qh).sum(1).flatten(1)
+    knorm = sim in ("distance", "pidistance")
+    s1, _, _ = cs.circulant_similarity_window(sim, qh, prox._to_heads(k_self), 1)
+    assert torch.allclose(sb._lse.reshape(B * heads, -1),
+                          s1[..., 0] + (qsq if knorm else 0.0), atol=1e-5)
+    s, col, crow = cs.circulant_similarity_window(sim, qh, prox._to_heads(k_guides[0]), gw)
+    gb = Circulant(F.softmax(s, dim=-1), col, crow, (n, n), gw)
+    lse = torch.logsumexp(s, dim=-1) + (qsq if knorm else 0.0)
+    got = merge_joint([vals[0], prox.apply_gamma(gb, vals[1])], [sb._lse, lse], heads)
+    assert torch.allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
+def test_a_one_neighbour_triton_window_takes_the_shortcut():
+    import models.circulant_flex as cf
+    p = GuidedGroupThreshold(8, Mh=4, window=1, guide_window=5, attn_backend="gather",
+                             sim_fun="pidistance")
+    p.attn_backend = "triton"                            # the branch constructor only
+    q = torch.complex(torch.randn(1, 4, 6, 6), torch.randn(1, 4, 6, 6))
+    assert isinstance(p._fused_branch(q, q, 1), cf.PointwiseAdjacency)

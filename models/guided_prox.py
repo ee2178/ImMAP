@@ -107,6 +107,7 @@ from models.circulant_similarity import circulant_similarity_window
 import models.circulant_flex as circulant_flex
 from models.circulant_flex import FlexAdjacency, PointwiseAdjacency
 from models.circulant_triton import TritonAdjacency
+from models.circulant_window import WindowAdjacency
 from models.prox import GroupThreshold, Polynomial
 
 
@@ -167,6 +168,100 @@ def as_guide_list(v):
     return [v]
 
 
+def _pixel_matrix(pix):
+    """A PixelConv's weight as the dense (cout, cin) matrix it applies (block-diagonal in groups)."""
+    W = pix.weight[:, :, 0, 0]
+    if pix.groups == 1:
+        return W
+    return torch.block_diag(*W.split(pix.cout // pix.groups, dim=0))
+
+
+class ProjectedGuide:
+    """A guide latent `v = A w`, held only through the two maps the guided prox reads from it.
+
+    The prox never uses `v` itself -- only `W_alpha v` (the guide energy, every layer) and
+    `W_phi v` (the guide keys, on an adjacency refresh). Both are linear in `w`, so each is ONE
+    strided conv of the guide IMAGE with the composed weight `W_. A` (Mh x C x P x P):
+
+        W_alpha (A w) = (W_alpha A) w
+
+    which skips the M-channel latent (M = 169 vs Mh = 64 in LGGS), both 1x1 convs on it, and
+    keeps only the C-channel guide image for the backward. Exact in exact arithmetic; the
+    reduction order differs, so ~1e-6 relative in fp32. Built lazily and memoised: a refresh
+    layer forms both maps in one conv, every other layer forms W_alpha v alone.
+
+    `IMMAP_GUIDE_FUSED=0` (or `ProjectedGuide.FUSE = False`) restores `v = A w` as a tensor.
+    """
+
+    FUSE = os.environ.get("IMMAP_GUIDE_FUSED", "1") != "0"
+
+    __slots__ = ("w", "analysis", "prox", "_alpha", "_phi")
+
+    def __init__(self, w, analysis, prox):
+        self.w, self.analysis, self.prox = w, analysis, prox
+        self._alpha = self._phi = None
+
+    @classmethod
+    def supported(cls, w, analysis, prox):
+        """The composition is expressible: a grouped prox, bias-free convs, an ordinary (not
+        planar-state) guide image."""
+        if not (cls.FUSE and getattr(prox, "grouped", False)):
+            return False
+        a = analysis
+        if getattr(a, "groups", 1) != 1 or a.conv_real.bias is not None:
+            return False
+        if a.conv_imag is not None and a.conv_imag.bias is not None:
+            return False
+        if any(p.conv.bias is not None for p in (prox.Walpha, prox.Wphi)):
+            return False
+        return w.dim() == 4 and w.shape[1] == a.conv_real.in_channels
+
+    def _project(self, pixes):
+        a = self.analysis
+        Wp = torch.cat([_pixel_matrix(p) for p in pixes], dim=0)             # (n Mh, M)
+        wr = torch.einsum("hm,mcpq->hcpq", Wp, a.conv_real.weight)
+        N = wr.shape[0]
+
+        def conv(x, W):
+            return F.conv2d(x, W, stride=a.stride, padding=a.padding)
+
+        x = self.w
+        if a.complex:
+            wc = torch.cat([wr, torch.einsum("hm,mcpq->hcpq", Wp, a.conv_imag.weight)], 0)
+            if x.is_complex():
+                # (xr + i xi)(wr + i wi): all four real products from ONE conv, with the
+                # real / imaginary halves stacked on the batch axis and the weights on the
+                # output axis
+                B = x.shape[0]
+                o = conv(torch.cat([x.real, x.imag], dim=0), wc)
+                out = torch.complex(o[:B, :N] - o[B:, N:], o[:B, N:] + o[B:, :N])
+            else:
+                o = conv(x, wc)
+                out = torch.complex(o[:, :N], o[:, N:])
+        elif x.is_complex():
+            out = torch.complex(conv(x.real, wr), conv(x.imag, wr))
+        else:
+            out = conv(x, wr)
+        return out.split(N // len(pixes), dim=1)
+
+    @property
+    def alpha(self):
+        """`W_alpha A w`."""
+        if self._alpha is None:
+            self._alpha, = self._project([self.prox.Walpha])
+        return self._alpha
+
+    @property
+    def phi(self):
+        """`W_phi A w` (formed together with `W_alpha A w` when that is still to come)."""
+        if self._phi is None:
+            if self._alpha is None:
+                self._phi, self._alpha = self._project([self.prox.Wphi, self.prox.Walpha])
+            else:
+                self._phi, = self._project([self.prox.Wphi])
+        return self._phi
+
+
 class GuidedGroupThreshold(GroupThreshold):
     """`GroupThreshold` with one extra adjacency per guide.  See module docstring.
 
@@ -190,8 +285,12 @@ class GuidedGroupThreshold(GroupThreshold):
     """
 
     def __init__(self, M, guide_window=None, joint_softmax=True, guide_blend=None,
-                 guide_gain0=1.0, **kws):
+                 guide_gain0=1.0, triton_materialize=False, **kws):
         super().__init__(M, **kws)
+        # triton backend: hold each window branch's softmax weights (models/circulant_window.py)
+        # instead of re-running the fused attention on every apply. The same map; a pure
+        # performance switch, so it may be flipped on a trained checkpoint.
+        self.triton_materialize = bool(triton_materialize)
         self.guide_window = int(self.window if guide_window is None
                                 else guide_window)
         assert self.guide_window % 2 == 1, "guide window side must be odd"
@@ -234,13 +333,30 @@ class GuidedGroupThreshold(GroupThreshold):
         sq = torch.sqrt(rho + self.eps)
         q = self._rho_scale(self.Wtheta(z) if self.grouped else z, sq)
         k_self = self._rho_scale(self.Wphi(z) if self.grouped else z, sq)
-        k_guides = [self._rho_scale(self.Wphi(g) if self.grouped else g, sq)
-                    for g in guides]
+        k_guides = [self._rho_scale(self._guide_phi(g), sq) for g in guides]
         return q, k_self, k_guides
+
+    # a guide is a latent tensor, or a `ProjectedGuide` that forms these maps directly
+    def _guide_alpha(self, g):
+        if isinstance(g, ProjectedGuide):
+            return g.alpha
+        return self.Walpha(g) if self.grouped else g
+
+    def _guide_phi(self, g):
+        if isinstance(g, ProjectedGuide):
+            return g.phi
+        return self.Wphi(g) if self.grouped else g
 
     # -- adjacencies ---------------------------------------------------------
     def _fused_branch(self, q, k, win):
         """One independently-normalised branch on the flex / triton backend."""
+        if win == 1 and circulant_flex.POINTWISE_SELF and self.attn_backend == "triton":
+            # One neighbour: Gamma = I and the lse is the score at the pixel itself, with the
+            # true complex modulus -- the triton kernel's convention, without its launch (fwd,
+            # bwd, and once per layer in apply). The LGGS self window is 1.
+            return PointwiseAdjacency(q, k, sim=self.sim_fun, heads=self.nheads)
+        if self.attn_backend == "triton" and self.triton_materialize:
+            return WindowAdjacency(q, k, win, sim=self.sim_fun, heads=self.nheads)
         if self.attn_backend == "triton":
             return TritonAdjacency(q, k, win, sim=self.sim_fun,
                                    heads=self.nheads,
@@ -360,7 +476,7 @@ class GuidedGroupThreshold(GroupThreshold):
         return w
 
     # -- prox ----------------------------------------------------------------
-    def forward(self, z, guide=None, sigma=None, cache=None, cross=None):
+    def forward(self, z, guide=None, sigma=None, cache=None, cross=None, dual=False):
         """`cross` (optional) adds one branch that attends between two OTHER latents:
 
             cross = {"query": fn() -> (B, M, H, W),   evaluated only when the adjacency refreshes
@@ -374,10 +490,15 @@ class GuidedGroupThreshold(GroupThreshold):
         therefore only relax the shrinkage of the atoms it is weighted onto. Like every guide it
         enters through the adjacency alone. Refreshed on the same dK schedule as Phi (rebuilt,
         not blended). cross=None is the prox exactly as before.
+
+        `dual=True` returns the Fenchel map `z - prox(z)` = `z * min(1, tau / xi)` (group
+        clipping) formed directly, one full-size pass instead of two. `GuidedFenchelProx` uses it.
         """
         guides = as_guide_list(guide)
         if not guides and cross is None:
             # Self-only view sharing every weight -- `GroupThreshold(ggt)`.
+            if dual:
+                return super().fenchel(z, sigma, cache)
             return super().forward(z, sigma, cache)
 
         refresh = (not cache) or cache.get("Phi") is None \
@@ -386,10 +507,8 @@ class GuidedGroupThreshold(GroupThreshold):
 
         za = self.Walpha(z) if self.grouped else z
         e_self = self.apply_gamma(Phi, _abs2(za))
-        terms = []
-        for Om, g in zip(Omegas, guides):
-            ga = self.Walpha(g) if self.grouped else g
-            terms.append(self.apply_gamma(Om, _abs2(ga)))
+        terms = [self.apply_gamma(Om, _abs2(self._guide_alpha(g)))
+                 for Om, g in zip(Omegas, guides)]
 
         if self.joint_fused and terms:
             # the joint simplex, from each branch's own softmax and its log-sum-exp
@@ -420,8 +539,11 @@ class GuidedGroupThreshold(GroupThreshold):
             xa = torch.sqrt(self.apply_gamma(cache["Xi"], _abs2(ga)) + self.eps)
             xi_x = self.beta_apply(xa) if self.grouped else xa
             xi = torch.sqrt(xi ** 2 + cross["weight"] * xi_x ** 2)
-        tau = self.tau(sigma, ref=z)
-        return z * F.relu(1.0 - tau / (xi + self.eps)), cache
+        q = self.tau(sigma, ref=z) / (xi + self.eps)
+        if dual:
+            # z - z relu(1 - q) = z min(1, q): the clip in one pass
+            return z * q.clamp_max(1.0), cache
+        return z * F.relu(1.0 - q), cache
 
     # -- fused joint softmax: one self-check per process ----------------------
     @torch.no_grad()
@@ -432,7 +554,7 @@ class GuidedGroupThreshold(GroupThreshold):
         process and raises if they disagree: a silently different attention would train
         without complaint. Returns the relative error (None when skipped)."""
         key = (self.attn_backend, self.sim_fun, self.nheads, self.window, self.guide_window,
-               ref.is_complex())
+               ref.is_complex(), self.triton_materialize)
         if key in _FUSED_JOINT_CHECKED or os.environ.get("IMMAP_SKIP_FUSED_CHECK") == "1":
             return None
         _FUSED_JOINT_CHECKED.add(key)
@@ -513,8 +635,8 @@ class GuidedFenchelProx(nn.Module):
         self.prox = prox
 
     def forward(self, z, guide=None, sigma=None, cache=None):
-        zt, cache = self.prox(z, guide, sigma, cache)
-        return z - zt, cache
+        # `z - prox(z)`, formed inside the prox as the clip itself
+        return self.prox(z, guide, sigma, cache, dual=True)
 
     def subgradient(self, z, guide=None, sigma=None, cache=None):
         # d g* telescopes to the inner prox, exactly as in `FenchelProx`.

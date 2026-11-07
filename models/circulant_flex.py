@@ -301,24 +301,40 @@ class PointwiseAdjacency:
     at the same pixel -- two reductions over the head dimension. The guided nets run
     `window: 1` beside a 15 x 15 guide window, and a FlexAdjacency there launches the whole
     attention kernel (forward and backward, every layer) to compute exactly this.
-    IMMAP_POINTWISE_SELF=0 restores the kernel."""
+    IMMAP_POINTWISE_SELF=0 restores the kernel.
+
+    COMPLEX q / k are accepted too, in the triton backend's convention
+    (models/circulant_triton.py): the score is `|<q,k>| - 1/2 ||k||^2` with the TRUE complex
+    modulus for the phase-invariant similarities, and `Re<q,k>` (= the [Re; Im]-stacked dot)
+    for the others. That is what lets the triton self branch skip its kernel as well."""
 
     __slots__ = ("H", "W", "win", "sim", "heads", "_lse")
 
     def __init__(self, q_img, k_img, sim="distance", heads=1):
         if sim not in FLEX_SIMS:
             raise ValueError(f"unsupported sim {sim!r}; expected one of {FLEX_SIMS}")
-        if q_img.is_complex() or k_img.is_complex():
-            raise ValueError("PointwiseAdjacency needs real query/key tensors; stack complex "
-                             "features as [Re; Im] first (GroupThreshold._stack_ri)")
+        if q_img.is_complex() != k_img.is_complex():
+            raise ValueError("PointwiseAdjacency needs q and k both real or both complex")
         B, C, H, W = q_img.shape
         self.H, self.W, self.win, self.sim, self.heads = H, W, 1, sim, heads
         d = C // heads                                    # heads are contiguous channel runs
-        score = (q_img * k_img).reshape(B, heads, d, H * W).sum(dim=2)        # (B, heads, S)
-        if sim in SIM_ABS:
-            score = score.abs()
+        if q_img.is_complex():
+            # <q, k> = sum_c q_c conj(k_c): Re and Im as two real reductions, no complex autograd
+            qr, qi, kr, ki = q_img.real, q_img.imag, k_img.real, k_img.imag
+            re = torch.addcmul(qr * kr, qi, ki).reshape(B, heads, d, H * W).sum(dim=2)
+            if sim in SIM_ABS:
+                im = torch.addcmul(qi * kr, -qr, ki).reshape(B, heads, d, H * W).sum(dim=2)
+                score = torch.sqrt(re * re + im * im + 1e-30)     # triton's SIM_EPS
+            else:
+                score = re
+            ksq = torch.addcmul(kr * kr, ki, ki)
+        else:
+            score = (q_img * k_img).reshape(B, heads, d, H * W).sum(dim=2)    # (B, heads, S)
+            if sim in SIM_ABS:
+                score = score.abs()
+            ksq = k_img * k_img
         if sim in SIM_KNORM:
-            score = score - 0.5 * (k_img * k_img).reshape(B, heads, d, H * W).sum(dim=2)
+            score = score - 0.5 * ksq.reshape(B, heads, d, H * W).sum(dim=2)
         self._lse = score
 
     def apply(self, x, transpose=False):
