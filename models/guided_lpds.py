@@ -70,6 +70,7 @@ import torch.nn.functional as F
 from models.guided_prox import (GuidedGroupThreshold, ProjectedGuide,
                                 as_guide_list, build_guided_prox)
 from models.base import batched_projection
+from models import compile_glue
 from models.components import to_complex, to_planar
 from models.lpds import LPDSLayer, _per_channel, gram
 from operators.identity import Identity
@@ -77,6 +78,12 @@ from operators.padding import calc_pad_2d, unpad
 from preprocessing.image import post_process, pre_process
 from preprocessing.kspace import (_pad_complex, kspace_post_process,
                                   kspace_pre_process)
+
+
+def _primal_step(x, data, Bz, tau, theta):
+    """`x+ = x - tau (data + B z)`, `xb = x+ + theta (x+ - x)` -- pure, for `compile_glue`."""
+    x_new = x - tau * (data + Bz)
+    return x_new, x_new + theta * (x_new - x)
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +171,18 @@ class GuidedLPDSLayer(LPDSLayer):
         else:
             Ex = hint[1] if (hint is not None and hint[0] is x) else gram(E, x, planar)
             data = Ex - y_tilde
-        residual = data + self.synthesis(z)
-        if pi_x is not None:
-            residual = residual - pi_x
-        x_new = x - tau * residual
+        if pi_x is None and compile_glue.enabled() and not x.is_complex():
+            # the primal step and its over-relaxation as one compiled piece (models/compile_glue);
+            # real tensors only (planar state, or a real net): inductor's complex support is thin
+            x_new, x_bar = compile_glue.compiled(_primal_step)(x, data, self.synthesis(z),
+                                                               tau, theta)
+        else:
+            residual = data + self.synthesis(z)
+            if pi_x is not None:
+                residual = residual - pi_x
+            x_new = x - tau * residual
 
-        x_bar = x_new + theta * (x_new - x)
+            x_bar = x_new + theta * (x_new - x)
 
         u = z + self.analysis(x_bar)
         if pi_z is not None:

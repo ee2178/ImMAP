@@ -12,10 +12,11 @@ no timing is printed for kernels that are wrong:
                with fresh values, backward -- implicit vs materialised: ms, peak memory, and
                the relative difference of the pooled energy and of dq / dk.
   3. net       a full LGGSNet training step (forward + backward + Adam) built from the LGGS
-               config, same weights: implicit, materialised, and materialised with the
-               planar state + planar convs (`--no-planar` skips it): ms / step, peak memory,
-               and the output / per-parameter gradient differences against implicit, beside
-               a noise floor (implicit with only the triton block size changed).
+               config, same weights: implicit, materialised, materialised + planar state and
+               convs (`--no-planar` skips it), and that + the compiled glue (`--no-compile`):
+               ms / step, peak memory, and the output / per-parameter gradient differences
+               against implicit, beside a noise floor (implicit with only the triton block
+               size changed). Stage 2 also shows the window kernels' autotuning on vs off.
   4. profile   (only when asked for) one training step of one arm under torch.profiler:
                forward / backward / optimizer wall time, GPU-busy vs wall (is the step
                launch-bound?), kernel launches per step, GPU time by kind of kernel (convs,
@@ -52,7 +53,7 @@ sys.path.insert(0, REPO)
 sys.modules.setdefault("nibabel", types.ModuleType("nibabel"))
 
 import models.circulant_window as cw                                  # noqa: E402
-from models import conv_gemm                                          # noqa: E402
+from models import compile_glue                                       # noqa: E402
 import models.guided_prox as gp                                       # noqa: E402
 from models.circulant_triton import HAVE_TRITON, TritonAdjacency      # noqa: E402
 from models.components import _GaussConvNd, set_complex_mode         # noqa: E402
@@ -152,10 +153,10 @@ def stage_branch(dev, a):
 
     def cycle(kind, grad=True):
         q, k = q0.detach().requires_grad_(grad), k0.detach().requires_grad_(grad)
-        if kind == "materialized":
-            adj = cw.WindowAdjacency(q, k, win, sim="pidistance")
-        else:
+        if kind == "implicit":
             adj = TritonAdjacency(q, k, win, sim="pidistance", block_m=a.block_m)
+        else:
+            adj = cw.WindowAdjacency(q, k, win, sim="pidistance")
         outs = [adj.apply(v) for v in vals]
         e = sum(o.sum() for o in outs) + adj._lse.sum()
         if grad:
@@ -163,21 +164,39 @@ def stage_branch(dev, a):
             return outs, dq, dk
         return outs, None, None
 
+    # "materialized, fixed" is the 64 x 4 tile every earlier run used; "materialized" autotunes
+    # each window kernel's tile (models/circulant_window.py; IMMAP_WINDOW_AUTOTUNE=0 is fixed).
+    kinds = [("implicit", None), ("materialized, fixed", False), ("materialized", True)]
+    keep = cw.AUTOTUNE
     res, out = {}, {}
-    for kind in ("implicit", "materialized"):
-        o, dq, dk = cycle(kind)
-        out[kind] = (torch.stack([x.detach() for x in o]), dq, dk)
-        with torch.no_grad():
-            fwd_ms, fwd_mb = timed(lambda: cycle(kind, grad=False), a.warmup, a.iters)
-        ms, mb = timed(lambda: cycle(kind), a.warmup, a.iters)
-        res[kind] = dict(fwd_ms=fwd_ms, fwd_peak_mib=fwd_mb, step_ms=ms, step_peak_mib=mb)
-        print(f"  {kind:12s}  fwd {fwd_ms:8.2f} ms  ({fwd_mb:7.0f} MiB)   "
-              f"fwd+bwd {ms:8.2f} ms  ({mb:7.0f} MiB)")
-    errs = [rel(x, y) for x, y in zip(out["materialized"], out["implicit"])]
-    print(f"  difference: energy {errs[0]:.1e}, dq {errs[1]:.1e}, dk {errs[2]:.1e}")
-    r = res["implicit"]["step_ms"] / res["materialized"]["step_ms"]
-    print(f"  speed-up per dK cycle (fwd+bwd): {r:.2f}x")
-    res["rel_err"] = dict(zip(("energy", "dq", "dk"), errs))
+    try:
+        for kind, tune in kinds:
+            if tune is not None:
+                cw.AUTOTUNE = tune
+            o, dq, dk = cycle(kind)                     # (the autotuner searches here, untimed)
+            out[kind] = (torch.stack([x.detach() for x in o]), dq, dk)
+            with torch.no_grad():
+                fwd_ms, fwd_mb = timed(lambda: cycle(kind, grad=False), a.warmup, a.iters)
+            ms, mb = timed(lambda: cycle(kind), a.warmup, a.iters)
+            res[kind] = dict(fwd_ms=fwd_ms, fwd_peak_mib=fwd_mb, step_ms=ms, step_peak_mib=mb)
+            print(f"  {kind:20s}  fwd {fwd_ms:8.2f} ms  ({fwd_mb:7.0f} MiB)   "
+                  f"fwd+bwd {ms:8.2f} ms  ({mb:7.0f} MiB)")
+    finally:
+        cw.AUTOTUNE = keep
+    res["rel_err"] = {}
+    for kind in ("materialized, fixed", "materialized"):
+        errs = [rel(x, y) for x, y in zip(out[kind], out["implicit"])]
+        res["rel_err"][kind] = dict(zip(("energy", "dq", "dk"), errs))
+        print(f"  {kind:20s}  vs implicit: energy {errs[0]:.1e}, dq {errs[1]:.1e}, "
+              f"dk {errs[2]:.1e}")
+    base = res["implicit"]["step_ms"]
+    for kind in ("materialized, fixed", "materialized"):
+        print(f"  speed-up per dK cycle (fwd+bwd), {kind}: {base / res[kind]['step_ms']:.2f}x")
+    tf = res["materialized, fixed"]["step_ms"] / res["materialized"]["step_ms"]
+    print(f"  autotuning alone: {tf:.2f}x")
+    res["tuned_configs"] = cw.tuned_configs()
+    for name, cfgs in res["tuned_configs"].items():
+        print(f"    {name:18s} {'; '.join(cfgs)}")
     return res
 
 
@@ -217,14 +236,19 @@ def stage_net(dev, a):
             dict(name="materialized", mat=True, bm=a.block_m, planar=False, time=True)]
     if not a.no_planar:
         arms.append(dict(name="mat + planar", mat=True, bm=a.block_m, planar=True, time=True))
+        if not a.no_compile:
+            # + the compiled glue (models/compile_glue.py, inductor)
+            arms.append(dict(name="+ compile", mat=True, bm=a.block_m, planar=True, time=True,
+                             compile=True))
     arms.append(dict(name="noise floor", mat=False, bm=a.noise_block_m, planar=False,
                      time=False))
     res, ref = {}, {}
     for arm in arms:
         name = arm["name"]
-        keep = (MGLPDSNet.PLANAR_STATE, _GaussConvNd.COMPLEX_MODE)
+        keep = (MGLPDSNet.PLANAR_STATE, _GaussConvNd.COMPLEX_MODE, compile_glue.MODE)
         MGLPDSNet.PLANAR_STATE = arm["planar"]
         set_complex_mode("planar" if arm["planar"] else keep[1])
+        compile_glue.set_mode("inductor" if arm.get("compile") else None)
         try:
             net = LGGSNet(**params, triton_materialize=arm["mat"], spectral_init=False)
             net = net.to(dev).train()
@@ -245,9 +269,12 @@ def stage_net(dev, a):
                 return xh
 
             xh = step(update=False)                     # same weights for the comparison
-            ref[name] = (xh.detach(), {n: p.grad.detach().clone()
-                                       for n, p in net.named_parameters()
-                                       if p.grad is not None})
+            # A parameter outside the loss's graph has grad None in eager autograd but an
+            # explicit zero through a compiled piece (the last layer's theta: its x_bar feeds
+            # nothing the loss sees). Same thing to Adam; compared here as zeros.
+            ref[name] = (xh.detach(), {n: (p.grad if p.grad is not None
+                                           else torch.zeros_like(p)).detach().clone()
+                                       for n, p in net.named_parameters()})
             if arm["time"]:
                 ms, mb = timed(step, a.warmup, a.iters)
                 res[name] = dict(step_ms=ms, step_peak_mib=mb)
@@ -257,6 +284,7 @@ def stage_net(dev, a):
         finally:
             MGLPDSNet.PLANAR_STATE = keep[0]
             set_complex_mode(keep[1])
+            compile_glue.set_mode(keep[2])
 
     base_out, base_g = ref["implicit"]
     others = [arm["name"] for arm in arms[1:]]
@@ -264,7 +292,6 @@ def stage_net(dev, a):
     rows = {}
     for name in others:
         out, gr = ref[name]
-        assert gr.keys() == base_g.keys(), f"{name}: a different set of parameters got gradients"
         rows[name] = {n: (nrel(gr[n], base_g[n]), rel(gr[n], base_g[n])) for n in base_g}
         res["rel_err"][name] = dict(
             output=rel(out, base_out),
@@ -331,8 +358,9 @@ def _dev_us(e):
 
 def _build_arm(arm, params, state, dev):
     """(net, restore): an LGGSNet for `arm` with the process switches it needs set."""
-    keep = (MGLPDSNet.PLANAR_STATE, _GaussConvNd.COMPLEX_MODE)
-    planar = arm == "planar"
+    keep = (MGLPDSNet.PLANAR_STATE, _GaussConvNd.COMPLEX_MODE, compile_glue.MODE)
+    planar = arm in ("planar", "compile")
+    compile_glue.set_mode("inductor" if arm == "compile" else None)
     MGLPDSNet.PLANAR_STATE = planar
     set_complex_mode("planar" if planar else keep[1])
     net = LGGSNet(**params, triton_materialize=arm != "implicit", spectral_init=False)
@@ -342,6 +370,7 @@ def _build_arm(arm, params, state, dev):
     def restore():
         MGLPDSNet.PLANAR_STATE = keep[0]
         set_complex_mode(keep[1])
+        compile_glue.set_mode(keep[2])
     return net, restore
 
 
@@ -366,7 +395,7 @@ def stage_profile(dev, a):
 
     net, restore = _build_arm(a.profile_arm, params, state, dev)
     try:
-        if a.profile_arm == "planar" and not net.planar_state_active():
+        if a.profile_arm in ("planar", "compile") and not net.planar_state_active():
             raise SystemExit("planar arm: LGGSNet.planar_state_active() is False")
         opt = torch.optim.Adam(net.parameters(), lr=1e-5)
 
@@ -499,8 +528,9 @@ def main():
                     help="block_m of stage 3's noise-floor arm (reorders fp32 only)")
     ap.add_argument("--top", type=int, default=8, help="stage 3: worst tensors to list")
     ap.add_argument("--profile-arm", default="planar",
-                    choices=["implicit", "materialized", "planar"],
-                    help="profile: which net (planar = materialized + planar state + convs)")
+                    choices=["implicit", "materialized", "planar", "compile"],
+                    help="profile: which net (planar = materialized + planar state + convs; "
+                         "compile = planar + the compiled glue)")
     ap.add_argument("--profile-steps", type=int, default=3, help="profile: steps recorded")
     ap.add_argument("--profile-top", type=int, default=25, help="profile: kernels listed")
     ap.add_argument("--trace", default=None, help="profile: write a chrome trace here")
@@ -510,6 +540,8 @@ def main():
     ap.add_argument("--no-tf32", action="store_true",
                     help="IEEE fp32 convs and matmuls (cudnn.allow_tf32 / matmul precision "
                          "'highest'): is a gap down to TF32?")
+    ap.add_argument("--no-compile", action="store_true",
+                    help="stage 3: skip the '+ compile' arm (planar + compiled glue)")
     ap.add_argument("--no-planar", action="store_true",
                     help="stage 3: skip the planar-state + planar-conv arm")
     ap.add_argument("--config", default=os.path.join(REPO, "config/knee/guided/lggs_R8_g1.json"))
@@ -530,8 +562,7 @@ def main():
     print(f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}, "
           f"matmul precision {torch.get_float32_matmul_precision()}, "
           f"cudnn.benchmark {torch.backends.cudnn.benchmark}, "
-          f"cudnn.allow_tf32 {torch.backends.cudnn.allow_tf32}, "
-          f"conv GEMM {conv_gemm.MODE or 'off'} (IMMAP_CONV_GEMM)")
+          f"cudnn.allow_tf32 {torch.backends.cudnn.allow_tf32}")
     gp._FUSED_JOINT_CHECKED.clear()
 
     out = {"device": torch.cuda.get_device_name(0), "args": vars(a)}

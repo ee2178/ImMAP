@@ -108,7 +108,7 @@ import models.circulant_flex as circulant_flex
 from models.circulant_flex import FlexAdjacency, PointwiseAdjacency
 from models.circulant_triton import TritonAdjacency
 from models.circulant_window import WindowAdjacency
-from models import conv_gemm
+from models import compile_glue
 from models.components import to_complex
 from models.prox import GroupThreshold, Polynomial
 
@@ -132,6 +132,36 @@ def merge_joint(outs, lses, nheads):
         t = pi * o.reshape(B, nheads, d, H, W)
         e = t if e is None else e + t
     return e.reshape(B, C, H, W)
+
+
+# ---------------------------------------------------------------------------------------------
+# Glue for `compile_glue`: pure tensor functions around the attention, compiled once and shared
+# by every layer (models/compile_glue.py says why only these). Planar codes, the LGGS layout:
+# a 1 x 1 self window (Gamma = I) and materialised guide windows (WindowAdjacency).
+# ---------------------------------------------------------------------------------------------
+def _glue_abs2_planar(t):
+    B, C2, H, W = t.shape
+    return (t * t).reshape(B, 2, C2 // 2, H, W).sum(dim=1)
+
+
+def _glue_energy_pre(za, guide_alphas, nheads):
+    """Planar W_alpha z and W_alpha v_g -> the self energy (image layout; Gamma = I) and each
+    guide energy straight in the attention's sequence layout, (B * h, H * W, Mh / h)."""
+    e_self = _glue_abs2_planar(za)
+    seqs = []
+    for ga in guide_alphas:
+        e = _glue_abs2_planar(ga)
+        B, C, H, W = e.shape
+        seqs.append(e.reshape(B * nheads, C // nheads, H * W).transpose(1, 2).contiguous())
+    return e_self, seqs
+
+
+def _glue_envelope_post(e_self, guide_out_seqs, lses, nheads, eps):
+    """The guide branches' attention outputs (sequence layout) back on the image grid, merged
+    with the self energy in the joint simplex, -> sqrt(energy + eps)."""
+    B, C, H, W = e_self.shape
+    outs = [e_self] + [o.transpose(1, 2).reshape(B, C, H, W) for o in guide_out_seqs]
+    return torch.sqrt(merge_joint(outs, lses, nheads) + eps)
 
 
 # One comparison against the gather backend per (backend, similarity, heads) per process:
@@ -231,7 +261,7 @@ class ProjectedGuide:
         N = wr.shape[0]
 
         def conv(x, W):
-            return conv_gemm.conv2d(x, W, stride=a.stride, padding=a.padding)
+            return F.conv2d(x, W, stride=a.stride, padding=a.padding)
 
         x = self.w
         n = N // len(pixes)
@@ -549,6 +579,20 @@ class GuidedGroupThreshold(GroupThreshold):
         sq_mod = self._abs2_planar if planar else _abs2
 
         za = self.Walpha(z) if self.grouped else z
+        if (planar and compile_glue.enabled() and self.grouped and self.joint_fused and guides
+                and isinstance(Phi, PointwiseAdjacency)
+                and all(isinstance(Om, WindowAdjacency) for Om in Omegas)):
+            # the LGGS layout: the glue around the attention through compiled pure functions
+            e_self, seqs = compile_glue.compiled(_glue_energy_pre)(
+                za, [self._guide_alpha(g) for g in guides], self.nheads)
+            outs = [Om.apply_seq(v) for Om, v in zip(Omegas, seqs)]
+            self._check_fused_joint(z.new_empty(
+                0, dtype=torch.complex128 if z.dtype == torch.float64 else torch.complex64))
+            xi_a = compile_glue.compiled(_glue_envelope_post)(
+                e_self, outs, [Phi._lse] + [Om._lse for Om in Omegas], self.nheads, self.eps)
+            xi = self.beta_apply(xi_a)
+            return self._scale_planar_code(z, xi, self.tau(sigma, ref=z), dual), cache
+
         e_self = self.apply_gamma(Phi, sq_mod(za))
         terms = [self.apply_gamma(Om, sq_mod(self._guide_alpha(g)))
                  for Om, g in zip(Omegas, guides)]

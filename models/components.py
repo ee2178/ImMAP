@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models import conv_gemm
-
 
 # ============================================================
 # Nonlinearities
@@ -313,10 +311,14 @@ class Conv2d(_GaussConvNd):
         self.conv_imag = nn.Conv2d(C, M, P, stride=stride, padding=self.padding,
                                    bias=bias, groups=self.groups) if complex else None
 
+    # Not unfold + GEMM. For the C = 1 dictionary convs (2 planar in, 338 out, 7 x 7, s = 2)
+    # cuDNN's weight gradient looks slow against the card's peak -- ~12 TFLOP/s on an L40S --
+    # but its output is tiny (338 x 98) over a 58,880-long reduction, which a GEMM handles
+    # worse: measured 2026-11, L40S, knee size, fwd+bwd, unfold + cuBLAS took 0.50-0.72x the
+    # speed of cuDNN for analysis, synthesis and the guide conv alike (IEEE or TF32).
     def _op(self, x, weight, bias=None):
-        # unfold + GEMM for a narrow input side when IMMAP_CONV_GEMM is on (models/conv_gemm.py)
-        return conv_gemm.conv2d(x, weight, bias=bias, stride=self.stride,
-                                padding=self.padding, groups=self.groups)
+        return F.conv2d(x, weight, bias=bias, stride=self.stride,
+                        padding=self.padding, groups=self.groups)
 
 
 class ConvTranspose2d(_GaussConvNd):
@@ -339,9 +341,8 @@ class ConvTranspose2d(_GaussConvNd):
             padding=self.padding, output_padding=self.output_padding, bias=bias,
             groups=self.groups) if complex else None
 
-    def _op(self, x, weight, bias=None):
-        # GEMM + fold for a narrow output side when IMMAP_CONV_GEMM is on (models/conv_gemm.py)
-        return conv_gemm.conv_transpose2d(x, weight, bias=bias, stride=self.stride,
+    def _op(self, x, weight, bias=None):          # cuDNN: see the note on Conv2d._op
+        return F.conv_transpose2d(x, weight, bias=bias, stride=self.stride,
             padding=self.padding, output_padding=self.output_padding,
             groups=self.groups)
 

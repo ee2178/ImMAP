@@ -342,7 +342,49 @@ def _wdot(
 # ===========================================================================
 #  autograd wrappers
 # ===========================================================================
+# The fixed launch (IMMAP_WINDOW_AUTOTUNE=0), and the space `triton.autotune` searches: query
+# tile x warps. Every kernel here writes each output element exactly once (plain stores into a
+# fresh tensor), so the autotuner's repeated trial launches are harmless, and the tile changes
+# only how queries are grouped, never the arithmetic of one output. Tuned once per key -- the
+# grid, window and channel widths -- and cached for the process.
 _CFG = dict(block_m=64, num_warps=4)
+AUTOTUNE = os.environ.get("IMMAP_WINDOW_AUTOTUNE", "1") != "0"
+_TILES = [(16, 2), (32, 2), (32, 4), (64, 2), (64, 4), (64, 8), (128, 4), (128, 8)]
+_KEYS = {
+    "_wscores_fwd": ["HW", "WIN", "C", "HAS_IMAG", "USE_KNORM"],
+    "_wscores_bwd_dq": ["HW", "WIN", "C", "HAS_IMAG"],
+    "_wscores_bwd_dk": ["HW", "WIN", "C", "HAS_IMAG", "USE_KNORM"],
+    "_wapply": ["HW", "WIN", "DV", "TRANSPOSE"],
+    "_wdot": ["HW", "WIN", "DV"],
+}
+_TUNED = {}
+
+
+def _tuned(name):
+    if name not in _TUNED:
+        _TUNED[name] = triton.autotune(
+            configs=[triton.Config({"BLOCK_M": m}, num_warps=w) for m, w in _TILES],
+            key=_KEYS[name])(globals()[name])
+    return _TUNED[name]
+
+
+def _launch(name, HW, B, *args, **meta):
+    """One kernel launch over (query tiles, batch): autotuned, or the fixed _CFG tile."""
+    if AUTOTUNE:
+        _tuned(name)[lambda M: (triton.cdiv(HW, M["BLOCK_M"]), B)](*args, **meta)
+    else:
+        bm = _CFG["block_m"]
+        globals()[name][(triton.cdiv(HW, bm), B)](*args, BLOCK_M=bm,
+                                                  num_warps=_CFG["num_warps"], **meta)
+
+
+def tuned_configs():
+    """{kernel: [chosen config per key]} -- what the autotuner picked, for the timing tools."""
+    out = {}
+    for name, t in _TUNED.items():
+        cache = getattr(t, "cache", {}) or {}
+        out[name] = [str(c) for c in cache.values()]
+    return out
 
 
 def _check(H, W, win, HW):
@@ -367,13 +409,10 @@ class _WindowScores(torch.autograd.Function):
             knorm = knorm + (ki * ki).sum(-1)
         K = win * win
         S = torch.empty((B, K, HW), dtype=qr.dtype, device=qr.device)
-        bm, nw = _CFG["block_m"], _CFG["num_warps"]
-        grid = (triton.cdiv(HW, bm), B)
-        _wscores_fwd[grid](qr, qi_, kr, ki_, knorm.contiguous(), S,
-                           qr.stride(0), qr.stride(1), S.stride(0), S.stride(1), HW,
-                           H, W, HW, win, (win - 1) // 2, eps,
-                           HAS_IMAG=has_imag, USE_KNORM=use_knorm, C=C,
-                           BLOCK_M=bm, BLOCK_C=BLOCK_C, num_warps=nw)
+        _launch("_wscores_fwd", HW, B, qr, qi_, kr, ki_, knorm.contiguous(), S,
+                qr.stride(0), qr.stride(1), S.stride(0), S.stride(1), HW,
+                H, W, HW, win, (win - 1) // 2, eps,
+                HAS_IMAG=has_imag, USE_KNORM=use_knorm, C=C, BLOCK_C=BLOCK_C)
         ctx.save_for_backward(qr, qi_, kr, ki_)
         ctx.cfg = (H, W, win, use_knorm, eps, has_imag, C, BLOCK_C)
         return S
@@ -386,16 +425,12 @@ class _WindowScores(torch.autograd.Function):
         B, HW, _ = qr.shape
         dqr, dqi = torch.empty_like(qr), torch.empty_like(qr)
         dkr, dki = torch.empty_like(kr), torch.empty_like(kr)
-        bm, nw = _CFG["block_m"], _CFG["num_warps"]
-        grid = (triton.cdiv(HW, bm), B)
         args = (qr.stride(0), qr.stride(1), dS.stride(0), dS.stride(1),
                 H, W, HW, win, (win - 1) // 2, eps)
-        _wscores_bwd_dq[grid](qr, qi_, kr, ki_, dS, dqr, dqi, *args,
-                              HAS_IMAG=has_imag, C=C, BLOCK_M=bm, BLOCK_C=BLOCK_C,
-                              num_warps=nw)
-        _wscores_bwd_dk[grid](qr, qi_, kr, ki_, dS, dkr, dki, *args,
-                              HAS_IMAG=has_imag, USE_KNORM=use_knorm, C=C,
-                              BLOCK_M=bm, BLOCK_C=BLOCK_C, num_warps=nw)
+        _launch("_wscores_bwd_dq", HW, B, qr, qi_, kr, ki_, dS, dqr, dqi, *args,
+                HAS_IMAG=has_imag, C=C, BLOCK_C=BLOCK_C)
+        _launch("_wscores_bwd_dk", HW, B, qr, qi_, kr, ki_, dS, dkr, dki, *args,
+                HAS_IMAG=has_imag, USE_KNORM=use_knorm, C=C, BLOCK_C=BLOCK_C)
         return (dqr, dqi if has_imag else None, dkr, dki if has_imag else None,
                 None, None, None, None, None)
 
@@ -406,11 +441,8 @@ def _launch_apply(P, v, H, W, win, transpose):
     if BLOCK_V > 128:
         raise ValueError(f"DV={DV} per head must round up to <= 128")
     out = torch.empty_like(v)
-    bm, nw = _CFG["block_m"], _CFG["num_warps"]
-    _wapply[(triton.cdiv(HW, bm), B)](
-        P, v, out, P.stride(0), P.stride(1), v.stride(0), v.stride(1),
-        H, W, HW, win, (win - 1) // 2,
-        TRANSPOSE=transpose, DV=DV, BLOCK_M=bm, BLOCK_V=BLOCK_V, num_warps=nw)
+    _launch("_wapply", HW, B, P, v, out, P.stride(0), P.stride(1), v.stride(0), v.stride(1),
+            H, W, HW, win, (win - 1) // 2, TRANSPOSE=transpose, DV=DV, BLOCK_V=BLOCK_V)
     return out
 
 
@@ -418,11 +450,8 @@ def _launch_dot(x, y, H, W, win):
     B, HW, DV = x.shape
     K = win * win
     dP = torch.empty((B, K, HW), dtype=x.dtype, device=x.device)
-    bm, nw = _CFG["block_m"], _CFG["num_warps"]
-    _wdot[(triton.cdiv(HW, bm), B)](
-        x, y, dP, dP.stride(0), dP.stride(1), x.stride(0), x.stride(1),
-        H, W, HW, win, (win - 1) // 2,
-        DV=DV, BLOCK_M=bm, BLOCK_V=_next_pow2(DV), num_warps=nw)
+    _launch("_wdot", HW, B, x, y, dP, dP.stride(0), dP.stride(1), x.stride(0), x.stride(1),
+            H, W, HW, win, (win - 1) // 2, DV=DV, BLOCK_V=_next_pow2(DV))
     return dP
 
 
@@ -495,6 +524,11 @@ class WindowAdjacency:
     def values(self):
         """The weights in `Circulant`'s (B*h, Q, K) layout (tests / inspection; a copy)."""
         return self.P.transpose(1, 2)
+
+    def apply_seq(self, v, transpose=False):
+        """`apply` on values already in the sequence layout, (B * heads, H * W, C / heads) ->
+        the same layout: no image <-> sequence copies (the caller fuses them elsewhere)."""
+        return window_apply(self.P, v, self.H, self.W, self.win, transpose)
 
     def apply(self, x, transpose=False):
         if x.is_complex():
