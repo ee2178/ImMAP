@@ -21,6 +21,7 @@ callers run their eager code unchanged.
 from __future__ import annotations
 
 import os
+import warnings
 
 import torch
 
@@ -69,13 +70,56 @@ def enabled():
     return MODE is not None
 
 
+_FELL_BACK = set()
+
+
 def compiled(fn):
-    """`fn` compiled under the current mode (memoised per function and mode), or `fn`."""
+    """`fn` compiled under the current mode (memoised per function and mode), or `fn`.
+
+    Shapes: dynamo's AUTOMATIC dynamic shapes (dynamic=None). The first call compiles for its
+    exact sizes; the first call with a different size recompiles with that dimension symbolic,
+    and from then on one graph serves every size. The image grid is NOT fixed per run: fastMRI
+    knee volumes come in several widths, and with dynamic=False each width cost a compile until
+    dynamo's recompile limit (8) stopped the run (2026-11-08, LGGS knee, latent width 184 then
+    160).
+
+    Failure: compiling is a speed-up, never a dependency. If dynamo refuses a piece -- a graph
+    break under fullgraph, the recompile limit, a backend failure -- that piece runs its eager
+    code (the same map) for the rest of the process, with one warning, instead of the
+    exception ending a training run.
+    """
     if MODE is None:
         return fn
     key = (fn, MODE)
     if key not in _CACHE:
-        # fullgraph: these are pure tensor functions, so a graph break is a bug, not a
-        # fallback to accept silently. dynamic=False: the shapes are the grid's, fixed per run.
-        _CACHE[key] = torch.compile(fn, backend=MODE, fullgraph=True, dynamic=False)
+        import torch._dynamo.exc as dexc
+        # What dynamo raises when it refuses: TorchDynamoException covers graph breaks
+        # (Unsupported), backend failures and internal errors; the recompile limit under
+        # fullgraph raises FailOnRecompileLimitHit, which is NOT one of those (it derives from
+        # Exception directly) -- and is exactly what ended the 2026-11-08 run.
+        refused = tuple(c for c in (dexc.TorchDynamoException,
+                                    getattr(dexc, "FailOnRecompileLimitHit", None)) if c)
+        # fullgraph: a graph break in a pure tensor function is a bug -- surface it (once, as
+        # the warning below), rather than silently compiling half the function
+        cf = torch.compile(fn, backend=MODE, fullgraph=True, dynamic=None)
+
+        def run(*args):
+            if key in _FELL_BACK:
+                return fn(*args)
+            try:
+                return cf(*args)
+            except refused as err:
+                _FELL_BACK.add(key)
+                warnings.warn(f"compile_glue: {fn.__name__} could not be compiled "
+                              f"({type(err).__name__}: {str(err).splitlines()[0]}); running it "
+                              f"eagerly from now on -- same result, without the fusion")
+                return fn(*args)
+
+        run.__name__ = fn.__name__
+        _CACHE[key] = run
     return _CACHE[key]
+
+
+def fell_back():
+    """Names of the pieces that fell back to eager in this process (for logs and tests)."""
+    return sorted(k[0].__name__ for k in _FELL_BACK)

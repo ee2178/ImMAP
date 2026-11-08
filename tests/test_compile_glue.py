@@ -34,6 +34,7 @@ def setup(monkeypatch):
     yield lambda mode: compile_glue.set_mode(mode)
     compile_glue.set_mode(old)
     compile_glue._CACHE.clear()
+    compile_glue._FELL_BACK.clear()
 
 
 class _AlwaysChecked(set):
@@ -122,3 +123,58 @@ def test_off_and_inapplicable_configurations_keep_the_eager_path(setup, monkeypa
     monkeypatch.setattr(MGLPDSNet, "PLANAR_STATE", False)  # complex code
     run(lggs(K=3), y, guides, sigma)
     assert not taken
+
+
+def problem_hw(H, W, seed=1):
+    g = torch.Generator().manual_seed(seed)
+    c = lambda: torch.complex(torch.randn(1, 1, H, W, generator=g, dtype=D),     # noqa: E731
+                              torch.randn(1, 1, H, W, generator=g, dtype=D))
+    return c(), [c()], torch.full((1, 1, 1, 1), 0.05, dtype=D)
+
+
+def test_many_image_widths_compile_once_more_not_once_each(setup):
+    """The knee crash (2026-11-08): volumes of several widths, each a fresh compile, until the
+    recompile limit stopped the run. With automatic dynamic shapes the second width makes the
+    grid symbolic and every later width reuses that graph."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+    torch._dynamo.reset()
+    counters.clear()
+    setup("aot_eager")
+    net = lggs(K=4)
+    widths = [14, 16, 18, 20, 22, 24, 26, 28, 30, 32]           # 10 > the limit of 8
+    for W in widths:
+        y, guides, sigma = problem_hw(16, W)
+        setup("aot_eager")
+        x1, z1, _ = run(net, y, guides, sigma)
+        setup(None)
+        x0, z0, _ = run(net, y, guides, sigma)
+        assert close(x1, x0, 1e-12) and close(z1, z0, 1e-12), W
+    assert compile_glue.fell_back() == []
+    # static first, then one symbolic version per piece (plus first-layer variants)
+    assert counters["stats"]["unique_graphs"] <= 12, dict(counters["stats"])
+
+
+def test_a_dynamo_failure_falls_back_to_eager_instead_of_raising(setup, monkeypatch):
+    """Whatever dynamo refuses -- here its recompile limit, lowered to 1 and hit by a second
+    shape under dynamic=False -- the run continues on the eager code, with one warning."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    cfg = torch._dynamo.config
+    name = "recompile_limit" if hasattr(cfg, "recompile_limit") else "cache_size_limit"
+    monkeypatch.setattr(cfg, name, 1)
+    real_compile = torch.compile
+    monkeypatch.setattr(compile_glue.torch, "compile",
+                        lambda fn, **kw: real_compile(fn, **dict(kw, dynamic=False)))
+    setup("aot_eager")
+    net = lggs(K=3)
+    res = []
+    with pytest.warns(UserWarning, match="could not be compiled"):
+        for W in (14, 18):
+            y, guides, sigma = problem_hw(16, W)
+            setup("aot_eager")
+            res.append(run(net, y, guides, sigma))
+    assert compile_glue.fell_back()                        # something fell back ...
+    setup(None)
+    x0, z0, _ = run(net, *problem_hw(16, 18))
+    assert close(res[1][0], x0, 1e-12) and close(res[1][1], z0, 1e-12)   # ... to the same map
