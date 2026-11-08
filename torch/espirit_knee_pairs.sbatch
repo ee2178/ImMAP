@@ -31,7 +31,11 @@
 #                                      truth. lam is scale-free, so scale_fac does not move it.
 #                                      Check a threshold first (minutes, one GPU):
 #                                        python scripts/check_espirit_support.py
-#                                      The 0.95 maps stay in .../pdfs_espirit_acs32.
+#                                      The 0.95 maps (.../pdfs_espirit_acs32, the s1 runs'
+#                                      targets) were deleted 2026-11-07 to free scratch.
+#                                      THRESH_EIG=0.95 regenerates them, as
+#                                      .../pdfs_espirit_acs32_eig0.95 (the s1 configs name the
+#                                      old path).
 #
 # Output: ../datasets/fastmri_preprocessed/knee_coil_combined/${CONTRAST}_espirit_acs${ACS}_eig${THRESH_EIG}/,
 # one h5 per volume with `smaps` (S, C, H, W) and `image` (S, H, W) = sum_c conj(s_c) c_c --
