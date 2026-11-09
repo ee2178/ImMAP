@@ -74,15 +74,32 @@ def _parse_variant(s):
     return name, kws
 
 
-def stripe_index(d, fg):
-    """(horizontal, vertical): variance of the row (column) means of d over var(d), foreground."""
-    d = torch.where(fg, d, torch.zeros_like(d))
-    n_row, n_col = fg.sum(1).clamp_min(1), fg.sum(0).clamp_min(1)
-    rows = d.sum(1) / n_row                                          # (H,) mean along each row
-    cols = d.sum(0) / n_col
-    v = d[fg].var().clamp_min(1e-30)
-    rr, cc = rows[fg.any(1)], cols[fg.any(0)]
-    return float(rr.var() / v) if rr.numel() > 1 else 0.0, float(cc.var() / v) if cc.numel() > 1 else 0.0
+def stripe_index(d, fg, min_frac=0.1):
+    """(horizontal, vertical) stripe index of d over the foreground, in [0, 1].
+
+    The PIXEL-WEIGHTED variance of the row (column) means over the variance of d, both over the
+    foreground pixels of the rows (columns) kept: those holding >= `min_frac` of the fullest
+    one's foreground. By the law of total variance this is the share of d's variance that is
+    constant along rows -- 0 for no row structure, 1 for pure horizontal stripes. (Until
+    2026-11-09 the row means were averaged UNWEIGHTED over every row with any foreground, so a
+    few near-empty edge rows could push the ratio far above 1.)"""
+    f = fg.to(d.dtype)
+
+    def one(dim):
+        n = f.sum(dim)                                      # foreground pixels per row / column
+        keep = n >= min_frac * n.max()
+        if int(keep.sum()) < 2:
+            return 0.0
+        sel = keep[:, None] if dim == 1 else keep[None, :]
+        w = f * sel                                         # foreground of the kept lines
+        tot = w.sum()
+        mu = (d * w).sum() / tot
+        total = ((d - mu).pow(2) * w).sum() / tot
+        m = (d * w).sum(dim)[keep] / n[keep]                # line means
+        between = (n[keep] * (m - mu).pow(2)).sum() / tot
+        return float(between / total.clamp_min(1e-30))
+
+    return one(1), one(0)
 
 
 def combine(smaps, coils):
