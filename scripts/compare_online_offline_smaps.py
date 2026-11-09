@@ -95,6 +95,87 @@ def residual(smaps, coils, rss):
     return r / rss.clamp_min(1e-12 * float(rss.max()))
 
 
+def setup(config, split="val", n_volumes=6, slices_per_volume=3, variants=(), noise=None,
+          seed=0):
+    """-> (ds, items, mri, variants, sigma): the config's paired dataset (per slice, the stored
+    offline SENSE target and maps), the picked item indices (`slices_per_volume` evenly over each
+    of `n_volumes` random volumes), its mri block, [(name, online_smaps kwargs)] -- the config's
+    online settings first, as "online", then each variant ("NAME:key=val,..." or (name, dict))
+    on top of them -- and the measurement noise std."""
+    cfg = json.load(open(config))
+    d, mri, tr = dict(cfg["data"][split]), cfg["mri"], cfg["training"]
+    if d.get("target") != "sense":
+        raise ValueError("the config's target must be 'sense' (offline maps) to compare against")
+    keep = ("split_csv", "kspace_roots", "start_slice", "end_slice", "target", "smap_root",
+            "scale_fac", "side_scale_fac", "volume_scales", "volume_stat", "side_volume_stat",
+            "volume_target")
+    ds = PairedKneeDataset(**{k: d[k] for k in keep if k in d}, enumerate_slices=True)
+    rng = np.random.default_rng(seed)
+    vols = sorted(rng.choice(len(ds.pairs), min(n_volumes, len(ds.pairs)), replace=False))
+    items = []
+    for v in vols:
+        idx = [i for i, (pi, _) in enumerate(ds.index) if pi == v]
+        pick = np.linspace(0, len(idx) - 1, min(slices_per_volume, len(idx))).round()
+        items += [idx[int(j)] for j in sorted(set(pick))]
+    base = dict(mri.get("online_smaps_kws") or {})
+    method = mri.get("online_smaps") or "espirit"
+    parsed = [_parse_variant(v) if isinstance(v, str) else v for v in variants]
+    out = [("online", dict(base, method=method))] + [
+        (n, {**base, "method": method, **kw}) for n, kw in parsed]
+    sigma = float(tr.get("val_noise_std", 0.015) if noise is None else noise)
+    return ds, items, mri, out, sigma
+
+
+def compare_slice(ds, idx, mri, variants, sigma, gen, dev):
+    """One slice -> (row of metrics, panel tensors for the FIRST variant, on CPU)."""
+    k, sm_off, img_off, _, _, _ = ds[idx]
+    name, sl = ds.item_id(idx)
+    k, sm_off, img_off = (t[None].to(dev) for t in (k, sm_off, img_off))
+    W = k.shape[-1]
+    mask = get_mask_cached(img_off, R=mri["R"], acs_lines=mri.get("acs_lines"),
+                           mode=mri.get("mask_dist", "uniform"), offset=0,
+                           center_frac=mri.get("center_frac"),
+                           adjust_accel=mri.get("adjust_accel", False))
+    y, _ = kspace_awgn(k, mask, sigma, "uniform", generator=gen)
+    acs = resolve_acs_lines(W, mri.get("acs_lines"), mri.get("center_frac"))
+
+    coils = ifftc(k)[0]
+    rss = coils.abs().pow(2).sum(0).sqrt()
+    a = rss[None, None]
+    fg = (a > otsu_threshold(a))[0, 0]
+    x_off = img_off[0, 0]
+    peak = float(x_off.abs()[fg].max())
+    h0, v0 = stripe_index(x_off.abs() - rss, fg)
+    row = dict(volume=name, slice=sl, acs_lines=acs, off_vs_rss_streak_h=h0,
+               off_vs_rss_streak_v=v0,
+               res_off=float(residual(sm_off[0], coils, rss)[fg].mean()))
+    panel = None
+    for vname, kws in variants:
+        with torch.no_grad():
+            sm_on = online_smaps(y, mask, acs_lines=acs, **kws)[0]
+        x_on = combine(sm_on, coils)
+        diff = x_on.abs() - x_off.abs()
+        mse = float(diff[fg].pow(2).mean())
+        h, v = stripe_index(diff, fg)
+        row.update({f"{vname}_floor_psnr": 10 * np.log10(peak ** 2 / max(mse, 1e-30)),
+                    f"{vname}_floor_nrmse": float(diff[fg].norm() / x_off.abs()[fg].norm()),
+                    f"{vname}_streak_h": h, f"{vname}_streak_v": v,
+                    f"{vname}_res": float(residual(sm_on, coils, rss)[fg].mean())})
+        if panel is None:
+            panel = tuple(t.detach().cpu() for t in (
+                x_off, x_on, diff, residual(sm_off[0], coils, rss), residual(sm_on, coils, rss),
+                sm_off[0], sm_on, fg))
+    return row, panel
+
+
+def summarize(rows):
+    keys = [k for k in rows[0] if k not in ("volume", "slice", "acs_lines")]
+    return {k: dict(mean=float(np.mean([r[k] for r in rows])),
+                    median=float(np.median([r[k] for r in rows])),
+                    min=float(np.min([r[k] for r in rows])),
+                    max=float(np.max([r[k] for r in rows]))) for k in keys}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -112,89 +193,31 @@ def main():
     args = ap.parse_args()
     dev = torch.device(args.device)
 
-    cfg = json.load(open(args.config))
-    d, mri, tr = dict(cfg["data"][args.split]), cfg["mri"], cfg["training"]
-    if d.get("target") != "sense":
-        raise SystemExit("the config's target must be 'sense' (offline maps) to compare against")
-    keep = ("split_csv", "kspace_roots", "start_slice", "end_slice", "target", "smap_root",
-            "scale_fac", "side_scale_fac", "volume_scales", "volume_stat", "side_volume_stat",
-            "volume_target")
-    ds = PairedKneeDataset(**{k: d[k] for k in keep if k in d}, enumerate_slices=True)
-    rng = np.random.default_rng(args.seed)
-    vols = sorted(rng.choice(len(ds.pairs), min(args.n_volumes, len(ds.pairs)), replace=False))
-    items = []
-    for v in vols:
-        idx = [i for i, (pi, _) in enumerate(ds.index) if pi == v]
-        pick = np.linspace(0, len(idx) - 1, min(args.slices_per_volume, len(idx))).round()
-        items += [idx[int(j)] for j in sorted(set(pick))]
-
-    base_kws = dict(mri.get("online_smaps_kws") or {})
-    method = mri.get("online_smaps") or "espirit"
-    variants = [("online", dict(base_kws, method=method))] + [
-        (n, {**base_kws, "method": method, **kw}) for n, kw in map(_parse_variant, args.variant)]
-    sigma = float(tr.get("val_noise_std", 0.015) if args.noise is None else args.noise)
-    print(f"{len(items)} slices from {len(vols)} {args.split} volumes; noise {sigma:g}; "
-          f"variants: " + "; ".join(f"{n} {kw}" for n, kw in variants))
-
+    ds, items, mri, variants, sigma = setup(args.config, args.split, args.n_volumes,
+                                            args.slices_per_volume, args.variant, args.noise,
+                                            args.seed)
+    print(f"{len(items)} slices; noise {sigma:g}; variants: "
+          + "; ".join(f"{n} {kw}" for n, kw in variants))
     os.makedirs(args.out, exist_ok=True)
     gen = torch.Generator(device=dev).manual_seed(args.seed)
     rows, n_panel = [], 0
     for idx in items:
-        k, sm_off, img_off, _, _, _ = ds[idx]
-        name, sl = ds.item_id(idx)
-        k, sm_off, img_off = (t[None].to(dev) for t in (k, sm_off, img_off))
-        W = k.shape[-1]
-        mask = get_mask_cached(img_off, R=mri["R"], acs_lines=mri.get("acs_lines"),
-                               mode=mri.get("mask_dist", "uniform"), offset=0,
-                               center_frac=mri.get("center_frac"),
-                               adjust_accel=mri.get("adjust_accel", False))
-        y, _ = kspace_awgn(k, mask, sigma, "uniform", generator=gen)
-        acs = resolve_acs_lines(W, mri.get("acs_lines"), mri.get("center_frac"))
-
-        coils = ifftc(k)[0]
-        rss = coils.abs().pow(2).sum(0).sqrt()
-        a = rss[None, None]
-        fg = (a > otsu_threshold(a))[0, 0]
-        x_off = img_off[0, 0]
-        peak = float(x_off.abs()[fg].max())
-        d_off = x_off.abs() - rss
-        row = dict(volume=name, slice=sl, acs_lines=acs,
-                   off_vs_rss_streak_h=stripe_index(d_off, fg)[0],
-                   off_vs_rss_streak_v=stripe_index(d_off, fg)[1],
-                   res_off=float(residual(sm_off[0], coils, rss)[fg].mean()))
-        panel = None
-        for vname, kws in variants:
-            with torch.no_grad():
-                sm_on = online_smaps(y, mask, acs_lines=acs, **kws)[0]
-            x_on = combine(sm_on, coils)
-            diff = x_on.abs() - x_off.abs()
-            mse = float(diff[fg].pow(2).mean())
-            h, v = stripe_index(diff, fg)
-            row.update({f"{vname}_floor_psnr": 10 * np.log10(peak ** 2 / max(mse, 1e-30)),
-                        f"{vname}_floor_nrmse": float(diff[fg].norm() / x_off.abs()[fg].norm()),
-                        f"{vname}_streak_h": h, f"{vname}_streak_v": v,
-                        f"{vname}_res": float(residual(sm_on, coils, rss)[fg].mean())})
-            if vname == "online":
-                panel = (x_off, x_on, diff, residual(sm_off[0], coils, rss),
-                         residual(sm_on, coils, rss), sm_off[0], sm_on, fg)
+        row, panel = compare_slice(ds, idx, mri, variants, sigma, gen, dev)
         rows.append(row)
-        print(f"  {name} sl {sl}: floor PSNR {row['online_floor_psnr']:.2f} dB, stripe h/v "
-              f"{row['online_streak_h']:.3f}/{row['online_streak_v']:.3f} (target vs RSS "
-              f"{row['off_vs_rss_streak_h']:.3f}/{row['off_vs_rss_streak_v']:.3f}), residual "
-              f"on/off {row['online_res']:.4f}/{row['res_off']:.4f}", flush=True)
-        if n_panel < args.panels and panel is not None:
-            _panel(os.path.join(args.out, f"{name}_sl{sl}.png"), f"{name} slice {sl}",
-                   *[t.detach().cpu() if torch.is_tensor(t) else t for t in panel])
+        print(f"  {row['volume']} sl {row['slice']}: floor PSNR {row['online_floor_psnr']:.2f} "
+              f"dB, stripe h/v {row['online_streak_h']:.3f}/{row['online_streak_v']:.3f} "
+              f"(target vs RSS {row['off_vs_rss_streak_h']:.3f}/"
+              f"{row['off_vs_rss_streak_v']:.3f}), residual on/off "
+              f"{row['online_res']:.4f}/{row['res_off']:.4f}", flush=True)
+        if n_panel < args.panels:
+            _panel(os.path.join(args.out, f"{row['volume']}_sl{row['slice']}.png"),
+                   f"{row['volume']} slice {row['slice']}", *panel)
             n_panel += 1
 
-    keys = [k for k in rows[0] if k not in ("volume", "slice", "acs_lines")]
-    summary = {k: dict(mean=float(np.mean([r[k] for r in rows])),
-                       median=float(np.median([r[k] for r in rows])),
-                       min=float(np.min([r[k] for r in rows])),
-                       max=float(np.max([r[k] for r in rows]))) for k in keys}
+    summary = summarize(rows)
     print(f"\n{'quantity':<28}{'mean':>10}{'median':>10}{'min':>10}{'max':>10}")
-    for k, s in summary.items():
-        print(f"{k:<28}{s['mean']:10.4f}{s['median']:10.4f}{s['min']:10.4f}{s['max']:10.4f}")
+    for k, st in summary.items():
+        print(f"{k:<28}{st['mean']:10.4f}{st['median']:10.4f}{st['min']:10.4f}{st['max']:10.4f}")
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump(dict(config=args.config, split=args.split, noise=sigma,
                        variants={n: kw for n, kw in variants}, summary=summary), f, indent=2)
@@ -208,8 +231,10 @@ def main():
 
 
 def _panel(path, title, x_off, x_on, diff, r_off, r_on, sm_off, sm_on, fg):
+    """The per-slice figure; saved to `path`, or returned (for a notebook) when path is None."""
     import matplotlib
-    matplotlib.use("Agg")
+    if path is not None:
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     vmax = float(x_off.abs()[fg].quantile(0.99))
     c = int(sm_off.abs().pow(2).sum(dim=(-2, -1)).argmax())          # the strongest coil
@@ -239,6 +264,8 @@ def _panel(path, title, x_off, x_on, diff, r_off, r_on, sm_off, sm_on, fg):
     ax.set_title("column means of the diff (vertical stripes)", fontsize=9)
     fig.suptitle(title)
     fig.tight_layout()
+    if path is None:
+        return fig
     fig.savefig(path, dpi=100)
     plt.close(fig)
 
