@@ -88,13 +88,14 @@ RUN_TAG = "s3"
 SPLITS = "config/knee/guided/splits"
 # Raw k-space roots per CLUSTER (the CSV pairs are looked up in every root, so the layout does
 # not matter). torch: fastMRI's multicoil train + val. bigpurple: the paired multi-contrast knee
-# copy at /gpfs/scratch/rl5285/fastmrimutiknee/{train,val,test}, reached through the symlink
+# copy at /gpfs/scratch/rl5285/fastmrimutiknee/<split>/multicoil_<split>, reached through the symlink
 # ../datasets/fastmri_multiknee (bigpurple/setup_knee_data.sh). IMMAP_CLUSTER picks one; the
 # launchers set it. Every other data path (maps, scales, splits) is the same on both clusters.
 KNEE_ROOTS = {
     "torch": ["../datasets/fastmri/knee/multicoil_train",
               "../datasets/fastmri/knee/multicoil_val"],
-    "bigpurple": [f"../datasets/fastmri_multiknee/{s}" for s in ("train", "val", "test")],
+    "bigpurple": [f"../datasets/fastmri_multiknee/{s}/multicoil_{s}"
+                  for s in ("train", "val", "test")],
 }
 CLUSTER = os.environ.get("IMMAP_CLUSTER", "torch")
 if CLUSTER not in KNEE_ROOTS:

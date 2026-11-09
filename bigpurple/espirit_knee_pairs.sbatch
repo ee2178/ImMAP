@@ -33,8 +33,9 @@ THRESH_EIG="${THRESH_EIG:-0.9}"
 CHUNK="${CHUNK:-4}"
 N_SHARDS=8
 OUT="../datasets/fastmri_preprocessed/knee_coil_combined/${CONTRAST}_espirit_acs${ACS}_eig${THRESH_EIG}"
-ROOTS=(../datasets/fastmri_multiknee/train ../datasets/fastmri_multiknee/val
-       ../datasets/fastmri_multiknee/test)
+ROOTS=(../datasets/fastmri_multiknee/train/multicoil_train
+       ../datasets/fastmri_multiknee/val/multicoil_val
+       ../datasets/fastmri_multiknee/test/multicoil_test)
 
 CONDA_BASE="$(conda info --base 2>/dev/null)"
 [ -n "$CONDA_BASE" ] || { echo "conda not on PATH" >&2; exit 1; }
@@ -44,7 +45,7 @@ export PYTHONNOUSERSITE=1
 IMMAP_ROOT="${IMMAP_ROOT:-$HOME/scratch/ImMAP}"
 cd "$IMMAP_ROOT" || { echo "no such dir: $IMMAP_ROOT" >&2; exit 1; }
 mkdir -p bigpurple/logs
-[ -d ../datasets/fastmri_multiknee/train ] || {
+[ -d ../datasets/fastmri_multiknee/train/multicoil_train ] || {
     echo "no ../datasets/fastmri_multiknee: run bash bigpurple/setup_knee_data.sh" >&2; exit 1; }
 
 SHARD="${SLURM_ARRAY_TASK_ID:-0}"
