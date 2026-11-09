@@ -128,6 +128,17 @@ class GuidedLPDSLayer(LPDSLayer):
         v = self.analyse_guides(guides)
         return [to_planar(t) for t in v] if planar else v
 
+    def _zero_code(self, x):
+        """The all-zero latent the analysis conv would produce from `x`: M channels (2M planar),
+        on the strided grid, complex for a complex code."""
+        B, Hz, Wz = _code_shape(self, x)
+        planar = self.is_complex and not x.is_complex() and x.shape[1] == 2 * self.C
+        ch = 2 * self.M if planar else self.M
+        dtype = x.dtype
+        if self.is_complex and not planar and not x.is_complex():
+            dtype = torch.complex128 if x.dtype == torch.float64 else torch.complex64
+        return torch.zeros(B, ch, Hz, Wz, dtype=dtype, device=x.device)
+
     # -- forward ------------------------------------------------------------
     def forward(self, state, y_tilde, guide=None, E=None, sigma=None, pi=None,
                 cache=None):
@@ -151,12 +162,17 @@ class GuidedLPDSLayer(LPDSLayer):
                   and x0.shape[1] == 2 * self.C)
         v = self.guide_latents(guides, planar=planar) if guides else None
 
-        if state is None:
+        if state is None and getattr(self, "z_init", "prox") == "prox":
+            # cold start (lpds.jl): x = y~, z = GGT*(A y~) -- this layer makes no primal step
             x = y_tilde
             z, cache = self.prox(self.analysis(x), v, sigma, cache)
             return (x, z), cache
 
-        x, z = state
+        if state is None:
+            # z(0) = 0, x(0) = y~ (paper Eq. 13): this layer is a full sweep like every other
+            x, z = y_tilde, self._zero_code(y_tilde)
+        else:
+            x, z = state
         pi_x, pi_z = (None, None) if pi is None else pi
 
         tau = self.tau(sigma, ref=x)
@@ -192,6 +208,13 @@ class GuidedLPDSLayer(LPDSLayer):
         return (x_new, z_new), cache
 
 
+def _code_shape(layer, x):
+    B, _, H, W = x.shape
+    P, s = layer.P, layer.stride
+    p = (P - 1) // 2
+    return B, (H + 2 * p - P) // s + 1, (W + 2 * p - P) // s + 1
+
+
 def make_guided_lpds_layer(C, M, spectral_init=True, **kws):
     """One `GuidedLPDSLayer`, filters tied (`B = A^H`) and spectrally scaled."""
     layer = GuidedLPDSLayer(C, M, **kws)
@@ -199,6 +222,25 @@ def make_guided_lpds_layer(C, M, spectral_init=True, **kws):
     if spectral_init:
         layer.spectral_normalize()
     return layer
+
+
+def tie_transforms_(layers):
+    """Point every layer's W_theta, W_phi, W_alpha, W_beta and gamma at layer 0's (in place).
+
+    What Sljiva's LGGS runs share (config/guided_lpdsnet.yaml `share: {αβ: true, θϕ: true,
+    γ: true, ρ: false}`, the April-2026 runs behind the paper's results) and what the paper
+    states for the W's (arXiv 2610.22643, Sec. IV-A). eta, theta, A, B, tau and rho stay per
+    layer. Assigning the submodule makes each parameter one object: the optimiser updates it
+    once and `parameters()` counts it once (state_dict still lists it under every layer).
+    """
+    src = layers[0].prox.prox
+    if not src.grouped:
+        return layers
+    for layer in layers[1:]:
+        dst = layer.prox.prox
+        dst.Wtheta, dst.Wphi, dst.Walpha, dst.Wbeta = src.Wtheta, src.Wphi, src.Walpha, src.Wbeta
+        dst.gamma = src.gamma
+    return layers
 
 
 class _PaddedDataGrad:
@@ -243,8 +285,41 @@ class LGGSNet(nn.Module):
                  init_strategy="semi_orthogonal", attn_backend="gather",
                  flex_block_size=128, is_complex=True, preproc="kspace",
                  spectral_init=True, guide_blend=None, guide_gain0=1.0,
-                 triton_materialize=False):
+                 triton_materialize=False, tie_transforms=True, z_init="prox",
+                 guide_mean="per_guide", self_sim_fun=None, adj_blend=True,
+                 similarity_scale="learned", prox_degrees=None):
+        """Paper-alignment switches (notes/lggs_paper_alignment.md; arXiv 2610.22643). Apart
+        from tie_transforms, every default is the port's behaviour:
+
+        tie_transforms    ALWAYS on (2026-11-09): W_theta, W_phi, W_alpha, W_beta and gamma are
+                          shared across the K layers, as in Sljiva's LGGS runs (`share:` in
+                          config/guided_lpdsnet.yaml) and the paper (Sec. IV-A); eta, theta, A,
+                          B, tau and rho stay per layer. The key is kept so configs that name it
+                          still load; False is refused. Checkpoints trained untied (before this
+                          date) do not load into the tied net -- load_state_dict says so.
+        z_init            "prox": layer 0 is a cold start, z = GGT*(A y~) -- K - 1 sweeps.
+                          "zero": z(0) = 0 and every layer is a full sweep (paper Eq. 13).
+        guide_mean        "per_guide": each guide its own mean. "joint": one mean over all
+                          N_g guide slices (paper Appendix B, mu_w = mean(w)).
+        self_sim_fun, adj_blend, similarity_scale -> GuidedGroupThreshold (models/guided_prox).
+        prox_degrees      polynomial degree in sigma of the prox THRESHOLD tau alone; None =
+                          `degrees`, which otherwise sets the step sizes eta, theta too. Sljiva's
+                          LGGS runs: a noise-adaptive threshold (`degrees: 1` reaches only the
+                          GT's tau in src/networks/lpds.jl) with CONSTANT steps (degree 0) --
+                          `degrees=0, prox_degrees=1`.
+        """
         super().__init__()
+        if z_init not in ("prox", "zero"):
+            raise ValueError(f"z_init must be 'prox' or 'zero'; got {z_init!r}")
+        if guide_mean not in ("per_guide", "joint"):
+            raise ValueError(f"guide_mean must be 'per_guide' or 'joint'; got {guide_mean!r}")
+        if not tie_transforms:
+            raise ValueError("LGGS ties W_theta, W_phi, W_alpha, W_beta and gamma across layers "
+                             "(Sljiva's runs, the paper); tie_transforms=False is no longer "
+                             "supported")
+        self.tie_transforms = True
+        self.z_init = z_init
+        self.guide_mean = guide_mean
         self.K, self.M, self.C, self.P, self.s = int(K), int(M), int(C), int(P), int(s)
         self.is_complex = bool(is_complex)
         self.attn_backend = attn_backend
@@ -255,11 +330,14 @@ class LGGSNet(nn.Module):
         self.preproc = preproc
         self.pad_stride = self.s
 
+        self.prox_degrees = int(degrees if prox_degrees is None else prox_degrees)
         prox_kws = dict(nheads=nheads, dK=dK, sim_fun=sim_fun, rho0=rho0,
+                        degrees=self.prox_degrees,
                         gamma0=gamma0, rho_inv=rho_inv,
                         init_strategy=init_strategy, attn_backend=attn_backend,
                         flex_block_size=flex_block_size,
-                        triton_materialize=triton_materialize)
+                        triton_materialize=triton_materialize, self_sim_fun=self_sim_fun,
+                        adj_blend=adj_blend, similarity_scale=similarity_scale)
         if guide_blend is not None:            # "additive": models/guided_prox.py
             prox_kws.update(guide_blend=guide_blend, guide_gain0=guide_gain0)
         layer_kws = dict(P=P, stride=s, lam0=lam0, tau0=tau0, theta0=theta0,
@@ -271,6 +349,10 @@ class LGGSNet(nn.Module):
                                        **layer_kws)
         self.layers = nn.ModuleList(
             [proto] + [copy.deepcopy(proto) for _ in range(self.K - 1)])
+        for layer in self.layers:
+            layer.z_init = z_init
+        if self.tie_transforms:
+            tie_transforms_(self.layers)
 
     # -- guide preprocessing -------------------------------------------------
     def _prep_guides(self, guide, ref):
@@ -288,9 +370,14 @@ class LGGSNet(nn.Module):
             return []
         out = []
         pad = calc_pad_2d(*guides[0].shape[-2:], self.pad_stride)
+        joint = None
+        if self.guide_mean == "joint":
+            # one mean over all N_g guide slices (paper Appendix B: mu_w = mean(w))
+            joint = torch.stack([w.to(ref.dtype) for w in guides], dim=1).mean(
+                dim=(-4, -3, -2, -1), keepdim=True)[:, 0]
         for w in guides:
             w = w.to(ref.dtype)
-            w = w - w.mean(dim=(-3, -2, -1), keepdim=True)
+            w = w - (w.mean(dim=(-3, -2, -1), keepdim=True) if joint is None else joint)
             if any(pad):
                 w = _pad_complex(w, pad)
             if w.shape[-2:] != ref.shape[-2:]:
@@ -396,6 +483,23 @@ class LGGSNet(nn.Module):
                 f"nothing pads it, so the strided analysis / synthesis pair "
                 f"would not land back on the input grid.")
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """With tied transforms, refuse a checkpoint whose layers carry DIFFERENT W's (an untied
+        run): loading it would write every layer's copy into the one shared tensor, last wins."""
+        if self.tie_transforms:
+            ref = {}
+            for k, v in state_dict.items():
+                parts = k.split(".")
+                if len(parts) > 2 and parts[0] == "layers" and any(
+                        w in parts for w in ("Wtheta", "Wphi", "Walpha", "Wbeta", "gamma")):
+                    tail = ".".join(parts[2:])
+                    if tail in ref and not torch.equal(ref[tail], v):
+                        raise ValueError(
+                            f"tie_transforms=True, but the checkpoint's layers hold different "
+                            f"{tail}: it was trained with untied transforms")
+                    ref.setdefault(tail, v)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     # -- hooks ---------------------------------------------------------------
     def compile_flex(self):
         """torch.compile every guided prox's fused kernel (GPU; call once)."""
@@ -428,7 +532,9 @@ class LGGSNet(nn.Module):
 
     def extra_repr(self):
         return (f"K={self.K}, M={self.M}, C={self.C}, s={self.s}, "
-                f"preproc={self.preproc}")
+                f"preproc={self.preproc}, tie_transforms={self.tie_transforms}, "
+                f"z_init={self.z_init}, guide_mean={self.guide_mean}, "
+                f"prox_degrees={self.prox_degrees}")
 
 
 # Alias: the class is the port of `guided_lpds.jl`'s `GuidedLPDSNet`; `LGGSNet`
@@ -446,7 +552,8 @@ def lggs_defaults(num_guides=1, **over):
     """
     cfg = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
                joint_softmax=True, sim_fun="pidistance", lam0=1e-3, tau0=0.5,
-               theta0=0.0, dK=5, nheads=1, init_strategy="semi_orthogonal",
+               theta0=0.0, degrees=0, prox_degrees=1, dK=5, nheads=1,
+               init_strategy="semi_orthogonal",
                is_complex=True, preproc="kspace")
     cfg.update(over)
     return cfg, int(num_guides)

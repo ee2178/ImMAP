@@ -82,7 +82,7 @@ def test_materialized_guided_prox_equals_the_gather_prox(n_guides, heads):
     fused = GuidedGroupThreshold(M, triton_materialize=True, **kw).double()
     fused.load_state_dict(gather.state_dict())
     fused.attn_backend, fused.joint_fused = "triton", True     # constructors only: CPU box
-    gp._FUSED_JOINT_CHECKED.add(("triton", "pidistance", heads, 1, 5, True, True))
+    gp._FUSED_JOINT_CHECKED.add(("triton", "pidistance", heads, 1, 5, True, True, "pidistance"))
 
     z = cplx(2, M, n, n).requires_grad_()
     gs = [cplx(2, M, n, n) for _ in range(n_guides)]

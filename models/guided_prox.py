@@ -343,8 +343,33 @@ class GuidedGroupThreshold(GroupThreshold):
     """
 
     def __init__(self, M, guide_window=None, joint_softmax=True, guide_blend=None,
-                 guide_gain0=1.0, triton_materialize=False, **kws):
+                 guide_gain0=1.0, triton_materialize=False, self_sim_fun=None,
+                 adj_blend=True, similarity_scale="learned", **kws):
         super().__init__(M, **kws)
+        # Paper-alignment switches (notes/lggs_paper_alignment.md). Defaults are the port's
+        # behaviour, so existing configs and checkpoints are unchanged.
+        #   self_sim_fun      similarity of the SELF block S_zz; None = `sim_fun`, as before.
+        #                     The paper (arXiv 2610.22643, Sec. III-D, Eqs. 7, 15) applies the
+        #                     phase-invariant form only to guide terms: plain "distance" here.
+        #   adj_blend         blend a rebuilt adjacency with the previous one (Alg. 4 of
+        #                     GroupCDL, gather backend only). The paper forms Gamma afresh.
+        #   similarity_scale  "learned": the noise-adaptive rho scaling of q, k (group.jl);
+        #                     "none": no scale -- the paper's softmax has no temperature.
+        self.self_sim = self.sim_fun if self_sim_fun is None else str(self_sim_fun)
+        self.adj_blend = bool(adj_blend)
+        if similarity_scale not in ("learned", "none"):
+            raise ValueError(f"similarity_scale must be 'learned' or 'none'; "
+                             f"got {similarity_scale!r}")
+        self.similarity_scale = similarity_scale
+        if similarity_scale == "none":
+            self.rho = None
+        if (self.attn_backend in ("triton", "flex") and self.self_sim != self.sim_fun
+                and self.window > 1):
+            # a 1 x 1 self window is closed-form for any similarity (PointwiseAdjacency);
+            # a wider one would need a second fused kernel family
+            raise ValueError(f"self_sim_fun={self.self_sim!r} differs from sim_fun on the "
+                             f"{self.attn_backend} backend, which supports that only for a "
+                             f"1 x 1 self window (window={self.window})")
         # triton backend: hold each window branch's softmax weights (models/circulant_window.py)
         # instead of re-running the fused attention on every apply. The same map; a pure
         # performance switch, so it may be flipped on a trained checkpoint.
@@ -376,7 +401,24 @@ class GuidedGroupThreshold(GroupThreshold):
 
     # -- projections ---------------------------------------------------------
     def _rho_scale(self, x, sq):
+        if sq is None:                                  # similarity_scale="none"
+            return x
         return x / sq if self.rho_inv else x * sq
+
+    def _qk_scale(self, z, sigma):
+        """sqrt(rho + eps), doubled for a planar code's halves -- or None without a scale."""
+        if self.rho is None:
+            return None
+        sq = torch.sqrt(self.rho(sigma, ref=z) + self.eps)
+        if self._is_planar_state(z) and sq.shape[1] > 1:
+            sq = torch.cat((sq, sq), dim=1)            # planar q, k: one rho per PAIR
+        return sq
+
+    def _scaled_qk(self, z, sigma):
+        """The unguided fallback's q, k (GroupThreshold), honouring similarity_scale."""
+        if self.rho is not None:
+            return super()._scaled_qk(z, sigma)
+        return (self.Wtheta(z) if self.grouped else z), (self.Wphi(z) if self.grouped else z)
 
     def _project_qk(self, z, guides, sigma):
         """Query from `z`, keys from `z` and each guide, all sharing one rho.
@@ -387,11 +429,8 @@ class GuidedGroupThreshold(GroupThreshold):
         self and guide similarities on a common scale, which a joint softmax
         needs to mean anything.
         """
-        rho = self.rho(sigma, ref=z)
-        sq = torch.sqrt(rho + self.eps)
+        sq = self._qk_scale(z, sigma)
         planar = self._is_planar_state(z)
-        if planar and sq.shape[1] > 1:
-            sq = torch.cat((sq, sq), dim=1)            # planar q, k: one rho per PAIR
         q = self._rho_scale(self.Wtheta(z) if self.grouped else z, sq)
         k_self = self._rho_scale(self.Wphi(z) if self.grouped else z, sq)
         k_guides = [self._rho_scale(self._guide_phi(g), sq) for g in guides]
@@ -414,27 +453,29 @@ class GuidedGroupThreshold(GroupThreshold):
         return self.Wphi(g) if self.grouped else g
 
     # -- adjacencies ---------------------------------------------------------
-    def _fused_branch(self, q, k, win):
-        """One independently-normalised branch on the flex / triton backend."""
+    def _fused_branch(self, q, k, win, sim=None):
+        """One independently-normalised branch on the flex / triton backend. `sim` defaults to
+        `sim_fun`; the self branch passes `self_sim`."""
+        sim = self.sim_fun if sim is None else sim
         if win == 1 and circulant_flex.POINTWISE_SELF and self.attn_backend == "triton":
             # One neighbour: Gamma = I and the lse is the score at the pixel itself, with the
             # true complex modulus -- the triton kernel's convention, without its launch (fwd,
             # bwd, and once per layer in apply). The LGGS self window is 1.
-            return PointwiseAdjacency(q, k, sim=self.sim_fun, heads=self.nheads)
+            return PointwiseAdjacency(q, k, sim=sim, heads=self.nheads)
         if self.attn_backend == "triton" and self.triton_materialize:
-            return WindowAdjacency(q, k, win, sim=self.sim_fun, heads=self.nheads)
+            return WindowAdjacency(q, k, win, sim=sim, heads=self.nheads)
         if self.attn_backend == "triton":
-            return TritonAdjacency(q, k, win, sim=self.sim_fun,
+            return TritonAdjacency(q, k, win, sim=sim,
                                    heads=self.nheads,
                                    block_m=self.triton_block_m)
         q, k = self._stack_ri(q), self._stack_ri(k)
         if win == 1 and circulant_flex.POINTWISE_SELF:
             # one neighbour: the identity and a pointwise score, no attention kernel
-            return PointwiseAdjacency(q, k, sim=self.sim_fun, heads=self.nheads)
+            return PointwiseAdjacency(q, k, sim=sim, heads=self.nheads)
         # The mask must be THIS branch's window. It used to be the self window for every
         # branch, so with window != guide_window (LGGS: 1 vs 15) a flex guide branch attended
         # over the self window only.
-        return FlexAdjacency(q, k, win, sim=self.sim_fun, heads=self.nheads,
+        return FlexAdjacency(q, k, win, sim=sim, heads=self.nheads,
                              block_mask=self._flex_block_mask(q, win),
                              compiled=self._flex_fn)
 
@@ -445,7 +486,7 @@ class GuidedGroupThreshold(GroupThreshold):
         if self.attn_backend != "gather":
             # One independent windowed attention per branch. Under joint_softmax
             # they are merged afterwards through their log-sum-exps (forward).
-            return (self._fused_branch(q, k_self, self.window),
+            return (self._fused_branch(q, k_self, self.window, sim=self.self_sim),
                     [self._fused_branch(q, kg, self.guide_window)
                      for kg in k_guides])
 
@@ -454,7 +495,7 @@ class GuidedGroupThreshold(GroupThreshold):
     def _gather_adjacencies(self, q, k_self, k_guides, spatial):
         qh = self._to_heads(q)
         s_phi, col_phi, crow_phi = circulant_similarity_window(
-            self.sim_fun, qh, self._to_heads(k_self), self.window)
+            self.self_sim, qh, self._to_heads(k_self), self.window)
         branches = [circulant_similarity_window(
             self.sim_fun, qh, self._to_heads(kg), self.guide_window)
             for kg in k_guides]
@@ -499,7 +540,7 @@ class GuidedGroupThreshold(GroupThreshold):
             cache["gdupdate"] = 1
         elif cache.get("gdupdate", 0) % self.dK == 0:
             Phi_new, Om_new = self._build_adjacencies(z, guides, sigma)
-            if isinstance(Phi_new, Circulant):
+            if isinstance(Phi_new, Circulant) and self.adj_blend:
                 g = self.gamma(sigma, ref=z).reshape(-1)          # (nheads,)
                 g = g.repeat(z.shape[0]).view(-1, 1, 1)           # (B*h, 1, 1)
 
@@ -521,8 +562,7 @@ class GuidedGroupThreshold(GroupThreshold):
         window, with its OWN row-softmax. Same projections and rho as every other branch, so it
         adds no parameters; it stays out of the joint simplex because its query differs and the
         scores are not comparable with the self / guide ones."""
-        rho = self.rho(sigma, ref=q_lat)
-        sq = torch.sqrt(rho + self.eps)
+        sq = self._qk_scale(q_lat, sigma)
         q = self._rho_scale(self.Wtheta(q_lat) if self.grouped else q_lat, sq)
         k = self._rho_scale(self.Wphi(k_lat) if self.grouped else k_lat, sq)
         if self.attn_backend != "gather":
@@ -645,7 +685,7 @@ class GuidedGroupThreshold(GroupThreshold):
         process and raises if they disagree: a silently different attention would train
         without complaint. Returns the relative error (None when skipped)."""
         key = (self.attn_backend, self.sim_fun, self.nheads, self.window, self.guide_window,
-               ref.is_complex(), self.triton_materialize)
+               ref.is_complex(), self.triton_materialize, self.self_sim)
         if key in _FUSED_JOINT_CHECKED or os.environ.get("IMMAP_SKIP_FUSED_CHECK") == "1":
             return None
         _FUSED_JOINT_CHECKED.add(key)
@@ -663,7 +703,7 @@ class GuidedGroupThreshold(GroupThreshold):
         q, k_self, k_guides = self._project_qk(z, [g], None)
         vals = [_abs2(self.Walpha(t) if self.grouped else t) for t in (z, g)]
 
-        branches = [self._fused_branch(q, k_self, self.window),
+        branches = [self._fused_branch(q, k_self, self.window, sim=self.self_sim),
                     self._fused_branch(q, k_guides[0], self.guide_window)]
         outs = [self.apply_gamma(A, v) for A, v in zip(branches, vals)]
         fused = merge_joint(outs, [A._lse for A in branches], self.nheads)

@@ -76,7 +76,20 @@ class PairedKneeDataset(Dataset):
                  enumerate_slices=False, pad_multiple=1, organ_mask_source="none",
                  organ_mask_kws=None, check_acquisition=True, target="rss", smap_root=None,
                  volume_scales=None, volume_stat="acs_p95", side_volume_stat="full_p95",
-                 volume_target=1.0):
+                 volume_target=1.0, guide_slices=1):
+        # guide_slices: N_g side (PD) slices centred on the target slice, as the LGGS paper's
+        # guide (arXiv 2610.22643, Sec. III-E). 1 = the same slice only, the batch exactly as
+        # before. > 1 adds the OFFLINE maps of those slices (from the target's map file: same
+        # session, same coils) to coil-combine them with -- the target slice's online maps do
+        # not exist for its neighbours -- so it needs target='sense'. Slices beyond the volume
+        # repeat the edge slice.
+        guide_slices = int(guide_slices)
+        if guide_slices < 1 or guide_slices % 2 == 0:
+            raise ValueError(f"guide_slices must be odd and >= 1, got {guide_slices}")
+        if guide_slices > 1 and target != "sense":
+            raise ValueError("guide_slices > 1 coil-combines the guide slices with the offline "
+                             "maps, so it needs target='sense' (smap_root)")
+        self.guide_slices = guide_slices
         if target not in ("rss", "sense"):
             raise ValueError(f"target must be 'rss' or 'sense', got {target!r}")
         if target == "sense" and not smap_root:
@@ -185,8 +198,18 @@ class PairedKneeDataset(Dataset):
             if self.volume_scales is None else self.volume_scales[i]
         with h5py.File(pdfs_path, "r") as f:
             kspace = torch.from_numpy(f["kspace"][sl]) * main_fac
-        with h5py.File(pd_path, "r") as f:
-            side = torch.from_numpy(f["kspace"][sl]) * side_fac
+        side_smaps = None
+        if self.guide_slices == 1:
+            with h5py.File(pd_path, "r") as f:
+                side = torch.from_numpy(f["kspace"][sl]) * side_fac
+        else:
+            h = self.guide_slices // 2
+            js = [min(max(sl + o, 0), n - 1) for o in range(-h, h + 1)]   # edge slices repeat
+            with h5py.File(pd_path, "r") as f:
+                side = torch.stack([torch.from_numpy(f["kspace"][j]) for j in js]) * side_fac
+            with h5py.File(map_path, "r") as f:
+                side_smaps = torch.stack([torch.from_numpy(f["smaps"][j]) for j in js]
+                                         ).to(torch.complex64)
 
         C, H, W = kspace.shape
         rss = ifftc(kspace).abs().pow(2).sum(dim=0, keepdim=True).sqrt()      # (1, H, W)
@@ -205,6 +228,9 @@ class PairedKneeDataset(Dataset):
         else:
             organ = rss_object_mask(rss, **self.organ_mask_kws)
         pad_hw = torch.tensor(embedded_size((H, W), self.pad_multiple), dtype=torch.long)
+        if side_smaps is not None:
+            # (G, C, H, W) side k-space and its maps: training/recon.py::_guide combines them
+            return kspace, smaps, image, organ, pad_hw, side, side_smaps
         return kspace, smaps, image, organ, pad_hw, side
 
 
@@ -215,7 +241,7 @@ def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, 
                            pad_multiple=1, organ_mask_source="none", organ_mask_kws=None,
                            check_acquisition=True, num_workers=8, task="recon", target="rss",
                            smap_root=None, volume_scales=None, volume_stat="acs_p95",
-                           side_volume_stat="full_p95", volume_target=1.0):
+                           side_volume_stat="full_p95", volume_target=1.0, guide_slices=1):
     """`task` is accepted (the recon configs carry it) and must be "recon"."""
     if task != "recon":
         raise ValueError(f"fastmri_paired serves recon batches only, got task={task!r}")
@@ -226,7 +252,7 @@ def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, 
                            check_acquisition=check_acquisition, target=target,
                            smap_root=smap_root, volume_scales=volume_scales,
                            volume_stat=volume_stat, side_volume_stat=side_volume_stat,
-                           volume_target=volume_target)
+                           volume_target=volume_target, guide_slices=guide_slices)
     num_workers = int(num_workers)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
                       num_workers=num_workers, pin_memory=True,

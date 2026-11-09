@@ -19,6 +19,8 @@
             "lam0": 0.001,
             "tau0": 0.5,
             "theta0": 0.0,
+            "degrees": 0,
+            "prox_degrees": 1,
             "dK": 5,
             "nheads": 1,
             "init_strategy": "semi_orthogonal",

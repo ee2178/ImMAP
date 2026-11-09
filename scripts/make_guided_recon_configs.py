@@ -35,6 +35,7 @@ What is inherited, from what scripts/make_mg_recon_configs.py writes TODAY for k
     training     steps, epochs, val cadence, noise range, val noise / seed, loss, clip
     optimizer    Adam at the grid LR (LGGS: the grid's group-attention LR, from mggrouplpds)
     scheduler    cosine over the grid's step count
+    (LR, eta_min and clip are replaced by Sljiva's for EVERY cell when TRAIN_RECIPE="sljiva")
     data         slice ranges, organ_mask_source (NOT scale_fac: per contrast, set below)
     lpdsnet      its whole model block, from the grid's lpdsnet cell
 
@@ -158,6 +159,7 @@ TGVN_SIZE = dict(num_cascades=12, sens_chans=8, sens_pools=4, chans=18, pools=4)
 # tests/test_guided_recon.py pins it to lggs_defaults(attn_backend="triton").
 LGGS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
                    joint_softmax=True, sim_fun="pidistance", lam0=1e-3, tau0=0.5, theta0=0.0,
+                   degrees=0, prox_degrees=1,       # noise-adaptive threshold, constant steps
                    dK=5, nheads=1, init_strategy="semi_orthogonal", is_complex=True,
                    preproc="kspace", attn_backend="triton")
 
@@ -172,6 +174,33 @@ LGGS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
 #   guided_compile      torch.compile the glue around the attention (models/compile_glue.py)
 LGGS_SPEED_PARAMS = dict(triton_materialize=True)
 LGGS_SPEED_TRAINING = dict(planar_state=True, complex_conv="planar", guided_compile=True)
+
+# LGGS AS PUBLISHED (arXiv 2610.22643; notes/lggs_paper_alignment.md): the port's LGGS_PARAMS with
+# every paper-alignment switch on, the paper's Table S1 windows, its training recipe, and the
+# same speed settings. Not in DEFAULT_MODELS -- adding it there would renumber the launcher's
+# array tasks -- so launch it by name: MODELS="lggs_paper" sbatch --array=0 ...
+LGGS_PAPER_PARAMS = dict(
+    LGGS_PARAMS,
+    guide_window=3,                 # Table S1: W_g = 3 (the port: 15)
+    dK=1,                           # Gamma formed afresh in every layer (Sec. II-C, III-C)
+    adj_blend=False,                # ... and not blended with the previous one
+    tie_transforms=True,            # W_theta, W_phi, W_alpha, W_beta tied (Sec. IV-A)
+    self_sim_fun="distance",        # S_zz plain distance (Eqs. 7, 15); guide stays pidistance
+    similarity_scale="none",        # no learned temperature rho on q, k
+    z_init="zero",                  # z(0) = 0, K full sweeps (Eq. 13)
+    guide_mean="joint",             # mu_w over all N_g guide slices (Appendix B)
+)
+LGGS_PAPER_DATA = dict(guide_slices=3)          # N_g = 3 slices centred on the target (III-E)
+
+# THE OPTIMISATION RECIPE -- ONE SWITCH, THE SAME FOR EVERY CELL, so the comparison stays fair:
+#   "grid"    the mg grid's values, inherited per model (Adam 5e-4, LGGS 2e-4; cosine to 1e-6;
+#             clip 0.05). IN FORCE (2026-11-09): the running sweep was launched with it.
+#   "sljiva"  Sljiva's config/train.yaml, the recipe of its LGGS runs and the paper: cosine
+#             4e-4 -> 2e-6 over 3e5 steps, warmup 0, global-norm clip 1 (torch's
+#             clip_grad_norm_ is the same rule).
+# TODO(next sweep): switch to "sljiva" -- for ALL cells at once, never for some.
+TRAIN_RECIPE = "grid"
+SLJIVA_RECIPE = dict(lr=4e-4, eta_min=2e-6, clip_grad=1.0)
 
 MODELS = {
     "tgvn": dict(task="recon", guided=True, grid_base="varnet", pad_multiple=1,
@@ -188,6 +217,10 @@ MODELS = {
     "lggs": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
                  model=dict(type="LGGS", params=LGGS_PARAMS),
                  speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING)),
+    "lggs_paper": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                       model=dict(type="LGGS", params=LGGS_PAPER_PARAMS),
+                       speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING),
+                       data=LGGS_PAPER_DATA),
 }
 
 # Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,
@@ -296,8 +329,11 @@ def make_config(r, model, g, grid):
            else base["data"]["train"]["pad_multiple"])
     training = {k: v for k, v in base["training"].items() if k != "log_levels"}
     training["metric_range"] = METRIC_RANGE
+    if TRAIN_RECIPE == "sljiva":
+        training["clip_grad"] = SLJIVA_RECIPE["clip_grad"]
     speed = spec.get("speed") or {}
     training.update(speed.get("training", {}))
+    training.update(spec.get("training") or {})
     mri = dict(grid["lpdsnet"]["mri"], guide_R=int(g), guide_acs_lines=0,
                guide_mask_dist="uniform")
     name = cell_name(r, model, g)
@@ -308,8 +344,8 @@ def make_config(r, model, g, grid):
         "model": json.loads(json.dumps(model_block)),
         "paths": {"save_dir": f"trained_nets/guided_recon/{ANATOMY}/{RUN_TAG}/{name}",
                   "ckpt": None},
-        "data": {"train": _data("train", base["data"]["train"], pad),
-                 "val": _data("val", base["data"]["val"], pad)},
+        "data": {"train": dict(_data("train", base["data"]["train"], pad), **(spec.get("data") or {})),
+                 "val": dict(_data("val", base["data"]["val"], pad), **(spec.get("data") or {}))},
         "training": training,
         "mri": mri,
         "optimizer": base["optimizer"],
@@ -318,6 +354,13 @@ def make_config(r, model, g, grid):
     }
     if speed.get("params"):
         cfg["model"]["params"].update(speed["params"])
+    if TRAIN_RECIPE == "sljiva":
+        cfg["optimizer"] = dict(cfg["optimizer"], params=dict(
+            cfg["optimizer"]["params"], lr=SLJIVA_RECIPE["lr"]))
+        cfg["scheduler"] = dict(cfg["scheduler"], params=dict(
+            cfg["scheduler"]["params"], eta_min=SLJIVA_RECIPE["eta_min"]))
+    elif TRAIN_RECIPE != "grid":
+        raise ValueError(f"TRAIN_RECIPE must be 'grid' or 'sljiva', got {TRAIN_RECIPE!r}")
     if spec["task"] == "i2sb_recon":
         start = spec.get("x1_source", X1_SOURCE)
         tau, tau_ref, _ = bridge_tau(start, r)

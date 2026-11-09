@@ -129,6 +129,9 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
         # guide in: same undersampling (and offset) as the net's guide, the operator's maps
         if side is None:
             raise ValueError("x1_source='guide' needs a paired loader (side k-space)")
+        if isinstance(side, dict):
+            raise ValueError("x1_source='guide' starts the bridge from ONE side slice; set "
+                             "data.*.guide_slices to 1")
         g = undersample_guide(side.to(device, non_blocking=True), guide_R, guide_acs_lines,
                               guide_mask_dist, guide_offset)
         guide_img = Sense(extra["smaps"]).adjoint(ifftc(g))

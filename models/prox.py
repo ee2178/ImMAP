@@ -832,7 +832,8 @@ class GroupThreshold(nn.Module):
         # enough (models/base.py::project_once; a no-op guard outside batched_projection)
         if project_once(self.gamma):
             self.gamma.project_(lo=0.05, hi=0.95)
-        self.rho.project_(lo=0.1)
+        if self.rho is not None:             # None: similarity_scale="none" (guided prox)
+            self.rho.project_(lo=0.1)
         if self.grouped and project_once(self.Wbeta):
             self.Wbeta.weight.clamp_(min=0.0)
 

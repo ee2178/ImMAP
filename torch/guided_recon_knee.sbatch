@@ -33,7 +33,8 @@
 # SAME SETTINGS AS THE ONE-SHOT RECON GRID, NOT TGVN'S RECIPE: the configs are regenerated on every
 # launch from scripts/make_mg_recon_configs.py's knee cells (measured k-space + AWGN, online
 # ESPIRiT, center_frac 0.04 uniform mask, sigma ~ U[0.01, 0.02], Adam + cosine over 300k steps,
-# clip 0.05; magnitude NL1+NL2). LR: the grid's (LGGS: its group-attention LR). Splits are TGVN's
+# clip 0.05; magnitude NL1+NL2). LR: the grid's (LGGS: its group-attention LR) -- TRAIN_RECIPE in
+# the generator switches every cell to Sljiva's (4e-4 -> 2e-6, clip 1) at once. Splits are TGVN's
 # patient-level PD/PDFS pairs (config/knee/guided/splits/). Target: the offline SENSE image of the
 # PDFS k-space (ESPIRiT, ACS 32, thresh_eig 0.9 -- torch/espirit_knee_pairs.sbatch MUST have
 # finished; a cell refuses to start without the maps). Intensity: PER-VOLUME normalization --

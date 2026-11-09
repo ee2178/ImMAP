@@ -214,7 +214,13 @@ def _level_loss(net, levels, recon_e, x0, image, organ_mask, T, zinv, use_mask, 
 # none (E2E-VarNet, LPDSNet, ...) is how the unguided baselines train on the SAME paired data.
 # Unguided runs on the 5-tuple loader never reach any of this.
 def _unpack(batch):
-    """-> (kspace, smaps, image, organ_mask, pad_hw, side), side None for a 5-tuple."""
+    """-> (kspace, smaps, image, organ_mask, pad_hw, side), side None for a 5-tuple.
+
+    A 7-tuple is the paired loader with guide_slices > 1: `side` then comes back as a dict,
+    {"kspace": (B, G, C, H, W), "smaps": (B, G, C, H, W)} -- the guide slices and the offline
+    maps that coil-combine them (datasets/fastmri/paired.py)."""
+    if len(batch) == 7:
+        return (*batch[:5], {"kspace": batch[5], "smaps": batch[6]})
     if len(batch) == 6:
         return tuple(batch)
     if len(batch) != 5:
@@ -267,6 +273,21 @@ def _guide(net, side, smaps, T, device, guide_R=1, guide_acs_lines=0, guide_mask
     if side is None:
         raise ValueError(f"{type(net).__name__} is a guided model but the loader provides no "
                          f"side information; use a paired loader (data name 'fastmri_paired')")
+    if isinstance(side, dict):
+        # N_g guide slices (guide_slices > 1): each undersampled like the single guide and
+        # coil-combined with ITS OWN offline maps -> (B, G, 1, H, W), which a guided net splits
+        # into G guides (models/guided_prox.py::as_guide_list)
+        if getattr(net, "guide_domain", "image") == "kspace":
+            raise ValueError(f"{type(net).__name__} takes a k-space guide; guide_slices > 1 "
+                             f"is implemented for image-domain guides only")
+        k, maps = side["kspace"], side["smaps"].to(device, non_blocking=True)
+        gs = []
+        for j in range(k.shape[1]):
+            kj = undersample_guide(k[:, j].to(device, non_blocking=True), guide_R,
+                                   guide_acs_lines, guide_mask_dist, guide_offset)
+            g = Sense(maps[:, j]).adjoint(ifftc(kj))
+            gs.append(g if T.is_identity else T.adjoint(g))
+        return torch.stack(gs, dim=1)
     side = undersample_guide(side.to(device, non_blocking=True), guide_R, guide_acs_lines,
                              guide_mask_dist, guide_offset)
     if getattr(net, "guide_domain", "image") == "kspace":
@@ -282,6 +303,10 @@ def guide_display(net, guide, side, guide_R, T=None):
     back from the embedded grid by T. Empty when the net took no guide."""
     if guide is None:
         return []
+    if isinstance(side, dict):                    # N_g guide slices: show the centre one
+        side = side["kspace"][:, side["kspace"].shape[1] // 2]
+    if guide.dim() == 5:
+        guide = guide[:, guide.shape[1] // 2]
     rss = lambda k: ifftc(k).abs().pow(2).sum(dim=1, keepdim=True).sqrt()
     if getattr(net, "guide_domain", "image") == "kspace":
         seen = rss(guide)

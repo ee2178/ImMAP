@@ -314,7 +314,7 @@ def fused_prox(heads=1, lse_shift=None, **kw):
     gather = GuidedGroupThreshold(8, attn_backend="gather", **args).double()
     gather.load_state_dict(fused.state_dict())
     shift = iter(lse_shift or [])
-    fused._fused_branch = lambda q, k, win: FakeFused(fused, q, k, win, next(shift, 0.0))
+    fused._fused_branch = lambda q, k, win, sim=None: FakeFused(fused, q, k, win, next(shift, 0.0))
     return fused, gather
 
 
