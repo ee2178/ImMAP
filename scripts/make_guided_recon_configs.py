@@ -328,16 +328,26 @@ def _data(split, base_split, pad_multiple):
             "num_workers": 8}
 
 
+# ONE tau for every bridge cell (--tau; the launchers' TAU), e.g. to compare starting points at
+# the SAME bridge temperature rather than each at its own calibrated one. Replaces the per-start
+# calibration, and tags the cell names (and so the run dirs) with "_tau<value>" so these runs never
+# share a directory with calibrated ones. None = per-start calibration (BRIDGE_TAU_DIR).
+TAU_OVERRIDE = None
+
+
 def bridge_tau_path(r, model):
-    """Where a bridge cell's start-point calibration lives, else None."""
+    """Where a bridge cell's start-point calibration lives, else None (also under --tau)."""
     spec = MODELS[model]
-    if spec["task"] != "i2sb_recon":
+    if spec["task"] != "i2sb_recon" or TAU_OVERRIDE is not None:
         return None
     return f"{BRIDGE_TAU_DIR}/{spec.get('x1_source', X1_SOURCE)}_R{r}_{NORMALIZATION}.json"
 
 
 def cell_name(r, model, g):
-    return f"{model}_R{r}" + (f"_g{g}" if MODELS[model]["guided"] else "")
+    name = f"{model}_R{r}" + (f"_g{g}" if MODELS[model]["guided"] else "")
+    if TAU_OVERRIDE is not None and MODELS[model]["task"] == "i2sb_recon":
+        name += f"_tau{TAU_OVERRIDE:g}"
+    return name
 
 
 def make_config(r, model, g, grid):
@@ -383,6 +393,8 @@ def make_config(r, model, g, grid):
     if spec["task"] == "i2sb_recon":
         start = spec.get("x1_source", X1_SOURCE)
         tau, tau_ref, _ = bridge_tau(start, r)
+        if TAU_OVERRIDE is not None:
+            tau = float(TAU_OVERRIDE)                   # tau_ref only matters for x1_rms
         cfg["model"]["params"]["tau"] = tau             # BridgeTGVN checks it matches i2sb
         cfg["training"]["loss_type"] = "complex-mse"
         cfg["i2sb"] = {**SCHEDULE, "tau": tau, "deterministic": False, "posterior": "ddpm",
@@ -431,7 +443,12 @@ def main():
     p.add_argument("--list-cells", action="store_true",
                    help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name<TAB>tau file' "
                         "and exit (tau file: a bridge cell's calibration path, else '-')")
+    p.add_argument("--tau", type=float, default=None,
+                   help="one bridge tau for every i2sb cell (no per-start calibration); the cell "
+                        "names get a _tau<value> suffix")
     args = p.parse_args()
+    global TAU_OVERRIDE
+    TAU_OVERRIDE = args.tau
     write_config = _write_config()
 
     todo = cells(args.accels, args.models, args.guide_accels)
@@ -451,7 +468,7 @@ def main():
             write_config(cfg, path)
             extra = ""
             if cfg["task"] == "i2sb_recon":
-                cal = bridge_tau(cfg["i2sb"]["x1_source"], r)[2]
+                cal = TAU_OVERRIDE is not None or bridge_tau(cfg["i2sb"]["x1_source"], r)[2]
                 extra = (f" x1={cfg['i2sb']['x1_source']} tau={cfg['i2sb']['tau']:g} "
                          f"tau_scale={cfg['i2sb']['tau_scale']} tau_ref={cfg['i2sb']['tau_ref']}"
                          + ("" if cal else " (UNCALIBRATED: zero-filled fallback)"))

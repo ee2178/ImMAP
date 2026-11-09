@@ -533,6 +533,32 @@ def test_generator_cells_and_config_keys():
             assert cfg["training"]["metric_range"] == "gt_max", name
 
 
+def test_one_tau_for_every_start():
+    """--tau: the same tau in every bridge cell (model and i2sb), no calibration file, and the
+    cell names tagged so the runs never share a dir with calibrated ones."""
+    import yaml
+    with tempfile.TemporaryDirectory() as out:
+        cells = subprocess.run(
+            [sys.executable, os.path.join(REPO, "scripts", "make_guided_recon_configs.py"),
+             "--models", "sbtgvn_c8_guide", "sbtgvn_c8_acs", "sbtgvn_c8_adjoint", "--tau",
+             "0.07", "--list-cells"], check=True, cwd=REPO, capture_output=True, text=True
+        ).stdout.splitlines()
+        rows = [c.split(chr(9)) for c in cells if c.strip()]          # tab-separated
+        assert [r[4] for r in rows] == [f"sbtgvn_c8_{s}_R8_g1_tau0.07"
+                                        for s in ("guide", "acs", "adjoint")]
+        assert all(r[5] == "-" for r in rows)
+        subprocess.run([sys.executable, os.path.join(REPO, "scripts",
+                                                     "make_guided_recon_configs.py"),
+                        "--models", "sbtgvn_c8_guide", "sbtgvn_c8_acs", "--tau", "0.07",
+                        "--out", out], check=True, cwd=REPO, stdout=subprocess.DEVNULL)
+        for s_ in ("guide", "acs"):
+            name = f"sbtgvn_c8_{s_}_R8_g1_tau0.07"
+            cfg = yaml.safe_load(open(os.path.join(out, "knee", "guided", f"{name}.json")))
+            assert cfg["i2sb"]["tau"] == cfg["model"]["params"]["tau"] == 0.07
+            assert cfg["i2sb"]["x1_source"] == s_
+            assert cfg["paths"]["save_dir"].endswith(name)
+
+
 def test_bridge_tau_is_read_per_start_and_normalization():
     """Volume norm: tau = TAU_MARGIN_ABS x the absolute gap rule, no tau_ref. Fixed norm:
     TAU_MARGIN x the relative gap rule, tau_ref calibrated. Files keyed by start, R and
