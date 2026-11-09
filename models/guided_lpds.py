@@ -73,6 +73,7 @@ from models.base import batched_projection
 from models import compile_glue
 from models.components import to_complex, to_planar
 from models.lpds import LPDSLayer, _per_channel, gram
+from models.sb_schedule import BridgeScheduleMixin
 from operators.identity import Identity
 from operators.padding import calc_pad_2d, unpad
 from preprocessing.image import post_process, pre_process
@@ -153,7 +154,12 @@ class GuidedLPDSLayer(LPDSLayer):
         guides = as_guide_list(guide)
 
         hint = cache.pop("_gram_x", None)
-        x0 = y_tilde if state is None else state[0]
+        # state = (x, None): start the iteration at x instead of y~ (a bridge state, BridgeLGGS)
+        x_init = None
+        if state is not None and state[1] is None:
+            x_init, state = state[0], None
+        x_start = y_tilde if x_init is None else x_init
+        x0 = x_start if state is None else state[0]
         # planar STATE (LGGSNet.planar_state_active): x, z arrive real, [re; im] stacked. The
         # convs and the prox take that form as it is; only the data term and the guides adapt.
         # Told apart by the channel count, not the dtype: a complex net is also fed REAL images
@@ -164,13 +170,13 @@ class GuidedLPDSLayer(LPDSLayer):
 
         if state is None and getattr(self, "z_init", "prox") == "prox":
             # cold start (lpds.jl): x = y~, z = GGT*(A y~) -- this layer makes no primal step
-            x = y_tilde
+            x = x_start
             z, cache = self.prox(self.analysis(x), v, sigma, cache)
             return (x, z), cache
 
         if state is None:
             # z(0) = 0, x(0) = y~ (paper Eq. 13): this layer is a full sweep like every other
-            x, z = y_tilde, self._zero_code(y_tilde)
+            x, z = x_start, self._zero_code(x_start)
         else:
             x, z = state
         pi_x, pi_z = (None, None) if pi is None else pi
@@ -243,6 +249,32 @@ def tie_transforms_(layers):
     return layers
 
 
+_TIED = ("Wtheta", "Wphi", "Walpha", "Wbeta", "gamma")
+
+
+def _refuse_untied(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                   error_msgs):
+    """Load pre-hook of LGGSNet: refuse a state dict whose layers hold DIFFERENT copies of a tied
+    transform (an untied run) -- loading it would write every layer's copy into the one shared
+    tensor, last wins. `prefix` is this net's position in the model being loaded ("" alone,
+    "lggs." inside SBUnetLGGS, ...)."""
+    head = prefix + "layers."
+    ref = {}
+    for k, v in state_dict.items():
+        if not k.startswith(head):
+            continue
+        parts = k[len(head):].split(".")
+        if len(parts) < 2 or not any(w in parts for w in _TIED):
+            continue
+        tail = ".".join(parts[1:])                       # drop the layer index
+        if tail in ref and not torch.equal(ref[tail], v):
+            raise ValueError(f"{prefix or 'LGGSNet.'}layers.*.{tail} differs between layers: "
+                             f"this checkpoint was trained with untied transforms, which LGGS "
+                             f"no longer has (retrain, or evaluate it from a pre-2026-11-09 "
+                             f"commit)")
+        ref.setdefault(tail, v)
+
+
 class _PaddedDataGrad:
     """A learned operator's data gradient, seen from the PREPROCESSED grid.
 
@@ -285,18 +317,18 @@ class LGGSNet(nn.Module):
                  init_strategy="semi_orthogonal", attn_backend="gather",
                  flex_block_size=128, is_complex=True, preproc="kspace",
                  spectral_init=True, guide_blend=None, guide_gain0=1.0,
-                 triton_materialize=False, tie_transforms=True, z_init="prox",
+                 triton_materialize=False, z_init="prox",
                  guide_mean="per_guide", self_sim_fun=None, adj_blend=True,
                  similarity_scale="learned", prox_degrees=None):
-        """Paper-alignment switches (notes/lggs_paper_alignment.md; arXiv 2610.22643). Apart
-        from tie_transforms, every default is the port's behaviour:
+        """W_theta, W_phi, W_alpha, W_beta and gamma are ONE set shared by the K layers (as in
+        Sljiva's LGGS runs, `share:` in config/guided_lpdsnet.yaml, and the paper, Sec. IV-A);
+        eta, theta, A, B, tau and rho stay per layer. There is no untied variant. A checkpoint
+        whose layers hold different W's (trained untied, before 2026-11-09) is refused on load,
+        also when this net is nested in another model (SBUnetLGGS): `_refuse_untied`.
 
-        tie_transforms    ALWAYS on (2026-11-09): W_theta, W_phi, W_alpha, W_beta and gamma are
-                          shared across the K layers, as in Sljiva's LGGS runs (`share:` in
-                          config/guided_lpdsnet.yaml) and the paper (Sec. IV-A); eta, theta, A,
-                          B, tau and rho stay per layer. The key is kept so configs that name it
-                          still load; False is refused. Checkpoints trained untied (before this
-                          date) do not load into the tied net -- load_state_dict says so.
+        Paper-alignment switches (notes/lggs_paper_alignment.md; arXiv 2610.22643); every
+        default is the port's behaviour:
+
         z_init            "prox": layer 0 is a cold start, z = GGT*(A y~) -- K - 1 sweeps.
                           "zero": z(0) = 0 and every layer is a full sweep (paper Eq. 13).
         guide_mean        "per_guide": each guide its own mean. "joint": one mean over all
@@ -313,11 +345,6 @@ class LGGSNet(nn.Module):
             raise ValueError(f"z_init must be 'prox' or 'zero'; got {z_init!r}")
         if guide_mean not in ("per_guide", "joint"):
             raise ValueError(f"guide_mean must be 'per_guide' or 'joint'; got {guide_mean!r}")
-        if not tie_transforms:
-            raise ValueError("LGGS ties W_theta, W_phi, W_alpha, W_beta and gamma across layers "
-                             "(Sljiva's runs, the paper); tie_transforms=False is no longer "
-                             "supported")
-        self.tie_transforms = True
         self.z_init = z_init
         self.guide_mean = guide_mean
         self.K, self.M, self.C, self.P, self.s = int(K), int(M), int(C), int(P), int(s)
@@ -351,8 +378,10 @@ class LGGSNet(nn.Module):
             [proto] + [copy.deepcopy(proto) for _ in range(self.K - 1)])
         for layer in self.layers:
             layer.z_init = z_init
-        if self.tie_transforms:
-            tie_transforms_(self.layers)
+        tie_transforms_(self.layers)
+        # a pre-hook, not a load_state_dict override: it runs at any nesting depth (an
+        # override is skipped when a parent model's load_state_dict recurses into this one)
+        self._register_load_state_dict_pre_hook(_refuse_untied)
 
     # -- guide preprocessing -------------------------------------------------
     def _prep_guides(self, guide, ref):
@@ -483,23 +512,6 @@ class LGGSNet(nn.Module):
                 f"nothing pads it, so the strided analysis / synthesis pair "
                 f"would not land back on the input grid.")
 
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        """With tied transforms, refuse a checkpoint whose layers carry DIFFERENT W's (an untied
-        run): loading it would write every layer's copy into the one shared tensor, last wins."""
-        if self.tie_transforms:
-            ref = {}
-            for k, v in state_dict.items():
-                parts = k.split(".")
-                if len(parts) > 2 and parts[0] == "layers" and any(
-                        w in parts for w in ("Wtheta", "Wphi", "Walpha", "Wbeta", "gamma")):
-                    tail = ".".join(parts[2:])
-                    if tail in ref and not torch.equal(ref[tail], v):
-                        raise ValueError(
-                            f"tie_transforms=True, but the checkpoint's layers hold different "
-                            f"{tail}: it was trained with untied transforms")
-                    ref.setdefault(tail, v)
-        return super().load_state_dict(state_dict, strict=strict, assign=assign)
-
     # -- hooks ---------------------------------------------------------------
     def compile_flex(self):
         """torch.compile every guided prox's fused kernel (GPU; call once)."""
@@ -532,9 +544,70 @@ class LGGSNet(nn.Module):
 
     def extra_repr(self):
         return (f"K={self.K}, M={self.M}, C={self.C}, s={self.s}, "
-                f"preproc={self.preproc}, tie_transforms={self.tie_transforms}, "
+                f"preproc={self.preproc}, "
                 f"z_init={self.z_init}, guide_mean={self.guide_mean}, "
                 f"prox_degrees={self.prox_degrees}")
+
+
+class BridgeLGGS(BridgeScheduleMixin, LGGSNet):
+    """LGGS as an I2SB x0-regressor for reconstruction (task "i2sb_recon"; sb/i2sb_recon.py):
+
+        x0_hat, _ = net(x_t, sigma=std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n, guide=guide_image)
+
+    The same K guided primal-dual sweeps as LGGSNet on the measurement y (k-space preprocessing,
+    the same data term), but STARTED AT THE BRIDGE STATE: the primal iterate begins at x_t (in
+    the DC-removed frame of kspace_pre_process, x_t - mu) and layer 0 is the usual cold start
+    z = GGT*(A x_t) from it. The noise level the thresholds see is
+
+        sigma = sqrt(std_fwd^2 + sigma_n^2)     per sample
+
+    the bridge's own noise on top of the measurement's -- SBUnetLGGS's convention -- so the
+    noise-adaptive threshold (prox_degrees) widens toward t = 1. The guide is the fully
+    sampled side image, as for LGGS; `guided=False` runs the sweeps self-only.
+
+    Known maps and a complex output, like BridgeTGVN: the bridge state shares its phase
+    reference with the operator (x0_source "operator"). The schedule params MUST match
+    cfg["i2sb"] (assert_schedule_matches runs at startup)."""
+
+    def __init__(self, kind="brownian", tau=0.1, n_points=1000, beta_max=0.3, guided=True,
+                 **lggs):
+        if lggs.get("preproc", "kspace") != "kspace":
+            raise ValueError("BridgeLGGS reconstructs from k-space: preproc must be 'kspace'")
+        if not lggs.get("is_complex", True):
+            raise ValueError("BridgeLGGS needs is_complex=True: the bridge state is complex")
+        super().__init__(**dict(lggs, preproc="kspace"))
+        self.guided = bool(guided)
+        self._init_bridge_tables(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max)
+
+    def forward(self, x_t, sigma=None, x1=None, y=None, E=None, sigma_n=None, guide=None,
+                step=None):
+        if y is None or E is None:
+            raise ValueError("BridgeLGGS needs the measurement y and its operator E")
+        if not torch.is_complex(x_t) or x_t.shape[1] != self.C:
+            raise ValueError(f"expected a complex (B, {self.C}, H, W) bridge state, got "
+                             f"{tuple(x_t.shape)} {x_t.dtype}")
+        B = y.shape[0]
+        if sigma is None:
+            if step is None:
+                raise ValueError("BridgeLGGS needs the bridge position: sigma (std_fwd) or step")
+            st = torch.as_tensor(step, device=self.std_fwd.device).reshape(-1).long()
+            sigma = self.std_fwd[st]
+        s_b = torch.as_tensor(sigma, dtype=torch.float32, device=y.device).reshape(-1)
+        s_b = s_b.expand(B) if s_b.numel() == 1 else s_b
+        s_n = torch.zeros(B, device=y.device) if sigma_n is None else torch.as_tensor(
+            sigma_n, dtype=torch.float32, device=y.device).reshape(-1).expand(B)
+        sig = torch.sqrt(s_b ** 2 + s_n ** 2).reshape(B, 1, 1, 1)
+
+        y_tilde, Ep, params = kspace_pre_process(y, E, self.pad_stride)
+        mu, pad = params
+        x0 = _pad_complex(x_t, pad) if any(pad) else x_t
+        x0 = x0.to(y_tilde.dtype) - mu
+        if x0.shape != y_tilde.shape:
+            raise ValueError(f"bridge state {tuple(x0.shape)} is not on the measurement grid "
+                             f"{tuple(y_tilde.shape)}")
+        guides = self._prep_guides(guide if self.guided else None, y_tilde)
+        x, _ = self._sweeps((x0, None), y_tilde, guides, Ep, sig)
+        return kspace_post_process(x, list(params)), None
 
 
 # Alias: the class is the port of `guided_lpds.jl`'s `GuidedLPDSNet`; `LGGSNet`

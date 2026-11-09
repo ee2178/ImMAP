@@ -26,6 +26,7 @@ from .sb_unet import SBUnet
 from .sb_unet_lggs import SBUnetLGGS
 from .sb_recon_unet import SBReconUnet
 from .tgvn import TGVN, BridgeTGVN
+from .guided_lpds import BridgeLGGS
 from .unsb_nets import PatchDiscriminator, PatchEncoder, FeatureTap, PatchNCE, build_critics
 from .forward_ops import ForwardOp
 
@@ -112,6 +113,11 @@ def build_model(cfg):
     # started at x_t, Phi conditioned on the bridge position. Schedule params match cfg["i2sb"].
     elif model_type == "BridgeTGVN":
         return BridgeTGVN(**params)
+    elif model_type in ("BridgeLGGS", "SBLGGS"):
+        # LGGS as an i2sb_recon bridge regressor (models/guided_lpds.py::BridgeLGGS)
+        if params.get("guide_window", 1) <= 1 or params.get("Mh") is None:
+            raise ValueError(f"{model_type} needs guide_window > 1 and Mh, as LGGS does")
+        return BridgeLGGS(**params)
 
     # Multi*level* family (models/ml_cdlnet.py): the hierarchy is the MODEL
     # (x = D_1 D_2 ... D_L g_L), not a solver device, so the transfer operators

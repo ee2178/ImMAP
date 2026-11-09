@@ -62,7 +62,8 @@
                 "gamma0": 0.8,
                 "init_strategy": "semi_orthogonal",
                 "sim_fun": "pidistance",
-                "degrees": 1,
+                "degrees": 0,
+                "prox_degrees": 1,
                 "is_complex": false,
                 "preproc": "image"
             }

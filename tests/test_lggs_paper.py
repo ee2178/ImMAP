@@ -3,8 +3,8 @@
 
 Each switch is checked for what it claims, and the defaults for changing nothing:
 
-  tie_transforms     one W_theta/phi/alpha/beta for all layers; the paper-size parameter count;
-                     a checkpoint with untied W's refused
+  tied transforms    (no switch: always) one W_theta/phi/alpha/beta and gamma for all layers;
+                     the paper-size parameter count; an untied checkpoint refused, nested too
   z_init="zero"      layer 0 is a full sweep from (y~, 0)
   self_sim_fun       the self block's similarity, through the fused (pointwise) branch and gather
                      alike
@@ -36,7 +36,7 @@ from operators import Sense                                        # noqa: E402
 from operators.fourier import fftc, ifftc                          # noqa: E402
 
 D = torch.float64
-PAPER = dict(tie_transforms=True, z_init="zero", guide_mean="joint", self_sim_fun="distance",
+PAPER = dict(z_init="zero", guide_mean="joint", self_sim_fun="distance",
              adj_blend=False, similarity_scale="none", dK=1)
 
 
@@ -61,23 +61,24 @@ def close(a, b, tol):
 # defaults change nothing
 # =============================================================================================
 def test_defaults_are_the_port_with_tied_transforms():
-    """Every switch defaults to the port, except tying, which is forced (Sljiva's runs tie the
-    W's and gamma; so does the paper for the W's)."""
+    """Every switch defaults to the port. Tying is not a switch: always on (Sljiva's runs tie
+    the W's and gamma; so does the paper for the W's), and there is no option to untie."""
     net = small()
     gt = net.layers[0].prox.prox
-    assert (net.tie_transforms, net.z_init, net.guide_mean) == (True, "prox", "per_guide")
+    assert (net.z_init, net.guide_mean) == ("prox", "per_guide")
+    assert not hasattr(net, "tie_transforms")
     assert (gt.self_sim, gt.adj_blend, gt.similarity_scale) == (gt.sim_fun, True, "learned")
     assert gt.rho is not None
     assert net.layers[0].prox.prox.Wtheta is net.layers[1].prox.prox.Wtheta
-    with pytest.raises(ValueError, match="no longer supported"):
-        small(tie_transforms=False)
+    with pytest.raises(TypeError, match="tie_transforms"):
+        small(tie_transforms=True)                          # not an argument at all
 
 
 # =============================================================================================
 # tied transforms
 # =============================================================================================
 def test_tied_transforms_are_one_object_and_train_as_one():
-    net = small(tie_transforms=True)
+    net = small()
     w0 = net.layers[0].prox.prox
     for layer in net.layers[1:]:
         t = layer.prox.prox
@@ -116,6 +117,20 @@ def test_tied_net_refuses_an_untied_checkpoint(which):
     with pytest.raises(ValueError, match="untied"):
         net.load_state_dict(sd)
     net.load_state_dict(small().state_dict())                        # a tied one loads
+
+    # NESTED (SBUnetLGGS holds its LGGS as `lggs`): the parent's load_state_dict recurses into
+    # the child without calling the child's load_state_dict, so the check is a load pre-hook
+    class Parent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.pre = torch.nn.Linear(2, 2).double()
+            self.lggs = small()
+    parent = Parent()
+    psd = {k: v.clone() for k, v in parent.state_dict().items()}
+    psd["lggs." + key] += 1.0
+    with pytest.raises(ValueError, match="untied"):
+        parent.load_state_dict(psd)
+    parent.load_state_dict(Parent().state_dict())
 
 
 # =============================================================================================
@@ -332,7 +347,7 @@ def test_generator_lggs_paper_cell():
     gen = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gen)
     p = gen.MODELS["lggs_paper"]["model"]["params"]
-    assert p["guide_window"] == 3 and p["dK"] == 1 and p["tie_transforms"] is True
+    assert p["guide_window"] == 3 and p["dK"] == 1 and "tie_transforms" not in p
     assert (p["z_init"], p["guide_mean"], p["self_sim_fun"], p["similarity_scale"]) == \
         ("zero", "joint", "distance", "none") and p["adj_blend"] is False
     assert gen.MODELS["lggs_paper"]["data"] == {"guide_slices": 3}

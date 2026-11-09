@@ -86,8 +86,20 @@ DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c12", "tgvn_c10", "tgvn_c8", "tgvn_c6
 # dir that has a checkpoint, so reusing an earlier set's would silently continue those runs.
 RUN_TAG = "s3"
 SPLITS = "config/knee/guided/splits"
-KSPACE_ROOTS = ["../datasets/fastmri/knee/multicoil_train",
-                "../datasets/fastmri/knee/multicoil_val"]
+# Raw k-space roots per CLUSTER (the CSV pairs are looked up in every root, so the layout does
+# not matter). torch: fastMRI's multicoil train + val. bigpurple: the paired multi-contrast knee
+# copy at /gpfs/scratch/rl5285/fastmrimutiknee/{train,val,test}, reached through the symlink
+# ../datasets/fastmri_multiknee (bigpurple/setup_knee_data.sh). IMMAP_CLUSTER picks one; the
+# launchers set it. Every other data path (maps, scales, splits) is the same on both clusters.
+KNEE_ROOTS = {
+    "torch": ["../datasets/fastmri/knee/multicoil_train",
+              "../datasets/fastmri/knee/multicoil_val"],
+    "bigpurple": [f"../datasets/fastmri_multiknee/{s}" for s in ("train", "val", "test")],
+}
+CLUSTER = os.environ.get("IMMAP_CLUSTER", "torch")
+if CLUSTER not in KNEE_ROOTS:
+    raise SystemExit(f"IMMAP_CLUSTER={CLUSTER!r}: expected one of {sorted(KNEE_ROOTS)}")
+KSPACE_ROOTS = KNEE_ROOTS[CLUSTER]
 # Offline ESPIRiT maps + SENSE images of the PDFS (target) volumes: torch/espirit_knee_pairs.sbatch
 # at thresh_eig 0.9 (the 0.95 maps in .../pdfs_espirit_acs32 cut into the anatomy).
 PDFS_MAPS = "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9"
@@ -184,7 +196,6 @@ LGGS_PAPER_PARAMS = dict(
     guide_window=3,                 # Table S1: W_g = 3 (the port: 15)
     dK=1,                           # Gamma formed afresh in every layer (Sec. II-C, III-C)
     adj_blend=False,                # ... and not blended with the previous one
-    tie_transforms=True,            # W_theta, W_phi, W_alpha, W_beta tied (Sec. IV-A)
     self_sim_fun="distance",        # S_zz plain distance (Eqs. 7, 15); guide stays pidistance
     similarity_scale="none",        # no learned temperature rho on q, k
     z_init="zero",                  # z(0) = 0, K full sweeps (Eq. 13)
@@ -244,6 +255,13 @@ for _n in TGVN_CASCADE_SWEEP:
             model=dict(type="BridgeTGVN", params=dict(guided=True, cond_sigma=True,
                                                       **dict(TGVN_SIZE, num_cascades=_n),
                                                       **SCHEDULE)))
+# ... and LGGS as the bridge regressor (models/guided_lpds.py::BridgeLGGS): the knee LGGS cell's
+# architecture and speed settings, started at the bridge state: sblggs_<start>.
+for _src in BRIDGE_STARTS:
+    MODELS[f"sblggs_{_src}"] = dict(
+        task="i2sb_recon", guided=True, grid_base="mggrouplpds", pad_multiple=2, x1_source=_src,
+        model=dict(type="BridgeLGGS", params=dict(LGGS_PARAMS, **SCHEDULE)),
+        speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING))
 
 # Per-start bridge temperature. The gap x0 - x1 differs completely between starts (aliasing for
 # "adjoint", blur for "acs", CONTRAST for "guide"), so each gets its own calibration, written by

@@ -472,9 +472,13 @@ def test_generator_cells_and_config_keys():
     names = [gen.cell_name(*c) for c in gen.cells()]
     assert names == ["lpdsnet_R8", "lggs_R8_g1", "tgvn_c12_R8_g1", "tgvn_c10_R8_g1",
                      "tgvn_c8_R8_g1", "tgvn_c6_R8_g1"], names
-    bridge = [f"sbtgvn_c8_{s}" for s in gen.BRIDGE_STARTS]
+    bridge = [f"sbtgvn_c8_{s}" for s in gen.BRIDGE_STARTS] + \
+        [f"sblggs_{s}" for s in gen.BRIDGE_STARTS]
     assert [gen.cell_name(8, m, 1) for m in bridge] == [
-        "sbtgvn_c8_guide_R8_g1", "sbtgvn_c8_adjoint_R8_g1", "sbtgvn_c8_acs_R8_g1"]
+        "sbtgvn_c8_guide_R8_g1", "sbtgvn_c8_adjoint_R8_g1", "sbtgvn_c8_acs_R8_g1",
+        "sblggs_guide_R8_g1", "sblggs_adjoint_R8_g1", "sblggs_acs_R8_g1"]
+    p = gen.MODELS["sblggs_adjoint"]["model"]["params"]
+    assert {k: p[k] for k in gen.LGGS_PARAMS} == gen.LGGS_PARAMS     # the knee LGGS cell
     for n in gen.TGVN_CASCADE_SWEEP:
         p = gen.MODELS[f"tgvn_c{n}"]["model"]["params"]
         assert p["num_cascades"] == n and p["chans"] == 18 and p["sens_chans"] == 8
@@ -520,7 +524,7 @@ def test_generator_cells_and_config_keys():
             if cfg["task"] == "i2sb_recon":
                 for k in ("kind", "tau", "n_points", "beta_max"):
                     assert cfg["model"]["params"][k] == cfg["i2sb"][k], (name, k)
-                assert cfg["i2sb"]["x1_source"] == name.split("_")[2], name
+                assert cfg["i2sb"]["x1_source"] == gen.MODELS[name.split("_R")[0]]["x1_source"]
                 assert cfg["i2sb"]["tau_scale"] == gen.TAU_SCALE, name
                 assert (gen.TAU_SCALE == "none") == (gen.NORMALIZATION == "volume")
                 assert isinstance(cfg["i2sb"]["dc_lam"], float), (name, cfg["i2sb"]["dc_lam"])
@@ -781,6 +785,76 @@ def test_i2sb_recon_end_to_end_bridge_tgvn_with_2x_guide():
         raises(ValueError, lambda: train_i2sb_recon(
             spy, torch.optim.Adam(spy.parameters()), None, "cpu", loader(), None, tau=0.1,
             tau_scale="x1_rms", save_dir=d), "tau_ref")
+
+
+def _tiny_bridge_lggs(**kw):
+    from models.guided_lpds import BridgeLGGS
+    torch.manual_seed(0)
+    base = dict(tau=0.1, K=3, M=8, C=1, P=5, s=2, Mh=4, window=1, guide_window=3, dK=2,
+                lam0=0.05, attn_backend="gather", spectral_init=False, degrees=0,
+                prox_degrees=1)
+    return BridgeLGGS(**dict(base, **kw))
+
+
+def test_bridge_lggs_is_lggs_started_at_the_bridge_state():
+    """Started where LGGSNet starts (x_t = y~ + mu, the k-space preprocessing's own start) and
+    at the same total noise sqrt(std_fwd^2 + sigma_n^2), BridgeLGGS IS LGGSNet; another x_t gives
+    another output (the bridge state is used); the guide matters unless guided=False."""
+    from models.guided_lpds import LGGSNet
+    from preprocessing.kspace import kspace_pre_process
+    net = _tiny_bridge_lggs()
+    m = torch.zeros(1, 1, H, W)
+    m[..., ::2] = 1
+    m[..., W // 2 - 2:W // 2 + 2] = 1
+    E = Mask(m) @ FFT2D() @ Sense(torch.from_numpy(MAPS)[None])
+    g = torch.Generator().manual_seed(1)
+    rnd = lambda: torch.complex(torch.randn(1, 1, H, W, generator=g),          # noqa: E731
+                                torch.randn(1, 1, H, W, generator=g))
+    x, guide = rnd(), rnd()
+    y = E.forward(x)
+    with torch.no_grad():
+        ref, _ = LGGSNet.forward(net, y, guide=guide, E=E,
+                                 sigma=torch.full((1, 1, 1, 1), 0.05))
+        yt, _, (mu, _) = kspace_pre_process(y, E, net.pad_stride)
+        out, _ = net(yt + mu, sigma=torch.tensor([0.03]), y=y, E=E,
+                     sigma_n=torch.tensor([0.04]), guide=guide)         # sqrt(.03^2 + .04^2)
+        assert torch.allclose(out, ref, atol=1e-5), float((out - ref).abs().max())
+        other, _ = net(rnd(), sigma=torch.tensor([0.03]), y=y, E=E,
+                       sigma_n=torch.tensor([0.04]), guide=guide)
+        assert float((other - ref).abs().max()) > 1e-3
+        noguide, _ = _tiny_bridge_lggs(guided=False)(yt + mu, sigma=torch.tensor([0.03]), y=y,
+                                                      E=E, sigma_n=torch.tensor([0.04]),
+                                                      guide=guide)
+        assert float((noguide - ref).abs().max()) > 1e-6
+    raises(ValueError, lambda: _tiny_bridge_lggs(preproc="image"), "k-space")
+
+
+def test_i2sb_recon_end_to_end_bridge_lggs():
+    from training.i2sb_recon import train_i2sb_recon
+    import physics.online_smaps as osm
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,  # noqa: E731
+                                                drop_last=False, scale_fac=1.0, start_slice=1,
+                                                end_slice=3, num_workers=0, pad_multiple=2)
+        net = _tiny_bridge_lggs()
+        before = [p.detach().clone() for p in net.parameters()]
+        wb = FakeWandb()
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
+        try:
+            train_i2sb_recon(net, torch.optim.Adam(net.parameters(), lr=1e-3), None, "cpu",
+                             loader(), loader(), num_epochs=1, steps_per_epoch=2,
+                             val_every_epochs=1, R=4, acs_lines=4,
+                             kspace_type="measurement_awgn", online_smaps="espirit",
+                             noise_std=(0.0, 0.01), val_noise_std=0.005, val_seed=0,
+                             loss_type="complex-mse", tau=0.1, val_mode="full_recon",
+                             val_nfe=2, guide_R=1, save_dir=d, wandb=wb, dc_iters=2)
+        finally:
+            osm.online_smaps = real
+        assert sum(not torch.equal(a, b) for a, b in zip(before, net.parameters())) > 0
+        assert any("val/nodc_psnr" in c for c in wb.calls)
+        assert os.path.exists(os.path.join(d, "net_bestval.ckpt"))
 
 
 def test_guide_bridge_start_is_the_side_image_with_the_nets_guide_lines():

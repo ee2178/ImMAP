@@ -23,8 +23,8 @@ are the better reference** for anything compared against the paper's results.
 
 | Item | Port (before 2026-11-09) | Sljiva, evaluated runs | Paper text | Now |
 |---|---|---|---|---|
-| W_theta, W_phi, W_alpha, W_beta | untied | **tied** (`share: αβ, θϕ`) | tied (Sec. IV-A) | **forced tied** |
-| gamma (adjacency blend weight) | per layer | **tied** (`share: γ`) | - (no blending) | **forced tied** |
+| W_theta, W_phi, W_alpha, W_beta | untied | **tied** (`share: αβ, θϕ`) | tied (Sec. IV-A) | **tied, no untied option** |
+| gamma (adjacency blend weight) | per layer | **tied** (`share: γ`) | - (no blending) | **tied, no untied option** |
 | rho | learned, per layer | learned, per layer (`share ρ: false`) | none | per layer; `similarity_scale: none` optional |
 | Threshold noise-adaptivity | `degrees 0` | `degrees: 1` on the prox threshold; steps eta, theta at 0 | not mentioned | **Sljiva's**: `degrees: 0`, `prox_degrees: 1` |
 | Guide window | 15 | **15** | 3 (Table S1) | 15 in `lggs`, 3 in `lggs_paper` |
@@ -39,20 +39,23 @@ are the better reference** for anything compared against the paper's results.
 
 ## Changes on 2026-11-09
 
-### 1. Tied transforms and gamma are forced
+### 1. Tied transforms and gamma, always
 
-`models/guided_lpds.py::tie_transforms_`, called by every `LGGSNet`, shares W_theta, W_phi,
-W_alpha, W_beta **and gamma** across the K layers. eta, theta, A, B, tau and rho stay per layer, as
-in Sljiva. `tie_transforms=False` is refused.
+`models/guided_lpds.py::tie_transforms_`, called by every `LGGSNet` (so also by `SBUnetLGGS`,
+which builds its stage as one), shares W_theta, W_phi, W_alpha, W_beta **and gamma** across the K
+layers. eta, theta, A, B, tau and rho stay per layer, as in Sljiva. There is **no untied option**:
+`LGGSNet` takes no `tie_transforms` argument (naming it is a TypeError).
 
 At paper size this gives 1.04 M parameters (real W's), against Table S1's 1.08 M (which would fit
 complex W's). Before the change it was 2.30 M.
 
 **Consequences:**
 - **Old checkpoints:** any LGGS checkpoint trained before this date (the knee `lggs` run, the
-  NYUMets `SBUnetLGGS` runs) has untied W's and does **not** load. `load_state_dict` raises a
-  clear error rather than writing every layer's copy into the one shared tensor. Retrain, or
-  check out an older commit to evaluate them.
+  NYUMets `SBUnetLGGS` runs) has untied W's and does **not** load: a load pre-hook on `LGGSNet`
+  (`_refuse_untied`) raises rather than writing every layer's copy into the one shared tensor.
+  A pre-hook, not a `load_state_dict` override, so it also fires when LGGS is nested (an
+  override is skipped when `SBUnetLGGS.load_state_dict` recurses into its `lggs` child). Retrain,
+  or check out an older commit to evaluate them.
 - **gamma only matters on the gather backend,** which blends adjacencies. The triton backend
   re-caches instead of blending (see below).
 
@@ -60,12 +63,12 @@ complex W's). Before the change it was 2.30 M.
 
 `LGGSNet(prox_degrees=...)` sets the polynomial degree in sigma of the prox threshold tau
 **alone**. `degrees` keeps setting the step sizes eta, theta, and `prox_degrees=None` (the default)
-follows `degrees`, so the NYUMets `SBUnetLGGS` configs (`degrees: 1`, steps included) are
-unchanged.
+follows `degrees`.
 
 Sljiva's runs use `degrees: 1`, which reaches only the GT's tau (`src/networks/lpds.jl`); the
 step sizes are degree 0. The knee cells (`LGGS_PARAMS`, `lggs_defaults`) now carry that split,
-`degrees: 0, prox_degrees: 1`. The threshold starts constant (slope 0) and learns its slope from
+`degrees: 0, prox_degrees: 1`, and so do the 22 NYUMets `SBUnetLGGS` configs (until
+2026-11-09 they had `degrees: 1`, the steps noise-adaptive too). The threshold starts constant (slope 0) and learns its slope from
 the per-sample noise level the trainer passes. The fused planar clip kernel accepts a per-sample
 threshold (B, M, 1, 1), so the fast path is kept.
 
