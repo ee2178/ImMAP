@@ -216,17 +216,52 @@ def save_ckpt(
     # per-process temp name: two processes saving the same path (a cell launched twice) must not
     # write into one temp file either; the last complete rename wins, and neither is truncated
     tmp = f"{path}.partial.{os.getpid()}"
-    try:
-        _save_payload(get_state_dict, path=tmp, step=step, model=model, optimizer=optimizer,
-                      scheduler=scheduler, backtrack_count=backtrack_count, best_loss=best_loss,
-                      best_val_loss=best_val_loss, ema=ema)
-        os.replace(tmp, path)
-    except BaseException:
+
+    # A FULL FILESYSTEM IS RETRIED, then skipped (2026-11-10: bigpurple's shared scratch returned
+    # ENOSPC intermittently -- a fileset/pool limit, not this user's quota -- and killed multi-day
+    # runs at a checkpoint). Each attempt waits longer; if the space never comes back, this save
+    # is skipped with a warning and training goes on: the previous checkpoint is intact (atomic
+    # rename), and the next save tries again. Any other error is raised at once.
+    for attempt, delay in enumerate(list(SAVE_RETRY_DELAYS) + [None]):
         try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+            _save_payload(get_state_dict, path=tmp, step=step, model=model,
+                          optimizer=optimizer, scheduler=scheduler,
+                          backtrack_count=backtrack_count, best_loss=best_loss,
+                          best_val_loss=best_val_loss, ema=ema)
+            os.replace(tmp, path)
+            if attempt:
+                print(f"[ckpt] saved {path} on attempt {attempt + 1}", flush=True)
+            return True
+        except BaseException as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if not _is_space_error(e):
+                raise
+            if delay is None:
+                print(f"[ckpt] WARNING: filesystem still full after {attempt + 1} attempts; "
+                      f"SKIPPING this save of {path} (the previous one is intact): {e}",
+                      flush=True)
+                return False
+            print(f"[ckpt] no space writing {path} ({e}); retrying in {delay:.0f} s",
+                  flush=True)
+            _sleep(delay)
+
+
+# Waits (s) between attempts at a checkpoint save that hit a full filesystem: ~15 min in all.
+SAVE_RETRY_DELAYS = (30, 60, 120, 240, 480)
+_sleep = __import__("time").sleep          # module-level so tests can replace it
+
+
+def _is_space_error(e):
+    """A full filesystem or exhausted quota, as torch.save / the OS report it."""
+    import errno
+    if isinstance(e, OSError) and e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+        return True
+    msg = str(e)
+    return any(s in msg for s in ("No space left", "Disk quota exceeded", "unexpected pos",
+                                  "basic_ios::clear"))
 
 
 def _save_payload(get_state_dict, path, step, model, optimizer, scheduler, backtrack_count,

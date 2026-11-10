@@ -31,10 +31,9 @@ from datasets.registry import build_loader
 from models import build_model
 from sb.base import build_schedule
 from sb.i2sb_recon import bridge_noise_scale, i2sb_recon_sample
-from training.common import load_ckpt
 import yaml
 from training.forward_op import fixed_val_subset
-from training.i2sb_recon import BESTVAL_CKPT, _measure
+from training.i2sb_recon import BESTVAL_CKPT, _measure, load_sampling_weights
 from training.metrics import compute_metrics
 
 
@@ -59,7 +58,7 @@ def load_run(run_dir, ckpt=BESTVAL_CKPT, device=None, config=None):
         raise ValueError(f"{cfg_path} is task {cfg.get('task')!r}, not i2sb_recon")
     i2, mri, tr = cfg["i2sb"], cfg["mri"], cfg["training"]
     net = build_model(cfg).to(device).eval()
-    load_ckpt(os.path.join(run_dir, ckpt), model=net, device=device)
+    load_sampling_weights(net, os.path.join(run_dir, ckpt), device)   # net.ckpt -> its EMA
     bridge = build_schedule(kind=i2.get("kind", "brownian"), tau=i2["tau"],
                             n_points=i2.get("n_points", 1000), beta_max=i2.get("beta_max", 0.3),
                             device=device)
@@ -87,7 +86,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", required=True, help="an i2sb_recon run's save_dir (has config)")
     ap.add_argument("--config", default=None, help="default: <run-dir>/config.json")
-    ap.add_argument("--ckpt", default=BESTVAL_CKPT, help="file in run-dir (default: best val)")
+    ap.add_argument("--ckpt", default=BESTVAL_CKPT,
+                    help="file in run-dir: net_bestval.ckpt (best val, default) or net.ckpt "
+                         "(the latest validation; its EMA weights are used)")
     ap.add_argument("--dc", type=_setting, nargs="+",
                     default=[(7, 7e-5), (7, 1e-3), (7, 1e-2)], metavar="ITERS:LAM")
     ap.add_argument("--nfe", type=int, default=None, help="default: the run's val_nfe")

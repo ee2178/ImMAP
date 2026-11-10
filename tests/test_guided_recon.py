@@ -674,6 +674,29 @@ def test_volume_stats_and_per_volume_loader_scaling():
         raises(KeyError, lambda: PairedKneeDataset(csv, root, volume_scales=out), "pd0.h5")
 
 
+def test_guide_display_uses_the_operators_maps():
+    """A k-space guide (TGVN's) is shown as |S^H F^-1 k| with the operator's maps -- what an
+    image guide and the i2sb guide start are -- not as its coil RSS; RSS only without maps."""
+    from scripts.eval_guided_recon import guide_image
+    k = torch.randn(1, C, H, W, dtype=torch.complex64)
+    maps = torch.from_numpy(MAPS)[None]
+    want = Sense(maps).adjoint(ifftc(k)).abs()
+
+    class KNet:
+        guide_domain = "kspace"
+    (lab, seen), = tr.guide_display(KNet(), k, k, 1, smaps=maps)
+    assert lab == "guide" and torch.allclose(seen, want, atol=1e-6)
+    tiles = tr.guide_display(KNet(), k, k, 2, smaps=maps)          # the reference tile too
+    assert torch.allclose(tiles[1][1], want, atol=1e-6)
+    (_, rss), = tr.guide_display(KNet(), k, k, 1)                   # no maps: RSS fallback
+    assert torch.allclose(rss, ifftc(k).abs().pow(2).sum(1, keepdim=True).sqrt(), atol=1e-6)
+    E = Mask(torch.ones(1, 1, H, W)) @ FFT2D() @ Sense(maps)
+    assert torch.allclose(guide_image({"guide": k, "E": E}), want, atol=1e-6)
+    assert torch.allclose(guide_image({"guide": k, "smaps": maps}), want, atol=1e-6)
+    img = torch.randn(1, 1, H, W, dtype=torch.complex64)
+    assert torch.allclose(guide_image({"guide": img}), img.abs())
+
+
 def test_guide_undersampling():
     side = torch.randn(1, C, H, W, dtype=torch.complex64) + 1
     assert tr.undersample_guide(side, 1) is side

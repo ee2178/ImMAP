@@ -14,10 +14,20 @@ the noise are drawn per step, so x1 cannot come from the loader:
     loss         =  loss_fn(x0, x0_hat)         (optionally t-weighted, see i2sb._bridge_loss)
 
 Everything after the measurement is train_i2sb's skeleton: epochs of steps_per_epoch optimizer
-steps, gradient accumulation, EMA (validation and net_ema.ckpt use the average), averaged-loss
-backtracking and checkpoint-on-improvement of net.ckpt. On top of it, the best validation PSNR is
-kept as net_bestval.ckpt, since the train loss of a bridge regressor (a single random step) is a
-poor proxy for the quality of the sampled reconstruction.
+steps, gradient accumulation, EMA (validation uses the average) and averaged-loss backtracking.
+
+CHECKPOINTS ARE WRITTEN ONLY AT VALIDATION (every val_every_epochs, and after the last epoch):
+
+    net.ckpt          the LATEST state: live weights, optimizer, scheduler and the EMA -- what a
+                      requeue resumes from and a backtrack restores. Sample from its EMA
+                      (load_sampling_weights does that); best_val_loss holds THIS validation's -PSNR
+    net_bestval.ckpt  the best validation PSNR so far, averaged (EMA) weights
+
+Nothing is kept for the best TRAIN loss: for a bridge regressor (one random step per sample) it is
+a poor proxy for the sampled reconstruction, and saving net.ckpt + net_ema.ckpt on every improving
+epoch was a full write every ~80 s early in training -- the writes bigpurple's scratch kept
+refusing (ENOSPC, 2026-11-10). A non-finite loss before the first validation has no checkpoint to
+backtrack to and stops the run.
 
 The measurement settings (cfg["mri"], and noise_std / val_noise_std / val_seed) mean the same as
 in train_recon, so an i2sb_recon run and a one-shot recon run on the same config blocks see the
@@ -65,20 +75,20 @@ from sb.i2sb_recon import (DC_LAM, TAU_SCALES, X1_SOURCES, bridge_noise_scale, b
                            online_support,
                            predict_x0_recon, i2sb_recon_sample)
 from training.common import (EMA, POSTFIX_EVERY, apply_loss_mask, embed_for_net, get_lr,
-                             load_ckpt, prepare_measurement, save_ckpt, save_ema_ckpt)
+                             load_ckpt, prepare_measurement, save_ckpt)
 from training.common import backtrack as do_backtrack, resync_schedule
 from training.i2sb import _bridge_loss
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
 from training.recon import (_check_paired, _ckpt_field, _guide, _unpack, guide_display,
-                            undersample_guide)
+                            operator_maps, undersample_guide)
 from visualization.image import recon_panel
 from visualization.params import get_param_logs
 from visualization.wandb_image import wandb_image
 
 
 BESTVAL_CKPT = "net_bestval.ckpt"
-LAST_CKPT = "net_last.ckpt"         # the latest validated (averaged) net, every validation
+LATEST_CKPT = "net.ckpt"            # the latest state, every validation (sample from its EMA)
 X0_SOURCES = ("operator", "stored")
 
 
@@ -263,10 +273,8 @@ def train_i2sb_recon(
         print(f"[i2sb_recon] gradient accumulation x{accum_steps}")
 
     os.makedirs(save_dir, exist_ok=True)
-    ckpt_path = os.path.join(save_dir, "net.ckpt")
-    ema_ckpt_path = os.path.join(save_dir, "net_ema.ckpt")
+    ckpt_path = os.path.join(save_dir, LATEST_CKPT)
     bestval_path = os.path.join(save_dir, BESTVAL_CKPT)
-    last_path = os.path.join(save_dir, LAST_CKPT)
 
     best_val_psnr = -float("inf")
     if start_epoch > 0:
@@ -361,15 +369,10 @@ def train_i2sb_recon(
                     backtrack_count=backtrack_count, backtrack_factor=backtrack_factor)
                 print(f"backtrack #{backtrack_count} -> LR {new_lr}")
             else:
-                raise RuntimeError(f"Backtrack at epoch {epoch} but no valid checkpoint "
-                                   f"(best_loss={best_loss}).")
-        elif save_ckpt_fn and avg_loss < best_loss:
-            save_ckpt_fn(ckpt_path, model=net, optimizer=opt, scheduler=sched,
-                         step=global_step, backtrack_count=backtrack_count,
-                         best_loss=avg_loss, ema=ema)
-            if ema is not None:
-                save_ema_ckpt(ema_ckpt_path, ema, net, step=global_step, best_loss=avg_loss)
-            best_loss = avg_loss
+                raise RuntimeError(f"Backtrack at epoch {epoch} but no checkpoint yet (net.ckpt "
+                                   f"is written at validation; best_loss={best_loss}).")
+        elif avg_loss < best_loss:
+            best_loss = avg_loss        # the backtrack bar; reaches disk with net.ckpt at validation
 
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss, "train/lr": get_lr(opt)[0], "train/epoch": epoch,
@@ -377,7 +380,8 @@ def train_i2sb_recon(
         elif not wandb:
             print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
 
-        if val_loader is not None and val_every_epochs and (epoch + 1) % val_every_epochs == 0:
+        at_val = bool(val_every_epochs) and (epoch + 1) % val_every_epochs == 0
+        if val_loader is not None and at_val:
             t_val = time.time()
             val_ctx = ema.average_parameters() if ema is not None else contextlib.nullcontext()
             with val_ctx:
@@ -392,16 +396,6 @@ def train_i2sb_recon(
                     metric_range=metric_range, support_thresh=support_thresh,
                     support_state=bool(support_state),
                     wandb=wandb, global_step=global_step, epoch=epoch)
-                if save_ckpt_fn:
-                    # The LATEST validated net, every validation, whatever its score: i2sb recon
-                    # is volatile -- val PSNR need not improve with training -- and net.ckpt is
-                    # written only when the training loss improves (noisy for a bridge: random t
-                    # per sample), so neither of the other two is guaranteed to be recent.
-                    # Averaged (EMA) weights, like net_bestval; best_val_loss holds THIS
-                    # validation's -PSNR. A sampling checkpoint, not a resume one.
-                    save_ckpt_fn(last_path, model=net, step=global_step,
-                                 backtrack_count=backtrack_count, best_loss=best_loss,
-                                 best_val_loss=-float(val["psnr"]))
                 if save_ckpt_fn and math.isfinite(val["psnr"]) and val["psnr"] > best_val_psnr:
                     best_val_psnr = val["psnr"]
                     # under the EMA context, so this is the averaged net -- the one validated
@@ -412,9 +406,32 @@ def train_i2sb_recon(
                   f"PSNR {val['psnr']:.2f} dB (zero-filled {val['zf_psnr']:.2f})")
             if isinstance(sched, ReduceLROnPlateau):
                 sched.step(val["loss"])
+        else:
+            val = None
+
+        if save_ckpt_fn and (at_val or epoch + 1 == num_epochs):
+            # The LATEST state, whatever its score (i2sb val PSNR need not improve with training):
+            # the resume / backtrack checkpoint. Outside the EMA context, so the weights are the
+            # LIVE ones training continues from; the average rides along in ema_state_dict.
+            save_ckpt_fn(ckpt_path, model=net, optimizer=opt, scheduler=sched, step=global_step,
+                         backtrack_count=backtrack_count, best_loss=best_loss, ema=ema,
+                         best_val_loss=None if val is None else -float(val["psnr"]))
 
     pbar.close()
     return net
+
+
+def load_sampling_weights(net, path, device="cpu"):
+    """Load the weights to SAMPLE from: a checkpoint's EMA when it carries one (net.ckpt: live
+    weights + average -- validation scored the average), else its model weights (net_bestval.ckpt
+    and older runs' net_ema / net_last already hold the average). -> the checkpoint dict."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    net.load_state_dict(ckpt["model_state_dict"])
+    if ckpt.get("ema_state_dict") is not None:
+        ema = EMA(net.parameters())
+        ema.load_state_dict(ckpt["ema_state_dict"])
+        ema.copy_to()
+    return ckpt
 
 
 @torch.no_grad()
@@ -498,14 +515,14 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
             agg[k] += float(m[k]) * bs
             agg[f"zf_{k}"] += float(mz[k]) * bs
         n += bs
-        last = (gt, pred, x1, mmask, sigma_n, guide, _unpack(batch)[5])
+        last = (gt, pred, x1, mmask, sigma_n, guide, _unpack(batch)[5], operator_maps(E))
 
     mean = {k: v / max(n, 1) for k, v in agg.items()}
 
     if wandb and last is not None:
-        x0, pred, x1, mmask, sigma_n, guide, side = last
+        x0, pred, x1, mmask, sigma_n, guide, side, maps = last
         img, rec, zf = (x0, pred, x1) if mmask is None else (x0 * mmask, pred * mmask, x1 * mmask)
-        gtiles = guide_display(net, guide, side, meas.get("guide_R", 1))
+        gtiles = guide_display(net, guide, side, meas.get("guide_R", 1), smaps=maps)
         gimgs = [(g if mmask is None else g * mmask)[:1] for _, g in gtiles]
         panel, pstats = recon_panel(img[:1], rec[:1], zero_filled=zf[:1], gain=residual_gain,
                                     guides=gimgs)

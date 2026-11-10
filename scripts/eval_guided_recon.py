@@ -100,14 +100,22 @@ def reconstruct(run, m):
 
 
 def guide_image(m):
-    """The guide as an image for display: |guide| for image-domain guides, the coil RSS of a
-    k-space guide (TGVN takes k-space), the centre slice of several."""
+    """The guide as an image for display, the same way whichever net took it: an image-domain
+    guide as |g|; a k-space guide (TGVN's) coil-combined with the OPERATOR'S maps, |S^H F^-1 k|
+    (m["smaps"], or the maps inside m["E"]) -- what image guides and the i2sb guide start use.
+    The centre slice of several."""
+    from training.recon import operator_maps
     g = m["guide"]
     if g is None:
         return None
     if g.dim() == 5:
         g = g[:, g.shape[1] // 2]
-    if g.shape[1] > 1:                            # k-space, coils on dim 1
-        from operators.fourier import ifftc
-        return ifftc(g).abs().pow(2).sum(1, keepdim=True).sqrt()
-    return g.abs()
+    if g.shape[1] == 1:
+        return g.abs()
+    from operators.fourier import ifftc
+    maps = m.get("smaps")
+    if maps is None and m.get("E") is not None:
+        maps = operator_maps(m["E"])
+    if maps is None:
+        raise ValueError("a k-space guide needs the operator's maps (m['smaps'] or m['E'])")
+    return Sense(maps.to(g.device)).adjoint(ifftc(g)).abs()

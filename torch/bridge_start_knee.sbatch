@@ -77,15 +77,25 @@ BASE_CONFIG="config/knee/guided/${NAME}.json"
 echo "[bridge] task ${SLURM_ARRAY_TASK_ID}/$((N_TOTAL - 1)): knee ${NAME} (tau file ${TAU_FILE})"
 
 regenerate() {
-    # private output dir, then move THIS cell's config in: parallel tasks never read a
-    # config another task is writing
-    local tmp
-    tmp="$(mktemp -d)"
-    "${GEN[@]}" --out "${tmp}" > "${tmp}/gen.log"
-    grep -F "${NAME}" "${tmp}/gen.log" || true
+    # Stage the generated config in a private dir NEXT TO its destination (same filesystem), so
+    # putting it in place is an atomic rename -- never a cross-filesystem copy that can leave a
+    # half-written config -- and parallel array tasks never read a config another is writing.
+    # A full filesystem (bigpurple's shared scratch, 2026-11-10: ENOSPC on a 4 KB config) is
+    # retried with backoff before giving up.
+    local tmp try
     mkdir -p config/knee/guided
-    mv -f "${tmp}/knee/guided/${NAME}.json" "${BASE_CONFIG}"
-    rm -rf "${tmp}"
+    for try in 1 2 3 4 5 6; do
+        tmp="$(mktemp -d -p config/knee/guided .gen.XXXXXX)" \
+            && "${GEN[@]}" --out "${tmp}" > "${tmp}/gen.log" \
+            && mv -f "${tmp}/knee/guided/${NAME}.json" "${BASE_CONFIG}" \
+            && { grep -F "${NAME}" "${tmp}/gen.log" || true; rm -rf "${tmp}"; return 0; }
+        [ -n "${tmp}" ] && [ -f "${tmp}/gen.log" ] && tail -3 "${tmp}/gen.log" >&2
+        [ -n "${tmp}" ] && rm -rf "${tmp}"
+        echo "[bridge] writing ${BASE_CONFIG} failed (attempt ${try}/6); retrying in $((30 * try)) s" >&2
+        sleep $((30 * try))
+    done
+    echo "[bridge] could not write ${BASE_CONFIG} after 6 attempts (filesystem full?)" >&2
+    exit 1
 }
 
 regenerate

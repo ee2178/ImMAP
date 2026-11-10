@@ -1,0 +1,519 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb, amsthm, mathtools, bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[colorlinks=true, linkcolor=blue!50!black, citecolor=blue!50!black,
+            urlcolor=blue!50!black]{hyperref}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---- notation -----------------------------------------------------------------------------
+\newcommand{\x}{\bm{x}}
+\newcommand{\y}{\bm{y}}
+\newcommand{\uu}{\bm{u}}
+\newcommand{\vv}{\bm{v}}
+\newcommand{\eps}{\bm{\varepsilon}}
+\newcommand{\zz}{\bm{z}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\C}{\mathbb{C}}
+\newcommand{\CN}{\mathcal{CN}}
+\newcommand{\Id}{\bm{I}}
+\newcommand{\Op}{\bm{E}}
+\newcommand{\D}{D_\theta}
+\newcommand{\ssb}{\sigma_{\mathrm{sb}}}
+\newcommand{\grad}{\nabla}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{I$^2$SB through the ImMAP lens:\\[2pt]
+       \large the Brownian bridge as a ladder of conditional denoising problems,\\
+       and Tweedie ascent toward the MAP estimate given $\x_1$}
+\author{ImMAP project notes}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+I$^2$SB trains a network on a Brownian bridge between paired endpoints $(\x_0, \x_1)$ and
+samples with a DDPM-style reverse posterior. We give a different reading of the same
+objects. With the starting point $\x_1$ known, every bridge state is, after an affine change
+of coordinates, a Gaussian \emph{denoising} problem for $\x_0$ at a noise level fixed by the
+bridge time. The trained regressor is therefore a conditional MMSE denoiser,
+$\D(\x_t, t) \approx \E[\x_0 \mid \x_t, \x_1]$, and by Tweedie's formula its residual is a
+scaled score of the noise-smoothed conditional prior $p_\sigma(\cdot \mid \x_1)$. This turns
+the bridge into the setting of Kadkhodaie--Simoncelli and ImMAP: an annealed, Tweedie-driven
+ascent toward the maximum a posteriori estimate of $\x_0$ given $\x_1$ (and, with a data term,
+given the measurement $\y$ too). We write that ascent directly in bridge coordinates, with
+noise injection that keeps every iterate on the bridge marginals, and show that I$^2$SB's own
+sampler is the special case with a prescribed step size and noise level. The formulas match
+\code{sb/immap\_sb\_ascent.py} line for line; Table~\ref{tab:code} gives the correspondence.
+\end{abstract}
+
+\paragraph{Notation.}
+Images are vectors in $\C^N$. Noise is circularly-symmetric complex Gaussian,
+$\eps \sim \CN(\bm 0, \Id)$, i.e.\ $\E|\varepsilon_n|^2 = 1$ per entry (variance $1/2$ per
+real component); $\CN(\bm\mu, s^2\Id)$ has density
+$(\pi s^2)^{-N}\exp(-\|\x - \bm\mu\|^2/s^2)$. For a real function $f$ of a complex vector we
+use the Wirtinger gradient $\grad_{\uu} f \coloneqq \partial f / \partial \bar{\uu}$, which is
+half the gradient in real coordinates, $\tfrac12(\partial_{\mathrm{Re}} + i\,
+\partial_{\mathrm{Im}})$; with it, all formulas below read exactly as in the real case.
+$\x_0$ is the target (the fully-sampled image), $\x_1$ the bridge's prior endpoint (in MRI:
+the zero-filled image $\Op^H\y$, the ACS low-pass image, or a guide contrast), and $t \in
+[0,1]$ the bridge time, $t = 0$ at $\x_0$.
+
+%=============================================================================================
+\section{The Brownian bridge}
+%=============================================================================================
+
+\subsection{Marginals}
+Let $X_t = \x_0 + \sqrt{V}\,B_t$ with $B_t$ a standard complex Brownian motion, so
+$\operatorname{Cov}(X_t, X_s) = V\min(t,s)\,\Id$. Conditioning on the endpoint $X_1 = \x_1$
+pins the path at both ends. Because $(X_t, X_1)$ is jointly Gaussian given $\x_0$, with
+$\operatorname{Cov}(X_t, X_1) = Vt\,\Id$ and $\operatorname{Var}X_1 = V\Id$, the conditional law
+is
+\begin{equation}
+  q(\x_t \mid \x_0, \x_1) = \CN\!\big((1-t)\,\x_0 + t\,\x_1,\; \ssb(t)^2\,\Id\big),
+  \qquad \ssb(t)^2 = V\,t(1-t).
+  \label{eq:marginal}
+\end{equation}
+Equivalently,
+\begin{equation}
+  \x_t = (1-t)\,\x_0 + t\,\x_1 + \ssb(t)\,\eps, \qquad \eps \sim \CN(\bm0, \Id),
+  \quad \eps \perp (\x_0, \x_1).
+  \label{eq:reparam}
+\end{equation}
+The total variance $V$ is set by the bridge \emph{temperature} $\tau$, $V = 4\tau^2$, so that
+$\ssb$ peaks at $\tau$ at the midpoint $t = \tfrac12$. In the code, $\ssb$ is
+\code{std\_sb} and $\sqrt{Vt}$ is the forward std \code{std\_fwd}, with
+$\code{std\_fwd}[-1]^2 = V$.
+
+\begin{remark}[General I$^2$SB schedules]
+With a time-varying diffusion $\beta(t)$ and $\sigma^2(t) = \int_0^t\beta$,
+$\bar\sigma^2(t) = \int_t^1\beta$, the same computation gives
+$\x_t = \mu_0(t)\x_0 + \mu_1(t)\x_1 + \ssb(t)\eps$ with
+$\mu_0 = \bar\sigma^2/(\sigma^2+\bar\sigma^2)$, $\mu_1 = \sigma^2/(\sigma^2+\bar\sigma^2)$ and
+$\ssb^2 = \sigma^2\bar\sigma^2/(\sigma^2+\bar\sigma^2)$. The Brownian bridge is
+$\beta \equiv V$, giving $\mu_0 = 1-t$, $\mu_1 = t$. Everything below holds for a general schedule with
+$(1-t, t)$ replaced by $(\mu_0, \mu_1)$ and $V = \sigma^2(1)$; we keep the Brownian form for
+readability.
+\end{remark}
+
+\subsection{The reverse posterior}
+Given $\x_0$, the bridge is Markov, and on $[0,t]$ it is a Brownian bridge from $\x_0$ to
+$\x_t$. For $s < t$ this gives
+\begin{equation}
+  q(\x_s \mid \x_t, \x_0) = \CN\!\Big(\big(1 - \tfrac{s}{t}\big)\x_0 + \tfrac{s}{t}\,\x_t,\;
+  V\,\tfrac{s(t-s)}{t}\,\Id\Big).
+  \label{eq:posterior}
+\end{equation}
+I$^2$SB's sampler is \eqref{eq:posterior} with $\x_0$ replaced by the network's estimate,
+iterated from $\x_1$ down a fixed ladder of times (\code{sb.base.reverse\_sample},
+\code{posterior="ddpm"}).
+
+\subsection{What the network learns}
+I$^2$SB trains a regressor on pairs: draw $(\x_0, \x_1)$, $t \sim \mathcal U[0,1]$ and
+$\x_t \sim q(\cdot\mid\x_0,\x_1)$, and minimise
+\begin{equation}
+  \mathcal L(\theta) = \E\,\big\|\D(\x_t, t, \x_1) - \x_0\big\|^2 .
+\end{equation}
+The minimiser of a squared loss is the conditional expectation, so at the optimum
+\begin{equation}
+  \D(\x_t, t, \x_1) = \E[\x_0 \mid \x_t, \x_1].
+  \label{eq:mmse}
+\end{equation}
+The conditioning set is whatever the network is given. Our recon regressors receive $\x_1$
+(and the measurement $\y$, $\Op$) besides $\x_t$, so \eqref{eq:mmse} conditions on $\x_1$. A
+network that saw $\x_t$ alone would learn $\E[\x_0\mid\x_t]$, which differs whenever $\x_1$
+carries information about $\x_0$ not already in $\x_t$.
+
+%=============================================================================================
+\section{The bridge as a ladder of denoising problems}
+%=============================================================================================
+
+\begin{lemma}[Debiased state]\label{lem:debias}
+Fix $\x_1$ and $t \in [0,1)$, and define
+\begin{equation}
+  \uu_t \coloneqq \frac{\x_t - t\,\x_1}{1-t}.
+  \label{eq:debias}
+\end{equation}
+Then
+\begin{equation}
+  \uu_t = \x_0 + \sigma(t)\,\eps, \qquad
+  \sigma(t)^2 = \frac{\ssb(t)^2}{(1-t)^2} = \frac{V\,t}{1-t},
+  \qquad \eps \perp (\x_0, \x_1).
+  \label{eq:denoising}
+\end{equation}
+The map $t \mapsto \sigma(t)$ is a bijection $[0,1) \to [0, \infty)$ with inverse
+\begin{equation}
+  t(\sigma) = \frac{\sigma^2}{\sigma^2 + V}, \qquad\text{and}\qquad \ssb(t) = (1-t)\,\sigma(t).
+  \label{eq:t_of_sigma}
+\end{equation}
+\end{lemma}
+\begin{proof}
+Substitute \eqref{eq:reparam} into \eqref{eq:debias}. Inverting
+$\sigma^2 = Vt/(1-t)$ gives $t = \sigma^2/(\sigma^2+V)$.
+\end{proof}
+
+So the bridge state at time $t$ is, given $\x_1$, the clean target $\x_0$ plus white Gaussian
+noise of a \emph{known} level $\sigma(t)$. The bridge time and the noise level are one
+variable. Moving from $t = 1$ to $t = 0$ is the familiar denoising ladder from
+$\sigma = \infty$ to $\sigma = 0$, with the endpoint $\x_1$ acting as side information. Since
+$(\x_t, \x_1) \mapsto (\uu_t, \x_1)$ is invertible for $t < 1$,
+\begin{equation}
+  \D(\x_t, t, \x_1) = \E[\x_0 \mid \x_t, \x_1] = \E[\x_0 \mid \uu_t, \x_1]:
+  \label{eq:cond_denoiser}
+\end{equation}
+\emph{the I$^2$SB regressor is a conditional MMSE denoiser at noise level $\sigma(t)$}.
+$\x_1$ enters in two roles: as conditioning information, and in the change of coordinates
+that removes the deterministic part $t\,\x_1$ of the state.
+
+%=============================================================================================
+\section{MAP estimation given \texorpdfstring{$\x_1$}{x1}, and Tweedie's formula}
+%=============================================================================================
+
+\subsection{The goal}
+Given the starting point $\x_1$, we want the maximum a posteriori estimate
+\begin{equation}
+  \hat\x_0 = \arg\max_{\x}\; \log p(\x \mid \x_1),
+  \label{eq:map}
+\end{equation}
+and in reconstruction, with the measurement $\y$ too, $\arg\max_{\x} \log p(\x\mid\x_1,\y)$
+(Section~\ref{sec:prox}). The conditional prior $p(\x\mid\x_1)$ is not available in closed
+form. What we have is \eqref{eq:cond_denoiser}, a denoiser of $\x_0$ at every noise level,
+given $\x_1$.
+
+\subsection{The smoothed conditional prior}
+Let $\varphi_\sigma$ be the $\CN(\bm0,\sigma^2\Id)$ density. The law of $\uu = \x_0+\sigma\eps$
+given $\x_1$ is the conditional prior convolved with the noise:
+\begin{equation}
+  p_\sigma(\uu\mid\x_1) = \int \varphi_\sigma(\uu - \x)\,p(\x\mid\x_1)\,d\x,
+  \qquad p_\sigma(\cdot\mid\x_1) \xrightarrow[\sigma\to0]{} p(\cdot\mid\x_1).
+  \label{eq:smoothed}
+\end{equation}
+For large $\sigma$ it is a heavily blurred version of the prior, smooth and close to
+unimodal. As $\sigma \to 0$ it sharpens back to $p(\cdot\mid\x_1)$.
+
+\begin{proposition}[Conditional Tweedie / Miyasawa]\label{prop:tweedie}
+For $\uu = \x_0 + \sigma\eps$ with $\eps\sim\CN(\bm0,\Id)$ independent of $(\x_0,\x_1)$,
+\begin{equation}
+  \E[\x_0 \mid \uu, \x_1] = \uu + \sigma^2\,\grad_{\uu}\log p_\sigma(\uu\mid\x_1).
+  \label{eq:tweedie}
+\end{equation}
+\end{proposition}
+\begin{proof}
+$\varphi_\sigma(\bm z) \propto \exp(-\|\bm z\|^2/\sigma^2)$, so
+$\grad_{\bm z}\varphi_\sigma(\bm z) = -\sigma^{-2}\bm z\,\varphi_\sigma(\bm z)$ (Wirtinger
+derivative with respect to $\bar{\bm z}$). Differentiate \eqref{eq:smoothed} under the
+integral:
+\[
+  \sigma^2\grad_{\uu}p_\sigma(\uu\mid\x_1)
+  = \int (\x - \uu)\,\varphi_\sigma(\uu-\x)\,p(\x\mid\x_1)\,d\x
+  = p_\sigma(\uu\mid\x_1)\big(\E[\x_0\mid\uu,\x_1] - \uu\big),
+\]
+and divide by $p_\sigma(\uu\mid\x_1)$.
+\end{proof}
+
+Combined with \eqref{eq:cond_denoiser}, the residual of the trained network \emph{is} the
+score of the smoothed conditional prior, scaled by the noise variance:
+\begin{equation}
+  \boxed{\;\D(\x_t, t, \x_1) - \uu_t = \sigma(t)^2\,\grad_{\uu}\log p_{\sigma(t)}(\uu_t\mid\x_1).\;}
+  \label{eq:residual_score}
+\end{equation}
+A step $\uu + h\,(\D - \uu)$ is gradient ascent on $\log p_\sigma(\cdot\mid\x_1)$ with step
+size $h\sigma^2$. The step $h = 1$ jumps straight to the posterior mean, which is what a
+one-shot reconstruction network does.
+
+\subsection{Annealing}
+Ascending $\log p_\sigma$ while lowering $\sigma$ is a coarse-to-fine continuation. At large
+$\sigma$ the landscape is smooth and the ascent is easy. As $\sigma$ shrinks the iterate
+follows a mode of the sharpening density, and as $\sigma\to0$ it approaches a maximiser of
+$p(\cdot\mid\x_1)$, the MAP estimate \eqref{eq:map}. Injecting fresh noise along the way
+(Section~\ref{sec:ascent}) turns the deterministic ascent into a stochastic one that draws
+samples instead (Kadkhodaie--Simoncelli~\cite{ks2021}). The bridge supplies the whole family
+$\{p_\sigma(\cdot\mid\x_1)\}_\sigma$ through a single network, one noise level per bridge time.
+
+%=============================================================================================
+\section{The Tweedie (Kadkhodaie--Simoncelli / ImMAP) ascent}\label{sec:ascent}
+%=============================================================================================
+
+In debiased coordinates the iterate is a pair $(\uu_k, \sigma_k)$. One step reads
+\begin{align}
+  \vv_k &= \E[\x_0\mid\uu_k,\x_1] \approx \D(\x_k, t_k, \x_1),
+  \label{eq:ks_denoise}\\
+  \uu_{k+1} &= (1-h_k)\,\uu_k + h_k\,\vv_k + \gamma^u_k\,\zz_k
+  \;=\; \uu_k + h_k\,\sigma_k^2\,\grad_{\uu}\log p_{\sigma_k}(\uu_k\mid\x_1) + \gamma^u_k\,\zz_k,
+  \label{eq:ks_step}
+\end{align}
+with $\zz_k\sim\CN(\bm0,\Id)$ fresh and $h_k \in (0,1]$.
+
+\paragraph{Noise accounting.}
+Suppose $\vv_k$ removes the noise of $\uu_k$, i.e.\ $\vv_k \approx \x_0$. Then the noise left in
+$(1-h_k)\uu_k + h_k\vv_k$ is $(1-h_k)\sigma_k\eps$, and after the injection
+\begin{equation}
+  \sigma_{k+1}^2 = (1-h_k)^2\sigma_k^2 + (\gamma^u_k)^2 .
+\end{equation}
+We prescribe the contraction $\sigma_{k+1} = (1-\beta h_k)\,\sigma_k$, with $\beta\in(0,1]$, which
+fixes the injected noise:
+\begin{equation}
+  (\gamma^u_k)^2 = \big[(1-\beta h_k)^2 - (1-h_k)^2\big]\,\sigma_k^2 .
+  \label{eq:ks_gamma}
+\end{equation}
+$\beta = 1$ injects nothing and gives the deterministic ascent toward the MAP estimate;
+$\beta < 1$ keeps fresh noise in every step. $\beta$ sets how much of the noise removed by a
+step is put back, and $h_k$ how far the step moves.
+
+\paragraph{Schedules.}
+The step size follows Kadkhodaie--Simoncelli, $h_k = h_0 k / (1 + h_0(k-1))$, small at first
+and growing toward 1. The noise level either follows the recursion alone ("open"), or is
+re-estimated from the residual. Since $\E\|\D - \uu\|^2 \approx N\sigma^2$ when the denoiser is
+accurate,
+\[
+  \hat\sigma_k^2 = \tfrac1N\|\vv_k - \uu_k\|^2 ,
+\]
+which is ImMAP's self-paced ladder. This estimate is biased high at large $\sigma$, where
+$\D$ shrinks toward the mean, and includes $\D$'s own error at small $\sigma$. The iteration
+stops when $\sigma_k < \sigma_{\min}$ and returns the last $\vv_k$.
+
+%=============================================================================================
+\section{Re-placing the step on the bridge}
+%=============================================================================================
+
+Forming $\uu$ explicitly is a bad idea near $t = 1$: the factor $1/(1-t)$ in
+\eqref{eq:debias} blows up. Instead we carry the step out in the bridge coordinates
+themselves. After the step the noise level is $\sigma' = (1-\beta h_k)\sigma_k$, i.e.\ the new
+bridge time is $t' = \sigma'^2/(\sigma'^2+V)$ by \eqref{eq:t_of_sigma}. We map the stepped
+$\bar\uu = (1-h_k)\uu_k + h_k\vv_k$ back onto the bridge \emph{at $t'$}:
+\begin{equation}
+  \x_{k+1} = (1-t')\,\bar\uu + t'\,\x_1 + \gamma_k\,\eps_k .
+  \label{eq:replace}
+\end{equation}
+
+\begin{proposition}[The step in bridge coordinates]\label{prop:bridge_step}
+With $\uu_k = (\x_k - t_k\x_1)/(1-t_k)$, \eqref{eq:replace} is
+\begin{equation}
+  \x_{k+1} = c_x\,\x_k + c_v\,\vv_k + c_1\,\x_1 + \gamma_k\,\eps_k,
+  \qquad
+  c_x = \frac{(1-h_k)(1-t')}{1-t_k},\quad c_v = h_k(1-t'),\quad c_1 = t' - c_x\,t_k,
+  \label{eq:coeffs}
+\end{equation}
+with $c_x + c_v + c_1 = 1$. The noise carried over from $\x_k$ has std $\rho_k\,\ssb(t')$ with
+\begin{equation}
+  \rho_k = \frac{1-h_k}{1-\beta h_k} \in [0,1],
+\end{equation}
+so the injection that brings the total exactly to the bridge std at $t'$ is
+\begin{equation}
+  \boxed{\;\gamma_k^2 = \ssb(t')^2\,\big(1-\rho_k^2\big) = (1-t')^2(\gamma^u_k)^2.\;}
+  \label{eq:gamma}
+\end{equation}
+\end{proposition}
+\begin{proof}
+Expand \eqref{eq:replace}:
+$(1-t')\big[(1-h_k)\tfrac{\x_k - t_k\x_1}{1-t_k} + h_k\vv_k\big] + t'\x_1$ gives the three
+coefficients. They sum to $c_x(1-t_k) + h_k(1-t') + t' = (1-h_k)(1-t') + h_k(1-t') + t' = 1$.
+The noise in $\x_k$ is $\ssb(t_k)\eps = (1-t_k)\sigma_k\eps$, and $c_x$ times it is
+$(1-h_k)(1-t')\sigma_k\eps = \rho_k(1-t')\sigma'\eps = \rho_k\,\ssb(t')\eps$, using
+$\sigma' = (1-\beta h_k)\sigma_k$ and $\ssb(t') = (1-t')\sigma'$. Adding independent noise of
+variance $\gamma_k^2$ gives total variance $\ssb(t')^2$ exactly when \eqref{eq:gamma} holds.
+The last equality is \eqref{eq:ks_gamma} times $(1-t')^2$.
+\end{proof}
+
+\begin{remark}[The iterates stay on the bridge]
+If $\vv_k = \x_0$ and $\x_k \sim q(\cdot\mid\x_0,\x_1)$ at $t_k$, then
+$\x_{k+1} = (1-t')\x_0 + t'\x_1 + \rho_k\ssb(t')\eps + \gamma_k\eps_k$ is distributed exactly as
+the bridge marginal \eqref{eq:marginal} at $t'$. With an accurate denoiser, every iterate is a
+bridge state, which is the input distribution the network was trained on.
+\end{remark}
+
+\begin{remark}[Why the step must land at the \emph{new} time]
+An earlier variant relaxed $\x_k$ toward the bridge mean at the \emph{current} time,
+$(1-t_k)\vv_k + t_k\x_1$. On a noise-free iterate that already lies on the bridge, with a
+perfect denoiser, that mean equals $\x_k$ and the time re-estimated from it returns $t_k$
+again. The step then removes noise but never moves along the bridge, and the iteration stalls.
+Mapping onto the bridge at the contracted time $t'$ is what makes progress.
+\end{remark}
+
+\begin{remark}[Starting point]
+$\x_1$ itself is a fixed point: at $t = 1$ the state carries no noise and $\sigma = \infty$,
+so any bridge-consistent estimator maps it to itself. The ascent therefore starts at a
+finite $\sigma_0$, i.e.\ $t_0 = \sigma_0^2/(\sigma_0^2+V) < 1$, as Kadkhodaie--Simoncelli start
+at a finite $\sigma_0$. A natural initial state is the bridge sample around a first estimate,
+$\x_{t_0} = (1-t_0)\,\D(\x_1, 1, \x_1) + t_0\x_1 + \ssb(t_0)\eps$.
+\end{remark}
+
+\begin{algorithm}[H]
+\caption{ImMAP-SB: Tweedie ascent on the bridge (\code{sb/immap\_sb\_ascent.py})}
+\label{alg:immap_sb}
+\begin{algorithmic}[1]
+\Require endpoint $\x_1$; regressor $\D$; total variance $V = 4\tau^2$; start $\sigma_0$;
+         $\beta\in(0,1]$; $h_0$; $\sigma_{\min}$; optional data prox $P$ (Sec.~\ref{sec:prox})
+\State $t_0 \gets \sigma_0^2/(\sigma_0^2+V)$;\quad
+       $\x \gets (1-t_0)\,\D(\x_1, 1, \x_1) + t_0\x_1 + \ssb(t_0)\,\eps$;\quad $k \gets 1$
+\While{$\sigma_k > \sigma_{\min}$}
+  \State $\vv \gets \D(\x, t_k, \x_1)$;\quad if $P$: $\vv \gets P(\vv;\,\sigma_k)$
+         \Comment{conditional MMSE estimate}
+  \State $h \gets h_0 k / (1 + h_0(k-1))$;\quad $\sigma' \gets (1-\beta h)\,\sigma_k$;\quad
+         $t' \gets \sigma'^2/(\sigma'^2+V)$
+  \State $c_x \gets (1-h)(1-t')/(1-t_k)$;\quad $c_v \gets h(1-t')$;\quad $c_1 \gets t' - c_x t_k$
+  \State $\rho \gets (1-h)/(1-\beta h)$;\quad $\gamma \gets \ssb(t')\sqrt{1-\rho^2}$
+  \State $\x \gets c_x\,\x + c_v\,\vv + c_1\,\x_1 + \gamma\,\eps$, \ $\eps\sim\CN(\bm0,\Id)$
+  \State $(t_k, \sigma_k) \gets (t', \sigma')$;\quad $k \gets k+1$
+         \Comment{or re-estimate $\sigma_k$ from $\|\vv - \uu\|$}
+\EndWhile
+\State \Return $\vv$
+\end{algorithmic}
+\end{algorithm}
+
+%=============================================================================================
+\section{\texorpdfstring{I$^2$SB}{I2SB}'s sampler is a special case}
+%=============================================================================================
+
+\begin{proposition}\label{prop:i2sb}
+Take one step of the ascent from $t$ to a prescribed $s < t$, and let
+$r = \sigma(s)/\sigma(t)$. With
+\begin{equation}
+  h = 1 - r^2 = \frac{t-s}{t(1-s)}, \qquad \beta = \frac{1}{1+r},
+  \label{eq:i2sb_params}
+\end{equation}
+Proposition~\ref{prop:bridge_step} gives exactly I$^2$SB's reverse step \eqref{eq:posterior}
+with $\x_0$ replaced by $\vv = \D(\x_t, t, \x_1)$.
+\end{proposition}
+\begin{proof}
+First the time. $1 - \beta h = 1 - (1-r)(1+r)/(1+r) = r$, so $\sigma' = r\,\sigma(t) = \sigma(s)$
+and $t' = s$. With $\sigma^2 = Vt/(1-t)$, $r^2 = s(1-t)/(t(1-s))$, which gives the stated form of $h$.
+Then the coefficients of \eqref{eq:coeffs}:
+\[
+  c_v = h(1-s) = \frac{t-s}{t} = 1 - \frac{s}{t},\qquad
+  c_x = \frac{r^2(1-s)}{1-t} = \frac{s}{t},\qquad
+  c_1 = s - \frac{s}{t}\,t = 0,
+\]
+the mean of \eqref{eq:posterior}. Finally the noise. $\rho = (1-h)/(1-\beta h) = r^2/r = r$, so
+\[
+  \gamma^2 = \ssb(s)^2(1-r^2) = V s(1-s)\cdot\frac{t-s}{t(1-s)} = V\,\frac{s(t-s)}{t},
+\]
+the variance of \eqref{eq:posterior}.
+\end{proof}
+
+So I$^2$SB's sampler is the Tweedie ascent with its step size tied to the training ladder,
+$h = 1-r^2$, and with $\beta = 1/(1+r)$. For small steps, $r\to1$ and $\beta\to\tfrac12$:
+the I$^2$SB posterior re-injects roughly half the noise each step removes. This is a
+stochastic, sampling-type ascent, not the deterministic one ($\beta = 1$). The ImMAP view
+separates three things the I$^2$SB sampler ties together:
+\begin{itemize}[leftmargin=1.5em]
+  \item the \textbf{step size} $h_k$, which can be chosen freely instead of being set by the ladder;
+  \item the \textbf{stochasticity} $\beta$, anywhere from deterministic MAP ascent ($\beta=1$) to
+        I$^2$SB's $\approx\tfrac12$;
+  \item the \textbf{noise ladder}: open-loop, or self-paced from the residual norm, with a
+        starting level $\sigma_0$ that need not be the trained maximum.
+  \end{itemize}
+Proposition~\ref{prop:i2sb} is checked numerically against
+\nolinkurl{sb.base.reverse_sample} in \nolinkurl{tests/test_immap_sb_ascent.py}.
+
+%=============================================================================================
+\section{Adding the measurement: a data-consistency prox}\label{sec:prox}
+%=============================================================================================
+
+For reconstruction the target is $p(\x_0\mid\x_1,\y)$, with $\y = \Op\x_0 + \bm n$ and
+$\bm n \sim \CN(\bm0, \sigma_y^2\Id)$. Take the local Gaussian approximation
+$p(\x_0\mid\uu,\x_1) \approx \CN(\vv, c\,\sigma^2\Id)$ around the denoiser output. Here
+$c \le 1$ allows for the posterior spread being smaller than the noise variance, and is hand-tuned
+as ImMAP's $\lambda$. Then
+\begin{equation}
+  \E[\x_0\mid\uu,\x_1,\y] \approx \arg\min_{\x}\;
+    \frac{\|\y - \Op\x\|^2}{\sigma_y^2} + \frac{\|\x - \vv\|^2}{c\,\sigma^2}
+  = \big(\Op^H\Op + \lambda\Id\big)^{-1}\big(\Op^H\y + \lambda\,\vv\big),
+  \qquad \lambda = \frac{\sigma_y^2}{c\,\sigma^2}.
+  \label{eq:prox}
+\end{equation}
+It is solved with a few conjugate-gradient iterations warm-started at $\vv$, and replaces
+$\vv_k$ in Algorithm~\ref{alg:immap_sb}.
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{$\lambda$ follows the bridge.} It is large at small $\sigma$, where the
+        denoiser is trusted and the prox is nearly the identity, and small at large $\sigma$,
+        where the data dominate. The CG step of I$^2$SB-Recon~\cite{wang2024} is
+        \eqref{eq:prox} with a \emph{fixed} $\lambda$ ($7\cdot10^{-5}$). With measurement
+        noise $\sigma_y > 0$, a fixed tiny $\lambda$ fits the noise on the measured lines at
+        every step and amplifies it. The ImMAP view sets $\lambda$ from $\sigma_y$ and
+        $\sigma(t)$ instead.
+  \item \textbf{No double counting in principle.} When $\x_1 = \Op^H\y$ and the noise is white,
+        $\Op^H\y$ is a sufficient statistic for $\x_0$ given $\y$, so a regressor conditioned
+        on $\x_1$ already targets $\E[\x_0\mid\uu,\y]$ and \eqref{eq:prox} adds no new
+        information. In practice it corrects the regressor's errors, which is where its value
+        lies. When $\x_1$ does \emph{not} contain the measurement (a guide-contrast start, or
+        another study), \eqref{eq:prox} is the only place $\y$ enters.
+\end{itemize}
+
+%=============================================================================================
+\section{Summary}
+%=============================================================================================
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Object & Formula & Code \\
+\midrule
+bridge marginal & $\x_t = (1-t)\x_0 + t\x_1 + \ssb(t)\eps$, $\ssb^2 = Vt(1-t)$ &
+  \code{sb.base.bridge\_coeffs} \\
+temperature & $V = 4\tau^2$, $\max_t\ssb = \tau$ & \code{std\_fwd[-1]**2} \\
+debiased state & $\uu_t = (\x_t - t\x_1)/(1-t) = \x_0 + \sigma(t)\eps$ & \code{\_Bridge} \\
+time $\leftrightarrow$ noise & $\sigma^2 = Vt/(1-t)$, \ $t = \sigma^2/(\sigma^2+V)$ &
+  \code{t\_of\_sigma}, \code{sigma\_of\_t} \\
+regressor & $\D(\x_t,t,\x_1) = \E[\x_0\mid\uu_t,\x_1]$ & \code{predict\_x0\_recon} \\
+Tweedie & $\D - \uu = \sigma^2\grad\log p_\sigma(\uu\mid\x_1)$ & --- \\
+ascent step & $\x' = c_x\x + c_v\vv + c_1\x_1 + \gamma\eps$ & \code{bridge\_ascent\_step} \\
+injection & $\gamma^2 = \ssb(t')^2(1-\rho^2)$, $\rho = \frac{1-h}{1-\beta h}$ &
+  \code{bridge\_ascent\_step} \\
+I$^2$SB special case & $h = 1-r^2$, $\beta = 1/(1+r)$ & \code{reverse\_sample("ddpm")} \\
+data prox & $(\Op^H\Op + \lambda\Id)^{-1}(\Op^H\y + \lambda\vv)$, $\lambda = \sigma_y^2/(c\sigma^2)$ &
+  \code{cg\_data\_consistency}, \code{ImMAPProx} \\
+\bottomrule
+\end{tabular}
+\caption{The ImMAP reading of I$^2$SB and where each piece lives in the code
+(\code{sb/base.py}, \code{sb/immap\_sb\_ascent.py}, \code{sb/i2sb\_recon.py},
+\code{sb/immap\_sb.py}).}
+\label{tab:code}
+\end{table}
+
+The reading in one line: \emph{with $\x_1$ known, the bridge is a family of conditional
+denoising problems; the I$^2$SB network is their MMSE denoiser; Tweedie turns it into the
+score of the smoothed conditional prior; and annealed ascent on that score, re-placed on the
+bridge at each new time, approaches the MAP estimate of $\x_0$ given $\x_1$, with I$^2$SB's
+own sampler as one setting of its step size and noise.}
+
+\begin{thebibliography}{9}
+\bibitem{liu2023}
+G.-H.~Liu, A.~Vahdat, D.-A.~Huang, E.~A.~Theodorou, W.~Nie, A.~Anandkumar.
+I$^2$SB: Image-to-Image Schr\"odinger Bridge. \emph{ICML}, 2023.
+
+\bibitem{ks2021}
+Z.~Kadkhodaie, E.~P.~Simoncelli.
+Stochastic solutions for linear inverse problems using the prior implicit in a denoiser.
+\emph{NeurIPS}, 2021.
+
+\bibitem{efron2011}
+B.~Efron. Tweedie's formula and selection bias.
+\emph{Journal of the American Statistical Association}, 106(496), 2011.
+
+\bibitem{miyasawa1961}
+K.~Miyasawa. An empirical Bayes estimator of the mean of a normal population.
+\emph{Bulletin of the International Statistical Institute}, 38, 1961.
+
+\bibitem{wang2024}
+Y.~Wang, Y.~Yang, Z.-X.~Cui, et al.
+Guided MRI reconstruction via Schr\"odinger bridge. arXiv:2411.14269.
+\end{thebibliography}
+
+\end{document}

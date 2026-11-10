@@ -8,8 +8,9 @@ Pinned:
   * the complex bridge: x1 = E^H y, forward_sample at step 0 is ~x0, and the reverse sampler
     driven by an ORACLE regressor lands on x0 -- complex noise and all;
   * SBReconUnet's planar round trip (complex in, complex out) and its guard rails;
-  * the training loop runs, updates the net, writes net.ckpt / net_ema.ckpt / net_bestval.ckpt,
-    and refuses a schedule mismatch and an embedding it cannot use;
+  * the training loop runs, updates the net, writes net.ckpt (latest, resumable) and
+    net_bestval.ckpt ONLY at validation (and after the last epoch), samples net.ckpt through its
+    EMA, and refuses a schedule mismatch and an embedding it cannot use;
   * the shipped configs: every key reaches train_i2sb_recon exactly once, and the model builds.
 
 Runs locally on torch 1.12 with the same stubs as tests/test_train_unsb.py.
@@ -218,17 +219,59 @@ def test_training_loop_updates_and_checkpoints():
         run(net, d, wandb=wb)
         changed = sum(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
         assert changed > 0
-        for f in ("net.ckpt", "net_ema.ckpt", "net_bestval.ckpt", "net_last.ckpt"):
-            assert os.path.exists(os.path.join(d, f)), f
-        # net_last: the LATEST validation's net, whatever its score -- the final step here
-        last = torch.load(os.path.join(d, "net_last.ckpt"), map_location="cpu",
-                          weights_only=False)
+        assert sorted(f for f in os.listdir(d) if f.endswith(".ckpt")) == \
+            ["net.ckpt", "net_bestval.ckpt"], os.listdir(d)          # no net_ema / net_last
+        # net.ckpt: the LATEST validation's state, whatever its score -- the final step here --
+        # resumable (optimizer, scheduler slot, EMA) and carrying that validation's -PSNR
+        last = torch.load(os.path.join(d, "net.ckpt"), map_location="cpu", weights_only=False)
         assert last["step"] == 2 * 2, last["step"]                   # 2 epochs x 2 steps
+        assert last["optimizer_state_dict"] is not None and last["ema_state_dict"] is not None
         psnrs = [c[1]["val/psnr"] for c in wb.calls if "val/psnr" in c[1]]
         assert abs(-last["best_val_loss"] - psnrs[-1]) < 1e-4
+        # the LIVE weights (training continues from them), not the average
+        live = dict(net.named_parameters())
+        assert all(torch.equal(v, live[k].detach()) for k, v in last["model_state_dict"].items()
+                   if k in live)
         keys = wb.keys()
         for k in ("train/loss", "val/psnr", "val/zf_psnr", "val/recon_example"):
             assert k in keys, (k, sorted(keys))
+
+
+def test_checkpoints_only_at_validation():
+    """Every write happens at a validation step, or after the last epoch: none on the epochs
+    between, however much the train loss improves (bigpurple's scratch, 2026-11-10)."""
+    from training.common import save_ckpt
+    from training.i2sb_recon import load_sampling_weights
+    writes = []
+
+    def counting_save(path, **kw):
+        writes.append((os.path.basename(path), kw["step"]))
+        return save_ckpt(path, **kw)
+
+    with tempfile.TemporaryDirectory() as d:
+        net = make_net()
+        # 5 epochs x 2 steps, validation every 2 epochs -> validations at steps 4 and 8, the
+        # last epoch ends at step 10 (not a validation)
+        run(net, d, num_epochs=5, val_every_epochs=2, save_ckpt_fn=counting_save)
+        steps = {s for _, s in writes}
+        assert steps <= {4, 8, 10}, writes
+        assert [s for f, s in writes if f == "net.ckpt"] == [4, 8, 10], writes
+        assert all(s in (4, 8) for f, s in writes if f == "net_bestval.ckpt"), writes
+
+        # sampling from net.ckpt uses its EMA, net_bestval.ckpt its (already averaged) weights
+        ck = torch.load(os.path.join(d, "net.ckpt"), map_location="cpu", weights_only=False)
+        fresh = make_net()
+        load_sampling_weights(fresh, os.path.join(d, "net.ckpt"))
+        named = [(k, p) for k, p in fresh.named_parameters() if p.is_floating_point()]
+        assert len(named) == len(ck["ema_state_dict"]["shadow"])
+        assert all(torch.equal(p.detach(), sh)
+                   for (_, p), sh in zip(named, ck["ema_state_dict"]["shadow"]))
+        assert any(not torch.equal(p.detach(), ck["model_state_dict"][k])
+                   for k, p in named)                                # i.e. not the live ones
+        bv = torch.load(os.path.join(d, "net_bestval.ckpt"), map_location="cpu",
+                        weights_only=False)
+        load_sampling_weights(fresh, os.path.join(d, "net_bestval.ckpt"))
+        assert all(torch.equal(v, fresh.state_dict()[k]) for k, v in bv["model_state_dict"].items())
 
 
 def test_single_pass_validation_and_resume():

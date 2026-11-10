@@ -296,26 +296,44 @@ def _guide(net, side, smaps, T, device, guide_R=1, guide_acs_lines=0, guide_mask
     return g if T.is_identity else T.adjoint(g)
 
 
-def guide_display(net, guide, side, guide_R, T=None):
+def operator_maps(E):
+    """The coil maps inside an encoding operator (its Sense factor), or None."""
+    for op in getattr(E, "ops", [E]):
+        if hasattr(op, "smaps") and torch.is_tensor(op.smaps):
+            return op.smaps
+    return None
+
+
+def guide_display(net, guide, side, guide_R, T=None, smaps=None):
     """[(label, image)] of the guide for the val panel: what `net` was given -- zero-filled when
     the guide is accelerated -- and, when it is, the fully-sampled side scan for reference.
-    K-space guides are shown as their coil RSS (no maps needed); image guides as |g|, cropped
-    back from the embedded grid by T. Empty when the net took no guide."""
+
+    Every k-space guide (TGVN's, and the fully-sampled reference) is shown COIL-COMBINED WITH
+    THE OPERATOR'S MAPS `smaps`, |S^H F^-1 k| -- the same combination an image guide and the
+    i2sb guide start (x1) use -- so the guide looks the same whichever net took it. Coil RSS only
+    when no maps are passed. Image guides as |g|, cropped back from the embedded grid by T.
+    Empty when the net took no guide."""
     if guide is None:
         return []
     if isinstance(side, dict):                    # N_g guide slices: show the centre one
         side = side["kspace"][:, side["kspace"].shape[1] // 2]
     if guide.dim() == 5:
         guide = guide[:, guide.shape[1] // 2]
-    rss = lambda k: ifftc(k).abs().pow(2).sum(dim=1, keepdim=True).sqrt()
+
+    def combine(k):
+        k = k.to(guide.device)
+        if smaps is None:
+            return ifftc(k).abs().pow(2).sum(dim=1, keepdim=True).sqrt()
+        return Sense(smaps.to(k.device)).adjoint(ifftc(k)).abs()
+
     if getattr(net, "guide_domain", "image") == "kspace":
-        seen = rss(guide)
+        seen = combine(guide)
     else:
         seen = guide if T is None or T.is_identity else T.forward(guide)
     if float(guide_R) == 1:
         return [("guide", seen)]
     return [(f"guide {guide_R:g}x zero-filled", seen),
-            ("guide fully sampled", rss(side.to(seen.device)))]
+            ("guide fully sampled", combine(side))]
 
 
 def _forward(net, y, E, sigma, guide):
@@ -862,7 +880,8 @@ def train_recon(
 
                     # The guide(s) as the net saw them, after the residual; see
                     # guide_display. Masked like the other tiles.
-                    gtiles = guide_display(net, guide_v, side_v, guide_R, T_v)
+                    gtiles = guide_display(net, guide_v, side_v, guide_R, T_v,
+                                           smaps=smaps_v)
                     gimgs = [g if p_mask is None else g * p_mask for _, g in gtiles]
 
                     panel, pstats = recon_panel(
