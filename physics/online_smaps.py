@@ -178,7 +178,7 @@ def estimate_cost_gb(shape, n_kernels, dtype_bytes=8):
 def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=4,
                  thresh_rowspace=0.05, thresh_eig=0.0, maxit=100,
                  walsh_ks=5, walsh_stride=2, walsh_phase_ref="virtual",
-                 window=None, clamp=ACS_CLAMP, phase_correct=False):
+                 window=None, clamp=ACS_CLAMP, phase_correct=False, return_lam=False):
     """Coil maps from the measured centre of `kspace`.
 
     Parameters
@@ -262,16 +262,19 @@ def online_smaps(kspace, mask, method="espirit", acs_lines=None, kernel_size=4,
     if window == "hamming":
         kc = hamming_window(kc)
 
+    lam = None
     if method == "walsh":
+        if return_lam:
+            raise ValueError("return_lam needs method='espirit' (Walsh has no eigenvalue map)")
         smaps = walsh(ifftc(kc), ks=walsh_ks, stride=walsh_stride,
                       phase_ref=walsh_phase_ref)
     else:
-        smaps = espirit(kc, acs_size=(ax, ay), kernel_size=kernel_size,
-                        thresh_rowspace=thresh_rowspace, thresh_eig=thresh_eig,
-                        maxit=maxit)
+        smaps, lam = espirit(kc, acs_size=(ax, ay), kernel_size=kernel_size,
+                             thresh_rowspace=thresh_rowspace, thresh_eig=thresh_eig,
+                             maxit=maxit, return_lam=True)
     if phase_correct:
         smaps = phase_correct_maps(smaps, ifftc(kc))
-    return smaps
+    return (smaps, lam) if return_lam else smaps
 
 
 def phase_correct_maps(smaps, calib):

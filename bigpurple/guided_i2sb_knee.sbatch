@@ -36,6 +36,8 @@
 # Submit:        sbatch bigpurple/guided_i2sb_knee.sbatch
 # One cell:      sbatch --array=1 bigpurple/guided_i2sb_knee.sbatch                  (sblggs)
 # Other cells:   MODELS="sblggs_guide sblggs_acs" sbatch --array=0-1 --export=ALL bigpurple/guided_i2sb_knee.sbatch
+# Noise:           NOISE=low|none ... sbatch --export=ALL ...  (training sigma U[0, 0.01] / none;
+#                  their runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/)
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-knee
@@ -72,6 +74,9 @@ die() { echo "[i2sb-knee] $*" >&2; exit 1; }
 
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels 1)
+if [ -n "${NOISE:-}" ]; then
+    GEN+=(--noise "${NOISE}")   # added noise preset: grid (default) | low | none; own run tag
+fi
 if [ -n "${TAU:-}" ]; then
     GEN+=(--tau "${TAU}")       # one tau for every cell: no calibration, names get _tau<value>
 fi

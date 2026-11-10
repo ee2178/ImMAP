@@ -69,7 +69,9 @@ def main():
                                 "adjust_accel", "online_smaps", "online_smaps_kws") if k in mri}
     meas.setdefault("online_smaps", None)
     meas.setdefault("online_smaps_kws", None)
-    noise = tr.get("val_noise_std") or tr.get("noise_std")
+    # the TRAINING noise: tau sizes the bridge the net is trained on (validation adds none now)
+    noise = tr.get("noise_std")
+    noise = tr.get("val_noise_std", 0.0) if noise is None else noise
 
     sq, n, per, diffs = 0.0, 0, [], []
     scales, rel = [], []            # slice_scale(x1) per slice, and its gap pixels

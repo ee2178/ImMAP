@@ -51,6 +51,8 @@
 # One cell:        sbatch --array=1 torch/guided_recon_knee.sbatch          (lggs_R8_g1)
 # Other cells:     MODELS="tgvn_c8" GUIDE_ACCELS="1 2 4" sbatch --array=0-2 --export=ALL torch/guided_recon_knee.sbatch
 # Smoke test:      sbatch --array=0 --time=00:30:00 torch/guided_recon_knee.sbatch
+# Noise:           NOISE=low|none ... sbatch --export=ALL ...  (training sigma U[0, 0.01] / none;
+#                  their runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/)
 # Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
@@ -69,6 +71,9 @@ mkdir -p torch/logs
 
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels ${GUIDE_ACCELS})
+if [ -n "${NOISE:-}" ]; then
+    GEN+=(--noise "${NOISE}")   # added noise preset: grid (default) | low | none; own run tag
+fi
 CELLS="$("${GEN[@]}" --list-cells)"
 N_TOTAL="$(echo "${CELLS}" | wc -l)"
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TOTAL}" ]; then

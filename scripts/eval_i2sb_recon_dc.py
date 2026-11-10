@@ -43,50 +43,28 @@ def _setting(s):
     return int(it), float(lam)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--run-dir", required=True, help="an i2sb_recon run's save_dir (has config)")
-    ap.add_argument("--config", default=None, help="default: <run-dir>/config.json")
-    ap.add_argument("--ckpt", default=BESTVAL_CKPT, help="file in run-dir (default: best val)")
-    ap.add_argument("--dc", type=_setting, nargs="+",
-                    default=[(7, 7e-5), (7, 1e-3), (7, 1e-2)], metavar="ITERS:LAM")
-    ap.add_argument("--nfe", type=int, default=None, help="default: the run's val_nfe")
-    ap.add_argument("--n-slices", type=int, default=None, help="default: the run's val_slices")
-    ap.add_argument("--batch", type=int, default=None)
-    ap.add_argument("--seed", type=int, default=None, help="default: the run's val_seed")
-    ap.add_argument("--out", default=None, help="default: <run-dir>/eval_dc")
-    args = ap.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg_path = args.config or next(
-        (p for p in (os.path.join(args.run_dir, f"config.{e}") for e in ("json", "yaml", "yml"))
+def load_run(run_dir, ckpt=BESTVAL_CKPT, device=None, config=None):
+    """A trained i2sb_recon run, ready to sample: {"cfg", "net" (eval, weights loaded), "bridge"
+    (its schedule), "meas" (training/i2sb_recon.py::_measure's settings, validation mask offset),
+    "kspace_type", "noise_std" (the validation noise), "nfe", "seed", "i2", "tr", "device"}."""
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    cfg_path = config or next(
+        (p for p in (os.path.join(run_dir, f"config.{e}") for e in ("json", "yaml", "yml"))
          if os.path.exists(p)), None)
     if cfg_path is None:
-        raise FileNotFoundError(f"no config.json / config.yaml in {args.run_dir}; pass --config")
+        raise FileNotFoundError(f"no config.json / config.yaml in {run_dir}")
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)                     # what train.py does on resume
     if cfg.get("task") != "i2sb_recon":
         raise ValueError(f"{cfg_path} is task {cfg.get('task')!r}, not i2sb_recon")
     i2, mri, tr = cfg["i2sb"], cfg["mri"], cfg["training"]
-
     net = build_model(cfg).to(device).eval()
-    load_ckpt(os.path.join(args.run_dir, args.ckpt), model=net, device=device)
+    load_ckpt(os.path.join(run_dir, ckpt), model=net, device=device)
     bridge = build_schedule(kind=i2.get("kind", "brownian"), tau=i2["tau"],
                             n_points=i2.get("n_points", 1000), beta_max=i2.get("beta_max", 0.3),
                             device=device)
     if hasattr(net, "assert_schedule_matches"):
         net.assert_schedule_matches(bridge)
-    nfe = args.nfe or int(i2.get("val_nfe", 20))
-    seed = int(args.seed if args.seed is not None else tr.get("val_seed") or 0)
-    tau_scale, tau_ref = i2.get("tau_scale", "none"), i2.get("tau_ref")
-
-    vcfg = dict(cfg["data"]["val"])
-    if args.batch:
-        vcfg["batch_size"] = args.batch
-    n = args.n_slices if args.n_slices is not None else tr.get("val_slices")
-    loader = fixed_val_subset(build_loader(vcfg, shuffle=False, drop_last=False), n, seed)
-
     meas = dict(R=mri["R"], acs_lines=mri.get("acs_lines", 24),
                 mask_dist=mri.get("mask_dist", "uniform"), mask_offset=0,
                 center_frac=mri.get("center_frac"), adjust_accel=mri.get("adjust_accel", False),
@@ -96,9 +74,45 @@ def main():
                 x0_source=i2.get("x0_source", "operator"),
                 guide_R=mri.get("guide_R", 1), guide_acs_lines=mri.get("guide_acs_lines", 0),
                 guide_mask_dist=mri.get("guide_mask_dist", "uniform"))
-    kspace_type = mri.get("val_kspace_type") or mri.get("kspace_type", "simulated")
     noise_std = tr.get("val_noise_std")
     noise_std = tr.get("noise_std", (0.0, 0.01)) if noise_std is None else noise_std
+    return dict(cfg=cfg, net=net, bridge=bridge, meas=meas, i2=i2, tr=tr, device=device,
+                kspace_type=mri.get("val_kspace_type") or mri.get("kspace_type", "simulated"),
+                noise_std=noise_std, nfe=int(i2.get("val_nfe", 20)),
+                seed=int(tr.get("val_seed") or 0))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--run-dir", required=True, help="an i2sb_recon run's save_dir (has config)")
+    ap.add_argument("--config", default=None, help="default: <run-dir>/config.json")
+    ap.add_argument("--ckpt", default=BESTVAL_CKPT, help="file in run-dir (default: best val)")
+    ap.add_argument("--dc", type=_setting, nargs="+",
+                    default=[(7, 7e-5), (7, 1e-3), (7, 1e-2)], metavar="ITERS:LAM")
+    ap.add_argument("--nfe", type=int, default=None, help="default: the run's val_nfe")
+    ap.add_argument("--noise", type=float, default=None,
+                    help="added measurement noise std; default: the run's val_noise_std "
+                         "(0 = the scan as acquired, its own noise only)")
+    ap.add_argument("--n-slices", type=int, default=None, help="default: the run's val_slices")
+    ap.add_argument("--batch", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None, help="default: the run's val_seed")
+    ap.add_argument("--out", default=None, help="default: <run-dir>/eval_dc")
+    args = ap.parse_args()
+
+    run = load_run(args.run_dir, args.ckpt, config=args.config)
+    cfg, net, bridge, meas, i2, tr = (run[k] for k in ("cfg", "net", "bridge", "meas", "i2", "tr"))
+    device, kspace_type, noise_std = run["device"], run["kspace_type"], run["noise_std"]
+    if args.noise is not None:
+        noise_std = float(args.noise)
+    nfe = args.nfe or run["nfe"]
+    seed = int(args.seed if args.seed is not None else run["seed"])
+    tau_scale, tau_ref = i2.get("tau_scale", "none"), i2.get("tau_ref")
+    vcfg = dict(cfg["data"]["val"])
+    if args.batch:
+        vcfg["batch_size"] = args.batch
+    n = args.n_slices if args.n_slices is not None else tr.get("val_slices")
+    loader = fixed_val_subset(build_loader(vcfg, shuffle=False, drop_last=False), n, seed)
     mask_metrics = bool(tr.get("use_organ_mask", False))
 
     settings = list(dict.fromkeys([(0, 0.0)] + list(args.dc)))

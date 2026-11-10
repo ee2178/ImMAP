@@ -209,6 +209,28 @@ def save_ckpt(
 
         return obj.state_dict()
 
+    # ATOMIC: write beside the target, then rename over it. torch.save straight onto `path`
+    # leaves a truncated file when the write fails part-way (a full / over-quota filesystem:
+    # "unexpected pos ... " from inline_container, 2026-11-10 on bigpurple), and `path` is the
+    # run's only resume checkpoint. A failed write now leaves the previous checkpoint intact.
+    # per-process temp name: two processes saving the same path (a cell launched twice) must not
+    # write into one temp file either; the last complete rename wins, and neither is truncated
+    tmp = f"{path}.partial.{os.getpid()}"
+    try:
+        _save_payload(get_state_dict, path=tmp, step=step, model=model, optimizer=optimizer,
+                      scheduler=scheduler, backtrack_count=backtrack_count, best_loss=best_loss,
+                      best_val_loss=best_val_loss, ema=ema)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _save_payload(get_state_dict, path, step, model, optimizer, scheduler, backtrack_count,
+                  best_loss, best_val_loss, ema):
     torch.save(
         {
             "step": step,

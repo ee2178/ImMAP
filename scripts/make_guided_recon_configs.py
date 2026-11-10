@@ -85,6 +85,34 @@ DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c12", "tgvn_c10", "tgvn_c8", "tgvn_c6
 # per-contrast fixed scale_fac). A new tag means new run directories: the launchers RESUME any run
 # dir that has a checkpoint, so reusing an earlier set's would silently continue those runs.
 RUN_TAG = "s3"
+
+# ADDED MEASUREMENT NOISE (the protocol is measured k-space + AWGN): training sigma range and the
+# fixed validation sigma, per preset. "grid" is the mg grid's (what every run so far used); the
+# noise is there to keep the nets from memorising the scans, so "low" keeps a little of it and
+# "none" adds nothing (the scanner's own thermal noise stays in the k-space either way). Picked
+# with --noise / the launchers' NOISE; a preset other than "grid" appends "_noise-<preset>" to the
+# run tag, so its runs never share (or resume) a dir with runs at another noise level.
+NOISE_PRESETS = {
+    "grid": None,                                     # inherit the grid's training U[0.01, 0.02]
+    "low": dict(noise_std=[0.0, 0.01]),
+    "none": dict(noise_std=[0.0, 0.0]),
+}
+NOISE = "grid"
+# VALIDATION ADDS NO NOISE, whatever the training preset (2026-11-10): the measurement as scanned,
+# its own thermal noise only -- the realistic case, and the one the i2sb samplers are judged on
+# (the added noise was dragging their val metrics down as training went on, through the sampler
+# and the CG step). Nets trained on the grid's U[0.01, 0.02] then see sigma_n = 0 at validation,
+# just outside their training range; "low" and "none" include it.
+VAL_NOISE_STD = 0.0
+
+
+def run_tag():
+    return RUN_TAG if NOISE == "grid" else f"{RUN_TAG}_noise-{NOISE}"
+
+
+def _noise_suffix():
+    """The noise preset in file names (the bridge tau calibration: the gap includes the noise)."""
+    return "" if NOISE == "grid" else f"_noise-{NOISE}"
 SPLITS = "config/knee/guided/splits"
 # Raw k-space roots per CLUSTER (the CSV pairs are looked up in every root, so the layout does
 # not matter). torch: fastMRI's multicoil train + val. bigpurple: the paired multi-contrast knee
@@ -139,6 +167,12 @@ TAU = 0.03 * PDFS_SCALE_FAC / _OLD_SCALE_FAC
 # paper's defaults. Validation only -- val/* is WITH it, val/nodc_* the plain sampler on the same
 # noise draws (val cost x2). dc_iters 0 turns it off.
 I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
+# Hard support at validation sampling: every x0 prediction is multiplied by the support of the
+# OPERATOR's own online ESPIRiT maps at eigenvalue 0.9 -- the offline target's threshold, so the
+# recon's background is 0 where the target's is. Test-time computable (the measurement alone).
+# support_state also masks the bridge state after every step (off: the net then sees states
+# like its training ones).
+I2SB_SUPPORT = {"support_thresh": 0.9, "support_state": False}
 # Bridge start (sb/i2sb_recon.py): "adjoint" = zero-filled E^H y (aliased); "acs" = only the
 # mask's contiguous centre block, an alias-free low-pass image -- the bridge then deblurs, with
 # the guide supplying structure. Its width is the mask's centre (center_frac). Uniform
@@ -283,7 +317,7 @@ def bridge_tau(start, r, root=REPO, normalization=None):
     absolute tau (tau_scale "none"). No file -> the zero-filled fallback TAU / TAU_REF."""
     norm = normalization or NORMALIZATION
     absolute = norm != "fixed"
-    p = os.path.join(root, BRIDGE_TAU_DIR, f"{start}_R{r}_{norm}.json")
+    p = os.path.join(root, BRIDGE_TAU_DIR, f"{start}_R{r}_{norm}{_noise_suffix()}.json")
     if not os.path.exists(p):
         return TAU, (None if absolute else TAU_REF), False
     with open(p) as f:
@@ -340,7 +374,7 @@ def bridge_tau_path(r, model):
     spec = MODELS[model]
     if spec["task"] != "i2sb_recon" or TAU_OVERRIDE is not None:
         return None
-    return f"{BRIDGE_TAU_DIR}/{spec.get('x1_source', X1_SOURCE)}_R{r}_{NORMALIZATION}.json"
+    return f"{BRIDGE_TAU_DIR}/{spec.get('x1_source', X1_SOURCE)}_R{r}_{NORMALIZATION}{_noise_suffix()}.json"
 
 
 def cell_name(r, model, g):
@@ -358,6 +392,9 @@ def make_config(r, model, g, grid):
            else base["data"]["train"]["pad_multiple"])
     training = {k: v for k, v in base["training"].items() if k != "log_levels"}
     training["metric_range"] = METRIC_RANGE
+    if NOISE_PRESETS[NOISE] is not None:
+        training.update(NOISE_PRESETS[NOISE], noise_dist="uniform")
+    training["val_noise_std"] = VAL_NOISE_STD
     if TRAIN_RECIPE == "sljiva":
         training["clip_grad"] = SLJIVA_RECIPE["clip_grad"]
     speed = spec.get("speed") or {}
@@ -369,9 +406,9 @@ def make_config(r, model, g, grid):
     run = f"{ANATOMY}_PDFS_from_PD_{name}" if spec["guided"] else f"{ANATOMY}_PDFS_{name}"
     cfg = {
         "task": spec["task"],
-        "experiment": {"name": f"{run}_{RUN_TAG}"},
+        "experiment": {"name": f"{run}_{run_tag()}"},
         "model": json.loads(json.dumps(model_block)),
-        "paths": {"save_dir": f"trained_nets/guided_recon/{ANATOMY}/{RUN_TAG}/{name}",
+        "paths": {"save_dir": f"trained_nets/guided_recon/{ANATOMY}/{run_tag()}/{name}",
                   "ckpt": None},
         "data": {"train": dict(_data("train", base["data"]["train"], pad), **(spec.get("data") or {})),
                  "val": dict(_data("val", base["data"]["val"], pad), **(spec.get("data") or {}))},
@@ -400,7 +437,7 @@ def make_config(r, model, g, grid):
         cfg["i2sb"] = {**SCHEDULE, "tau": tau, "deterministic": False, "posterior": "ddpm",
                        "x1_source": start, "x0_source": "operator",
                        "tau_scale": TAU_SCALE, "tau_ref": tau_ref,
-                       "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC}
+                       "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC, **I2SB_SUPPORT}
     return cfg
 
 
@@ -443,12 +480,17 @@ def main():
     p.add_argument("--list-cells", action="store_true",
                    help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name<TAB>tau file' "
                         "and exit (tau file: a bridge cell's calibration path, else '-')")
+    p.add_argument("--noise", choices=list(NOISE_PRESETS), default="grid",
+                   help="added TRAINING noise: grid U[0.01, 0.02], low U[0, 0.01], none; "
+                        "validation adds none (VAL_NOISE_STD); non-grid presets get their own "
+                        "run tag")
     p.add_argument("--tau", type=float, default=None,
                    help="one bridge tau for every i2sb cell (no per-start calibration); the cell "
                         "names get a _tau<value> suffix")
     args = p.parse_args()
-    global TAU_OVERRIDE
+    global TAU_OVERRIDE, NOISE
     TAU_OVERRIDE = args.tau
+    NOISE = args.noise
     write_config = _write_config()
 
     todo = cells(args.accels, args.models, args.guide_accels)

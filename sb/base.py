@@ -220,7 +220,8 @@ def predict_x0(net, xt, sigma, cond=None, target_channels=1, guide=None, dc=None
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def reverse_sample(sched, pred_x0_fn, x1, nfe=None, deterministic=False, posterior="ddpm",
-                   clip_denoise=False, log_count=1, verbose=True, noise_scale=None):
+                   clip_denoise=False, log_count=1, verbose=True, noise_scale=None,
+                   post_step=None):
     """Shared reverse loop for every SB variant (image or latent -- it only touches tensors).
 
     Walks the discrete bridge from the prior end (x1, t = 1) down to the target end (t = 0),
@@ -245,7 +246,8 @@ def reverse_sample(sched, pred_x0_fn, x1, nfe=None, deterministic=False, posteri
     `nfe` = number of function evaluations (default interval - 1, i.e. every step). `log_count`
     intermediate states are recorded for diagnostics. `noise_scale` (kappa, per sample) multiplies
     the injected noise only, as in forward_sample: the ddpm mixing weights depend on RATIOS of
-    std_fwd, in which a per-sample temperature cancels.
+    std_fwd, in which a per-sample temperature cancels. `post_step(x_t) -> x_t`, if given, is
+    applied to the state after every update (noise included), e.g. a support projection.
 
     Returns
     -------
@@ -292,6 +294,8 @@ def reverse_sample(sched, pred_x0_fn, x1, nfe=None, deterministic=False, posteri
             x_t = mu_x0[n_prev] * x0_hat + mu_x1[n_prev] * x1
             if not deterministic and n_prev > 0:
                 x_t = x_t + kappa * std_sb[n_prev] * torch.randn_like(x_t)
+        if post_step is not None:
+            x_t = post_step(x_t)
 
         if n_prev in log_steps:
             xs.append(x_t.detach().cpu())

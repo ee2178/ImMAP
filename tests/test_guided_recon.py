@@ -533,6 +533,59 @@ def test_generator_cells_and_config_keys():
             assert cfg["training"]["metric_range"] == "gt_max", name
 
 
+def test_noise_presets():
+    """--noise: the training range and val sigma per preset, and a run tag of its own (also for
+    the bridge tau calibration file) for every preset but the grid's."""
+    import yaml
+    want = {"grid": ([0.01, 0.02], 0.0, "s3"), "low": ([0.0, 0.01], 0.0, "s3_noise-low"),
+            "none": ([0.0, 0.0], 0.0, "s3_noise-none")}
+    with tempfile.TemporaryDirectory() as out:
+        for preset, (rng, val, tag) in want.items():
+            d = os.path.join(out, preset)
+            subprocess.run([sys.executable, os.path.join(REPO, "scripts",
+                                                         "make_guided_recon_configs.py"),
+                            "--models", "tgvn_c8", "sbtgvn_c8_guide", "--noise", preset,
+                            "--out", d], check=True, cwd=REPO, stdout=subprocess.DEVNULL)
+            cfg = yaml.safe_load(open(os.path.join(d, "knee", "guided", "tgvn_c8_R8_g1.json")))
+            t = cfg["training"]
+            assert t["noise_std"] == rng and t["val_noise_std"] == val, (preset, t["noise_std"])
+            assert cfg["paths"]["save_dir"] == f"trained_nets/guided_recon/knee/{tag}/tgvn_c8_R8_g1"
+            cells = subprocess.run(
+                [sys.executable, os.path.join(REPO, "scripts", "make_guided_recon_configs.py"),
+                 "--models", "sbtgvn_c8_guide", "--noise", preset, "--list-cells"],
+                check=True, cwd=REPO, capture_output=True, text=True).stdout.splitlines()
+            tau_file = cells[0].split(chr(9))[5]
+            assert tau_file.endswith("guide_R8_volume.json" if preset == "grid"
+                                     else f"guide_R8_volume_noise-{preset}.json"), tau_file
+
+
+def test_zero_added_noise_trains():
+    """noise preset "none": sigma_n = 0 everywhere -- the noise-conditioned nets take it."""
+    from training.i2sb_recon import train_i2sb_recon
+    import physics.online_smaps as osm
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,  # noqa: E731
+                                                drop_last=False, scale_fac=1.0, start_slice=1,
+                                                end_slice=3, num_workers=0, pad_multiple=2)
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
+        try:
+            for net in (_tiny_bridge_lggs(), BridgeSpy(
+                    __import__("models.tgvn", fromlist=["BridgeTGVN"]).BridgeTGVN(
+                        tau=0.1, **TINY_TGVN))):
+                train_i2sb_recon(net, torch.optim.Adam(net.parameters(), lr=1e-4), None, "cpu",
+                                 loader(), loader(), num_epochs=1, steps_per_epoch=1,
+                                 val_every_epochs=1, R=4, acs_lines=4,
+                                 kspace_type="measurement_awgn", online_smaps="espirit",
+                                 noise_std=(0.0, 0.0), val_noise_std=0.0, val_seed=0,
+                                 loss_type="complex-mse", tau=0.1, val_mode="full_recon",
+                                 val_nfe=2, guide_R=1, save_dir=d)
+                assert all(torch.isfinite(p).all() for p in net.parameters())
+        finally:
+            osm.online_smaps = real
+
+
 def test_one_tau_for_every_start():
     """--tau: the same tau in every bridge cell (model and i2sb), no calibration file, and the
     cell names tagged so the runs never share a dir with calibrated ones."""

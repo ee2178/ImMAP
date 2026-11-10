@@ -37,6 +37,8 @@
 # Submit:          CASCADES=8 sbatch --export=ALL torch/bridge_start_knee.sbatch
 # One start:       CASCADES=8 sbatch --array=0 --export=ALL torch/bridge_start_knee.sbatch    (guide)
 # Fewer starts:    CASCADES=8 STARTS="guide acs" sbatch --array=0-1 --export=ALL torch/bridge_start_knee.sbatch
+# Noise:           NOISE=low|none ... sbatch --export=ALL ...  (training sigma U[0, 0.01] / none;
+#                  their runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/)
 # Calibrate only:  CASCADES=8 CALIBRATE_ONLY=1 sbatch --time=01:00:00 --export=ALL torch/bridge_start_knee.sbatch
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
@@ -58,6 +60,9 @@ MODELS=""
 for s in ${STARTS}; do MODELS="${MODELS} sbtgvn_c${CASCADES}_${s}"; done
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels 1)
+if [ -n "${NOISE:-}" ]; then
+    GEN+=(--noise "${NOISE}")   # added noise preset: grid (default) | low | none; own run tag
+fi
 CELLS="$("${GEN[@]}" --list-cells)"
 N_TOTAL="$(echo "${CELLS}" | wc -l)"
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TOTAL}" ]; then

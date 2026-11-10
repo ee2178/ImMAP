@@ -62,6 +62,7 @@ from operators.fourier import ifftc
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from sb.base import build_schedule, n_steps, forward_sample, forward_std
 from sb.i2sb_recon import (DC_LAM, TAU_SCALES, X1_SOURCES, bridge_noise_scale, bridge_start,
+                           online_support,
                            predict_x0_recon, i2sb_recon_sample)
 from training.common import (EMA, POSTFIX_EVERY, apply_loss_mask, embed_for_net, get_lr,
                              load_ckpt, prepare_measurement, save_ckpt, save_ema_ckpt)
@@ -206,6 +207,10 @@ def train_i2sb_recon(
     dc_lam=DC_LAM,                   # (I2SB-Recon, arXiv 2411.14269); full_recon val only, see
                                      # sb/i2sb_recon.py::cg_data_consistency. With dc_iters > 0
                                      # the val metrics are WITH it and val/nodc_* without it
+    support_thresh=None,             # full_recon val: a HARD SUPPORT on every x0 prediction, from
+    support_state=False,             # the operator's own online ESPIRiT eigenvalues > thresh
+                                     # (sb/i2sb_recon.py::online_support); support_state masks
+                                     # the bridge state too. None = no support (as before)
     # ---- paths (cfg["paths"]) ----
     save_dir=None,
     ckpt=None,
@@ -382,7 +387,8 @@ def train_i2sb_recon(
                     kspace_type=val_kspace_type or kspace_type,
                     noise_std=noise_std if val_noise_std is None else val_noise_std,
                     meas=meas, kappa_fn=kappa_fn, dc_iters=int(dc_iters), dc_lam=float(dc_lam),
-                    metric_range=metric_range,
+                    metric_range=metric_range, support_thresh=support_thresh,
+                    support_state=bool(support_state),
                     wandb=wandb, global_step=global_step, epoch=epoch)
                 if save_ckpt_fn and math.isfinite(val["psnr"]) and val["psnr"] > best_val_psnr:
                     best_val_psnr = val["psnr"]
@@ -400,6 +406,16 @@ def train_i2sb_recon(
 
 
 @torch.no_grad()
+def measurement_support(y, E, meas, thresh):
+    """The hard support online_support() gives for this batch's measurement: the operator's own
+    ESPIRiT settings (meas["online_smaps_kws"]) on its own mask and ACS."""
+    if (meas.get("online_smaps") or "espirit") != "espirit":
+        raise ValueError("support_thresh needs online_smaps='espirit' (an eigenvalue map)")
+    mask = next(op.mask for op in E.ops if getattr(op, "OP_KIND", None) == "kspace_diag")
+    acs = resolve_acs_lines(y.shape[-1], meas["acs_lines"], meas["center_frac"])
+    return online_support(y, mask, acs, thresh, **(meas.get("online_smaps_kws") or {}))
+
+
 def _validate(net, bridge, val_loader, device, *, val_seed, **kws):
     """-> mean {"loss", "psnr", "ssim", "nrmse", "zf_psnr", "zf_ssim", "zf_nrmse"} over the split.
 
@@ -417,7 +433,8 @@ def _validate(net, bridge, val_loader, device, *, val_seed, **kws):
 def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, val_nfe,
                    deterministic, posterior, loss_fn, loss_type, use_organ_mask, residual_gain,
                    kspace_type, noise_std, meas, kappa_fn, wandb, global_step, epoch,
-                   dc_iters=0, dc_lam=DC_LAM, metric_range=1.0):
+                   dc_iters=0, dc_lam=DC_LAM, metric_range=1.0, support_thresh=None,
+                   support_state=False):
     net.eval()
     compare = val_mode == "full_recon" and dc_iters > 0
     keys = ("loss", "psnr", "ssim", "nrmse", "zf_psnr", "zf_ssim", "zf_nrmse")
@@ -433,10 +450,13 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
             guide_offset=0, **meas)
         bs = x0.shape[0]
         if val_mode == "full_recon":
+            sup = None if support_thresh is None else measurement_support(y, E, meas,
+                                                                          support_thresh)
             sample = lambda dc: i2sb_recon_sample(                       # noqa: E731
                 net, y, E, bridge, sigma_n=sigma_n, x1=x1, nfe=val_nfe,
                 deterministic=deterministic, posterior=posterior, verbose=False, guide=guide,
-                noise_scale=kappa_fn(x1), dc_iters=dc, dc_lam=dc_lam)[0]
+                noise_scale=kappa_fn(x1), dc_iters=dc, dc_lam=dc_lam, support=sup,
+                support_state=support_state)[0]
             if compare:                     # the plain sampler on the SAME noise draws
                 devs = [device] if torch.device(device).type == "cuda" else []
                 with torch.random.fork_rng(devices=devs):

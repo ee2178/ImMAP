@@ -174,14 +174,24 @@ def cg_data_consistency(x0_hat, y, E, lam=DC_LAM, iters=DC_ITERS):
 @torch.no_grad()
 def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoint", nfe=None,
                       deterministic=False, posterior="ddpm", log_count=1, verbose=True,
-                      guide=None, noise_scale=None, dc_iters=0, dc_lam=DC_LAM):
+                      guide=None, noise_scale=None, dc_iters=0, dc_lam=DC_LAM,
+                      support=None, support_state=False, trace=None):
     """Reconstruct x0 from (y, E) along the reverse bridge.
 
     `x1` defaults to bridge_start(y, E, x1_source); pass it to reuse one already built. y, E,
     sigma_n and the guide (side information) are held fixed along the whole trajectory.
     `noise_scale` is the per-sample temperature multiplier (bridge_noise_scale). `dc_iters` > 0
     applies cg_data_consistency(x0_hat, y, E, dc_lam, dc_iters) to every prediction before the
-    posterior step (I2SB-Recon; module doc); 0 is the plain sampler. Returns
+    posterior step (I2SB-Recon; module doc); 0 is the plain sampler.
+
+    `support` (B, 1, H, W), bool or 0/1: a HARD SUPPORT. Every x0 prediction is multiplied by
+    it after the data-consistency step, and so is the returned recon (the background of both is
+    exactly 0) -- and, with `support_state`, the bridge state
+    too after every update (the trajectory's background cannot drift; the net then sees states
+    unlike its training ones outside the support). online_support() builds one from the
+    operator's own ESPIRiT eigenvalues. `trace` (a list): one dict per function evaluation is
+    appended, {"step", "x_t" (the state the net saw), "x0_pre" (its prediction), "x0_dc" (after
+    data consistency), "x0_post" (and the support)}, on the CPU. Returns
     (recon, xs, pred_x0s), as sb.base.reverse_sample (no clip_denoise: a complex image has no
     [-1, 1] box)."""
     device = sched.std_fwd.device
@@ -193,8 +203,33 @@ def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoin
         sigma = forward_std(sched, step_t, xdim=x_t.shape[1:])
         x0_hat = predict_x0_recon(net, x_t, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n,
                                   guide=guide)
-        return cg_data_consistency(x0_hat, y, E, dc_lam, dc_iters)
+        x0_dc = cg_data_consistency(x0_hat, y, E, dc_lam, dc_iters)
+        x0 = x0_dc if sup is None else x0_dc * sup
+        if trace is not None:
+            trace.append(dict(step=int(step), x_t=x_t.detach().cpu(),
+                              x0_pre=x0_hat.detach().cpu(), x0_dc=x0_dc.detach().cpu(),
+                              x0_post=x0.detach().cpu()))
+        return x0
 
-    return reverse_sample(sched, pred_x0_fn, x1, nfe=nfe, deterministic=deterministic,
-                          posterior=posterior, clip_denoise=False, log_count=log_count,
-                          verbose=verbose, noise_scale=noise_scale)
+    sup = None if support is None else support.to(device=device, dtype=x1.real.dtype)
+    post = (lambda x: x * sup) if (sup is not None and support_state) else None
+    recon, xs, preds = reverse_sample(
+        sched, pred_x0_fn, x1 if post is None else post(x1), nfe=nfe,
+        deterministic=deterministic, posterior=posterior, clip_denoise=False,
+        log_count=log_count, verbose=verbose, noise_scale=noise_scale, post_step=post)
+    if sup is not None:
+        # the last ddpm step still keeps std_fwd[0]^2 / std_fwd[n]^2 of the previous state
+        # (std_fwd[0] > 0), so the recon is not exactly the last prediction: mask it too
+        recon = recon * sup
+    return recon, xs, preds
+
+
+def online_support(y, mask, acs_lines, thresh=0.9, **kws):
+    """(B, 1, H, W) bool: where the OPERATOR's own ESPIRiT top eigenvalue exceeds `thresh` -- the
+    hard support of online maps estimated as the operator's are (the same measurement, ACS and
+    kernel settings), whatever thresh_eig the operator itself uses (the configs keep 0, soft
+    maps). Test-time computable: it reads only the measurement. One extra ESPIRiT call."""
+    from physics.online_smaps import online_smaps
+    kws = {k: v for k, v in kws.items() if k != "thresh_eig"}
+    _, lam = online_smaps(y, mask, acs_lines=acs_lines, thresh_eig=0.0, return_lam=True, **kws)
+    return (lam > float(thresh))[:, None]

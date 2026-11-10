@@ -361,6 +361,59 @@ def test_dc_sampler_corrects_a_hallucinating_regressor():
     assert _rel_res(out[7], y, E) < 0.5 * _rel_res(out[0], y, E)
 
 
+def test_support_and_trace():
+    """`support`: every x0 prediction (so the recon) is 0 outside it, also with CG; with
+    `support_state` the state is too. `trace`: one entry per evaluation, pre / post DC."""
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    bg = torch.zeros_like(image)
+    bg[..., :4, :] = 0.3                                     # the regressor leaks background
+    sup = torch.ones(2, 1, H, H, dtype=torch.bool)
+    sup[..., :6, :] = False
+
+    def leaky(x_t, sigma=None, **_):
+        return image + bg, None
+
+    for dc in (0, 3):
+        trace = []
+        torch.manual_seed(0)
+        rec = i2sb_recon_sample(leaky, y, E, sched, nfe=6, verbose=False, dc_iters=dc,
+                                dc_lam=1e-2, support=sup, trace=trace)[0]
+        assert float(rec[~sup.expand_as(rec)].abs().max()) == 0.0
+        assert len(trace) == 6 and all(set(t) == {"step", "x_t", "x0_pre", "x0_dc", "x0_post"}
+                                       for t in trace)
+        assert float(trace[0]["x0_pre"][..., :4, :].abs().max()) > 0.1   # before the support
+        assert float(trace[0]["x0_post"][..., :4, :].abs().max()) == 0.0
+        # the state keeps its background unless support_state
+        assert float(trace[-1]["x_t"][..., :4, :].abs().max()) > 0
+    trace = []
+    i2sb_recon_sample(leaky, y, E, sched, nfe=6, verbose=False, support=sup, support_state=True,
+                      trace=trace)
+    assert all(float(t["x_t"][..., :6, :].abs().max()) == 0.0 for t in trace)
+
+
+def test_online_support_thresholds_the_operators_eigenvalues():
+    import physics.online_smaps as osm
+    from sb.i2sb_recon import online_support
+    lam = torch.linspace(0, 1, H * H).reshape(1, H, H).expand(2, H, H)
+    seen = {}
+
+    def fake(y, mask, acs_lines=None, thresh_eig=None, return_lam=False, **kw):
+        seen.update(kw, thresh_eig=thresh_eig, return_lam=return_lam)
+        return torch.ones(2, 4, H, H, dtype=torch.complex64), lam
+    real, osm.online_smaps = osm.online_smaps, fake
+    try:
+        s = online_support(torch.zeros(2, 4, H, H, dtype=torch.complex64), None, 4, 0.9,
+                           kernel_size=4, thresh_eig=0.0)
+    finally:
+        osm.online_smaps = real
+    assert s.shape == (2, 1, H, H) and s.dtype == torch.bool
+    assert torch.equal(s[:, 0], lam > 0.9)
+    assert seen["return_lam"] and seen["thresh_eig"] == 0.0 and seen["kernel_size"] == 4
+
+
 def test_dc_validation_logs_both_samplers():
     with tempfile.TemporaryDirectory() as d:
         wb = FakeWandb()
