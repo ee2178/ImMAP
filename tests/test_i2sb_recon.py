@@ -218,8 +218,14 @@ def test_training_loop_updates_and_checkpoints():
         run(net, d, wandb=wb)
         changed = sum(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
         assert changed > 0
-        for f in ("net.ckpt", "net_ema.ckpt", "net_bestval.ckpt"):
+        for f in ("net.ckpt", "net_ema.ckpt", "net_bestval.ckpt", "net_last.ckpt"):
             assert os.path.exists(os.path.join(d, f)), f
+        # net_last: the LATEST validation's net, whatever its score -- the final step here
+        last = torch.load(os.path.join(d, "net_last.ckpt"), map_location="cpu",
+                          weights_only=False)
+        assert last["step"] == 2 * 2, last["step"]                   # 2 epochs x 2 steps
+        psnrs = [c[1]["val/psnr"] for c in wb.calls if "val/psnr" in c[1]]
+        assert abs(-last["best_val_loss"] - psnrs[-1]) < 1e-4
         keys = wb.keys()
         for k in ("train/loss", "val/psnr", "val/zf_psnr", "val/recon_example"):
             assert k in keys, (k, sorted(keys))

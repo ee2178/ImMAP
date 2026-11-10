@@ -51,8 +51,8 @@
 # One cell:        sbatch --array=1 torch/guided_recon_knee.sbatch          (lggs_R8_g1)
 # Other cells:     MODELS="tgvn_c8" GUIDE_ACCELS="1 2 4" sbatch --array=0-2 --export=ALL torch/guided_recon_knee.sbatch
 # Smoke test:      sbatch --array=0 --time=00:30:00 torch/guided_recon_knee.sbatch
-# Noise:           NOISE=low|none ... sbatch --export=ALL ...  (training sigma U[0, 0.01] / none;
-#                  their runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/)
+# Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
+#                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"

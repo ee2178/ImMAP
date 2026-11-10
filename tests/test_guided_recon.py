@@ -518,7 +518,7 @@ def test_generator_cells_and_config_keys():
             else:
                 assert (d["scale_fac"], d["side_scale_fac"]) == (gen.PDFS_SCALE_FAC,
                                                                  gen.PD_SCALE_FAC)
-            assert cfg["paths"]["save_dir"] == f"trained_nets/guided_recon/knee/{gen.RUN_TAG}/{name}"
+            assert cfg["paths"]["save_dir"] == f"trained_nets/guided_recon/knee/{gen.run_tag()}/{name}"
             guided = gen.MODELS[name.split("_R")[0]]["guided"]
             assert ("from_PD" in cfg["experiment"]["name"]) == guided, cfg["experiment"]["name"]
             if cfg["task"] == "i2sb_recon":
@@ -626,7 +626,7 @@ def test_bridge_tau_is_read_per_start_and_normalization():
         os.makedirs(os.path.join(root, gen.BRIDGE_TAU_DIR))
         cal = {"tau_abs": 0.1, "tau_rel": 0.2, "tau_ref": 0.9}
         for norm in ("volume", "fixed"):
-            with open(os.path.join(root, gen.BRIDGE_TAU_DIR, f"guide_R8_{norm}.json"), "w") as f:
+            with open(os.path.join(root, gen.BRIDGE_TAU_DIR, f"guide_R8_{norm}{gen._noise_suffix()}.json"), "w") as f:
                 json.dump(cal, f)
         tau, tau_ref, ok = gen.bridge_tau("guide", 8, root=root, normalization="volume")
         assert ok and abs(tau - gen.TAU_MARGIN_ABS * 0.1) < 1e-3 and tau_ref is None
@@ -634,7 +634,7 @@ def test_bridge_tau_is_read_per_start_and_normalization():
         assert ok and abs(tau - gen.TAU_MARGIN * 0.2) < 1e-3 and tau_ref == 0.9
         assert gen.bridge_tau("acs", 8, root=root, normalization="volume")[2] is False
     assert gen.bridge_tau_path(8, "sbtgvn_c8_acs") == \
-        f"{gen.BRIDGE_TAU_DIR}/acs_R8_{gen.NORMALIZATION}.json"
+        f"{gen.BRIDGE_TAU_DIR}/acs_R8_{gen.NORMALIZATION}{gen._noise_suffix()}.json"
     assert gen.bridge_tau_path(8, "tgvn_c8") is None
 
 

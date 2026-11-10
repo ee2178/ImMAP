@@ -1,7 +1,7 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "knee_PDFS_lpdsnet_R8_s3"
+        "name": "knee_PDFS_lpdsnet_R8_s3_noise-low"
     },
     "model": {
         "type": "MGLPDSNet",
@@ -23,7 +23,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/guided_recon/knee/s3/lpdsnet_R8",
+        "save_dir": "trained_nets/guided_recon/knee/s3_noise-low/lpdsnet_R8",
         "ckpt": null
     },
     "data": {
@@ -73,8 +73,8 @@
         "steps_per_epoch": 50,
         "val_every_epochs": 100,
         "noise_std": [
-            0.01,
-            0.02
+            0.0,
+            0.01
         ],
         "noise_dist": "uniform",
         "val_noise_std": 0.0,

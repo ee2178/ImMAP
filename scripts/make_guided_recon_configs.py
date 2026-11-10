@@ -97,7 +97,7 @@ NOISE_PRESETS = {
     "low": dict(noise_std=[0.0, 0.01]),
     "none": dict(noise_std=[0.0, 0.0]),
 }
-NOISE = "grid"
+NOISE = "low"                       # the default since 2026-11-10: U[0, 0.01], user's call
 # VALIDATION ADDS NO NOISE, whatever the training preset (2026-11-10): the measurement as scanned,
 # its own thermal noise only -- the realistic case, and the one the i2sb samplers are judged on
 # (the added noise was dragging their val metrics down as training went on, through the sampler
@@ -480,7 +480,7 @@ def main():
     p.add_argument("--list-cells", action="store_true",
                    help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name<TAB>tau file' "
                         "and exit (tau file: a bridge cell's calibration path, else '-')")
-    p.add_argument("--noise", choices=list(NOISE_PRESETS), default="grid",
+    p.add_argument("--noise", choices=list(NOISE_PRESETS), default="low",
                    help="added TRAINING noise: grid U[0.01, 0.02], low U[0, 0.01], none; "
                         "validation adds none (VAL_NOISE_STD); non-grid presets get their own "
                         "run tag")

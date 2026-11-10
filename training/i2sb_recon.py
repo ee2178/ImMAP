@@ -78,6 +78,7 @@ from visualization.wandb_image import wandb_image
 
 
 BESTVAL_CKPT = "net_bestval.ckpt"
+LAST_CKPT = "net_last.ckpt"         # the latest validated (averaged) net, every validation
 X0_SOURCES = ("operator", "stored")
 
 
@@ -265,6 +266,7 @@ def train_i2sb_recon(
     ckpt_path = os.path.join(save_dir, "net.ckpt")
     ema_ckpt_path = os.path.join(save_dir, "net_ema.ckpt")
     bestval_path = os.path.join(save_dir, BESTVAL_CKPT)
+    last_path = os.path.join(save_dir, LAST_CKPT)
 
     best_val_psnr = -float("inf")
     if start_epoch > 0:
@@ -390,6 +392,16 @@ def train_i2sb_recon(
                     metric_range=metric_range, support_thresh=support_thresh,
                     support_state=bool(support_state),
                     wandb=wandb, global_step=global_step, epoch=epoch)
+                if save_ckpt_fn:
+                    # The LATEST validated net, every validation, whatever its score: i2sb recon
+                    # is volatile -- val PSNR need not improve with training -- and net.ckpt is
+                    # written only when the training loss improves (noisy for a bridge: random t
+                    # per sample), so neither of the other two is guaranteed to be recent.
+                    # Averaged (EMA) weights, like net_bestval; best_val_loss holds THIS
+                    # validation's -PSNR. A sampling checkpoint, not a resume one.
+                    save_ckpt_fn(last_path, model=net, step=global_step,
+                                 backtrack_count=backtrack_count, best_loss=best_loss,
+                                 best_val_loss=-float(val["psnr"]))
                 if save_ckpt_fn and math.isfinite(val["psnr"]) and val["psnr"] > best_val_psnr:
                     best_val_psnr = val["psnr"]
                     # under the EMA context, so this is the averaged net -- the one validated

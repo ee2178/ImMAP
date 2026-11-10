@@ -37,8 +37,8 @@
 # Submit:          CASCADES=8 sbatch --export=ALL torch/bridge_start_knee.sbatch
 # One start:       CASCADES=8 sbatch --array=0 --export=ALL torch/bridge_start_knee.sbatch    (guide)
 # Fewer starts:    CASCADES=8 STARTS="guide acs" sbatch --array=0-1 --export=ALL torch/bridge_start_knee.sbatch
-# Noise:           NOISE=low|none ... sbatch --export=ALL ...  (training sigma U[0, 0.01] / none;
-#                  their runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/)
+# Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
+#                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Calibrate only:  CASCADES=8 CALIBRATE_ONLY=1 sbatch --time=01:00:00 --export=ALL torch/bridge_start_knee.sbatch
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"

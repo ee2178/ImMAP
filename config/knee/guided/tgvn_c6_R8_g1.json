@@ -1,7 +1,7 @@
 {
     "task": "recon",
     "experiment": {
-        "name": "knee_PDFS_from_PD_tgvn_c6_R8_g1_s3"
+        "name": "knee_PDFS_from_PD_tgvn_c6_R8_g1_s3_noise-low"
     },
     "model": {
         "type": "TGVN",
@@ -17,7 +17,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/guided_recon/knee/s3/tgvn_c6_R8_g1",
+        "save_dir": "trained_nets/guided_recon/knee/s3_noise-low/tgvn_c6_R8_g1",
         "ckpt": null
     },
     "data": {
@@ -67,8 +67,8 @@
         "steps_per_epoch": 50,
         "val_every_epochs": 100,
         "noise_std": [
-            0.01,
-            0.02
+            0.0,
+            0.01
         ],
         "noise_dist": "uniform",
         "val_noise_std": 0.0,

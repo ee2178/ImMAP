@@ -36,8 +36,8 @@
 # Submit:        sbatch bigpurple/guided_i2sb_knee.sbatch
 # One cell:      sbatch --array=1 bigpurple/guided_i2sb_knee.sbatch                  (sblggs)
 # Other cells:   MODELS="sblggs_guide sblggs_acs" sbatch --array=0-1 --export=ALL bigpurple/guided_i2sb_knee.sbatch
-# Noise:           NOISE=low|none ... sbatch --export=ALL ...  (training sigma U[0, 0.01] / none;
-#                  their runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/)
+# Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
+#                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-knee
