@@ -298,6 +298,22 @@ for _src in BRIDGE_STARTS:
         model=dict(type="BridgeLGGS", params=dict(LGGS_PARAMS, **SCHEDULE)),
         speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING))
 
+# ... and the PLAIN UNet bridge baselines (models/sb_recon_unet.py::SBReconUnet), the I2SB-Recon
+# setup of arXiv 2411.14269: an ADM UNet that never sees (y, E) -- the measurement enters only
+# through x1 = E^H y and the sampler's CG step. The knee i2sb UNet's size (config/knee/i2sb/
+# unet_R8.json). "sbunet" is unguided; "sbunet_guided" also takes the guide (PD) image as two
+# extra input channels and nothing else. Both start at the zero-filled image, so they share the
+# "adjoint" bridge calibration with sbtgvn_c*_adjoint.
+SBUNET_PARAMS = dict(cond_x1=True, model_channels=64, num_res_blocks=2, channel_mult=[1, 2, 3, 4],
+                     attention_resolutions=[40], image_size=320, num_heads=4,
+                     num_head_channels=32, dropout=0.0, use_scale_shift_norm=True,
+                     resblock_updown=False, conv_resample=True, t0=1e-4, T=1.0)
+for _name, _guided in (("sbunet", False), ("sbunet_guided", True)):
+    MODELS[_name] = dict(
+        task="i2sb_recon", guided=_guided, grid_base="varnet", pad_multiple=1,
+        x1_source="adjoint",
+        model=dict(type="SBReconUnet", params=dict(SBUNET_PARAMS, guided=_guided, **SCHEDULE)))
+
 # Per-start bridge temperature. The gap x0 - x1 differs completely between starts (aliasing for
 # "adjoint", blur for "acs", CONTRAST for "guide"), so each gets its own calibration, written by
 # `scripts/calibrate_recon_bridge.py <config> --json BRIDGE_TAU_DIR/<start>_R<R>.json` (the bridge

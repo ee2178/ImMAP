@@ -25,6 +25,11 @@ same thing the synthesis UNets do with their prior contrast. The net then sees C
 (x_t and x1, each planar), otherwise 2. Without it the regressor has to read the zero-filled image
 out of x_t, which near t = 0 is almost entirely x0.
 
+`guided` (default False) appends the GUIDE image -- the side scan coil-combined under the
+operator's maps, what training/recon.py::_guide hands an image-domain net -- as two more planar
+channels: the guided UNet baseline, side information as plain input channels and nothing else.
+Unguided, the net declares `guided = False`, so the loops pass no guide even on paired data.
+
 Every other parameter goes to SBUnet unchanged, schedule copy included: kind / tau / n_points /
 beta_max MUST match cfg["i2sb"] (assert_schedule_matches is checked at startup).
 """
@@ -52,18 +57,23 @@ class SBReconUnet(nn.Module):
     # embedding (operators/truncate.py) must stay an identity for this net.
     pad_stride = 1
 
-    def __init__(self, cond_x1=True, **unet_kws):
+    guide_domain = "image"         # the loops hand a guided net the coil-combined side image
+
+    def __init__(self, cond_x1=True, guided=False, **unet_kws):
         super().__init__()
         self.cond_x1 = bool(cond_x1)
+        self.guided = bool(guided)
         if "C" in unet_kws or "out_channels" in unet_kws:
             raise ValueError("SBReconUnet sets the UNet's C / out_channels itself (planar "
-                             "complex in and out); set cond_x1 instead")
-        self.unet = SBUnet(C=4 if self.cond_x1 else 2, out_channels=2, **unet_kws)
+                             "complex in and out); set cond_x1 / guided instead")
+        C = 2 + 2 * self.cond_x1 + 2 * self.guided
+        self.unet = SBUnet(C=C, out_channels=2, **unet_kws)
 
     def assert_schedule_matches(self, sched, atol=1e-6):
         self.unet.assert_schedule_matches(sched, atol=atol)
 
-    def forward(self, x_t, sigma=None, x1=None, y=None, E=None, sigma_n=None, step=None):
+    def forward(self, x_t, sigma=None, x1=None, y=None, E=None, sigma_n=None, step=None,
+                guide=None):
         if not torch.is_complex(x_t):
             raise TypeError(f"SBReconUnet expects a complex bridge state, got {x_t.dtype}")
         if x_t.shape[1] != 1:
@@ -73,5 +83,19 @@ class SBReconUnet(nn.Module):
             if x1 is None:
                 raise ValueError("SBReconUnet(cond_x1=True) needs x1, the zero-filled image")
             net_in = torch.cat([net_in, to_planar(x1)], dim=1)
+        if self.guided:
+            if guide is None:
+                raise ValueError("SBReconUnet(guided=True) needs the guide image")
+            if guide.dim() == 5:                   # (B, G, 1, H, W): one guide slice only
+                if guide.shape[1] != 1:
+                    raise ValueError(f"SBReconUnet takes one guide slice, got {guide.shape[1]}")
+                guide = guide[:, 0]
+            if guide.shape != x_t.shape or not torch.is_complex(guide):
+                raise ValueError(f"guide {tuple(guide.shape)} {guide.dtype} must be a complex "
+                                 f"image shaped like x_t {tuple(x_t.shape)}")
+            net_in = torch.cat([net_in, to_planar(guide)], dim=1)
+        elif guide is not None:
+            raise ValueError("SBReconUnet(guided=False) is the unguided baseline but was handed "
+                             "a guide; set guided=True or drop the guide")
         out, _ = self.unet(net_in, sigma=sigma, step=step)
         return from_planar(out), None

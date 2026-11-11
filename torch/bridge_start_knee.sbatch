@@ -40,6 +40,9 @@
 # Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
 #                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Calibrate only:  CASCADES=8 CALIBRATE_ONLY=1 sbatch --time=01:00:00 --export=ALL torch/bridge_start_knee.sbatch
+# Other cells:     any i2sb_recon cell of make_guided_recon_configs.py by name (CASCADES not
+#                  needed), e.g. the plain UNet bridge baselines, unguided / guide as channels:
+#                  MODELS="sbunet sbunet_guided" sbatch --array=0-1 --export=ALL torch/bridge_start_knee.sbatch
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
 ACCELS="${ACCELS:-8}"
@@ -47,7 +50,8 @@ STARTS="${STARTS:-guide adjoint acs}"
 CAL_SLICES="${CAL_SLICES:-60}"
 CALIBRATE_ONLY="${CALIBRATE_ONLY:-}"
 FORCE_RESTART="${FORCE_RESTART:-}"
-: "${CASCADES:?set CASCADES to the settled TGVN depth (12, 10, 8 or 6), e.g. CASCADES=8 sbatch --export=ALL ...}"
+: "${MODELS:=}"
+[ -n "${MODELS}" ] || : "${CASCADES:?set CASCADES to the settled TGVN depth (12, 10, 8 or 6), e.g. CASCADES=8 sbatch --export=ALL ...}"
 
 source ~/.bashrc
 conda activate gcdl
@@ -56,8 +60,9 @@ set -eo pipefail
 : "${SLURM_ARRAY_TASK_ID:?must be run as an array job (sbatch sets SLURM_ARRAY_TASK_ID)}"
 mkdir -p torch/logs
 
-MODELS=""
-for s in ${STARTS}; do MODELS="${MODELS} sbtgvn_c${CASCADES}_${s}"; done
+if [ -z "${MODELS}" ]; then
+    for s in ${STARTS}; do MODELS="${MODELS} sbtgvn_c${CASCADES}_${s}"; done
+fi
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels 1)
 if [ -n "${NOISE:-}" ]; then

@@ -586,6 +586,53 @@ def test_zero_added_noise_trains():
             osm.online_smaps = real
 
 
+def test_sbunet_baselines_train():
+    """The plain UNet bridge baselines (make_guided_recon_configs.py: sbunet, sbunet_guided)
+    train on the paired loader: the unguided one is handed no guide, the guided one gets the
+    coil-combined side image at every call, as two extra input channels."""
+    from training.i2sb_recon import train_i2sb_recon
+    from models.sb_recon_unet import SBReconUnet
+    import physics.online_smaps as osm
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    for name, guided in (("sbunet", False), ("sbunet_guided", True)):
+        spec = gen.MODELS[name]
+        assert spec["guided"] == guided and spec["x1_source"] == "adjoint"
+        assert spec["model"]["type"] == "SBReconUnet"
+        assert spec["model"]["params"]["guided"] == guided
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,  # noqa: E731
+                                                drop_last=False, scale_fac=1.0, start_slice=1,
+                                                end_slice=3, num_workers=0, pad_multiple=2)
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
+        try:
+            for guided in (False, True):
+                net = SBReconUnet(guided=guided, model_channels=8, num_res_blocks=1,
+                                  channel_mult=[1, 2], attention_resolutions=[], image_size=32,
+                                  num_heads=1, num_head_channels=-1, kind="brownian", tau=0.1,
+                                  n_points=1000, beta_max=0.3)
+                seen = []
+                fwd = net.forward
+                net.forward = lambda *a, guide=None, **k: (seen.append(guide), fwd(*a, guide=guide, **k))[1]
+                train_i2sb_recon(net, torch.optim.Adam(net.parameters(), lr=1e-4), None, "cpu",
+                                 loader(), loader(), num_epochs=1, steps_per_epoch=1,
+                                 val_every_epochs=1, R=4, acs_lines=4,
+                                 kspace_type="measurement_awgn", online_smaps="espirit",
+                                 noise_std=(0.0, 0.01), val_noise_std=0.0, val_seed=0,
+                                 loss_type="complex-mse", tau=0.1, val_mode="full_recon",
+                                 val_nfe=2, guide_R=1, dc_iters=7, save_dir=d)
+                assert seen, "the net was never called"
+                if guided:
+                    assert all(g is not None and torch.is_complex(g) for g in seen)
+                else:
+                    assert all(g is None for g in seen)
+                assert all(torch.isfinite(p).all() for p in net.parameters())
+        finally:
+            osm.online_smaps = real
+
+
 def test_one_tau_for_every_start():
     """--tau: the same tau in every bridge cell (model and i2sb), no calibration file, and the
     cell names tagged so the runs never share a dir with calibrated ones."""
