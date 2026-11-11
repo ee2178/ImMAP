@@ -13,6 +13,13 @@ so the frozen net later sees in LGGS precisely the inputs it was trained on. The
 matters only through the maps the guide is combined with (online ESPIRiT on the undersampled
 target): the transfer itself never sees y.
 
+BATCHING. Volumes differ in matrix size and coil count, so the loader serves one slice at a time
+and each goes through the measurement on its own (its guide needs its own online maps). The
+transfer is purely image-domain, so the resulting guide / target images are CENTER-CROPPED to a
+common `crop` (the anatomy; the readout oversampling is empty) and stacked: `batch_size` slices
+per optimizer step. Validation scores the same crop. The net is fully convolutional, so LGGS
+applies it to the uncropped guide.
+
 Validation on a fixed subset, as the recon loops: PSNR / SSIM of |T(guide)| against the target
 (metric_range as everywhere), and of the RAW guide after the best per-slice scalar gain
 (val/guide_psnr) -- the floor any transfer has to beat. Checkpoints at validation only: net.ckpt
@@ -35,7 +42,19 @@ LOSS_ON = ("mag", "complex")
 BESTVAL_CKPT = "net_bestval.ckpt"
 
 
-def _pair(batch, net, device, meas, noise_std, generator=None, guide_offset=0):
+def _center_crop(x, hw):
+    """Centre crop of the last two dims to hw = (H, W); refuses an image smaller than that."""
+    if hw is None:
+        return x
+    H, W = x.shape[-2:]
+    h, w = int(hw[0]), int(hw[1])
+    if h > H or w > W:
+        raise ValueError(f"crop {(h, w)} is larger than the image {(H, W)}")
+    top, left = (H - h) // 2, (W - w) // 2
+    return x[..., top:top + h, left:left + w]
+
+
+def _pair(batch, net, device, meas, noise_std, generator=None, guide_offset=0, crop=None):
     from training.i2sb_recon import _measure
     x0, _, _, _, _, _, gt, guide = _measure(batch, net, device, noise_std=noise_std,
                                             generator=generator, guide_offset=guide_offset,
@@ -46,7 +65,7 @@ def _pair(batch, net, device, meas, noise_std, generator=None, guide_offset=0):
         if guide.shape[1] != 1:
             raise ValueError("contrast_transfer takes one guide slice (guide_slices = 1)")
         guide = guide[:, 0]
-    return guide, gt, x0
+    return tuple(_center_crop(v, crop) for v in (guide, gt, x0))
 
 
 def _loss(out, gt, x0, loss_type, loss_on):
@@ -68,6 +87,8 @@ def train_contrast_transfer(
     steps_per_epoch=100,
     val_every_epochs=10,
     val_slices=None,
+    batch_size=4,                     # slices per optimizer step, stacked after the crop
+    crop=(320, 320),                  # centre crop (H, W) that makes the slices stackable
     clip_grad=None,
     loss_type="l1",
     loss_on="mag",
@@ -92,6 +113,8 @@ def train_contrast_transfer(
         raise ValueError(f"loss_on {loss_on!r} not in {LOSS_ON}")
     if whiten_kspace:
         raise NotImplementedError("contrast_transfer does not whiten")
+    if int(batch_size) < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     net.to(device).train()
     n_par = sum(p.numel() for p in net.parameters())
     print(f"[contrast_transfer] {type(net).__name__}({net.extra_repr()}) -- {n_par} parameters")
@@ -115,13 +138,16 @@ def train_contrast_transfer(
         net.train()
         run_loss, t0 = 0.0, time.time()
         for _ in range(steps_per_epoch):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
-            guide, gt, x0 = _pair(batch, net, device, dict(meas, kspace_type=kspace_type),
-                                  noise_std, guide_offset="random")
+            parts = []
+            for _ in range(int(batch_size)):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
+                parts.append(_pair(batch, net, device, dict(meas, kspace_type=kspace_type),
+                                   noise_std, guide_offset="random", crop=crop))
+            guide, gt, x0 = (torch.cat(v, dim=0) for v in zip(*parts))
             out = net(guide)
             loss = _loss(out, gt, x0, loss_type, loss_on)
             opt.zero_grad(set_to_none=True)
@@ -148,7 +174,7 @@ def train_contrast_transfer(
             val = _validate(net, val_loader, device, dict(meas, kspace_type=val_kspace_type or
                                                           kspace_type),
                             val_noise_std, val_seed, metric_range, loss_type, loss_on, wandb,
-                            global_step)
+                            global_step, crop)
             print(f"[epoch {epoch}] val PSNR {val['psnr']:.2f} dB, SSIM {val['ssim']:.4f} "
                   f"(guide, best gain: {val['guide_psnr']:.2f} dB / {val['guide_ssim']:.4f})")
             if save_ckpt_fn and math.isfinite(val["psnr"]) and val["psnr"] > best_val_psnr:
@@ -165,13 +191,13 @@ def train_contrast_transfer(
 
 @torch.no_grad()
 def _validate(net, loader, device, meas, noise_std, seed, metric_range, loss_type, loss_on,
-              wandb, global_step):
+              wandb, global_step, crop=None):
     net.eval()
     gen = torch.Generator(device=device).manual_seed(int(seed or 0))
     acc = dict(loss=0.0, psnr=0.0, ssim=0.0, guide_psnr=0.0, guide_ssim=0.0)
     n, panel = 0, None
     for batch in loader:
-        guide, gt, x0 = _pair(batch, net, device, meas, noise_std, generator=gen)
+        guide, gt, x0 = _pair(batch, net, device, meas, noise_std, generator=gen, crop=crop)
         out = net(guide)
         b = gt.shape[0]
         acc["loss"] += float(_loss(out, gt, x0, loss_type, loss_on)) * b

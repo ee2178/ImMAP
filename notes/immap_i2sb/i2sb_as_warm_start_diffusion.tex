@@ -1,0 +1,266 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb, amsthm, mathtools, bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage[colorlinks=true, linkcolor=blue!50!black, citecolor=blue!50!black,
+            urlcolor=blue!50!black]{hyperref}
+
+\newtheorem{proposition}{Proposition}
+
+\newcommand{\x}{\bm{x}}
+\newcommand{\uu}{\bm{u}}
+\newcommand{\y}{\bm{y}}
+\newcommand{\grad}{\nabla}
+\newcommand{\Op}{\bm{E}}
+\newcommand{\nn}{\bm{n}}
+\newcommand{\eps}{\bm{\varepsilon}}
+\newcommand{\zz}{\bm{z}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\Id}{\bm{I}}
+\newcommand{\D}{D_\theta}
+\newcommand{\ssb}{\sigma_{\mathrm{sb}}}
+
+\title{I$^2$SB is a warm-started diffusion}
+\author{ImMAP project notes}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{Claim.} With a regressor that knows $\x_1$, I$^2$SB~\cite{liu2023} is a
+variance-exploding (VE) diffusion on the conditional prior $p(\x_0\mid\x_1)$, written in
+different coordinates. It (i) regresses $\E[\x_0\mid\x_1]$, (ii) re-noises it to a finite
+noise level, and (iii) runs the standard VE ancestral sampler~\cite{song2021} down to zero
+noise. The bridge only changes how each state is presented to the network.
+
+\section*{One change of coordinates}
+
+The Brownian bridge has marginals
+$\x_t = (1-t)\,\x_0 + t\,\x_1 + \ssb(t)\,\eps$, $\ssb(t)^2 = Vt(1-t)$, $V = 4\tau^2$.
+Remove the $\x_1$ part and rescale:
+\begin{equation}
+  \uu \coloneqq \frac{\x_t - t\,\x_1}{1-t} = \x_0 + \sigma\eps,
+  \qquad \sigma^2 = \frac{Vt}{1-t},
+  \qquad t = \frac{\sigma^2}{\sigma^2+V}.
+  \label{eq:u}
+\end{equation}
+So bridge time \emph{is} a noise level, with $t\in[0,1)\leftrightarrow\sigma\in[0,\infty)$, and
+$\uu$ is a VE-diffused $\x_0$. Conversely,
+\begin{equation}
+  \x_t = \x_1 + c(\sigma)\,(\uu - \x_1), \qquad c(\sigma) = 1-t = \frac{V}{\sigma^2+V}.
+  \label{eq:x}
+\end{equation}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=stealth, font=\small]
+  \colorlet{ca}{blue!70!black}
+  \colorlet{cb}{teal!70!black}
+  \colorlet{cc}{orange!85!black}
+  % ---- the bridge -----------------------------------------------------------------------
+  \node[anchor=west] at (-0.3, 1.25) {\textbf{bridge:} \
+        $\x_t = (1-t)\,\x_0 + t\,\x_1 + \ssb(t)\,\eps$};
+  \draw[gray, thick] (0,0) -- (7.2,0);
+  \fill (0,0) circle (1.6pt) node[below=2pt] {$\x_0$};
+  \fill (7.2,0) circle (1.6pt) node[below=2pt] {$\x_1$};
+  \foreach \t/\r/\c in {0.2/0.24/ca, 0.5/0.30/cb, 0.8/0.24/cc} {
+    \fill[\c!15] (7.2*\t, 0) circle (\r);
+    \draw[\c, thick] (7.2*\t, 0) circle (\r);
+    \fill[\c] (7.2*\t, 0) circle (1.2pt);
+    \node[\c, above] at (7.2*\t, \r) {$t = \t$};
+  }
+  % ---- the denoising problems -----------------------------------------------------------
+  \node[anchor=west] at (-0.3, -4.75) {\textbf{denoising:} \
+        $\uu = \x_0 + \sigma(t)\,\eps$, \ $\sigma(t)^2 = Vt/(1-t)$};
+  \foreach \t/\r/\c/\s in {0.2/0.30/ca/0.5, 0.5/0.60/cb/1, 0.8/1.20/cc/2} {
+    \fill[\c!15] (7.2*\t, -2.8) circle (\r);
+    \draw[\c, thick] (7.2*\t, -2.8) circle (\r);
+    \fill (7.2*\t, -2.8) circle (1.6pt);
+    \node[below=-1pt] at (7.2*\t, -2.8 - \r) {$\x_0$};
+    \draw[->, \c, thick] (7.2*\t, -0.42) -- (7.2*\t, -2.8 + \r + 0.08);
+  }
+  \node[ca, right] at (1.44, -1.1) {$\sigma = 0.5$};
+  \node[cb, right] at (3.60, -1.1) {$\sigma = 1$};
+  \node[cc, right] at (5.76, -1.1) {$\sigma = 2$};
+  \node[align=left, anchor=west, font=\footnotesize] at (7.6, -1.4)
+        {$\uu = \dfrac{\x_t - t\,\x_1}{1-t}$\\[6pt]
+         $t = 1$: $\sigma = \infty$,\\ no information\\ beyond $\x_1$};
+\end{tikzpicture}
+\caption{Every bridge time is a denoising problem. Top: bridge states at three times, with
+their noise $\ssb(t)$ (shaded), which vanishes at both ends. Bottom: the same states after
+removing $t\,\x_1$ and rescaling by $1/(1-t)$; each is the target $\x_0$ plus noise
+$\sigma(t)$, which grows without bound toward $\x_1$. The network sees the top row, and
+its optimal output $\E[\x_0\mid\x_t,\x_1] = \E[\x_0\mid\uu,\x_1]$ is the denoiser of the bottom
+one. Radii drawn to scale for $V=1$.}
+\label{fig:ladder}
+\end{figure}
+
+\section*{Training}
+
+The I$^2$SB loss $\E\|\D(\x_t,t,\x_1)-\x_0\|^2$, with $t\sim\mathcal U[0,1]$, is ordinary
+conditional VE denoising, $\D \approx \E[\x_0\mid\uu,\x_1]$, with three design choices in
+EDM's~\cite{karras2022} vocabulary:
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item \textbf{input preconditioning} \eqref{eq:x}: the noisy state is shrunk toward $\x_1$ by
+        $c(\sigma)$, so the noise the network sees, $c(\sigma)\sigma = \ssb$, never exceeds
+        $\tau$, while $\sigma$ runs to $\infty$;
+  \item \textbf{noise-level distribution}: $t\sim\mathcal U[0,1]$ is
+        $p(\sigma) = 2\sigma V/(\sigma^2+V)^2$;
+  \item \textbf{loss}: plain $\x_0$-regression, uniform weight.
+\end{itemize}
+
+\section*{Sampling}
+
+\begin{proposition}
+Let $s<t$, $r = \sigma_s/\sigma_t$, and $\hat\x_0 = \D(\x_t,t,\x_1)$. I$^2$SB's reverse step
+$\x_s\sim\N\big((1-\tfrac st)\hat\x_0 + \tfrac st\x_t,\ V\tfrac{s(t-s)}{t}\Id\big)$ is, in the
+coordinates \eqref{eq:u},
+\begin{equation}
+  \uu_s = \uu_t + (\sigma_t^2-\sigma_s^2)\,\frac{\hat\x_0 - \uu_t}{\sigma_t^2}
+  + \sqrt{\frac{\sigma_s^2(\sigma_t^2-\sigma_s^2)}{\sigma_t^2}}\;\zz,
+  \qquad \zz\sim\N(\bm0,\Id),
+  \label{eq:step}
+\end{equation}
+the VE ancestral step, with $(\hat\x_0-\uu_t)/\sigma_t^2 = \grad\log p_{\sigma_t}(\uu_t\mid\x_1)$
+by Tweedie's formula.
+\end{proposition}
+
+\begin{proof}
+Substitute $\x_t = (1-t)\uu_t + t\x_1$ into the mean and divide by $1-s$:
+the $\x_1$ terms cancel, and
+$\E[\uu_s] = \tfrac{s(1-t)}{t(1-s)}\uu_t + \tfrac{t-s}{t(1-s)}\hat\x_0 = r^2\uu_t + (1-r^2)\hat\x_0$,
+using $r^2 = \tfrac{s(1-t)}{t(1-s)}$ from \eqref{eq:u}. The variance divided by $(1-s)^2$ is
+$\sigma_s^2\tfrac{t-s}{t(1-s)} = \sigma_s^2(1-r^2)$. Both are \eqref{eq:step}.
+\end{proof}
+
+The bridge enters only when mapping back, $\x_s = \x_1 + c(\sigma_s)(\uu_s-\x_1)$: each
+denoiser output is used exactly as in a VE sampler, then rescaled and offset by bridge
+factors.
+
+\paragraph{The warm start is the first step.}
+At $t=1$, $\sigma=\infty$ and $r=0$, so \eqref{eq:step} keeps nothing of the current state:
+\[
+  \uu_{t_1} = \D(\x_1,1,\x_1) + \sigma(t_1)\,\zz = \E[\x_0\mid\x_1] + \sigma(t_1)\,\zz .
+\]
+That is: regress, then re-noise to $\sigma(t_1)$, then diffuse. This is the structure of
+SDEdit~\cite{meng2022} and come-closer-diffuse-faster~\cite{chung2022}, with the
+initialisation supplied by the network's own one-shot regression. The last step ($s=0$,
+$\sigma=0$) returns $\hat\x_0$.
+
+\paragraph{What the knobs become.}
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item \textbf{$\tau$ sets the noise scale.} On a fixed $t$-grid every $\sigma_k$ scales with
+        $\sqrt V = 2\tau$, so $\tau$ decides how warm the start is. At $20$ uniform steps
+        ($t_1\approx0.95$), $\sigma(t_1)\approx1.7$ for $\tau=0.19$ and $\approx0.8$ for
+        $\tau=0.09$, against image intensities $\sim1$.
+  \item \textbf{The start $\x_1$} (zero-filled, ACS, guide) changes only the conditioning
+        variable and the centre of the preconditioning \eqref{eq:x}.
+  \item \textbf{Data consistency} (the CG step of I$^2$SB-Recon) replaces $\hat\x_0$ by an
+        estimate of $\E[\x_0\mid\uu,\x_1,\y]$ and leaves \eqref{eq:step} unchanged (next
+        section).
+\end{itemize}
+
+\section*{With a measurement: I\texorpdfstring{$^2$}{2}SB-Recon is ImMAP2}
+
+Conditioning also on a measurement $\y = \Op\x_0 + \nn$, with $\nn\sim\N(\bm0,\sigma_n^2\Id)$,
+changes only the target: $\uu$ is then a VE diffusion on the posterior $p(\x_0\mid\x_1,\y)$,
+and since $\eps$ is independent of $\y$, Tweedie still gives
+$\grad\log p_\sigma(\uu\mid\x_1,\y) = (\E[\x_0\mid\uu,\x_1,\y]-\uu)/\sigma^2$. The network
+supplies $\E[\x_0\mid\uu,\x_1]$. Approximating $p(\x_0\mid\uu,\x_1)\approx\N(\hat\x_0,
+\varsigma^2\Id)$ folds the data in:
+\begin{equation}
+  \bar\x_0 = (\Op^H\Op + \lambda\Id)^{-1}(\Op^H\y + \lambda\hat\x_0)
+  \approx \E[\x_0\mid\uu,\x_1,\y], \qquad \lambda = \sigma_n^2/\varsigma^2 ,
+  \label{eq:prox}
+\end{equation}
+the CG step of I$^2$SB-Recon~\cite{wang2024}. ImMAP2 (\texttt{diffusion/immap.py}) runs, at
+level $\sigma_k$: denoise to $\hat\x_0$, apply \eqref{eq:prox}, then
+\begin{equation}
+  \uu_{k+1} = \uu_k + h_k(\bar\x_0 - \uu_k)
+  + \sigma_k\sqrt{(1-\beta h_k)^2 - (1-h_k)^2}\;\zz,
+  \qquad \sigma_{k+1} = (1-\beta h_k)\,\sigma_k ,
+  \label{eq:immap2}
+\end{equation}
+where $\sigma_{k+1}$ is the level the injection aims for (ImMAP2 then re-estimates it from the
+next residual).
+
+\begin{proposition}
+With $r = \sigma_{k+1}/\sigma_k$, $h_k = 1-r^2$ and $\beta = 1/(1+r)$, the ImMAP2 step
+\eqref{eq:immap2} is the I$^2$SB step \eqref{eq:step} with $\hat\x_0$ replaced by
+$\bar\x_0$: I$^2$SB-Recon, written in the coordinates \eqref{eq:u}.
+\end{proposition}
+\begin{proof}
+$1-\beta h_k = (1+r-1+r^2)/(1+r) = r$, so the next level is $\sigma_{k+1}$. The mean
+$\uu_k + (1-r^2)(\bar\x_0-\uu_k)$ is that of \eqref{eq:step}, and the noise variance is
+$\sigma_k^2(r^2 - r^4) = \sigma_{k+1}^2(1-r^2)$.
+\end{proof}
+
+So the two methods share the step structure exactly and differ only in its settings:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & ImMAP2 & I$^2$SB-Recon \\
+\midrule
+denoiser & unconditional, prior $p(\x_0)$ & conditional, prior $p(\x_0\mid\x_1)$ \\
+noise ladder & closed loop, $\sigma_k^2 = \tfrac1n\|\hat\x_0 - \uu_k\|^2$ & open loop, fixed
+  $t$-grid \\
+step size $h_k$ & schedule $h_0k/(1+h_0(k-1))$ & $1-r^2$, the variance removed \\
+$\beta$ & fixed ($0.05$ by default) & $1/(1+r)$: $1$ on the first step, $\to\frac12$ \\
+prox weight $\lambda$ & $\lambda_0\sigma_n^2(1+\sigma_k^2)/\sigma_k^2$ & constant
+  ($7\cdot10^{-5}$) \\
+start & noise at $\sigma_{\max}$, or a warm start & $\x_1$ at $\sigma=\infty$: regress, re-noise \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The conditional prior is the one modelling difference; the rest are schedules.
+ImMAP2's $\lambda_k$ is \eqref{eq:prox} with $\varsigma^2 = \sigma_k^2/(1+\sigma_k^2)$, the
+posterior variance under a unit-variance Gaussian prior, so it follows the noise level; a
+constant $\lambda$ assumes the denoiser is equally uncertain at every level. The start
+decides what the prox contributes. For the zero-filled start, $\x_1 = \Op^H\y$ is sufficient
+for $\y$, so $\E[\x_0\mid\uu,\x_1]$ already uses the data and \eqref{eq:prox} only corrects
+the network's errors. For a guide start, \eqref{eq:prox} is the only way $\y$ enters, as in
+ImMAP2.
+
+\paragraph{Caveats.}
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item The equivalence needs the \emph{conditional} denoiser $\E[\x_0\mid\x_t,\x_1]$. A
+        network that is not given $\x_1$ (no \texttt{cond\_x1}, as in I$^2$SB-Inversion)
+        learns $\E[\x_0\mid\x_t]$. It reads $\x_1$ only through $\x_t$, which works near
+        $t=1$ but is not the conditional denoiser in general.
+  \item The estimation target and the sampler are the same as a VE diffusion's; the trained
+        networks need not be. Preconditioning, $p(\sigma)$ and loss weighting are exactly the
+        choices that shape what a finite network learns.
+  \item For a general I$^2$SB schedule, replace $(1-t,\,t)$ by $(\mu_0,\mu_1)$ and
+        $\sigma$ by $\ssb/\mu_0$; nothing else changes.
+\end{itemize}
+
+\begin{thebibliography}{9}
+\bibitem{liu2023}
+G.-H.~Liu et al. I$^2$SB: Image-to-Image Schr\"odinger Bridge. \emph{ICML}, 2023.
+\bibitem{song2021}
+Y.~Song et al. Score-based generative modeling through stochastic differential equations.
+\emph{ICLR}, 2021.
+\bibitem{karras2022}
+T.~Karras et al. Elucidating the design space of diffusion-based generative models.
+\emph{NeurIPS}, 2022.
+\bibitem{meng2022}
+C.~Meng et al. SDEdit. \emph{ICLR}, 2022.
+\bibitem{wang2024}
+Y.~Wang et al. Guided MRI reconstruction via Schr\"odinger bridge. arXiv:2411.14269, 2024.
+\bibitem{chung2022}
+H.~Chung, B.~Sim, J.~C.~Ye. Come-closer-diffuse-faster. \emph{CVPR}, 2022.
+\end{thebibliography}
+
+\end{document}

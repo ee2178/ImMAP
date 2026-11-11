@@ -27,8 +27,9 @@
 #     5 ct_unet16_cplx_R8_g1  2-level UNet, 16 channels, complex in / out  26k   g -> T(g)
 #
 # Magnitude nets keep the guide's phase (LGGS's similarity is phase-invariant). Every net starts at
-# the identity (residual, zero-initialised last layer). 20k Adam steps (1e-3, cosine), batch 4, L1
-# on |.|; validation on 200 fixed val slices: val/psnr, val/ssim of |T(guide)| vs the target, and
+# the identity (residual, zero-initialised last layer). 20k Adam steps (1e-3, cosine), 4 slices
+# per step, centre-cropped to 320 x 320 and stacked (volumes differ in size, so the loader serves
+# one slice), L1 on |.|; validation on the same crop of 200 fixed val slices: val/psnr, val/ssim of |T(guide)| vs the target, and
 # val/guide_psnr -- the raw guide after its best per-slice gain, the floor to beat.
 # Checkpoints: net.ckpt (latest), net_bestval.ckpt (best val PSNR; what LGGS loads).
 #

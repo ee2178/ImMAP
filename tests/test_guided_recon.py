@@ -725,23 +725,34 @@ def test_contrast_transfer_pretrains_on_the_recon_guide():
     import physics.online_smaps as osm
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
         csv, _ = make_data(root)
-        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=2, shuffle=False,  # noqa: E731
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,  # noqa: E731
                                                 drop_last=False, scale_fac=1.0, start_slice=1,
                                                 end_slice=3, num_workers=0, pad_multiple=1)
         real = osm.online_smaps
         osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
         wb = FakeWandb() if "FakeWandb" in globals() else None
+        seen = []
         try:
             torch.manual_seed(0)
             net = ContrastTransfer(arch="unet", width=4, levels=2)
+            fwd = net.forward
+            net.forward = lambda g: (seen.append(tuple(g.shape)), fwd(g))[1]
             before = [q.detach().clone() for q in net.parameters()]
             train_contrast_transfer(net, torch.optim.Adam(net.parameters(), lr=1e-2), None, "cpu",
                                     loader(), loader(), wandb=wb, num_epochs=2,
-                                    steps_per_epoch=3, val_every_epochs=1, R=4, acs_lines=4,
+                                    steps_per_epoch=3, val_every_epochs=1, batch_size=2,
+                                    crop=(16, 12), R=4, acs_lines=4,
                                     online_smaps="espirit", noise_std=(0.0, 0.01),
                                     val_noise_std=0.0, save_dir=d)
         finally:
             osm.online_smaps = real
+        # loader serves one slice; training stacks batch_size centre crops, validation one
+        assert (2, 1, 16, 12) in seen and (1, 1, 16, 12) in seen, set(seen)
+        assert set(seen) <= {(2, 1, 16, 12), (1, 1, 16, 12)}, set(seen)
+        from training.contrast_transfer import _center_crop
+        a = torch.arange(6 * 7.0).view(1, 1, 6, 7)
+        assert torch.equal(_center_crop(a, (2, 3)), a[..., 2:4, 2:5])
+        raises(ValueError, lambda: _center_crop(a, (8, 3)), "larger")
         assert any(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
         assert sorted(f for f in os.listdir(d) if f.endswith(".ckpt")) == \
             ["net.ckpt", "net_bestval.ckpt"]

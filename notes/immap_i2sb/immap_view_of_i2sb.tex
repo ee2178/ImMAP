@@ -15,7 +15,10 @@
             urlcolor=blue!50!black]{hyperref}
 
 \newtheorem{proposition}{Proposition}
-\newtheorem{lemma}{Lemma}
+\newtheorem{lemma}[proposition]{Lemma}
+\newtheorem{corollary}[proposition]{Corollary}
+\theoremstyle{definition}
+\newtheorem{assumption}{Assumption}
 \theoremstyle{remark}
 \newtheorem{remark}{Remark}
 
@@ -23,22 +26,27 @@
 \newcommand{\x}{\bm{x}}
 \newcommand{\y}{\bm{y}}
 \newcommand{\uu}{\bm{u}}
+\newcommand{\vv}{\bm{v}}
 \newcommand{\eps}{\bm{\varepsilon}}
 \newcommand{\zz}{\bm{z}}
+\newcommand{\nn}{\bm{n}}
 \newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
 \newcommand{\C}{\mathbb{C}}
+\newcommand{\N}{\mathcal{N}}
 \newcommand{\CN}{\mathcal{CN}}
 \newcommand{\Id}{\bm{I}}
 \newcommand{\Op}{\bm{E}}
 \newcommand{\D}{D_\theta}
 \newcommand{\ssb}{\sigma_{\mathrm{sb}}}
 \newcommand{\xh}{\hat{\x}_0}
-\newcommand{\epsh}{\hat{\eps}}
 \newcommand{\grad}{\nabla}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\mmse}{\operatorname{mmse}}
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{I$^2$SB through the ImMAP lens:\\[2pt]
-       \large predict the endpoint, then resample on the bridge}
+\title{ImMAP-SB: MAP estimation on the bridge,\\[2pt]
+       \large and I$^2$SB as one of its step-size choices}
 \author{ImMAP project notes}
 \date{November 2026}
 
@@ -46,28 +54,40 @@
 \maketitle
 
 \begin{abstract}
-We give a two-line reading of the I$^2$SB sampler. The trained regressor computes the
-conditional expectation of the bridge's endpoint, $\xh = \D(\x_t,t,\x_1) =
-\E[\x_0\mid\x_t,\x_1]$. One reverse step of I$^2$SB is then exactly: \emph{(i)} predict the
-endpoint, and \emph{(ii)} resample on the bridge between that prediction and $\x_1$ at a time
-$s<t$ closer to the target. The resample commits to some randomness; the next prediction
-conditions on it and is sharper. Along the exact reverse bridge the predictions form a
-martingale, from the blurry posterior mean $\E[\x_0\mid\x_1]$ at $t=1$ to a single sample of
-$\x_0$ at $t=0$. The only detail I$^2$SB adds is that the resample re-uses a fraction
-$r = \sigma(s)/\sigma(t)$ of the noise implied by the prediction; unrolled, the I$^2$SB state is
-a bridge sample around a precision-weighted average of all endpoint predictions so far.
-Resampling with entirely fresh noise ($r=0$) is the memoryless member of the same family.
+We derive a family of bridge samplers from one optimization problem: the MAP estimate of
+the target $\x_0$ given the bridge's prior endpoint $\x_1$ and, in reconstruction, the
+measurement $\y$. Three steps, each proved below, lead from the objective to the algorithm.
+\emph{(i) Smoothing.} The bridge supplies, at every time $t$, a Gaussian-smoothed version
+$J_\sigma = \log p_\sigma(\cdot\mid\x_1)$ of the log-posterior. It is concave for large
+$\sigma$, and its maximisers converge to the MAP estimate as $\sigma\to0$. So MAP is
+approached by continuation. \emph{(ii) The gradient step.} By Tweedie's formula the trained
+regressor gives $\grad J_\sigma$ exactly, and the curvature of $J_\sigma$ is bounded by
+$\sigma^{-2}$, so every step of size $h\sigma^2$, $h\in(0,2)$, provably increases $J_\sigma$.
+\emph{(iii) Staying where the gradient is known.} The network has only seen bridge states,
+where $\|\grad J_\sigma\|$ concentrates away from zero, not the stationary points the ascent
+heads for. Requiring every iterate to be a bridge state at the next noise level fixes the
+noise that must be injected after each step. The result is a two-parameter family of steps.
+I$^2$SB is the member whose step size equals the variance removed,
+$h\sigma_t^2 = \sigma_t^2 - \sigma_s^2$; it is the only step whose deterministic part is the
+exact conditional mean of the next bridge state. The probability-flow (DDIM-type) step and
+fresh resampling are the other natural members. Measurement data enter as the same ascent on
+the posterior-smoothed objective. Under a Gaussian approximation, its gradient is the CG
+data-consistency step of I$^2$SB-Recon, with a weight $\lambda$ that should follow the noise
+level rather than stay fixed.
 \end{abstract}
 
-\paragraph{Notation.}
-Images are vectors in $\C^N$; $\eps,\zz \sim \CN(\bm 0, \Id)$. $\x_0$ is the target (the
-fully-sampled image), $\x_1$ the bridge's prior endpoint (in MRI: the zero-filled image
-$\Op^H\y$, the ACS low-pass image, or a guide contrast), and $t\in[0,1]$ the bridge time,
-$t=0$ at $\x_0$. Gradients of real functions of complex vectors are Wirtinger gradients
-$\partial/\partial\bar{\uu}$, so all formulas read as in the real case.
+\paragraph{Notation and conventions.}
+$\x_0$ is the target (the fully sampled image), $\x_1$ the bridge's prior endpoint (in MRI:
+the zero-filled image $\Op^H\y$, the ACS low-pass image, or a guide contrast), $t\in[0,1]$ the
+bridge time with $t=0$ at $\x_0$. The analysis is written for real vectors in $\R^n$ with
+$\N(\bm0,\sigma^2\Id)$ noise. A complex image in $\C^N$ with $\CN(\bm0,\sigma^2\Id)$ noise is the
+real case in $\R^{2N}$ with variance $\sigma^2/2$ per component. With the Wirtinger gradient
+$\partial/\partial\bar\uu$ every update formula below is unchanged (the factors of $2$
+cancel); only the constant in the concavity threshold of Proposition~\ref{prop:curvature}
+moves by $\sqrt2$.
 
 %=============================================================================================
-\section{The bridge, and what the network learns}
+\section{The bridge is a ladder of denoising problems}
 %=============================================================================================
 
 The Brownian bridge between $\x_0$ and $\x_1$ has marginals
@@ -76,253 +96,550 @@ The Brownian bridge between $\x_0$ and $\x_1$ has marginals
   \qquad \eps \perp (\x_0,\x_1),
   \label{eq:marginal}
 \end{equation}
-with total variance $V = 4\tau^2$ set by the temperature $\tau$ ($\max_t \ssb = \tau$).
-I$^2$SB trains a regressor on pairs $(\x_0,\x_1)$, $t\sim\mathcal U[0,1]$, $\x_t$ drawn from
-\eqref{eq:marginal}, with the squared loss $\E\|\D(\x_t,t,\x_1) - \x_0\|^2$. Its minimiser is
-the conditional expectation,
+with total variance $V = 4\tau^2$ ($\max_t\ssb = \tau$). I$^2$SB~\cite{liu2023} trains a
+regressor with the squared loss $\E\|\D(\x_t,t,\x_1) - \x_0\|^2$ over pairs, times and bridge
+noise. Its minimiser is the conditional mean
 \begin{equation}
   \D(\x_t,t,\x_1) = \E[\x_0\mid\x_t,\x_1].
   \label{eq:mmse}
 \end{equation}
 
-\begin{remark}[General schedules]
-For an I$^2$SB schedule $\beta(t)$, $\x_t = \mu_0(t)\x_0 + \mu_1(t)\x_1 + \ssb(t)\eps$ with
-$\mu_0+\mu_1 = 1$. Everything below holds with $(1-t,\,t)$ replaced by $(\mu_0,\mu_1)$.
-\end{remark}
-
-%=============================================================================================
-\section{Step 1: predict the endpoint}
-%=============================================================================================
-
-At every step the network returns its prediction of the bridge's endpoint,
+\begin{lemma}[Debiased state]\label{lem:debias}
+Fix $\x_1$ and set $\uu_t \coloneqq (\x_t - t\,\x_1)/(1-t)$ for $t<1$. Then
 \begin{equation}
-  \boxed{\;\xh \coloneqq \D(\x_t,t,\x_1) = \E[\x_0\mid\x_t,\x_1].\;}
-  \label{eq:predict}
+  \uu_t = \x_0 + \sigma(t)\,\eps,\qquad \sigma(t)^2 = \frac{V t}{1-t},
+  \qquad t = \frac{\sigma^2}{\sigma^2 + V},
+  \label{eq:debias}
 \end{equation}
-This is not a small move toward $\x_0$: it is the full conditional expectation of the endpoint
-given everything the state reveals. How good it is depends on how much the state reveals,
-which the bridge time measures.
-
-\begin{lemma}[Bridge time is a noise level]\label{lem:debias}
-Fix $\x_1$ and $t<1$, and set $\uu_t \coloneqq (\x_t - t\,\x_1)/(1-t)$. Then
-\begin{equation}
-  \uu_t = \x_0 + \sigma(t)\,\eps,\qquad
-  \sigma(t)^2 = \frac{\ssb(t)^2}{(1-t)^2} = \frac{V t}{1-t},
-  \label{eq:denoising}
-\end{equation}
-and $t\mapsto\sigma(t)$ is a bijection $[0,1)\to[0,\infty)$.
+and $t\mapsto\sigma(t)$ is an increasing bijection $[0,1)\to[0,\infty)$. As a process,
+$\sigma^2\mapsto\uu$ is $\x_0$ plus a Brownian motion run in the variance $\sigma^2$:
+$\uu = \x_0 + \bm W(\sigma^2)$, $\bm W(0)=\bm0$, independent of $(\x_0,\x_1)$.
 \end{lemma}
 \begin{proof}
-Substitute \eqref{eq:marginal}.
+The marginal statement is \eqref{eq:marginal} divided by $1-t$. For the process, write the
+bridge as $\x_t = (1-t)\x_0 + t\x_1 + \sqrt V\,\bm B_t$ with $\bm B$ a standard Brownian bridge
+on $[0,1]$, and use Doob's representation $\bm B_t = (1-t)\,\bm W_0\big(t/(1-t)\big)$ with
+$\bm W_0$ a standard Brownian motion. Then
+$\uu_t = \x_0 + \sqrt V\,\bm W_0\big(t/(1-t)\big) = \x_0 + \bm W\big(Vt/(1-t)\big)$ with
+$\bm W(s) = \sqrt V\,\bm W_0(s/V)$, again a standard Brownian motion.
 \end{proof}
 
-So given $\x_1$, the state at time $t$ is the target plus white noise of std $\sigma(t)$, and
-since $(\x_t,\x_1)\mapsto(\uu_t,\x_1)$ is invertible, $\xh = \E[\x_0\mid\uu_t,\x_1]$ is the
-conditional MMSE denoiser at level $\sigma(t)$. At $t=1$ ($\sigma=\infty$) the state carries
-no information beyond $\x_1$, and $\xh = \E[\x_0\mid\x_1]$: the posterior mean over every
-plausible target, which is blurry. As $t\to0$ the noise vanishes and $\xh\to\x_0$.
+Since $(\x_t,\x_1)\mapsto(\uu_t,\x_1)$ is invertible, the regressor is the conditional MMSE
+denoiser at level $\sigma(t)$,
+\begin{equation}
+  \D(\x_t,t,\x_1) = \E[\x_0\mid\uu_t,\x_1].
+  \label{eq:cond_denoiser}
+\end{equation}
+One network therefore denoises $\x_0$ at every noise level, given $\x_1$. The rest of this
+note turns that into a MAP solver.
 
-\begin{remark}[Tweedie's formula]
-By Tweedie's formula (Miyasawa), the same prediction can be read as a gradient step on the
-noise-smoothed conditional prior $p_\sigma(\uu\mid\x_1) = \int\varphi_\sigma(\uu-\x)\,
-p(\x\mid\x_1)\,d\x$:
-\[
-  \xh = \uu_t + \sigma(t)^2\,\grad_{\uu}\log p_{\sigma(t)}(\uu_t\mid\x_1).
-\]
-This is an identity, not an extra computation: the network computes the expectation directly,
-and the formula reinterprets it as a full jump of step size $\sigma^2$ up the smoothed
-log-density. The reading below does not need it.
+\begin{remark}[General schedules]
+For an I$^2$SB schedule, $\x_t = \mu_0(t)\x_0 + \mu_1(t)\x_1 + \ssb(t)\eps$ with
+$\mu_0+\mu_1=1$, the bridge is a Brownian bridge under a time change. Everything below holds
+with $\uu_t = (\x_t - \mu_1\x_1)/\mu_0$ and $\sigma = \ssb/\mu_0$.
 \end{remark}
 
 %=============================================================================================
-\section{Step 2: resample on the bridge, closer to the target}
+\section{The objective, and its smoothing}
 %=============================================================================================
 
-We do not stop at $\xh$: at large $\sigma(t)$ it is an average over many targets, not one of
-them. Instead we treat it as a provisional endpoint and draw a new state on the bridge
-between $\xh$ and $\x_1$, at a time $s<t$, i.e.\ at a smaller noise level
-$\sigma(s)<\sigma(t)$:
+Given $\x_1$ we want
 \begin{equation}
-  \x_s = (1-s)\,\xh + s\,\x_1 + \ssb(s)\,\eps_s .
-  \label{eq:resample}
+  \hat\x_{\mathrm{MAP}} = \arg\max_{\x}\;\log p(\x\mid\x_1),
+  \label{eq:map}
 \end{equation}
-The noise $\eps_s$ can be drawn fresh, or partly re-used from the current state. The noise
-that the prediction implies is in $\x_t$ is
+and in reconstruction $\arg\max_{\x}\log p(\x\mid\x_1,\y)$ (Section~\ref{sec:data}). The
+conditional prior has no closed form and is in general non-concave. We follow the classical
+route for such problems, graduated optimisation: replace the objective by a smoothed one,
+solve the smooth problem, and reduce the smoothing. The smoothing that the bridge provides is
+Gaussian. Let $\varphi_\sigma$ be the $\N(\bm0,\sigma^2\Id)$ density and
 \begin{equation}
-  \epsh_t \coloneqq \frac{\x_t - (1-t)\,\xh - t\,\x_1}{\ssb(t)} = \frac{\uu_t - \xh}{\sigma(t)},
-  \label{eq:implied_noise}
+  p_\sigma(\uu\mid\x_1) = \int\varphi_\sigma(\uu-\x)\,p(\x\mid\x_1)\,d\x,
+  \qquad J_\sigma(\uu) \coloneqq \log p_\sigma(\uu\mid\x_1),
+  \label{eq:smoothed}
 \end{equation}
-and we take
-\begin{equation}
-  \eps_s = r\,\epsh_t + \sqrt{1-r^2}\;\zz, \qquad \zz\sim\CN(\bm0,\Id)\ \text{fresh},
-  \qquad r\in[0,1].
-  \label{eq:noise_mix}
-\end{equation}
-We write $\x_s \sim \mathcal R_s(\xh;\,\x_t)$ for this resample, \eqref{eq:resample} with
-\eqref{eq:noise_mix}. If $\xh = \x_0$ then $\epsh_t = \eps$ is standard normal, $\eps_s$ is too, and
-\eqref{eq:resample} is an exact draw from the bridge marginal at $s$, the input distribution
-the network was trained on.
+the law of $\uu = \x_0 + \sigma\eps$ given $\x_1$, i.e.\ the law of the debiased bridge state
+at time $t(\sigma)$. Three facts make $J_\sigma$ a good surrogate.
 
-The resample is where the sampler commits: the fresh noise $\zz$ picks out, at the coarse
-scale $\sigma(s)$, one of the targets that $\xh$ was averaging over. The next prediction
-conditions on that choice.
-
-%=============================================================================================
-\section{The predictions sharpen: a martingale}
-%=============================================================================================
-
-\begin{proposition}[Endpoint predictions form a martingale]\label{prop:martingale}
-Let $1 = t_0 > t_1 > \dots > t_K = 0$, and let $\x_{t_0},\x_{t_1},\dots$ be a path of the
-bridge \eqref{eq:marginal} visited from $\x_1$ toward $\x_0$. Then
-\begin{equation}
-  \xh^{(k)} \coloneqq \E[\x_0\mid\x_{t_k},\x_1]
-  = \E[\x_0\mid\x_{t_k},\x_{t_{k-1}},\dots,\x_{t_0}],
-  \label{eq:martingale}
-\end{equation}
-so $(\xh^{(k)})_k$ is a Doob martingale: $\E[\xh^{(k+1)}\mid\x_{t_k},\dots,\x_{t_0}] = \xh^{(k)}$.
-It starts at the posterior mean $\xh^{(0)} = \E[\x_0\mid\x_1]$ and ends at
-$\xh^{(K)} = \x_0$.
+\begin{proposition}[Tweedie / Miyasawa]\label{prop:tweedie}
+$\displaystyle \grad J_\sigma(\uu) = \frac{\E[\x_0\mid\uu,\x_1] - \uu}{\sigma^2}
+= \frac{\D(\x_t,t,\x_1) - \uu}{\sigma^2}$ \ at $\sigma = \sigma(t)$.
 \end{proposition}
 \begin{proof}
-Given its endpoints, the Brownian bridge is Markov. So given $\x_{t_k}$, the states at later
-times $t_{k-1},\dots,t_0$ (closer to $\x_1$) carry no further information about $\x_0$, which
-gives the equality in \eqref{eq:martingale}. The right-hand side conditions on a growing
-history, so the tower property gives the martingale property. At $t_K=0$ the state is $\x_0$.
+$\grad_{\uu}\varphi_\sigma(\uu-\x) = \sigma^{-2}(\x-\uu)\varphi_\sigma(\uu-\x)$. Differentiate
+\eqref{eq:smoothed} under the integral,
+$\sigma^2\grad p_\sigma(\uu\mid\x_1) = \int(\x-\uu)\varphi_\sigma(\uu-\x)p(\x\mid\x_1)\,d\x
+= p_\sigma(\uu\mid\x_1)\big(\E[\x_0\mid\uu,\x_1]-\uu\big)$, divide by $p_\sigma$, and use
+\eqref{eq:cond_denoiser}.
 \end{proof}
 
-This is the precise sense in which each step ``predicts the endpoint, and the predictions
-converge to it''. There is no fixed $\x_0$ waiting to be found at sampling time: the sampler
-creates the endpoint as it goes. The first prediction is the posterior mean over all plausible
-targets; each resample reveals more of one particular target; each later prediction conditions
-on what has been revealed and is sharper; at $t=0$ the predictions have collapsed onto a single
-sample of $p(\x_0\mid\x_1)$.
+So the network does not approximate the objective, it computes its gradient. The residual
+$\D - \uu$ is $\sigma^2\grad J_\sigma$.
 
-\begin{remark}[Exact only for the true reverse bridge]
-Proposition~\ref{prop:martingale} holds when the states are drawn from the true reverse
-kernel $p(\x_s\mid\x_t,\x_1) = \int q(\x_s\mid\x_t,\x_0)\,p(\x_0\mid\x_t,\x_1)\,d\x_0$, a
-mixture over plausible endpoints. I$^2$SB substitutes the point prediction $\xh$ for $\x_0$ in
-$q(\x_s\mid\x_t,\x_0)$ (Section~\ref{sec:i2sb}). That gets the mean of $\x_s$ right but
-drops the spread of $\x_0$ given $\x_t$ from its variance. The gap vanishes as the steps get
-small.
-\end{remark}
-
-%=============================================================================================
-\section{I\texorpdfstring{$^2$}{2}SB is this, with \texorpdfstring{$r=\sigma(s)/\sigma(t)$}{r = sigma(s)/sigma(t)}}\label{sec:i2sb}
-%=============================================================================================
-
-I$^2$SB's reverse step is the bridge posterior $q(\x_s\mid\x_t,\x_0)$ with $\x_0$ replaced
-by $\xh$:
+\begin{proposition}[Curvature]\label{prop:curvature}
 \begin{equation}
-  \x_s \sim \CN\!\Big(\big(1-\tfrac{s}{t}\big)\xh + \tfrac{s}{t}\,\x_t,\;
-  V\,\tfrac{s(t-s)}{t}\,\Id\Big)
+  \grad^2 J_\sigma(\uu) = \frac{\Cov[\x_0\mid\uu,\x_1] - \sigma^2\Id}{\sigma^4}.
+  \label{eq:hessian}
+\end{equation}
+Consequently \emph{(a)} $-\grad^2 J_\sigma \preceq \sigma^{-2}\Id$ everywhere, and \emph{(b)}
+if $p(\cdot\mid\x_1)$ is supported in a ball of radius $R$, then $J_\sigma$ is concave for every
+$\sigma\ge R$.
+\end{proposition}
+\begin{proof}
+By Bayes, $\grad_{\uu}\log p(\x\mid\uu,\x_1) = \sigma^{-2}(\x-\uu) - \grad J_\sigma(\uu)
+= \sigma^{-2}(\x - \bm m)$ with $\bm m = \E[\x_0\mid\uu,\x_1]$, by
+Proposition~\ref{prop:tweedie}. Hence
+$\grad_{\uu}\bm m = \int\x\,(\x-\bm m)^\top\sigma^{-2}p(\x\mid\uu,\x_1)\,d\x =
+\sigma^{-2}\Cov[\x_0\mid\uu,\x_1]$, and differentiating
+$\grad J_\sigma = \sigma^{-2}(\bm m - \uu)$ gives \eqref{eq:hessian}. (a) holds because a
+covariance is positive semidefinite. For (b), any law on a ball of radius $R$ around $\bm c$
+has $\bm a^\top\Cov\,\bm a \le \E[(\bm a^\top(\x-\bm c))^2] \le R^2\|\bm a\|^2$, so
+$\Cov\preceq R^2\Id\preceq\sigma^2\Id$.
+\end{proof}
+
+At large $\sigma$ the smoothed problem is concave and has a single maximiser; images have
+bounded intensities, so (b) applies with $R$ of the order of the image norm. It remains to
+show that reducing $\sigma$ leads back to the problem we want.
+
+\begin{assumption}\label{ass:prior}
+$p(\cdot\mid\x_1)$ is continuous on $\R^n$, vanishes outside a compact set, and has a unique
+maximiser $\x^\star$.
+\end{assumption}
+
+\begin{proposition}[Smoothed MAP $\to$ MAP]\label{prop:consistency}
+Under Assumption~\ref{ass:prior}, $J_\sigma$ attains its maximum for every $\sigma>0$, and
+every maximiser $\uu^\star_\sigma$ satisfies $\uu^\star_\sigma\to\x^\star$ as $\sigma\to0$.
+\end{proposition}
+\begin{proof}
+Write $p = p(\cdot\mid\x_1)$. It is bounded and uniformly continuous, with modulus $\omega$.
+For any $\delta>0$,
+$|p_\sigma(\uu) - p(\uu)| \le \E|p(\uu - \sigma\eps) - p(\uu)| \le
+\omega(\delta) + 2\|p\|_\infty\,\Pr(\sigma\|\eps\|>\delta)$, so $p_\sigma\to p$ uniformly on
+$\R^n$. Also $p_\sigma$ is continuous and tends to $0$ at infinity, so its maximum is attained.
+Let $B$ be an open ball around $\x^\star$. By continuity, compact support and uniqueness,
+$m \coloneqq \sup_{\uu\notin B} p(\uu) < p(\x^\star)$. Choose $\sigma$ small enough that
+$\sup|p_\sigma - p| < \tfrac12(p(\x^\star) - m)$. Then for $\uu\notin B$,
+$p_\sigma(\uu) < m + \tfrac12(p(\x^\star)-m) < p_\sigma(\x^\star)$, so every maximiser of
+$p_\sigma$ lies in $B$.
+\end{proof}
+
+Propositions~\ref{prop:curvature}(b) and~\ref{prop:consistency} are the two ends of a
+continuation: an easy concave problem at large $\sigma$, the MAP problem in the limit
+$\sigma\to0$, and in between a family that the bridge indexes by $t$. A local method that
+tracks a maximiser while $\sigma$ decreases solves \eqref{eq:map} when the tracked maximiser
+is the global one. That is guaranteed at the concave end and is the usual heuristic of
+graduated optimisation in between.
+
+%=============================================================================================
+\section{The gradient step}
+%=============================================================================================
+
+Gradient ascent on $J_\sigma$ with step size $h\sigma^2$ reads, by
+Proposition~\ref{prop:tweedie},
+\begin{equation}
+  \uu^+ = \uu + h\sigma^2\grad J_\sigma(\uu) = (1-h)\,\uu + h\,\D(\uu),
+  \label{eq:grad_step}
+\end{equation}
+a move of the fraction $h$ of the way toward the denoiser output. The curvature bound makes
+$\sigma^2$ the natural unit of step size.
+
+\begin{proposition}[Ascent lemma]\label{prop:ascent}
+For $h\in(0,2)$,
+\[
+  J_\sigma(\uu^+) \;\ge\; J_\sigma(\uu) + h\big(1-\tfrac h2\big)\,\sigma^2\|\grad J_\sigma(\uu)\|^2
+  \;=\; J_\sigma(\uu) + h\big(1-\tfrac h2\big)\,\frac{\|\D(\uu)-\uu\|^2}{\sigma^2}.
+\]
+The guaranteed increase is largest at $h=1$, the full jump to $\D(\uu)$.
+\end{proposition}
+\begin{proof}
+$f = -J_\sigma$ has $\grad^2 f\preceq L\Id$ with $L = \sigma^{-2}$
+(Proposition~\ref{prop:curvature}(a)). The descent lemma for such $f$,
+$f(\uu - \alpha\grad f) \le f(\uu) - \alpha(1-\tfrac{L\alpha}{2})\|\grad f\|^2$, follows
+from Taylor's theorem with that bound along the segment. Put $\alpha = h\sigma^2$.
+\end{proof}
+
+So every step \eqref{eq:grad_step} with $h\in(0,2)$ is a certified ascent step, without any
+assumption on the shape of the prior; a one-shot reconstruction network ($h=1$, a single
+denoiser call) is the single optimal step at the noise level it was trained for. The fixed
+points of \eqref{eq:grad_step} are the points with $\D(\uu)=\uu$, the stationary points of
+$J_\sigma$.
+
+%=============================================================================================
+\section{Staying where the gradient is known}\label{sec:typical}
+%=============================================================================================
+
+The gradient in Proposition~\ref{prop:tweedie} is exact for the true conditional mean. The
+network approximates it only where it was trained: at bridge states, i.e.\ at points
+$\uu = \x_0 + \sigma\eps$ distributed as $p_\sigma(\cdot\mid\x_1)$. An ascent at a fixed level
+heads for exactly the points that are not of this kind.
+
+\begin{lemma}[Bridge states have a large residual]\label{lem:residual}
+For $\uu\sim p_\sigma(\cdot\mid\x_1)$,
+\begin{equation}
+  \E\|\D(\uu) - \uu\|^2 = \sigma^4\,\E\|\grad J_\sigma(\uu)\|^2 = n\sigma^2 - \mmse(\sigma),
+  \qquad \mmse(\sigma) \coloneqq \E\|\D(\uu) - \x_0\|^2 \le n\sigma^2 .
+  \label{eq:residual}
+\end{equation}
+\end{lemma}
+\begin{proof}
+$\uu - \x_0 = (\uu - \D) + (\D - \x_0)$, and the two terms are orthogonal in expectation
+because the estimation error of a conditional mean is orthogonal to every function of the
+data, here $\uu - \D(\uu)$. So $n\sigma^2 = \E\|\uu-\D\|^2 + \mmse$. The bound is the error
+of the trivial estimator $\D(\uu) = \uu$.
+\end{proof}
+
+For images, $\mmse(\sigma)\ll n\sigma^2$ over most of the ladder: the denoiser removes most
+of the noise (for data near a $d$-dimensional set, $\mmse\approx d\sigma^2$ at small $\sigma$).
+So on the training distribution the residual concentrates at
+$\|\D-\uu\|\approx\sigma\sqrt{n - \mmse/\sigma^2}$, far from zero, whereas at the points the
+ascent converges to it is zero. A maximiser of $J_\sigma$ is a mode of $p_\sigma$, and in high
+dimension the mode is not a typical point. Running \eqref{eq:grad_step} to convergence at one
+level, or shrinking $\sigma$ more slowly than the steps remove noise, therefore evaluates the
+network ever further from its training data. We impose the opposite:
+
+\smallskip
+\noindent\textbf{Requirement (R).} \emph{Every iterate at level $\sigma_k$ is a bridge state:
+$\uu_k - \x_0 \sim \N(\bm0,\sigma_k^2\Id)$, independent of $\x_0$.}
+\smallskip
+
+\noindent With an accurate denoiser, the step \eqref{eq:grad_step} leaves noise of level
+$(1-h)\sigma$ in the iterate, less than the level $\sigma$ it came from. Requirement (R) at the
+next level $\sigma'$ decides how much fresh noise must be added back.
+
+\begin{proposition}[Noise injection]\label{prop:injection}
+Let $\uu$ satisfy (R) at level $\sigma$, and take the step
+$\uu' = (1-h)\,\uu + h\,\D(\uu) + \gamma\,\zz$ with $\zz\sim\N(\bm0,\Id)$ fresh. With an exact
+denoiser of the noise ($\D(\uu)=\x_0$), $\uu'$ satisfies (R) at level $\sigma'$ if and only if
+\begin{equation}
+  \gamma^2 = \sigma'^2 - (1-h)^2\sigma^2, \qquad\text{which requires}\qquad
+  (1-h)\,\sigma \le \sigma' .
+  \label{eq:injection}
+\end{equation}
+\end{proposition}
+\begin{proof}
+$\uu' - \x_0 = (1-h)\sigma\eps + \gamma\zz$ is Gaussian with variance $(1-h)^2\sigma^2+\gamma^2$
+and independent of $\x_0$.
+\end{proof}
+
+A step is therefore described by two numbers: the step size $h$ and the next level $\sigma'$.
+Kadkhodaie and Simoncelli~\cite{ks2021} parameterise the second as
+$\sigma' = (1-\beta h)\,\sigma$, $\beta\in[0,1]$; the constraint in \eqref{eq:injection} is
+$\beta\le1$, and $\beta=1$ injects nothing. The oracle assumption $\D(\uu)=\x_0$ is what makes
+(R) checkable. The next result removes it and identifies the step size at which the
+deterministic part of the step is right for the true conditional mean.
+
+\begin{proposition}[The exact reverse step]\label{prop:reverse}
+For $\sigma_s<\sigma_t$ and $r \coloneqq \sigma_s/\sigma_t$,
+\begin{align}
+  \E[\uu_s\mid\uu_t,\x_1] &= r^2\,\uu_t + (1-r^2)\,\D(\uu_t),
+  \label{eq:rev_mean}\\
+  \Cov[\uu_s\mid\uu_t,\x_1] &= \sigma_s^2(1-r^2)\,\Id + (1-r^2)^2\,\Cov[\x_0\mid\uu_t,\x_1].
+  \label{eq:rev_cov}
+\end{align}
+Hence the gradient step \eqref{eq:grad_step} has the exact conditional mean of the next state
+if and only if
+\begin{equation}
+  h = 1 - r^2, \qquad\text{i.e.}\qquad h\,\sigma_t^2 = \sigma_t^2 - \sigma_s^2 ,
+  \label{eq:h_star}
+\end{equation}
+the step size equals the variance removed. With this $h$, the injection
+\eqref{eq:injection} is $\gamma^2 = \sigma_s^2(1-r^2)$, the first term of \eqref{eq:rev_cov}.
+\end{proposition}
+\begin{proof}
+By Lemma~\ref{lem:debias}, given $\x_0$ the pair $(\uu_s,\uu_t)$ is a Brownian motion observed
+at variances $\sigma_s^2<\sigma_t^2$. Conditioning a Brownian motion on its value at a later
+time gives a Brownian bridge: $\uu_s\mid\uu_t,\x_0 \sim
+\N\big(\x_0 + r^2(\uu_t-\x_0),\ \sigma_s^2(1-r^2)\Id\big)$. The Markov property makes
+$\x_1$ (and any noisier state) irrelevant once $\uu_t$ and $\x_0$ are given. Averaging over
+$\x_0\sim p(\cdot\mid\uu_t,\x_1)$ with the laws of total expectation and total covariance gives
+\eqref{eq:rev_mean} and \eqref{eq:rev_cov}. The mean of \eqref{eq:grad_step} is
+$(1-h)\uu_t + h\D$, which equals \eqref{eq:rev_mean} for $\D\ne\uu_t$ iff $h = 1-r^2$.
+Finally $\sigma_s^2 - r^4\sigma_t^2 = \sigma_s^2(1-r^2)$.
+\end{proof}
+
+The step \eqref{eq:h_star} plus the injection \eqref{eq:injection} has the right mean and drops
+only the term $(1-r^2)^2\Cov[\x_0\mid\uu_t,\x_1]$ of the covariance: the spread of the endpoint
+around its estimate, which a single point estimate cannot represent. That term is
+$O\big((\sigma_t^2-\sigma_s^2)^2\big)$, so it vanishes on fine ladders.
+
+%=============================================================================================
+\section{The step on the bridge}\label{sec:bridge_step}
+%=============================================================================================
+
+Forming $\uu$ explicitly is unstable near $t=1$ (the factor $1/(1-t)$), so the step is carried
+out in bridge coordinates. The iterate is $(\x_k, t_k)$, with $\sigma_k = \sigma(t_k)$ and
+$\vv_k = \D(\x_k,t_k,\x_1)$; the next level $\sigma'$ gives $t' = \sigma'^2/(\sigma'^2+V)$; the
+stepped point $(1-h)\uu_k + h\vv_k$ is mapped onto the bridge at $t'$ and the injection is
+scaled by $1-t'$.
+
+\begin{proposition}[Bridge coordinates]\label{prop:bridge_step}
+The step of Proposition~\ref{prop:injection}, mapped to $\x$, is
+\begin{equation}
+  \x_{k+1} = c_x\,\x_k + c_v\,\vv_k + c_1\,\x_1 + \gamma_k\,\eps_k,\qquad
+  c_x = \frac{(1-h)(1-t')}{1-t_k},\quad c_v = h(1-t'),\quad c_1 = t' - c_x t_k,
+  \label{eq:coeffs}
+\end{equation}
+with $c_x+c_v+c_1 = 1$ and the injection $\gamma_k = (1-t')\gamma$ ($\gamma$ from
+\eqref{eq:injection}), i.e.
+\begin{equation}
+  \gamma_k^2 = \ssb(t')^2\,(1-\rho^2),\qquad
+  \rho = \frac{(1-h)\,\sigma_k}{\sigma'} = \frac{1-h}{1-\beta h}\in[0,1].
+  \label{eq:gamma}
+\end{equation}
+With an exact denoiser, $\x_{k+1}$ is distributed exactly as the bridge marginal
+\eqref{eq:marginal} at $t'$.
+\end{proposition}
+\begin{proof}
+$\x_{k+1} = (1-t')\big[(1-h)\tfrac{\x_k - t_k\x_1}{1-t_k} + h\vv_k\big] + t'\x_1 + (1-t')\gamma\zz$
+gives the coefficients, which sum to $(1-h)(1-t') + h(1-t') + t' = 1$. The noise carried from
+$\x_k$ is $c_x\ssb(t_k)\eps = (1-h)(1-t')\sigma_k\eps = \rho\,\ssb(t')\eps$, and
+$(1-t')^2\gamma^2 = (1-t')^2(\sigma'^2 - (1-h)^2\sigma_k^2) = \ssb(t')^2(1-\rho^2)$.
+\end{proof}
+
+This is \code{sb.immap\_sb\_ascent.bridge\_ascent\_step}.
+
+%=============================================================================================
+\section{I\texorpdfstring{$^2$}{2}SB and its neighbours are step-size choices}\label{sec:family}
+%=============================================================================================
+
+The derivation leaves the step size $h$ and the next level $\sigma'$ free. Prescribing the
+next level by a fixed time ladder, $\sigma' = \sigma(s)$ for a step $t\to s$, and writing
+$r = \sigma(s)/\sigma(t)$, three choices of $h$ stand out.
+
+\begin{proposition}[I$^2$SB]\label{prop:i2sb}
+With $h = 1-r^2$ (the exact-mean step \eqref{eq:h_star}), Proposition~\ref{prop:bridge_step}
+is exactly I$^2$SB's reverse step, the bridge posterior with $\x_0$ replaced by
+$\vv = \D(\x_t,t,\x_1)$:
+\begin{equation}
+  \x_s \sim \N\!\Big(\big(1-\tfrac{s}{t}\big)\vv + \tfrac{s}{t}\,\x_t,\;
+  V\,\tfrac{s(t-s)}{t}\,\Id\Big).
   \label{eq:posterior}
 \end{equation}
-(\code{sb.base.reverse\_sample}, \code{posterior="ddpm"}).
-
-\begin{proposition}[I$^2$SB = endpoint prediction + bridge resample]\label{prop:main}
-The resample \eqref{eq:resample}--\eqref{eq:noise_mix} with
-\begin{equation}
-  r = \frac{\sigma(s)}{\sigma(t)} = \sqrt{\frac{s(1-t)}{t(1-s)}}
-  \label{eq:r}
-\end{equation}
-is exactly the I$^2$SB step \eqref{eq:posterior}.
+In Kadkhodaie--Simoncelli form, $\beta = 1/(1+r)$.
 \end{proposition}
 \begin{proof}
-Substitute \eqref{eq:implied_noise} into \eqref{eq:resample}. The coefficient of $\x_t$ is
-$k = r\,\ssb(s)/\ssb(t)$. With $\ssb = (1-t)\sigma$ and $\sigma^2 = Vt/(1-t)$,
-\[
-  k = \frac{(1-s)\,\sigma(s)^2}{(1-t)\,\sigma(t)^2} = \frac{s}{t}.
-\]
-The coefficient of $\x_1$ is $s - k\,t = 0$, and that of $\xh$ is
-$(1-s) - k(1-t) = (t-s)/t$: the mean of \eqref{eq:posterior}. The fresh-noise variance is
-$\ssb(s)^2(1-r^2) = V s(1-s)\cdot\frac{t-s}{t(1-s)} = V\frac{s(t-s)}{t}$: the variance of
-\eqref{eq:posterior}.
+With $\sigma^2 = Vt/(1-t)$, $r^2 = s(1-t)/(t(1-s))$, so $h = (t-s)/(t(1-s))$. Then
+$c_v = h(1-s) = 1-\tfrac st$, $c_x = r^2(1-s)/(1-t) = \tfrac st$ and $c_1 = s - \tfrac st t = 0$,
+the mean of \eqref{eq:posterior}. $\rho = (1-h)\sigma(t)/\sigma(s) = r$, so
+$\gamma^2 = \ssb(s)^2(1-r^2) = Vs(1-s)\tfrac{t-s}{t(1-s)} = V\tfrac{s(t-s)}{t}$. Finally
+$1-\beta h = r$ gives $\beta = (1-r)/h = 1/(1+r)$.
 \end{proof}
 
-The identity holds for general schedules with $\sigma = \ssb/\mu_0$. We checked it
-numerically against \code{reverse\_sample} for the Brownian and I$^2$SB-$\beta$ schedules
-(agreement to $10^{-14}$).
+This is \code{sb.base.reverse\_sample} with \code{posterior="ddpm"};
+\code{tests/test\_immap\_sb\_ascent.py} checks the identity numerically.
 
-\paragraph{When the re-used noise matters.}
-$r$ depends only on how far the step moves.
-\begin{itemize}[leftmargin=1.5em]
-  \item \textbf{First step from $\x_1$:} $\sigma(1) = \infty$, so $r=0$. I$^2$SB's first step is
-        an endpoint prediction followed by a fully fresh resample.
-  \item \textbf{Last step to $s=0$:} $\ssb(0)=0$, so the output is $\xh$ whatever $r$ is.
-  \item \textbf{Coarse ladders} (few NFE): $r$ is small (e.g.\ $0.27$ for $t=0.6\to s=0.1$), and
-        I$^2$SB is nearly a fresh resample.
-  \item \textbf{Fine ladders:} $r\to1$; most of the noise is carried over and the step moves the
-        state only slightly toward $\xh$.
-\end{itemize}
-
-%=============================================================================================
-\section{What the re-used noise does: averaging the predictions}
-%=============================================================================================
-
-In debiased coordinates the step is especially simple. With $\uu_s = \xh + \sigma(s)\eps_s$
-and \eqref{eq:implied_noise}--\eqref{eq:noise_mix},
-\begin{equation}
-  \uu_s = r^2\,\uu_t + (1-r^2)\,\xh + \sigma(s)\sqrt{1-r^2}\;\zz .
-  \label{eq:u_step}
-\end{equation}
-So I$^2$SB moves the state only a fraction $1-r^2 = 1 - \sigma(s)^2/\sigma(t)^2$ of the way
-to the current prediction, and re-noises to $\sigma(s)$.
-
-\begin{proposition}[Precision-weighted average]\label{prop:average}
-Run \eqref{eq:u_step} down a ladder $\sigma_0=\infty > \sigma_1 > \dots > \sigma_K$, with
-endpoint predictions $\xh^{(k)}$ made at level $\sigma_k$. Then
-\begin{equation}
-  \uu_K = \bar{\uu}_K + \bm n_K,\qquad
-  \bar{\uu}_K = \sigma_K^2\sum_{k=0}^{K-1}\Big(\frac{1}{\sigma_{k+1}^2} - \frac{1}{\sigma_k^2}\Big)\,\xh^{(k)},
-  \label{eq:average}
-\end{equation}
-where the weights are nonnegative and sum to one, and $\bm n_K$ is the sampler's own noise,
-of std $\sigma_K$.
-\end{proposition}
+\begin{corollary}[The other natural members]\label{cor:family}
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{No injected noise}, $\gamma = 0$: $h = 1-r$ ($\beta=1$). This is the explicit
+        Euler step in $\sigma$ of the probability-flow ODE $d\uu/d\sigma = (\uu - \D(\uu))/\sigma$
+        $= -\sigma\grad J_\sigma$~\cite{song2021}, and the largest noise reduction per unit of
+        step size that still satisfies (R).
+  \item \textbf{Fresh resampling}, $h=1$: jump to $\vv$ and draw a new bridge state around it,
+        $\x_s = (1-s)\vv + s\x_1 + \ssb(s)\zz$ ($\rho=0$; \code{posterior="interpolant"}).
+  \item \textbf{ImMAP}~\cite{ks2021}: $h_k$ from its own schedule (growing toward $1$), $\beta$
+        free, and $\sigma'$ either open-loop or estimated from the residual through
+        Lemma~\ref{lem:residual}, $\hat\sigma^2 \approx \|\vv-\uu\|^2/n$ when
+        $\mmse\ll n\sigma^2$ (\code{sigma\_mode}).
+\end{enumerate}
+\end{corollary}
 \begin{proof}
-Split $\uu_k = \bar\uu_k + \bm n_k$ into the part driven by the $\xh$'s and the part driven
-by the injected noise. Dividing the $\bar\uu$ part of \eqref{eq:u_step} by $\sigma_{k+1}^2$
-and using $r^2 = \sigma_{k+1}^2/\sigma_k^2$ gives
-$\bar\uu_{k+1}/\sigma_{k+1}^2 = \bar\uu_k/\sigma_k^2 + (\sigma_{k+1}^{-2} - \sigma_k^{-2})\,\xh^{(k)}$,
-which telescopes from $1/\sigma_0^2 = 0$. The weights sum to
-$\sigma_K^2(\sigma_K^{-2} - \sigma_0^{-2}) = 1$. For the noise,
-$\operatorname{Var}\bm n_{k+1} = r^4\sigma_k^2 + \sigma_{k+1}^2(1-r^2) = \sigma_{k+1}^2$.
+(1) $\gamma=0$ in \eqref{eq:injection} is $(1-h)\sigma(t) = \sigma(s)$. The Euler step from
+$\sigma_t$ to $\sigma_s$ is $\uu + (\sigma_s-\sigma_t)(\uu-\D)/\sigma_t = r\uu + (1-r)\D$, the
+step \eqref{eq:grad_step} with $h=1-r$. (2) and (3) are \eqref{eq:coeffs} with $h=1$, and with
+the stated schedules.
 \end{proof}
 
-This is the whole picture of I$^2$SB: \emph{at each step, predict the endpoint; then resample
-on the bridge, at a lower noise level, around a running average of all endpoint predictions so
-far, each weighted by the precision $1/\sigma^2$ gained when it was made.} Early, blurry
-predictions get little weight; late, sharp ones get most of it. The decomposition is an
-algebraic identity of the sampler; the network enters only through the $\xh^{(k)}$, each of
-which depends on the state it was computed from.
-
-\begin{remark}[Fresh resampling, $r=0$]
-Drawing $\eps_s$ entirely fresh gives $\x_s = (1-s)\xh + s\x_1 + \ssb(s)\zz$, the forward bridge
-sample around the latest prediction (\code{posterior="interpolant"}). It is memoryless: the
-state is centred on the last prediction only, and nothing is averaged. With a perfect network,
-fresh resampling and I$^2$SB both produce exact bridge marginals; they differ only in how the
-network's errors propagate, which makes \code{interpolant} vs.\ \code{ddpm} a direct test of
-the value of the averaging.
+\begin{remark}[Dropping the noise from I$^2$SB's step]
+Keeping $h = 1-r^2$ but setting $\gamma=0$ (\code{deterministic=True}) violates
+\eqref{eq:injection}: with an exact denoiser the next state has noise level
+$r^2\sigma(t) = r\,\sigma(s) < \sigma(s)$, and the next network call is told it is at
+$\sigma(s)$. The consistent deterministic sampler is (1) above, $h = 1-r$.
 \end{remark}
 
+\begin{remark}[Euler--Maruyama]
+The reverse-time SDE in variance time, $d\uu = -\grad J_\sigma\,d(\sigma^2) + d\bm W$, has the
+Euler--Maruyama step $\uu_s = \uu_t + (\sigma_t^2-\sigma_s^2)\grad J_{\sigma_t}(\uu_t) +
+\sqrt{\sigma_t^2-\sigma_s^2}\,\zz$. Its drift is I$^2$SB's \eqref{eq:h_star}; its noise variance
+$\sigma_t^2-\sigma_s^2$ exceeds I$^2$SB's $\sigma_s^2(1-r^2) = r^2(\sigma_t^2 - \sigma_s^2)$,
+which is the exact conditional variance \eqref{eq:rev_cov} given $\x_0$.
+\end{remark}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+member & step size $h$ & next level $\sigma'$ & injected $\gamma^2$ (in $\uu$) \\
+\midrule
+I$^2$SB (\code{ddpm}) & $1-r^2$ & $\sigma(s)$ & $\sigma(s)^2(1-r^2)$ \\
+probability flow / Euler & $1-r$ & $\sigma(s)$ & $0$ \\
+fresh resampling (\code{interpolant}) & $1$ & $\sigma(s)$ & $\sigma(s)^2$ \\
+ImMAP / KS & schedule $h_k$ & $(1-\beta h)\sigma$ or $\hat\sigma$ & $\sigma'^2 - (1-h)^2\sigma^2$ \\
+\bottomrule
+\end{tabular}
+\caption{One step $\uu' = (1-h)\uu + h\vv + \gamma\zz$ of gradient ascent on
+$J_\sigma$ with the injection required by (R); $r = \sigma(s)/\sigma(t)$.}
+\label{tab:family}
+\end{table}
+
+%=============================================================================================
+\section{What the step size does: averaging the gradient steps}
+%=============================================================================================
+
+The exact-mean step size \eqref{eq:h_star} has a simple cumulative effect.
+
+\begin{proposition}[Precision-weighted average]\label{prop:average}
+Run I$^2$SB's step down a ladder $\sigma_0 = \infty > \sigma_1 > \dots > \sigma_K$, with
+denoiser outputs $\vv^{(k)}$ at level $\sigma_k$. Then $\uu_K = \bar\uu_K + \bm m_K$, with
+$\bm m_K$ the sampler's own noise, of variance $\sigma_K^2$ per component, and
+\begin{equation}
+  \bar\uu_K = \sigma_K^2\sum_{k=0}^{K-1}\Big(\frac{1}{\sigma_{k+1}^2} - \frac{1}{\sigma_k^2}\Big)\,
+  \vv^{(k)},
+  \label{eq:average}
+\end{equation}
+a convex combination: the weights are nonnegative and sum to one.
+\end{proposition}
+\begin{proof}
+Split $\uu_k = \bar\uu_k + \bm m_k$ into the part driven by the $\vv$'s and the part driven by
+the injected noise. Dividing the $\bar\uu$ part of $\uu_{k+1} = r_k^2\uu_k + (1-r_k^2)\vv^{(k)}
++ \gamma_k\zz_k$ by $\sigma_{k+1}^2$ and using $r_k^2 = \sigma_{k+1}^2/\sigma_k^2$ gives
+$\bar\uu_{k+1}/\sigma_{k+1}^2 = \bar\uu_k/\sigma_k^2 + (\sigma_{k+1}^{-2}-\sigma_k^{-2})\vv^{(k)}$,
+which telescopes from $1/\sigma_0^2 = 0$. The weights sum to
+$\sigma_K^2(\sigma_K^{-2}-\sigma_0^{-2}) = 1$, and
+$\operatorname{Var}\bm m_{k+1} = r_k^4\sigma_k^2 + \sigma_{k+1}^2(1-r_k^2) = \sigma_{k+1}^2$.
+\end{proof}
+
+So with $h$ tied to the variance removed, the iterate is a bridge state around a running
+average of every denoiser output so far, each weighted by the precision
+$\sigma^{-2}$ gained when it was made: early, blurry estimates receive little weight, late
+sharp ones most of it. Fresh resampling ($h=1$) keeps only the last estimate. The comparison
+\code{ddpm} vs.\ \code{interpolant} is therefore a direct test of the value of the averaging.
+
+\begin{remark}[The estimates sharpen]
+Along the exact reverse bridge the denoiser outputs
+$\vv^{(k)} = \E[\x_0\mid\uu_{t_k},\x_1]$ form a Doob martingale: the bridge is Markov
+(Lemma~\ref{lem:debias}), so $\vv^{(k)} = \E[\x_0\mid\uu_{t_k},\dots,\uu_{t_0},\x_1]$, an
+expectation over a growing history. They run from the posterior mean $\E[\x_0\mid\x_1]$ at
+$t=1$ to $\x_0$ at $t=0$. A point-estimate step reproduces this only up to the dropped term of
+\eqref{eq:rev_cov}.
+\end{remark}
+
+%=============================================================================================
+\section{Adding the measurement}\label{sec:data}
+%=============================================================================================
+
+In reconstruction the objective is $\arg\max_{\x}\log p(\x\mid\x_1,\y)$, with
+$\y = \Op\x_0 + \nn$, $\nn\sim\N(\bm0,\sigma_n^2\Id)$. Smooth it exactly as before:
+$J^{\y}_\sigma(\uu) \coloneqq \log p_\sigma(\uu\mid\x_1,\y)$, the law of $\uu = \x_0+\sigma\eps$
+given $(\x_1,\y)$. Propositions~\ref{prop:curvature}--\ref{prop:reverse} hold verbatim with
+$\x_1$ replaced by $(\x_1,\y)$, since their proofs use only that $\eps$ is independent of the
+conditioning variables. In particular:
+
+\begin{proposition}[Tweedie with the measurement]\label{prop:tweedie_y}
+$\grad J^{\y}_\sigma(\uu) = \big(\E[\x_0\mid\uu,\x_1,\y] - \uu\big)/\sigma^2$.
+\end{proposition}
+\begin{proof}
+$\eps$ is independent of $(\x_0,\x_1,\y)$, so $p_\sigma(\uu\mid\x_1,\y) =
+\int\varphi_\sigma(\uu-\x)p(\x\mid\x_1,\y)\,d\x$; repeat the proof of
+Proposition~\ref{prop:tweedie}.
+\end{proof}
+
+The whole ascent therefore carries over with $\vv$ replaced by $\bar\vv \approx
+\E[\x_0\mid\uu,\x_1,\y]$. The network supplies $\E[\x_0\mid\uu,\x_1]$; the measurement has to
+be folded in.
+
+\begin{proposition}[The data step]\label{prop:prox}
+Assume $\y$ is conditionally independent of $(\uu,\x_1)$ given $\x_0$, and approximate
+$p(\x_0\mid\uu,\x_1)\approx\N(\vv,\varsigma^2\Id)$ around the denoiser output $\vv$. Then
+\begin{equation}
+  \E[\x_0\mid\uu,\x_1,\y] \approx \bar\vv
+  = \arg\min_{\x}\ \|\y-\Op\x\|^2 + \lambda\|\x-\vv\|^2
+  = (\Op^H\Op + \lambda\Id)^{-1}(\Op^H\y + \lambda\vv),
+  \qquad \lambda = \frac{\sigma_n^2}{\varsigma^2},
+  \label{eq:prox}
+\end{equation}
+with equality when the approximation is exact.
+\end{proposition}
+\begin{proof}
+By the assumption, $p(\x_0\mid\uu,\x_1,\y)\propto p(\y\mid\x_0)\,p(\x_0\mid\uu,\x_1)$. With a
+Gaussian likelihood and a Gaussian prior the posterior is Gaussian, and its mean is the
+minimiser of $\|\y-\Op\x\|^2/\sigma_n^2 + \|\x-\vv\|^2/\varsigma^2$.
+\end{proof}
+
+\eqref{eq:prox} is the proximal point of the data term at $\vv$, solved with a few
+conjugate-gradient iterations warm-started at $\vv$: the CG step of
+I$^2$SB-Recon~\cite{wang2024} (\code{sb.i2sb\_recon.cg\_data\_consistency}). The ImMAP-SB step
+is then a gradient step on the posterior-smoothed objective, prior part by the network and
+data part by the proximal correction, followed by the injection that (R) requires.
+
+\begin{lemma}[How to set $\lambda$]\label{lem:lambda}
+Averaged over bridge states, the posterior variance per component is at most the noise
+variance: $\tfrac1n\E\operatorname{tr}\Cov[\x_0\mid\uu,\x_1] = \mmse(\sigma)/n\le\sigma^2$.
+\end{lemma}
+\begin{proof}
+$\E\operatorname{tr}\Cov[\x_0\mid\uu,\x_1] = \E\|\x_0 - \E[\x_0\mid\uu,\x_1]\|^2 =
+\mmse(\sigma)$, and $\mmse(\sigma)\le n\sigma^2$ by Lemma~\ref{lem:residual}.
+\end{proof}
+
+So the approximation of Proposition~\ref{prop:prox} has $\varsigma^2\approx c\,\sigma^2$ with
+$c\in(0,1]$, and
+\begin{equation}
+  \lambda(\sigma) = \frac{\sigma_n^2}{c\,\sigma^2}.
+  \label{eq:lambda}
+\end{equation}
+The data weight follows the bridge: at large $\sigma$ the denoiser's estimate is uncertain and
+the data dominate; at small $\sigma$ the estimate is sharp and the proximal step barely moves
+it. I$^2$SB-Recon fixes $\lambda = 7\cdot10^{-5}$, which by \eqref{eq:prox} amounts to a
+posterior std $\varsigma = \sigma_n/\sqrt\lambda$ that is the same at every noise level. With
+$\sigma_n>0$ a small fixed $\lambda$ fits the measurement noise on the sampled lines at every
+step. It does so most at the last steps, where the actual posterior std
+($\varsigma\lesssim\sigma$, Lemma~\ref{lem:lambda}) is far below the implied
+$\sigma_n/\sqrt\lambda$.
+
+\begin{remark}[When the measurement is already in $\x_1$]
+The conditional independence in Proposition~\ref{prop:prox} holds for a guide-contrast start,
+where $\x_1$ is a different scan. For the zero-filled start, $\x_1 = \Op^H\y$ is a sufficient
+statistic for $\x_0$ given $\y$ (with white noise, the likelihood depends on $\y$ only through
+$\Op^H\y$), so $\E[\x_0\mid\uu,\x_1] = \E[\x_0\mid\uu,\x_1,\y]$ already: the network sees the
+data and \eqref{eq:prox} adds no information in exact arithmetic. It still corrects the
+network's errors, which is where its value lies in practice. The ACS start is in between: it
+keeps only the centre lines of $\y$, and the outer lines enter through \eqref{eq:prox} alone.
+\end{remark}
+
+%=============================================================================================
+\section{The algorithm}
+%=============================================================================================
+
 \begin{algorithm}[H]
-\caption{I$^2$SB as endpoint prediction + bridge resample}
-\label{alg:i2sb}
+\caption{ImMAP-SB: annealed gradient ascent on the bridge
+         (\code{sb/immap\_sb\_ascent.py}, \code{immap\_sb\_ascent})}
+\label{alg:immap_sb}
 \begin{algorithmic}[1]
-\Require $\x_1$; regressor $\D$; times $1 = t_0 > t_1 > \dots > t_K = 0$
-\State $\x \gets \x_1$
-\For{$k = 0,\dots,K-1$}
-  \State $\xh \gets \D(\x, t_k, \x_1)$
-         \Comment{predict the endpoint}
-  \State $\x \sim \mathcal R_{t_{k+1}}(\xh;\,\x)$
-         \Comment{resample on the bridge}
+\Require endpoint $\x_1$; regressor $\D$; total variance $V$; start level $\sigma_0$;
+         step sizes $h_k$; next levels (open-loop $\beta$, a ladder, or estimated); optional
+         measurement $(\y,\Op,\sigma_n)$ and $c$
+\State $t_0 \gets \sigma_0^2/(\sigma_0^2+V)$;\quad
+       $\x \gets (1-t_0)\,\D(\x_1, 1, \x_1) + t_0\x_1 + \ssb(t_0)\,\eps$
+       \Comment{a bridge state at $\sigma_0$}
+\For{$k = 0, 1, \dots$ while $\sigma_k > \sigma_{\min}$}
+  \State $\vv \gets \D(\x, t_k, \x_1)$
+         \Comment{$\sigma_k^2\grad J_{\sigma_k} = \vv - \uu$ (Prop.~\ref{prop:tweedie})}
+  \State if $\y$: $\vv \gets (\Op^H\Op + \lambda_k\Id)^{-1}(\Op^H\y + \lambda_k\vv)$,
+         $\lambda_k = \sigma_n^2/(c\,\sigma_k^2)$
+         \Comment{data step (Prop.~\ref{prop:prox})}
+  \State choose $h_k$ and $\sigma'$ with $(1-h_k)\sigma_k\le\sigma'$;\quad
+         $t' \gets \sigma'^2/(\sigma'^2+V)$
+  \State $\x \gets c_x\x + c_v\vv + c_1\x_1 + \gamma_k\eps$ \ (Prop.~\ref{prop:bridge_step})
+         \Comment{gradient step + injection (R)}
+  \State $(t_{k+1},\sigma_{k+1}) \gets (t',\sigma')$
 \EndFor
-\State \Return $\x$
+\State \Return $\vv$
 \end{algorithmic}
 \end{algorithm}
-\noindent Here $\mathcal R$ uses $r_k = \sigma(t_{k+1})/\sigma(t_k)$ for I$^2$SB and $r_k = 0$
-for fresh resampling. The last step lands at $t_K = 0$, where $\ssb = 0$, so the returned
-state is the final prediction $\xh$.
+
+\noindent The start is a bridge state at a finite $\sigma_0$: $\x_1$ itself ($\sigma=\infty$) is
+a fixed point of any bridge-consistent update. The returned estimate is the last denoiser
+output; for I$^2$SB's ladder ending at $t=0$, $\ssb(0)=0$ and the final state equals it.
 
 %=============================================================================================
 \section{Summary}
@@ -330,31 +647,50 @@ state is the final prediction $\xh$.
 
 \begin{table}[h]
 \centering
-\small
+\footnotesize
 \begin{tabular}{@{}lll@{}}
 \toprule
-Object & Formula & Code \\
+step of the derivation & statement & where \\
 \midrule
-bridge marginal & $\x_t = (1-t)\x_0 + t\x_1 + \ssb(t)\eps$, $\ssb^2 = Vt(1-t)$ &
-  \code{sb.base.bridge\_coeffs} \\
-time $\leftrightarrow$ noise & $\uu_t = \x_0 + \sigma(t)\eps$, $\sigma^2 = Vt/(1-t)$ & --- \\
-endpoint prediction & $\xh = \D(\x_t,t,\x_1) = \E[\x_0\mid\x_t,\x_1]$ & \code{predict\_x0} \\
-bridge resample & $\x_s = (1-s)\xh + s\x_1 + \ssb(s)\eps_s$ & \code{reverse\_sample} \\
-noise re-use & $\eps_s = r\epsh_t + \sqrt{1-r^2}\zz$ & \\
-\quad I$^2$SB & $r = \sigma(s)/\sigma(t)$ & \code{posterior="ddpm"} \\
-\quad fresh & $r = 0$ & \code{posterior="interpolant"} \\
-predictions & martingale, $\E[\x_0\mid\x_1]\to\x_0$ (exact reverse bridge) & --- \\
-I$^2$SB state & precision-weighted average of the $\xh^{(k)}$, plus noise & --- \\
+bridge $=$ denoising ladder & $\uu_t = \x_0 + \sigma(t)\eps$, Brownian in $\sigma^2$ &
+  Lemma~\ref{lem:debias} \\
+objective & $\max\log p(\x\mid\x_1[,\y])$, smoothed to $J_\sigma$ & \eqref{eq:map},
+  \eqref{eq:smoothed} \\
+smoothing is benign & concave for $\sigma\ge R$; maximisers $\to$ MAP as $\sigma\to0$ &
+  Props.~\ref{prop:curvature}, \ref{prop:consistency} \\
+gradient & $\sigma^2\grad J_\sigma = \D - \uu$ & Prop.~\ref{prop:tweedie} \\
+step & $\uu^+ = (1-h)\uu + h\D$, ascent for $h\in(0,2)$ & Prop.~\ref{prop:ascent} \\
+injection & $\gamma^2 = \sigma'^2-(1-h)^2\sigma^2$, from (R) & Lemma~\ref{lem:residual},
+  Prop.~\ref{prop:injection} \\
+exact-mean step size & $h\sigma_t^2 = \sigma_t^2-\sigma_s^2$ & Prop.~\ref{prop:reverse} \\
+I$^2$SB & that step size, ladder levels & Prop.~\ref{prop:i2sb} \\
+probability flow, resampling, ImMAP & $h = 1-r$; $h = 1$; free $h_k$, $\beta$ &
+  Cor.~\ref{cor:family} \\
+I$^2$SB's iterate & precision-weighted average of the $\vv^{(k)}$ & Prop.~\ref{prop:average} \\
+data & Tweedie on $p_\sigma(\cdot\mid\x_1,\y)$; CG prox, $\lambda = \sigma_n^2/(c\sigma^2)$ &
+  Props.~\ref{prop:tweedie_y}, \ref{prop:prox} \\
 \bottomrule
 \end{tabular}
-\caption{I$^2$SB as endpoint prediction followed by a bridge resample (\code{sb/base.py}).}
-\label{tab:code}
+\caption{From the MAP objective to the bridge sampler. Code: \code{sb/base.py}
+(\code{reverse\_sample}), \code{sb/immap\_sb\_ascent.py}, \code{sb/i2sb\_recon.py}.}
+\label{tab:summary}
 \end{table}
 
 \begin{thebibliography}{9}
 \bibitem{liu2023}
 G.-H.~Liu, A.~Vahdat, D.-A.~Huang, E.~A.~Theodorou, W.~Nie, A.~Anandkumar.
 I$^2$SB: Image-to-Image Schr\"odinger Bridge. \emph{ICML}, 2023.
+
+\bibitem{ks2021}
+Z.~Kadkhodaie, E.~P.~Simoncelli. Stochastic solutions for linear inverse problems using the
+prior implicit in a denoiser. \emph{NeurIPS}, 2021.
+
+\bibitem{song2021}
+Y.~Song, J.~Sohl-Dickstein, D.~P.~Kingma, A.~Kumar, S.~Ermon, B.~Poole. Score-based generative
+modeling through stochastic differential equations. \emph{ICLR}, 2021.
+
+\bibitem{wang2024}
+Y.~Wang et al. Guided MRI reconstruction via Schr\"odinger bridge. arXiv:2411.14269, 2024.
 
 \bibitem{efron2011}
 B.~Efron. Tweedie's formula and selection bias.

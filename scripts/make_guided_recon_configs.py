@@ -362,9 +362,12 @@ TRANSFER_NETS = {
     "ct_unet16_cplx": dict(arch="unet", mode="complex", width=16, levels=2),    # 26k
 }
 TRANSFER_DEFAULT = tuple(TRANSFER_NETS)
-# short and cheap: the nets are tiny, the cost is the measurement (online ESPIRiT per batch)
+# short and cheap: the nets are tiny, the cost is the measurement (online ESPIRiT per slice).
+# The loader serves one slice (volumes differ in size); batch_size slices per step are
+# centre-cropped to `crop` and stacked (training/contrast_transfer.py).
 TRANSFER_TRAINING = dict(num_epochs=200, steps_per_epoch=100, val_every_epochs=10,
-                         val_slices=200, loss_type="l1", loss_on="mag", clip_grad=None)
+                         val_slices=200, loss_type="l1", loss_on="mag", clip_grad=None,
+                         batch_size=4, crop=[320, 320])
 TRANSFER_OPTIM = dict(type="Adam", params=dict(lr=1e-3))
 TRANSFER_SCHED = dict(type="CosineAnnealingLR", params=dict(T_max=200 * 100, eta_min=1e-5))
 for _name, _p in TRANSFER_NETS.items():
@@ -373,7 +376,7 @@ for _name, _p in TRANSFER_NETS.items():
         model=dict(type="ContrastTransfer", params=dict(_p)),
         training=dict(TRANSFER_TRAINING,
                       **({"loss_on": "complex"} if _p["mode"] == "complex" else {})),
-        optimizer=TRANSFER_OPTIM, scheduler=TRANSFER_SCHED, data=dict(batch_size=4))
+        optimizer=TRANSFER_OPTIM, scheduler=TRANSFER_SCHED)
     # ... and LGGS with that transfer frozen in front of its guide: lggs_<ct name>, the knee LGGS
     # cell otherwise unchanged (needs the transfer's pretraining to have finished)
     MODELS[f"lggs_{_name}"] = dict(
