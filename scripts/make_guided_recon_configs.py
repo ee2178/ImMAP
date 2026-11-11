@@ -267,6 +267,19 @@ MODELS = {
                        model=dict(type="LGGS", params=LGGS_PAPER_PARAMS),
                        speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING),
                        data=LGGS_PAPER_DATA),
+    # MULTICONTRAST LGGS without an extra network: the knee LGGS cell, with the PD guide given its
+    # own feature space (models/guided_lpds.py; each starts equal to plain LGGS)
+    #   lggs_guide_w     its own W_phi^g, W_alpha^g in the prox (guide keys and energy)
+    #   lggs_guide_conv  its own analysis conv A_g in every layer (v = A_g w)
+    "lggs_guide_w": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                         model=dict(type="LGGS",
+                                    params=dict(LGGS_PARAMS, separate_guide_w=True)),
+                         speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING)),
+    "lggs_guide_conv": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                            model=dict(type="LGGS",
+                                       params=dict(LGGS_PARAMS, separate_guide_conv=True)),
+                            speed=dict(params=LGGS_SPEED_PARAMS,
+                                       training=LGGS_SPEED_TRAINING)),
 }
 
 # Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,

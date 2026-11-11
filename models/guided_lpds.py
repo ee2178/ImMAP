@@ -69,7 +69,7 @@ import torch.nn.functional as F
 
 from models.guided_prox import (GuidedGroupThreshold, ProjectedGuide,
                                 as_guide_list, build_guided_prox)
-from models.base import batched_projection
+from models.base import batched_projection, project_conv
 from models import compile_glue
 from models.components import to_complex, to_planar
 from models.lpds import LPDSLayer, _per_channel, gram
@@ -98,7 +98,7 @@ class GuidedLPDSLayer(LPDSLayer):
 
     def __init__(self, C, M, P=7, stride=1, lam0=1e-2, tau0=1e-1, theta0=1e-1,
                  degrees=0, is_complex=True, window=1, guide_window=None,
-                 joint_softmax=True, Mh=None, prox_kws=None):
+                 joint_softmax=True, Mh=None, prox_kws=None, separate_guide_conv=False):
         # Build the plain layer first (convs, tau, theta, and a prox we replace)
         # so the analysis/synthesis construction and init stay in one place.
         super().__init__(C, M, P=P, stride=stride, lam0=lam0, tau0=tau0,
@@ -112,11 +112,34 @@ class GuidedLPDSLayer(LPDSLayer):
                                       guide_window=guide_window,
                                       joint_softmax=joint_softmax, dual=True,
                                       **prox_kws)
+        # separate_guide_conv: the guide gets its OWN analysis conv A_g (v = A_g w) instead of
+        # this layer's A -- for a guide of another contrast. Created by `separate_guide_conv_()`
+        # once A is initialised (make_guided_lpds_layer), as a copy of it.
+        self.separate_guide_conv = bool(separate_guide_conv)
+        self.guide_analysis = None
+
+    @torch.no_grad()
+    def separate_guide_conv_(self):
+        """A_g := a copy of the (initialised) A, so an untrained net is the shared-A net."""
+        if self.separate_guide_conv:
+            self.guide_analysis = copy.deepcopy(self.analysis)
+        return self
+
+    @property
+    def guide_A(self):
+        """The analysis conv the GUIDE goes through: A_g with separate_guide_conv, else A."""
+        return self.analysis if self.guide_analysis is None else self.guide_analysis
+
+    @torch.no_grad()
+    def project_(self):
+        super().project_()
+        if self.guide_analysis is not None:
+            project_conv(self.guide_analysis)                # the unit ball, as A
 
     # -- guide latents ------------------------------------------------------
     def analyse_guides(self, guides):
-        """`[A w_g]` -- this layer's dictionary applied to each guide image."""
-        return [self.analysis(w) for w in guides]
+        """`[A w_g]` -- this layer's dictionary (or the guide's own, A_g) applied to each guide."""
+        return [self.guide_A(w) for w in guides]
 
     def guide_latents(self, guides, planar=False):
         """What the prox gets for each guide: `A w`, as a `ProjectedGuide` where the composition
@@ -124,8 +147,8 @@ class GuidedLPDSLayer(LPDSLayer):
         Same values either way; the projected form never builds the M-channel latent.
         `planar`: in the planar state's [re; im] form, to match a planar code."""
         gt = self.prox.prox
-        if ProjectedGuide.supported(guides[0], self.analysis, gt):
-            return [ProjectedGuide(w, self.analysis, gt, planar=planar) for w in guides]
+        if ProjectedGuide.supported(guides[0], self.guide_A, gt):
+            return [ProjectedGuide(w, self.guide_A, gt, planar=planar) for w in guides]
         v = self.analyse_guides(guides)
         return [to_planar(t) for t in v] if planar else v
 
@@ -227,7 +250,7 @@ def make_guided_lpds_layer(C, M, spectral_init=True, **kws):
     layer.init_filters()
     if spectral_init:
         layer.spectral_normalize()
-    return layer
+    return layer.separate_guide_conv_()
 
 
 def tie_transforms_(layers):
@@ -246,10 +269,12 @@ def tie_transforms_(layers):
         dst = layer.prox.prox
         dst.Wtheta, dst.Wphi, dst.Walpha, dst.Wbeta = src.Wtheta, src.Wphi, src.Walpha, src.Wbeta
         dst.gamma = src.gamma
+        if getattr(src, "separate_guide_w", False):         # the guide's own W's: tied too
+            dst.Wphi_g, dst.Walpha_g = src.Wphi_g, src.Walpha_g
     return layers
 
 
-_TIED = ("Wtheta", "Wphi", "Walpha", "Wbeta", "gamma")
+_TIED = ("Wtheta", "Wphi", "Walpha", "Wbeta", "gamma", "Wphi_g", "Walpha_g")
 
 
 def _refuse_untied(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
@@ -319,7 +344,8 @@ class LGGSNet(nn.Module):
                  spectral_init=True, guide_blend=None, guide_gain0=1.0,
                  triton_materialize=False, z_init="prox",
                  guide_mean="per_guide", self_sim_fun=None, adj_blend=True,
-                 similarity_scale="learned", prox_degrees=None, guide_transfer=None):
+                 similarity_scale="learned", prox_degrees=None, guide_transfer=None,
+                 separate_guide_w=False, separate_guide_conv=False):
         """W_theta, W_phi, W_alpha, W_beta and gamma are ONE set shared by the K layers (as in
         Sljiva's LGGS runs, `share:` in config/guided_lpdsnet.yaml, and the paper, Sec. IV-A);
         eta, theta, A, B, tau and rho stay per layer. There is no untied variant. A checkpoint
@@ -339,6 +365,13 @@ class LGGSNet(nn.Module):
                           LGGS runs: a noise-adaptive threshold (`degrees: 1` reaches only the
                           GT's tau in src/networks/lpds.jl) with CONSTANT steps (degree 0) --
                           `degrees=0, prox_degrees=1`.
+
+        For a guide of ANOTHER contrast (PD guiding PDFS), two ways to let the guide live in its
+        own feature space without an extra network (each starts equal to the shared net):
+        separate_guide_w     the guide's own W_phi^g, W_alpha^g in the prox (keys, energy); tied
+                             across layers like the other W's (models/guided_prox.py)
+        separate_guide_conv  the guide's own analysis conv A_g per layer, v = A_g w (A stays
+                             per layer as well), projected onto the unit ball like A
         """
         super().__init__()
         if z_init not in ("prox", "zero"):
@@ -373,13 +406,14 @@ class LGGSNet(nn.Module):
                         init_strategy=init_strategy, attn_backend=attn_backend,
                         flex_block_size=flex_block_size,
                         triton_materialize=triton_materialize, self_sim_fun=self_sim_fun,
-                        adj_blend=adj_blend, similarity_scale=similarity_scale)
+                        adj_blend=adj_blend, similarity_scale=similarity_scale,
+                        separate_guide_w=separate_guide_w)
         if guide_blend is not None:            # "additive": models/guided_prox.py
             prox_kws.update(guide_blend=guide_blend, guide_gain0=guide_gain0)
         layer_kws = dict(P=P, stride=s, lam0=lam0, tau0=tau0, theta0=theta0,
                          degrees=degrees, is_complex=is_complex, window=window,
                          guide_window=guide_window, joint_softmax=joint_softmax,
-                         Mh=Mh, prox_kws=prox_kws)
+                         Mh=Mh, prox_kws=prox_kws, separate_guide_conv=separate_guide_conv)
 
         proto = make_guided_lpds_layer(C, M, spectral_init=spectral_init,
                                        **layer_kws)

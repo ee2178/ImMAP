@@ -54,6 +54,9 @@
 # Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
 #                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
+# Multicontrast LGGS, no extra network: the knee LGGS cell with the guide's own W_phi, W_alpha
+#                  (lggs_guide_w) or its own analysis conv per layer (lggs_guide_conv):
+#                  MODELS="lggs_guide_w lggs_guide_conv" sbatch --array=0-1 --export=ALL torch/guided_recon_knee.sbatch
 # LGGS + guide transfer (after torch/contrast_transfer_knee.sbatch): the knee LGGS cell with a
 #                  pretrained contrast-transfer net frozen in front of its guide, lggs_<ct cell>:
 #                  MODELS="lggs_ct_unet8" sbatch --array=0 --export=ALL torch/guided_recon_knee.sbatch

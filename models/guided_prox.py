@@ -26,6 +26,17 @@ The guides `v_g` are latent-domain maps -- in LGGS they are the layer's own
 analysis operator applied to a fully-sampled prior image (`guided_lpds.jl`:
 `v = l.analysis(w)`), so the same dictionary sees the target and the guide.
 
+Separate guide transforms (`separate_guide_w=True`)
+--------------------------------------------------
+For a guide of a DIFFERENT contrast (PD guiding PDFS), the guide keys and energy need not live in
+the image's feature space. `separate_guide_w` gives the guide its own W_phi^g, W_alpha^g:
+
+    Omega_g = sim( W_theta z , W_phi^g v_g ; guide_window ),   guide energy (W_alpha^g v_g)^2
+
+W_theta (the query, the image's) and W_beta (applied after pooling) stay shared. The copies start
+equal to W_phi, W_alpha, so an untrained net is the shared-W net exactly, and LGGS ties them across
+layers like every other W. Off by default (no new parameters, checkpoints unchanged).
+
 Because the guide branch is what selects WHICH pixels group together, a
 fully-sampled prior contributes its (undegraded) self-similarity structure to
 the estimate without ever being added to it -- the estimate only inherits the
@@ -96,6 +107,7 @@ checkpoint trained on gather does not transfer bit-for-bit.
 
 from __future__ import annotations
 
+import copy
 import os
 
 import torch
@@ -250,7 +262,7 @@ class ProjectedGuide:
             return False
         if a.conv_imag is not None and a.conv_imag.bias is not None:
             return False
-        if any(p.conv.bias is not None for p in (prox.Walpha, prox.Wphi)):
+        if any(p.conv.bias is not None for p in (prox.guide_Walpha, prox.guide_Wphi)):
             return False
         return w.dim() == 4 and w.shape[1] == a.conv_real.in_channels
 
@@ -306,7 +318,7 @@ class ProjectedGuide:
     def alpha(self):
         """`W_alpha A w`."""
         if self._alpha is None:
-            self._alpha, = self._project([self.prox.Walpha])
+            self._alpha, = self._project([self.prox.guide_Walpha])
         return self._alpha
 
     @property
@@ -314,9 +326,10 @@ class ProjectedGuide:
         """`W_phi A w` (formed together with `W_alpha A w` when that is still to come)."""
         if self._phi is None:
             if self._alpha is None:
-                self._phi, self._alpha = self._project([self.prox.Wphi, self.prox.Walpha])
+                self._phi, self._alpha = self._project([self.prox.guide_Wphi,
+                                                        self.prox.guide_Walpha])
             else:
-                self._phi, = self._project([self.prox.Wphi])
+                self._phi, = self._project([self.prox.guide_Wphi])
         return self._phi
 
 
@@ -344,8 +357,13 @@ class GuidedGroupThreshold(GroupThreshold):
 
     def __init__(self, M, guide_window=None, joint_softmax=True, guide_blend=None,
                  guide_gain0=1.0, triton_materialize=False, self_sim_fun=None,
-                 adj_blend=True, similarity_scale="learned", **kws):
+                 adj_blend=True, similarity_scale="learned", separate_guide_w=False, **kws):
         super().__init__(M, **kws)
+        # the guide's own key / energy transforms (module docstring); copies of the image's
+        self.separate_guide_w = bool(separate_guide_w) and self.grouped
+        if self.separate_guide_w:
+            self.Wphi_g = copy.deepcopy(self.Wphi)
+            self.Walpha_g = copy.deepcopy(self.Walpha)
         # Paper-alignment switches (notes/lggs_paper_alignment.md). Defaults are the port's
         # behaviour, so existing configs and checkpoints are unchanged.
         #   self_sim_fun      similarity of the SELF block S_zz; None = `sim_fun`, as before.
@@ -441,16 +459,25 @@ class GuidedGroupThreshold(GroupThreshold):
             q, k_self, k_guides = conv(q), conv(k_self), [conv(k) for k in k_guides]
         return q, k_self, k_guides
 
+    # the transforms a GUIDE goes through: its own with separate_guide_w, else the image's
+    @property
+    def guide_Walpha(self):
+        return self.Walpha_g if self.separate_guide_w else self.Walpha
+
+    @property
+    def guide_Wphi(self):
+        return self.Wphi_g if self.separate_guide_w else self.Wphi
+
     # a guide is a latent tensor, or a `ProjectedGuide` that forms these maps directly
     def _guide_alpha(self, g):
         if isinstance(g, ProjectedGuide):
             return g.alpha
-        return self.Walpha(g) if self.grouped else g
+        return self.guide_Walpha(g) if self.grouped else g
 
     def _guide_phi(self, g):
         if isinstance(g, ProjectedGuide):
             return g.phi
-        return self.Wphi(g) if self.grouped else g
+        return self.guide_Wphi(g) if self.grouped else g
 
     # -- adjacencies ---------------------------------------------------------
     def _fused_branch(self, q, k, win, sim=None):
@@ -701,7 +728,7 @@ class GuidedGroupThreshold(GroupThreshold):
 
         z, g = rnd(), rnd()
         q, k_self, k_guides = self._project_qk(z, [g], None)
-        vals = [_abs2(self.Walpha(t) if self.grouped else t) for t in (z, g)]
+        vals = [_abs2(self.Walpha(z) if self.grouped else z), _abs2(self._guide_alpha(g))]
 
         branches = [self._fused_branch(q, k_self, self.window, sim=self.self_sim),
                     self._fused_branch(q, k_guides[0], self.guide_window)]
@@ -747,7 +774,7 @@ class GuidedGroupThreshold(GroupThreshold):
 
     def extra_repr(self):
         return (f"{super().extra_repr()}, guide_window={self.guide_window}, "
-                f"guide_blend={self.guide_blend}")
+                f"guide_blend={self.guide_blend}, separate_guide_w={self.separate_guide_w}")
 
 
 class GuidedFenchelProx(nn.Module):

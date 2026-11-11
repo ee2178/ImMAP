@@ -761,6 +761,74 @@ def test_contrast_transfer_pretrains_on_the_recon_guide():
             assert {"train/loss", "val/psnr", "val/ssim", "val/guide_psnr"} <= keys, keys
 
 
+def test_lggs_separate_guide_transforms():
+    """separate_guide_w / separate_guide_conv: the guide gets its own W_phi, W_alpha (tied across
+    layers) or its own analysis conv per layer; each starts as a copy, so the untrained net is
+    plain LGGS exactly; the copies then carry the guide alone, take gradients, are projected, and
+    the defaults add nothing to the state dict."""
+    from models.guided_lpds import LGGSNet
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    assert gen.MODELS["lggs_guide_w"]["model"]["params"] == dict(gen.LGGS_PARAMS,
+                                                                  separate_guide_w=True)
+    assert gen.MODELS["lggs_guide_conv"]["model"]["params"] == dict(gen.LGGS_PARAMS,
+                                                                     separate_guide_conv=True)
+    kw = dict(K=3, M=8, P=3, s=2, Mh=4, guide_window=3, attn_backend="gather")
+    maps = torch.from_numpy(MAPS)[None]
+    E = Mask(torch.ones(1, 1, H, W)) @ FFT2D() @ Sense(maps)
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64)
+    guide = torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64)
+    y = E(x)
+
+    def build(**extra):
+        torch.manual_seed(0)
+        return LGGSNet(**kw, **extra)
+
+    def out(net):
+        return net(y, guide=guide, E=E, sigma=torch.tensor(0.05))[0]
+
+    base = build()
+    assert not any("_g." in k or "guide_analysis" in k for k in base.state_dict())
+    ref = out(base).detach()
+    for flag in ("separate_guide_w", "separate_guide_conv"):
+        net = build(**{flag: True})
+        assert torch.allclose(out(net), ref, atol=1e-5), flag      # identical at init
+        if flag == "separate_guide_w":
+            pr = [layer.prox.prox for layer in net.layers]
+            assert all(p.Wphi_g is pr[0].Wphi_g and p.Walpha_g is pr[0].Walpha_g for p in pr)
+            assert pr[0].Wphi_g is not pr[0].Wphi and pr[0].Walpha_g is not pr[0].Walpha
+            own = list(pr[0].Wphi_g.parameters()) + list(pr[0].Walpha_g.parameters())
+        else:
+            ga = [layer.guide_analysis for layer in net.layers]
+            assert all(a is not None and a is not layer.analysis
+                       for a, layer in zip(ga, net.layers))
+            assert ga[0] is not ga[1]                                   # per layer
+            # the LAST layer's dual update feeds nothing (the net returns x), so neither its A nor
+            # its A_g gets a gradient -- as in plain LGGS; every other layer's A_g does
+            own = [p for a in ga[:-1] for p in a.parameters()]
+        out(net).abs().pow(2).sum().backward()
+        assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in own), flag
+        if flag == "separate_guide_conv":
+            last = net.layers[-1]
+            assert all(p.grad is None or p.grad.abs().sum() == 0
+                       for p in list(last.analysis.parameters())
+                       + list(last.guide_analysis.parameters()))
+        with torch.no_grad():                                           # they act on the guide
+            for p in own:
+                p.mul_(1.5)
+        assert not torch.allclose(out(net), ref, atol=1e-4), flag
+        net2 = build(**{flag: True})
+        net2.load_state_dict(net.state_dict())                          # tied copies reload
+        assert torch.allclose(out(net2), out(net), atol=1e-6)
+        if flag == "separate_guide_conv":
+            with torch.no_grad():
+                net.layers[0].guide_analysis.weight = net.layers[0].guide_analysis.weight * 100
+            net.project()
+            w = net.layers[0].guide_analysis.weight
+            assert float(w.abs().pow(2).sum(dim=(2, 3)).sqrt().max()) <= 1 + 1e-5
+
+
 def test_lggs_with_a_frozen_guide_transfer():
     """lggs_<ct>: LGGS loads the pretrained transfer frozen, applies it to every guide before its
     own mean subtraction, keeps it in eval mode, and carries its weights in its state dict."""
