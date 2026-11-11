@@ -41,8 +41,11 @@
 #                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Calibrate only:  CASCADES=8 CALIBRATE_ONLY=1 sbatch --time=01:00:00 --export=ALL torch/bridge_start_knee.sbatch
 # Other cells:     any i2sb_recon cell of make_guided_recon_configs.py by name (CASCADES not
-#                  needed), e.g. the plain UNet bridge baselines, unguided / guide as channels:
-#                  MODELS="sbunet sbunet_guided" sbatch --array=0-1 --export=ALL torch/bridge_start_knee.sbatch
+#                  needed): MODELS="..." sbatch --array=... --export=ALL torch/bridge_start_knee.sbatch
+# CLUSTER SPLIT (2026-11-11): i2sb training now runs on BIGPURPLE -- the starts sweep
+#                  (bigpurple/guided_i2sb_knee.sbatch) and the UNet baselines incl. I2SB-Inversion
+#                  (bigpurple/baseline_sweep.sbatch). Torch keeps the end-to-end recon nets
+#                  (torch/guided_recon_knee.sbatch, torch/contrast_transfer_knee.sbatch).
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
 ACCELS="${ACCELS:-8}"

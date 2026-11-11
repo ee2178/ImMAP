@@ -319,7 +319,7 @@ class LGGSNet(nn.Module):
                  spectral_init=True, guide_blend=None, guide_gain0=1.0,
                  triton_materialize=False, z_init="prox",
                  guide_mean="per_guide", self_sim_fun=None, adj_blend=True,
-                 similarity_scale="learned", prox_degrees=None):
+                 similarity_scale="learned", prox_degrees=None, guide_transfer=None):
         """W_theta, W_phi, W_alpha, W_beta and gamma are ONE set shared by the K layers (as in
         Sljiva's LGGS runs, `share:` in config/guided_lpdsnet.yaml, and the paper, Sec. IV-A);
         eta, theta, A, B, tau and rho stay per layer. There is no untied variant. A checkpoint
@@ -347,6 +347,15 @@ class LGGSNet(nn.Module):
             raise ValueError(f"guide_mean must be 'per_guide' or 'joint'; got {guide_mean!r}")
         self.z_init = z_init
         self.guide_mean = guide_mean
+        # guide_transfer: {"params": {...}, "ckpt": path} -- a PRETRAINED contrast-transfer net
+        # (models/contrast_transfer.py, task "contrast_transfer"), frozen, applied to every guide
+        # before anything else sees it: LGGS then pools by similarity in the TRANSFERRED guide
+        # (a PDFS-like image from the PD scan). Its weights are part of this net's state dict, so
+        # a trained LGGS reloads them with the rest.
+        self.guide_transfer = None
+        if guide_transfer is not None:
+            from models.contrast_transfer import load_frozen_transfer
+            self.guide_transfer = load_frozen_transfer(guide_transfer)
         self.K, self.M, self.C, self.P, self.s = int(K), int(M), int(C), int(P), int(s)
         self.is_complex = bool(is_complex)
         self.attn_backend = attn_backend
@@ -383,6 +392,12 @@ class LGGSNet(nn.Module):
         # override is skipped when a parent model's load_state_dict recurses into this one)
         self._register_load_state_dict_pre_hook(_refuse_untied)
 
+    def train(self, mode=True):
+        super().train(mode)
+        if self.guide_transfer is not None:
+            self.guide_transfer.eval()                    # frozen: always in eval mode
+        return self
+
     # -- guide preprocessing -------------------------------------------------
     def _prep_guides(self, guide, ref):
         """Mean-subtract each guide and pad it onto `y~`'s grid.
@@ -397,6 +412,9 @@ class LGGSNet(nn.Module):
         guides = as_guide_list(guide)
         if not guides:
             return []
+        if self.guide_transfer is not None:
+            with torch.no_grad():
+                guides = [self.guide_transfer(w) for w in guides]
         out = []
         pad = calc_pad_2d(*guides[0].shape[-2:], self.pad_stride)
         joint = None

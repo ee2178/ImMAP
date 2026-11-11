@@ -54,6 +54,12 @@
 # Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
 #                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
+# LGGS + guide transfer (after torch/contrast_transfer_knee.sbatch): the knee LGGS cell with a
+#                  pretrained contrast-transfer net frozen in front of its guide, lggs_<ct cell>:
+#                  MODELS="lggs_ct_unet8" sbatch --array=0 --export=ALL torch/guided_recon_knee.sbatch
+# CLUSTER SPLIT:   end-to-end recon (LGGS / TGVN / LPDSNet, contrast transfer) runs HERE on torch;
+#                  every i2sb cell runs on bigpurple (bigpurple/guided_i2sb_knee.sbatch,
+#                  bigpurple/baseline_sweep.sbatch).
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
 ACCELS="${ACCELS:-8}"
@@ -120,7 +126,12 @@ fi
 # the offline target maps must exist (torch/espirit_knee_pairs.sbatch); fail now, not at step 0
 python - "${BASE_CONFIG}" <<'PY'
 import json, os, sys
-d = json.load(open(sys.argv[1]))["data"]["train"]
+cfg = json.load(open(sys.argv[1]))
+d = cfg["data"]["train"]
+gt = (cfg["model"].get("params") or {}).get("guide_transfer")
+if gt and not os.path.isfile(gt["ckpt"]):
+    sys.exit(f"[guided] the frozen guide transfer is not trained yet: {gt['ckpt']}\n"
+             f"         run torch/contrast_transfer_knee.sbatch first (same NOISE)")
 root = d.get("smap_root")
 if d.get("target") == "sense" and (not root or not os.path.isdir(root) or not os.listdir(root)):
     sys.exit(f"[guided] offline maps missing or empty: {root}\n"

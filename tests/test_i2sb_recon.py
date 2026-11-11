@@ -410,6 +410,68 @@ def test_dc_sampler_corrects_a_hallucinating_regressor():
     assert _rel_res(out[7], y, E) < 0.5 * _rel_res(out[0], y, E)
 
 
+def test_eps_parameterization_and_loss():
+    """predict="eps": the UNet's output is the bridge noise and the net returns
+    x0_hat = x_t - std_fwd * eps_hat (I2SB runner.py compute_pred_x0); loss_target="eps" trains
+    it with the eps-matching MSE, and refuses an extra t-weighting on top."""
+    torch.manual_seed(0)
+    net = SBReconUnet(cond_x1=False, predict="eps", model_channels=32, num_res_blocks=1,
+                      channel_mult=(1, 2), attention_resolutions=(16,), image_size=H,
+                      num_head_channels=32, kind="brownian", tau=TAU, n_points=N)
+    x = torch.randn(2, 1, H, H, dtype=torch.complex64)
+    sigma = torch.tensor([0.05, 0.2]).view(2, 1, 1, 1)
+    eps = torch.randn(2, 2, H, H)
+    net.unet.forward = lambda inp, sigma=None, step=None: (eps, None)
+    out, _ = net(x, sigma=sigma)
+    assert torch.allclose(out, x - sigma * from_planar(eps), atol=1e-6)
+    raises(ValueError, lambda: SBReconUnet(predict="v"), "predict")
+    with tempfile.TemporaryDirectory() as d:
+        torch.manual_seed(0)
+        net = SBReconUnet(cond_x1=False, predict="eps", model_channels=32, num_res_blocks=1,
+                          channel_mult=(1, 2), attention_resolutions=(16,), image_size=H,
+                          num_head_channels=32, kind="brownian", tau=TAU, n_points=N)
+        before = [p.detach().clone() for p in net.parameters()]
+        run(net, d, num_epochs=1, loss_target="eps", ema_decay=0.99, accum_steps=2)
+        assert any(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
+        assert all(torch.isfinite(p).all() for p in net.parameters())
+        raises(ValueError, lambda: run(net, d, num_epochs=1, loss_target="eps",
+                                       loss_weight="snr"), "loss_target")
+        raises(ValueError, lambda: run(net, d, num_epochs=1, loss_target="x1"), "loss_target")
+
+
+def test_bridge_inversion_is_their_update():
+    """sb/i2sb_recon.py::bridge_inversion is I2SB-Inversion's ddim_inversion loop step for step:
+    x_{i+1} = x_i - (s_{i+1}^2 - s_i^2) / (s_i^2 + 1e-8) * (x_i - x0_hat(x_i, i)), indices
+    0..n-1, their code's sign; and the full method returns the data-consistent target for an
+    oracle regressor."""
+    from sb.i2sb_recon import bridge_inversion, i2sb_inversion_sample
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    x = torch.randn(1, 1, 8, 8, dtype=torch.complex64)
+
+    def half(x_t, sigma=None, **_):
+        return 0.5 * x_t, None
+    n = 50
+    got = bridge_inversion(half, x, sched, n_steps_inv=n)
+    s2 = sched.std_fwd.double() ** 2
+    want = x.clone()
+    for i in range(n - 1):
+        c = float((s2[i + 1] - s2[i]) / (s2[i] + 1e-8))
+        want = want - c * (want - 0.5 * want)
+    assert torch.allclose(got, want, rtol=1e-4, atol=1e-6)
+
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+
+    def oracle(x_t, sigma=None, **_):
+        return image, None
+    torch.manual_seed(0)
+    rec, extra = i2sb_inversion_sample(oracle, y, E, sched, x1=E.adjoint(y), nfe=10)
+    assert set(extra) == {"recon_1", "b_hat"}
+    for v in (rec, extra["recon_1"], extra["b_hat"]):
+        assert float((v - image).abs().max() / image.abs().max()) < 0.05
+
+
 def test_support_and_trace():
     """`support`: every x0 prediction (so the recon) is 0 outside it, also with CG; with
     `support_state` the state is too. `trace`: one entry per evaluation, pre / post DC."""

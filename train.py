@@ -50,6 +50,13 @@ def build_optimizer(model, cfg):
             params["fused"] = True
         return torch.optim.Adam(model.parameters(), **params)
 
+    if opt_cfg["type"] == "AdamW":
+        # I2SB / I2SB-Inversion's optimizer (runner.py build_optimizer_sched: AdamW, lr, l2_norm)
+        params = dict(opt_cfg["params"])
+        if "fused" not in params and _fused_ok(model):
+            params["fused"] = True
+        return torch.optim.AdamW(model.parameters(), **params)
+
     raise ValueError(f"Unknown optimizer {opt_cfg['type']}")
 
 def build_scheduler(optimizer, cfg):
@@ -457,6 +464,25 @@ def main(config_path):
             **train_kws,
             **cfg["mri"],
             **cfg["i2sb"],
+            **cfg["paths"],
+            )
+    elif task == "contrast_transfer":
+        # a tiny guide contrast-transfer net, pretrained before a guided net uses it frozen
+        # (training/contrast_transfer.py, models/contrast_transfer.py)
+        from training.contrast_transfer import train_contrast_transfer
+        steps_per_epoch = cfg["training"]["steps_per_epoch"]
+        train_contrast_transfer(
+            net=model,
+            opt=optimizer,
+            sched=scheduler,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            wandb=wandb,
+            start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
+            **train_kws,
+            **cfg["mri"],
             **cfg["paths"],
             )
     elif task == "latent_i2sb":

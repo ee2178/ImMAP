@@ -314,6 +314,74 @@ for _name, _guided in (("sbunet", False), ("sbunet_guided", True)):
         x1_source="adjoint",
         model=dict(type="SBReconUnet", params=dict(SBUNET_PARAMS, guided=_guided, **SCHEDULE)))
 
+# "sbunet_inv": I2SB-INVERSION (Wang et al., arXiv 2411.14269) as its code runs it
+# (github.com/zhyjSIAT/I2SB-Inversion, i2sb-inversion/: train.py, i2sb/runner.py, i2sb/network.py,
+# i2sb/ckpt_util.py::config_cartesian, sample.py). What is THEIRS:
+#   start      x1 = the guide (PD) image, fully sampled, coil-combined with its OWN maps (online
+#              ESPIRiT on its own centre; theirs: T1 with T1's maps)        i2sb.guide_maps "own"
+#   net        ADM, 256 channels, 2 res blocks, mult (1,1,2,2,4,4), attention at downsampling
+#              8/16/32 (their "32,16,8" at 256 px -> 40/20/10 px at our 320), 64-ch heads,
+#              resblock_updown, scale-shift norm, no dropout, RANDOM init (their pretrained-ADM
+#              load is commented out in network.py), 2 channels in/out: ONLY x_t and the step
+#              (--cond-x1 off), no guide channels; it predicts eps, x0 = x_t - std_fwd * eps
+#   sampling   80 NFE, stochastic posterior (eta 1), CG (7 iters, lam 7e-5) on EVERY x0
+#              prediction, no final hard DC, no support mask; then the INVERSION -- a
+#              deterministic walk back up the bridge from that recon (their code's update and
+#              sign; sb/i2sb_recon.py::bridge_inversion) -- and a second 80-NFE CG pass from it
+#              (i2sb_inversion_sample; scripts/eval_i2sb_recon_dc.py --inversion --nfe 80).
+# What is OURS, unified across the i2sb baselines (the user's call, 2026-11-11): the bridge
+# (Brownian, tau; theirs the I2SB beta schedule), the data protocol (per-volume p95 normalization
+# -- theirs divides each slice by its max --, PDFS target under the operator's maps, measured
+# k-space + AWGN, online maps for E), the 320 px grid, and the WHOLE TRAINING PROTOCOL: the grid's
+# optimizer, LR, cosine schedule, clipping, batch, step budget and validation (20 NFE, every val
+# slice, first pass only) -- not their AdamW 1e-5 / StepLR(1000, 0.99) / EMA 0.99 / no clipping /
+# batch 16 -- and the shared OBJECTIVE, complex-MSE on x0_hat, not their eps-matching MSE (set
+# training.loss_target "eps" for theirs). The net still outputs eps, x0_hat = x_t - std_fwd * eps.
+I2SBINV_UNET = dict(cond_x1=False, guided=False, predict="eps", model_channels=256,
+                    num_res_blocks=2, channel_mult=[1, 1, 2, 2, 4, 4],
+                    attention_resolutions=[40, 20, 10], image_size=320, num_heads=4,
+                    num_head_channels=64, dropout=0.0, use_scale_shift_norm=True,
+                    resblock_updown=True, conv_resample=True, t0=1e-4, T=1.0)
+MODELS["sbunet_inv"] = dict(
+    task="i2sb_recon", guided=True, grid_base="varnet", pad_multiple=1, x1_source="guide",
+    model=dict(type="SBReconUnet", params=dict(I2SBINV_UNET, **SCHEDULE)),
+    i2sb=dict(guide_maps="own", support_thresh=None, support_state=False))
+
+# GUIDE CONTRAST TRANSFER (models/contrast_transfer.py; task "contrast_transfer",
+# training/contrast_transfer.py): tiny nets mapping the PD guide -- as a guided net receives it,
+# coil-combined under the operator's maps -- onto the PDFS target, pretrained on their own and
+# then FROZEN inside LGGS (the lggs_<ct> cells below), which then pools by similarity in a
+# PDFS-like guide. Torch: torch/contrast_transfer_knee.sbatch. Run dirs:
+# trained_nets/guided_recon/knee/<RUN_TAG>/ct_<...>_R8_g1; LGGS loads its net_bestval.ckpt.
+TRANSFER_NETS = {
+    "ct_pixel":       dict(arch="pixel", mode="mag", width=32, depth=3),        # 1.2k params
+    "ct_patch3":      dict(arch="patch", mode="mag", width=32, depth=3, kernel=3),  # 1.4k
+    "ct_patch7":      dict(arch="patch", mode="mag", width=32, depth=3, kernel=7),  # 2.7k
+    "ct_unet8":       dict(arch="unet", mode="mag", width=8, levels=2),         # 6.5k
+    "ct_unet16":      dict(arch="unet", mode="mag", width=16, levels=2),        # 26k
+    "ct_unet16_cplx": dict(arch="unet", mode="complex", width=16, levels=2),    # 26k
+}
+TRANSFER_DEFAULT = tuple(TRANSFER_NETS)
+# short and cheap: the nets are tiny, the cost is the measurement (online ESPIRiT per batch)
+TRANSFER_TRAINING = dict(num_epochs=200, steps_per_epoch=100, val_every_epochs=10,
+                         val_slices=200, loss_type="l1", loss_on="mag", clip_grad=None)
+TRANSFER_OPTIM = dict(type="Adam", params=dict(lr=1e-3))
+TRANSFER_SCHED = dict(type="CosineAnnealingLR", params=dict(T_max=200 * 100, eta_min=1e-5))
+for _name, _p in TRANSFER_NETS.items():
+    MODELS[_name] = dict(
+        task="contrast_transfer", guided=True, grid_base="varnet", pad_multiple=1,
+        model=dict(type="ContrastTransfer", params=dict(_p)),
+        training=dict(TRANSFER_TRAINING,
+                      **({"loss_on": "complex"} if _p["mode"] == "complex" else {})),
+        optimizer=TRANSFER_OPTIM, scheduler=TRANSFER_SCHED, data=dict(batch_size=4))
+    # ... and LGGS with that transfer frozen in front of its guide: lggs_<ct name>, the knee LGGS
+    # cell otherwise unchanged (needs the transfer's pretraining to have finished)
+    MODELS[f"lggs_{_name}"] = dict(
+        task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+        model=dict(type="LGGS", params=LGGS_PARAMS),
+        speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING),
+        transfer=_name)
+
 # Per-start bridge temperature. The gap x0 - x1 differs completely between starts (aliasing for
 # "adjoint", blur for "acs", CONTRAST for "guide"), so each gets its own calibration, written by
 # `scripts/calibrate_recon_bridge.py <config> --json BRIDGE_TAU_DIR/<start>_R<R>.json` (the bridge
@@ -436,6 +504,13 @@ def make_config(r, model, g, grid):
     }
     if speed.get("params"):
         cfg["model"]["params"].update(speed["params"])
+    if spec.get("transfer"):
+        # the frozen guide transfer: the pretrained cell's best-validation weights
+        ct = spec["transfer"]
+        cfg["model"]["params"]["guide_transfer"] = {
+            "params": dict(MODELS[ct]["model"]["params"]),
+            "ckpt": f"trained_nets/guided_recon/{ANATOMY}/{run_tag()}/{cell_name(r, ct, g)}/"
+                    f"net_bestval.ckpt"}
     if TRAIN_RECIPE == "sljiva":
         cfg["optimizer"] = dict(cfg["optimizer"], params=dict(
             cfg["optimizer"]["params"], lr=SLJIVA_RECIPE["lr"]))
@@ -443,6 +518,15 @@ def make_config(r, model, g, grid):
             cfg["scheduler"]["params"], eta_min=SLJIVA_RECIPE["eta_min"]))
     elif TRAIN_RECIPE != "grid":
         raise ValueError(f"TRAIN_RECIPE must be 'grid' or 'sljiva', got {TRAIN_RECIPE!r}")
+    # a cell's OWN recipe (sbunet_inv: I2SB-Inversion's; the transfer nets) beats the shared one
+    if spec.get("optimizer"):
+        cfg["optimizer"] = json.loads(json.dumps(spec["optimizer"]))
+    if spec.get("scheduler"):
+        cfg["scheduler"] = json.loads(json.dumps(spec["scheduler"]))
+    if spec["task"] == "contrast_transfer":
+        keep = ("noise_std", "noise_dist", "val_noise_std", "val_seed", "metric_range")
+        cfg["training"] = dict({k: training[k] for k in keep if k in training},
+                               **spec["training"])
     if spec["task"] == "i2sb_recon":
         start = spec.get("x1_source", X1_SOURCE)
         tau, tau_ref, _ = bridge_tau(start, r)
@@ -454,6 +538,7 @@ def make_config(r, model, g, grid):
                        "x1_source": start, "x0_source": "operator",
                        "tau_scale": TAU_SCALE, "tau_ref": tau_ref,
                        "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC, **I2SB_SUPPORT}
+        cfg["i2sb"].update(spec.get("i2sb") or {})
     return cfg
 
 

@@ -90,12 +90,14 @@ from visualization.wandb_image import wandb_image
 BESTVAL_CKPT = "net_bestval.ckpt"
 LATEST_CKPT = "net.ckpt"            # the latest state, every validation (sample from its EMA)
 X0_SOURCES = ("operator", "stored")
+GUIDE_MAPS = ("operator", "own")    # x1_source "guide": which coil maps combine the side scan
+LOSS_TARGETS = ("x0", "eps")
 
 
 def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center_frac,
              adjust_accel, kspace_type, noise_std, noise_dist, online_smaps, online_smaps_kws,
              x1_source, x0_source="operator", guide_R=1, guide_acs_lines=0,
-             guide_mask_dist="uniform", guide_offset=0, generator=None):
+             guide_mask_dist="uniform", guide_offset=0, guide_maps="operator", generator=None):
     """One recon batch -> (x0, x1, y, E, sigma_n, organ_mask, gt, guide), all on `device`.
 
     x0 is the bridge target (see `x0_source` in the module docstring); gt is the stored image,
@@ -146,7 +148,21 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
                              "data.*.guide_slices to 1")
         g = undersample_guide(side.to(device, non_blocking=True), guide_R, guide_acs_lines,
                               guide_mask_dist, guide_offset)
-        guide_img = Sense(extra["smaps"]).adjoint(ifftc(g))
+        if guide_maps == "own":
+            # the side scan's OWN coil maps, estimated online from its own centre with the
+            # operator's ESPIRiT settings -- I2SB-Inversion's x1 is the T1 image combined with
+            # T1's maps (sample.py image_from_kspace(t1_kspace, t1_maps)), not the target's
+            from physics.online_smaps import online_smaps as _online_smaps
+            gmask = (g != 0).any(dim=1, keepdim=True).any(dim=2, keepdim=True).to(g.real.dtype)
+            gmaps = _online_smaps(
+                g, gmask, method=online_smaps or "espirit",
+                **dict(online_smaps_kws or {},
+                       acs_lines=resolve_acs_lines(g.shape[-1], acs_lines, center_frac)))
+            guide_img = Sense(gmaps).adjoint(ifftc(g))
+        elif guide_maps == "operator":
+            guide_img = Sense(extra["smaps"]).adjoint(ifftc(g))
+        else:
+            raise ValueError(f"guide_maps {guide_maps!r} not in {GUIDE_MAPS}")
     x1 = bridge_start(y, E, x1_source, guide_image=guide_img)
     x0 = image
     if x0_source == "operator" and online_smaps and kspace_type != "simulated":
@@ -209,6 +225,10 @@ def train_i2sb_recon(
     posterior="ddpm",
     x1_source="adjoint",
     x0_source="operator",            # bridge target in E's phase convention; see module doc
+    guide_maps="operator",           # x1_source "guide": "operator" (the target's maps) or "own"
+                                     # (the side scan's own online ESPIRiT, I2SB-Inversion's x1)
+    loss_target="x0",                # "eps": I2SB(-Inversion)'s eps-matching MSE,
+                                     # |(x0_hat - x0) / std_fwd|^2 -- for a net that predicts eps
     tau_scale="none",                # "x1_rms": each sample's tau follows its zero-filled
     tau_ref=None,                    # image's intensity, tau_i = tau * scale(x1_i) / tau_ref;
                                      # see sb/i2sb_recon.py::bridge_noise_scale
@@ -240,6 +260,13 @@ def train_i2sb_recon(
         raise ValueError(f"x0_source {x0_source!r} not in {X0_SOURCES}")
     if x1_source not in X1_SOURCES:
         raise ValueError(f"x1_source {x1_source!r} not in {X1_SOURCES}")
+    if guide_maps not in GUIDE_MAPS:
+        raise ValueError(f"guide_maps {guide_maps!r} not in {GUIDE_MAPS}")
+    if loss_target not in LOSS_TARGETS:
+        raise ValueError(f"loss_target {loss_target!r} not in {LOSS_TARGETS}")
+    if loss_target == "eps" and loss_weight != "uniform":
+        raise ValueError("loss_target='eps' already weights by 1/std_fwd^2; keep "
+                         "loss_weight='uniform'")
     if tau_scale not in TAU_SCALES:
         raise ValueError(f"tau_scale {tau_scale!r} not in {TAU_SCALES}")
     if tau_scale != "none" and not (tau_ref and float(tau_ref) > 0):
@@ -263,7 +290,8 @@ def train_i2sb_recon(
                 center_frac=center_frac, adjust_accel=adjust_accel, noise_dist=noise_dist,
                 online_smaps=online_smaps, online_smaps_kws=online_smaps_kws,
                 x1_source=x1_source, x0_source=x0_source, guide_R=guide_R,
-                guide_acs_lines=guide_acs_lines, guide_mask_dist=guide_mask_dist)
+                guide_acs_lines=guide_acs_lines, guide_mask_dist=guide_mask_dist,
+                guide_maps=guide_maps)
 
     ema = None
     if ema_decay:
@@ -326,9 +354,16 @@ def train_i2sb_recon(
                 std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
                 pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
                                         guide=guide)
-                loss = _bridge_loss(loss_fn, loss_type, x0, pred, organ_mask, use_organ_mask,
-                                    None, 1.0, std_fwd, loss_weight,
-                                    loss_weight_max=loss_weight_max)
+                if loss_target == "eps":
+                    # eps_hat - eps = (x0 - x0_hat) / std_fwd: the eps-matching MSE, unweighted
+                    # per sample (I2SB runner.py: F.mse_loss(pred, compute_label(step, x0, xt)))
+                    loss = _bridge_loss(loss_fn, loss_type, x0 / std_fwd, pred / std_fwd,
+                                        organ_mask, use_organ_mask, None, 1.0, std_fwd,
+                                        "uniform")
+                else:
+                    loss = _bridge_loss(loss_fn, loss_type, x0, pred, organ_mask,
+                                        use_organ_mask, None, 1.0, std_fwd, loss_weight,
+                                        loss_weight_max=loss_weight_max)
                 (loss / accum_steps).backward()
                 step_loss = step_loss + loss.detach() / accum_steps
 

@@ -224,6 +224,73 @@ def i2sb_recon_sample(net, y, E, sched, sigma_n=None, x1=None, x1_source="adjoin
     return recon, xs, preds
 
 
+@torch.no_grad()
+def bridge_inversion(net, x, sched, y=None, E=None, sigma_n=None, x1=None, guide=None,
+                     n_steps_inv=None, verbose=False):
+    """I2SB-Inversion's deterministic inversion (github.com/zhyjSIAT/I2SB-Inversion,
+    i2sb/diffusion.py::ddpm_inverse_sampling, second loop + ddim_inversion): walk a
+    reconstruction back up the bridge, ONE index at a time, with no noise and no data consistency,
+
+        x_{i+1} = x_i - (s_{i+1}^2 - s_i^2) / (s_i^2 + 1e-8) * (x_i - x0_hat(x_i, i)),
+
+    s = std_fwd, over the indices 0, 1, ..., n_steps_inv - 1 (their
+    `space_indices(inver_step, inver_step)`; inver_step defaults to the full interval, so the
+    state lands at the last index, which phase 3 starts from as if it were x1).
+
+    The SIGN is their code's. Their paper's Eq. 20 reads with a plus (x_{i+1} - x0 grows like the
+    bridge mean toward x1); the code moves each step toward the current prediction instead
+    (comment there: "inversion direction = -eps_net"), so the returned state stays close to a
+    reconstruction rather than becoming a guide-like image. The published numbers come from the
+    code, so this is what the baseline does."""
+    device = sched.std_fwd.device
+    n = int(sched.std_fwd.shape[0]) if n_steps_inv is None else int(n_steps_inv)
+    s2 = sched.std_fwd.to(device).double() ** 2
+    x = x.to(device)
+    for i in range(n - 1):
+        step_t = torch.full((x.shape[0],), i, device=device, dtype=torch.long)
+        sigma = forward_std(sched, step_t, xdim=x.shape[1:])
+        x0_hat = predict_x0_recon(net, x, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n, guide=guide)
+        coef = float((s2[i + 1] - s2[i]) / (s2[i] + 1e-8))
+        x = x - coef * (x - x0_hat)
+        if verbose and (i + 1) % 100 == 0:
+            print(f"  inversion {i + 1}/{n - 1}")
+    return x
+
+
+@torch.no_grad()
+def i2sb_inversion_sample(net, y, E, sched, x1, sigma_n=None, nfe=80, dc_iters=DC_ITERS,
+                          dc_lam=DC_LAM, n_steps_inv=None, guide=None, noise_scale=None,
+                          posterior="ddpm", verbose=False):
+    """The full I2SB-Inversion reconstruction (their sample.py, sampling_method="inversion"):
+
+        1. I2SB-Recon: the stochastic reverse bridge from x1 (the guide contrast) with CG data
+           consistency on every x0 prediction (nfe steps)                     -> recon_1
+        2. inversion: bridge_inversion(recon_1), deterministic, no CG       -> b_hat
+        3. I2SB-Recon again, from b_hat in place of x1, CG on every step     -> recon
+
+    No final hard data consistency (theirs is commented out) and no support mask: the output is
+    the last CG-corrected prediction, as reverse_sample's last step returns it. The net is called
+    with x1 = the ORIGINAL start throughout (a net with cond_x1=False, theirs, ignores it).
+    -> (recon, {"recon_1": ..., "b_hat": ...})."""
+    def recon_from(start):
+        def pred_x0_fn(x_t, step):
+            step_t = torch.full((x_t.shape[0],), step, device=x_t.device, dtype=torch.long)
+            sigma = forward_std(sched, step_t, xdim=x_t.shape[1:])
+            x0_hat = predict_x0_recon(net, x_t, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n,
+                                      guide=guide)
+            return cg_data_consistency(x0_hat, y, E, dc_lam, dc_iters)
+        return reverse_sample(sched, pred_x0_fn, start, nfe=nfe, deterministic=False,
+                              posterior=posterior, clip_denoise=False, log_count=1,
+                              verbose=verbose, noise_scale=noise_scale)[0]
+
+    x1 = x1.to(sched.std_fwd.device)
+    recon_1 = recon_from(x1)
+    b_hat = bridge_inversion(net, recon_1, sched, y=y, E=E, sigma_n=sigma_n, x1=x1, guide=guide,
+                             n_steps_inv=n_steps_inv, verbose=verbose)
+    recon = recon_from(b_hat)
+    return recon, {"recon_1": recon_1, "b_hat": b_hat}
+
+
 def online_support(y, mask, acs_lines, thresh=0.9, **kws):
     """(B, 1, H, W) bool: where the OPERATOR's own ESPIRiT top eigenvalue exceeds `thresh` -- the
     hard support of online maps estimated as the operator's are (the same measurement, ACS and

@@ -30,7 +30,7 @@ import datasets                                    # noqa: F401  (registers load
 from datasets.registry import build_loader
 from models import build_model
 from sb.base import build_schedule
-from sb.i2sb_recon import bridge_noise_scale, i2sb_recon_sample
+from sb.i2sb_recon import bridge_noise_scale, i2sb_inversion_sample, i2sb_recon_sample
 import yaml
 from training.forward_op import fixed_val_subset
 from training.i2sb_recon import BESTVAL_CKPT, _measure, load_sampling_weights
@@ -72,7 +72,8 @@ def load_run(run_dir, ckpt=BESTVAL_CKPT, device=None, config=None):
                 x1_source=i2.get("x1_source", "adjoint"),
                 x0_source=i2.get("x0_source", "operator"),
                 guide_R=mri.get("guide_R", 1), guide_acs_lines=mri.get("guide_acs_lines", 0),
-                guide_mask_dist=mri.get("guide_mask_dist", "uniform"))
+                guide_mask_dist=mri.get("guide_mask_dist", "uniform"),
+                guide_maps=i2.get("guide_maps", "operator"))
     noise_std = tr.get("val_noise_std")
     noise_std = tr.get("noise_std", (0.0, 0.01)) if noise_std is None else noise_std
     return dict(cfg=cfg, net=net, bridge=bridge, meas=meas, i2=i2, tr=tr, device=device,
@@ -99,6 +100,12 @@ def main():
     ap.add_argument("--batch", type=int, default=None)
     ap.add_argument("--seed", type=int, default=None, help="default: the run's val_seed")
     ap.add_argument("--out", default=None, help="default: <run-dir>/eval_dc")
+    ap.add_argument("--inversion", action="store_true",
+                    help="also run the full I2SB-Inversion method (recon -> deterministic "
+                         "inversion -> recon, sb/i2sb_recon.py::i2sb_inversion_sample) with the "
+                         "run's own dc_iters / dc_lam; ~ n_points extra net calls per slice")
+    ap.add_argument("--inversion-steps", type=int, default=None,
+                    help="inversion length (their --inver_step); default the full interval")
     args = ap.parse_args()
 
     run = load_run(args.run_dir, args.ckpt, config=args.config)
@@ -118,6 +125,9 @@ def main():
 
     settings = list(dict.fromkeys([(0, 0.0)] + list(args.dc)))
     names = ["plain" if it == 0 else f"dc{it}_lam{lam:g}" for it, lam in settings]
+    inv_dc = (int(i2.get("dc_iters", 7)), float(i2.get("dc_lam", 7e-5)))
+    if args.inversion:
+        names.append(f"inversion_dc{inv_dc[0]}_lam{inv_dc[1]:g}")
     print(f"{type(net).__name__} {args.ckpt} | {len(loader.dataset)} val slices, nfe={nfe}, "
           f"seed={seed} | settings: {', '.join(names)}")
 
@@ -132,15 +142,22 @@ def main():
         kappa = bridge_noise_scale(x1, tau_scale, tau_ref)
         mm = organ_mask if mask_metrics else None
         recs = []
-        for name, (it, lam) in zip(names, settings):
+        for name, (it, lam) in zip(names, settings + [inv_dc] * bool(args.inversion)):
             with torch.random.fork_rng(devices=devs):
                 torch.manual_seed(seed * 100003 + bi)           # same bridge noise per setting
                 t0 = time.time()
-                rec = i2sb_recon_sample(net, y, E, bridge, sigma_n=sigma_n, x1=x1, nfe=nfe,
-                                        deterministic=bool(i2.get("deterministic", False)),
-                                        posterior=i2.get("posterior", "ddpm"), verbose=False,
-                                        guide=guide, noise_scale=kappa, dc_iters=it,
-                                        dc_lam=lam)[0]
+                if name.startswith("inversion"):
+                    rec = i2sb_inversion_sample(net, y, E, bridge, x1, sigma_n=sigma_n, nfe=nfe,
+                                                dc_iters=it, dc_lam=lam, guide=guide,
+                                                n_steps_inv=args.inversion_steps,
+                                                noise_scale=kappa,
+                                                posterior=i2.get("posterior", "ddpm"))[0]
+                else:
+                    rec = i2sb_recon_sample(net, y, E, bridge, sigma_n=sigma_n, x1=x1, nfe=nfe,
+                                            deterministic=bool(i2.get("deterministic", False)),
+                                            posterior=i2.get("posterior", "ddpm"),
+                                            verbose=False, guide=guide, noise_scale=kappa,
+                                            dc_iters=it, dc_lam=lam)[0]
                 if device.type == "cuda":
                     torch.cuda.synchronize()
             a, bs = acc[name], x0.shape[0]
@@ -169,7 +186,8 @@ def main():
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "results.json"), "w") as f:
         json.dump(dict(run_dir=args.run_dir, ckpt=args.ckpt, nfe=nfe, seed=seed,
-                       settings=dict(zip(names, settings)), results=res), f, indent=2)
+                       settings=dict(zip(names, settings + [inv_dc] * bool(args.inversion))),
+                       results=res), f, indent=2)
     if panel is not None:
         _save_panel(os.path.join(out, "panel.png"), names, *panel)
     print(f"wrote {out}/results.json" + (" and panel.png" if panel is not None else ""))

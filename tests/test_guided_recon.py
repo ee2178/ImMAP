@@ -633,6 +633,171 @@ def test_sbunet_baselines_train():
             osm.online_smaps = real
 
 
+def test_sbunet_inv_is_the_i2sb_inversion_bridge():
+    """sbunet_inv (I2SB-Inversion as its code runs it): the bridge starts at the guide image
+    combined with the guide's OWN maps (online ESPIRiT on the fully-sampled side scan), the UNet
+    sees only x_t and the step -- no x1 channels, no guide channels, no guide handed in -- and
+    predicts eps, trained by the eps-matching loss; their optimizer and schedule."""
+    from training.i2sb_recon import train_i2sb_recon
+    import training.i2sb_recon as tir
+    from models.sb_recon_unet import SBReconUnet
+    import physics.online_smaps as osm
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    spec = gen.MODELS["sbunet_inv"]
+    assert spec["guided"] and spec["x1_source"] == "guide"         # paired data: x1 needs it
+    p = spec["model"]["params"]
+    assert spec["model"]["type"] == "SBReconUnet" and not p["cond_x1"] and not p["guided"]
+    assert p["predict"] == "eps" and p["model_channels"] == 256
+    assert p["channel_mult"] == [1, 1, 2, 2, 4, 4] and p["attention_resolutions"] == [40, 20, 10]
+    assert p["num_head_channels"] == 64 and p["resblock_updown"] and p["use_scale_shift_norm"]
+    assert spec["i2sb"]["guide_maps"] == "own" and "val_nfe" not in spec["i2sb"]
+    assert spec["i2sb"]["support_thresh"] is None
+    # the shared training protocol AND objective (complex-MSE on x0): nothing of its own
+    assert not spec.get("training") and "optimizer" not in spec and "scheduler" not in spec
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,  # noqa: E731
+                                                drop_last=False, scale_fac=1.0, start_slice=1,
+                                                end_slice=3, num_workers=0, pad_multiple=2)
+        real, real_start = osm.online_smaps, tir.bridge_start
+        full_mask_calls = []
+
+        def fake_maps(y, mask, **kw):
+            full_mask_calls.append(bool(torch.as_tensor(mask).bool().all()))
+            return torch.from_numpy(MAPS)[None].expand_as(y)
+        osm.online_smaps = fake_maps
+        starts, seen = [], []
+
+        def spy_start(y, E, source="adjoint", guide_image=None, **kw):
+            starts.append((source, guide_image is not None))
+            return real_start(y, E, source, guide_image=guide_image, **kw)
+        tir.bridge_start = spy_start
+        try:
+            net = SBReconUnet(cond_x1=False, guided=False, predict="eps", model_channels=8,
+                              num_res_blocks=1, channel_mult=[1, 2], attention_resolutions=[],
+                              image_size=32, num_heads=1, num_head_channels=-1, kind="brownian",
+                              tau=0.1, n_points=1000, beta_max=0.3)
+            assert not net.cond_x1 and not net.guided and net.predict == "eps"
+            fwd = net.forward
+            net.forward = lambda *a, guide=None, **k: (seen.append(guide), fwd(*a, guide=guide, **k))[1]
+            train_i2sb_recon(net, torch.optim.Adam(net.parameters(), lr=1e-4), None, "cpu",
+                             loader(), loader(), num_epochs=1, steps_per_epoch=1,
+                             val_every_epochs=1, R=4, acs_lines=4,
+                             kspace_type="measurement_awgn", online_smaps="espirit",
+                             noise_std=(0.0, 0.01), val_noise_std=0.0, val_seed=0,
+                             loss_type="complex-mse", tau=0.1, val_mode="full_recon",
+                             val_nfe=2, guide_R=1, dc_iters=7, x1_source="guide",
+                             guide_maps="own", loss_target="eps", save_dir=d)
+        finally:
+            osm.online_smaps, tir.bridge_start = real, real_start
+        assert starts and all(s == ("guide", True) for s in starts), starts
+        assert seen and all(g is None for g in seen)
+        assert all(torch.isfinite(p).all() for p in net.parameters())
+        # once per measurement on the undersampled target, once on the fully-sampled guide
+        assert True in full_mask_calls and False in full_mask_calls, full_mask_calls
+
+
+def test_contrast_transfer_nets_are_tiny_and_start_at_the_identity():
+    from models.contrast_transfer import ContrastTransfer
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    g = torch.randn(2, 1, H, W, dtype=torch.complex64)
+    for name, p in gen.TRANSFER_NETS.items():
+        net = ContrastTransfer(**p)
+        n = sum(q.numel() for q in net.parameters())
+        assert n < 30_000, (name, n)
+        out = net(g)
+        assert out.shape == g.shape and out.is_complex()
+        assert torch.allclose(out, g, atol=1e-6), name                 # identity at init
+        g5 = g[:, None]                                                 # (B, G, 1, H, W)
+        assert net(g5).shape == g5.shape
+    raises(ValueError, lambda: ContrastTransfer(arch="mlp"), "arch")
+    raises(TypeError, lambda: ContrastTransfer()(g.abs()), "complex")
+
+
+def test_contrast_transfer_pretrains_on_the_recon_guide():
+    """The pretraining loop sees the guide exactly as LGGS does (the paired loader's side scan,
+    coil-combined under the operator's maps) and the PDFS target; it learns, validates against the
+    raw guide's floor, and checkpoints at validation."""
+    from models.contrast_transfer import ContrastTransfer
+    from training.contrast_transfer import train_contrast_transfer
+    import physics.online_smaps as osm
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=2, shuffle=False,  # noqa: E731
+                                                drop_last=False, scale_fac=1.0, start_slice=1,
+                                                end_slice=3, num_workers=0, pad_multiple=1)
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.from_numpy(MAPS)[None].expand_as(y)
+        wb = FakeWandb() if "FakeWandb" in globals() else None
+        try:
+            torch.manual_seed(0)
+            net = ContrastTransfer(arch="unet", width=4, levels=2)
+            before = [q.detach().clone() for q in net.parameters()]
+            train_contrast_transfer(net, torch.optim.Adam(net.parameters(), lr=1e-2), None, "cpu",
+                                    loader(), loader(), wandb=wb, num_epochs=2,
+                                    steps_per_epoch=3, val_every_epochs=1, R=4, acs_lines=4,
+                                    online_smaps="espirit", noise_std=(0.0, 0.01),
+                                    val_noise_std=0.0, save_dir=d)
+        finally:
+            osm.online_smaps = real
+        assert any(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
+        assert sorted(f for f in os.listdir(d) if f.endswith(".ckpt")) == \
+            ["net.ckpt", "net_bestval.ckpt"]
+        if wb is not None:
+            keys = {k for c in wb.calls for k in c}
+            assert {"train/loss", "val/psnr", "val/ssim", "val/guide_psnr"} <= keys, keys
+
+
+def test_lggs_with_a_frozen_guide_transfer():
+    """lggs_<ct>: LGGS loads the pretrained transfer frozen, applies it to every guide before its
+    own mean subtraction, keeps it in eval mode, and carries its weights in its state dict."""
+    from models.contrast_transfer import ContrastTransfer
+    from models.guided_lpds import LGGSNet
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    spec = gen.MODELS["lggs_ct_unet8"]
+    assert spec["transfer"] == "ct_unet8" and spec["model"]["type"] == "LGGS"
+    p = dict(arch="patch", width=4, depth=2, kernel=3)
+    with tempfile.TemporaryDirectory() as d:
+        torch.manual_seed(0)
+        ct = ContrastTransfer(**p)
+        with torch.no_grad():
+            for q in ct.parameters():
+                q.normal_(0, 0.3)                                      # not the identity
+        ck = os.path.join(d, "net_bestval.ckpt")
+        torch.save({"model_state_dict": ct.state_dict()}, ck)
+        kw = dict(K=2, M=8, P=3, s=2, Mh=4, guide_window=3, attn_backend="gather")
+        net = LGGSNet(**kw, guide_transfer={"params": p, "ckpt": ck})
+        assert all(not q.requires_grad for q in net.guide_transfer.parameters())
+        assert any(q.requires_grad for q in net.parameters())
+        net.train()
+        assert net.training and not net.guide_transfer.training
+        g = torch.randn(1, 1, H, W, dtype=torch.complex64)
+        ref = torch.zeros(1, 1, H, W, dtype=torch.complex64)
+        (w,) = net._prep_guides(g, ref)
+        t = ct(g).detach()
+        assert torch.allclose(w, t - t.mean(dim=(-3, -2, -1), keepdim=True), atol=1e-5)
+        sd = net.state_dict()
+        assert any(k.startswith("guide_transfer.") for k in sd)
+        net2 = LGGSNet(**kw, guide_transfer={"params": p, "ckpt": ck})
+        net2.load_state_dict(sd)
+    with tempfile.TemporaryDirectory() as out:
+        r = subprocess.run([sys.executable, os.path.join(REPO, "scripts",
+                                                         "make_guided_recon_configs.py"),
+                            "--models", "lggs_ct_unet8", "ct_unet8", "--out", out],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        cfg = json.load(open(os.path.join(out, "knee", "guided", "lggs_ct_unet8_R8_g1.json")))
+        tcfg = json.load(open(os.path.join(out, "knee", "guided", "ct_unet8_R8_g1.json")))
+        gt = cfg["model"]["params"]["guide_transfer"]
+        assert gt["params"] == tcfg["model"]["params"]
+        assert gt["ckpt"] == tcfg["paths"]["save_dir"] + "/net_bestval.ckpt"
+        assert tcfg["task"] == "contrast_transfer" and set(tcfg["training"]) >= {
+            "num_epochs", "steps_per_epoch", "loss_type", "loss_on", "noise_std"}
+
+
 def test_one_tau_for_every_start():
     """--tau: the same tau in every bridge cell (model and i2sb), no calibration file, and the
     cell names tagged so the runs never share a dir with calibrated ones."""

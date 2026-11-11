@@ -30,6 +30,11 @@ operator's maps, what training/recon.py::_guide hands an image-domain net -- as 
 channels: the guided UNet baseline, side information as plain input channels and nothing else.
 Unguided, the net declares `guided = False`, so the loops pass no guide even on paired data.
 
+`predict` (default "x0") is what the UNet's output IS. "x0": the complex x0_hat directly. "eps":
+the bridge noise, as I2SB-Inversion's (and NVlabs I2SB's) nets predict it -- runner.py
+compute_pred_x0: x0_hat = x_t - std_fwd * eps_hat, so the net still RETURNS x0_hat and every
+loop and sampler is unchanged; train with i2sb `loss_target="eps"` for their eps-matching loss.
+
 Every other parameter goes to SBUnet unchanged, schedule copy included: kind / tau / n_points /
 beta_max MUST match cfg["i2sb"] (assert_schedule_matches is checked at startup).
 """
@@ -59,10 +64,13 @@ class SBReconUnet(nn.Module):
 
     guide_domain = "image"         # the loops hand a guided net the coil-combined side image
 
-    def __init__(self, cond_x1=True, guided=False, **unet_kws):
+    def __init__(self, cond_x1=True, guided=False, predict="x0", **unet_kws):
         super().__init__()
         self.cond_x1 = bool(cond_x1)
         self.guided = bool(guided)
+        if predict not in ("x0", "eps"):
+            raise ValueError(f"predict must be 'x0' or 'eps', got {predict!r}")
+        self.predict = predict
         if "C" in unet_kws or "out_channels" in unet_kws:
             raise ValueError("SBReconUnet sets the UNet's C / out_channels itself (planar "
                              "complex in and out); set cond_x1 / guided instead")
@@ -98,4 +106,12 @@ class SBReconUnet(nn.Module):
             raise ValueError("SBReconUnet(guided=False) is the unguided baseline but was handed "
                              "a guide; set guided=True or drop the guide")
         out, _ = self.unet(net_in, sigma=sigma, step=step)
-        return from_planar(out), None
+        out = from_planar(out)
+        if self.predict == "eps":
+            if sigma is None:
+                raise ValueError("SBReconUnet(predict='eps') needs sigma (std_fwd) to turn the "
+                                 "predicted noise into x0_hat")
+            s = torch.as_tensor(sigma, device=out.device, dtype=out.real.dtype)
+            s = s.reshape(s.shape[0], *([1] * (out.dim() - 1))) if s.dim() else s
+            out = x_t - s * out                    # I2SB runner.py: compute_pred_x0
+        return out, None
