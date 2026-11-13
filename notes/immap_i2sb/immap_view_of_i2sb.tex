@@ -642,6 +642,155 @@ a fixed point of any bridge-consistent update. The returned estimate is the last
 output; for I$^2$SB's ladder ending at $t=0$, $\ssb(0)=0$ and the final state equals it.
 
 %=============================================================================================
+\section{Why the objective conditions on \texorpdfstring{$\x_1$}{x1}: ratios, pairs, annealing}\label{sec:pairs}
+%=============================================================================================
+
+The objective \eqref{eq:map} conditions the target on its partner $\x_1$. A natural
+alternative, which needs no pairs, is to look for an image that is likely under the target
+law $p$ and unlikely under the source law $q$, i.e.\ to maximise a density ratio:
+\begin{equation}
+  \max_{\x}\ \log p(\x) - \gamma\log q(\x),\qquad \gamma\in[0,1].
+  \label{eq:ratio}
+\end{equation}
+This section shows why \eqref{eq:ratio} is the wrong per-image objective, which ratio pairs
+turn it into, and that the annealing of Sections 2--5 is what makes the paired version work.
+
+\paragraph{Three defects of the unpaired ratio.}
+\emph{(i) The measurement cancels.} With a shared likelihood,
+$\log p(\x\mid\y) - \log q(\x\mid\y) = \log p(\x) - \log q(\x) + \mathrm{const}$, so at
+$\gamma=1$ the data drop out. \emph{(ii) It can be unbounded.} If $q$ has thinner tails than $p$
+in some direction, $\log(p/q)\to\infty$ along it. \emph{(iii) It cannot assign modes.} The
+gradient $\grad\log p - \gamma\grad\log q$ is local. Which target mode corresponds to which
+source mode is a property of the two \emph{distributions} (a transport), not of the two
+densities at a point.
+
+\begin{remark}[An ADMM split, and when it is well posed]
+Splitting \eqref{eq:ratio} as $\min_{\x,\bm z} -\log p(\x) + \gamma\log q_\sigma(\bm z)$ s.t.\
+$\x=\bm z$ gives a target prox in $\x$ (a MAP denoise, plus the data step of
+Proposition~\ref{prop:prox}) and an ``anti-prox'' in $\bm z$,
+$\arg\min_{\bm z}\gamma\log q_\sigma(\bm z) + \tfrac\rho2\|\bm z - \vv\|^2$. Its Hessian is
+$\rho\Id + \gamma\grad^2\log q_\sigma \succeq (\rho - \gamma/\sigma^2)\Id$ by
+Proposition~\ref{prop:curvature}(a), so the $\bm z$-step is convex whenever $\rho\sigma^2>\gamma$.
+Linearised with Tweedie for a source denoiser $D_q$, it reads
+$\bm z \approx \vv + \tfrac{\gamma}{\rho\sigma^2}(\vv - D_q(\vv))$: it amplifies what the source
+model would remove. At a common noise level the search direction is
+$\grad\log p_\sigma - \grad\log q_\sigma = (D_p - D_q)/\sigma^2$, the noisy input cancelling. The
+split changes the solver, not the stationary points, so (i)--(iii) remain.
+\end{remark}
+
+\paragraph{The paired ratio.} With pairs, the source density of the \emph{target} variable is
+never needed. The ratio that pairs supply is between the joint law and the product of its
+marginals.
+
+\begin{proposition}[Pairs as a ratio]\label{prop:pmi}
+Let $q(\x_1)$ be the marginal of $\x_1$. Then
+\begin{align}
+  \log p(\x_0\mid\x_1) &= \log p(\x_0)
+  + \underbrace{\log\frac{p(\x_0,\x_1)}{p(\x_0)\,q(\x_1)}}_{\text{pointwise mutual information}}
+  + \mathrm{const},
+  \label{eq:pmi}\\
+  \grad_{\x_0}\log p(\x_0\mid\x_1) &= \grad\log p(\x_0) + \grad_{\x_0}\log p(\x_1\mid\x_0).
+  \nonumber
+\end{align}
+If $\y$ is conditionally independent of $\x_1$ given $\x_0$, then
+$\log p(\x_0\mid\x_1,\y) = \log p(\y\mid\x_0) + \log p(\x_0\mid\x_1) + \mathrm{const}$: the
+likelihood survives.
+\end{proposition}
+\begin{proof}
+Bayes: $p(\x_0\mid\x_1) = p(\x_0,\x_1)/q(\x_1)$; multiply and divide by $p(\x_0)$. The constant
+$-\log q(\x_1)$ does not depend on $\x_0$. The second statement is Bayes with
+$p(\y\mid\x_0,\x_1) = p(\y\mid\x_0)$.
+\end{proof}
+
+So the subtracted term of \eqref{eq:ratio} is replaced by an \emph{added} coupling score:
+which targets would produce this source. No ratio has to be estimated, because the regressor
+\eqref{eq:cond_denoiser} trained on pairs already gives $\grad\log p_\sigma(\cdot\mid\x_1)$.
+The bridge itself is a ratio of the same kind, taken against a reference coupling.
+
+\begin{proposition}[The bridge state as a noisy target under a reweighted prior]\label{prop:tilt}
+Assume $\pi(\x_0\mid\x_1)\propto p(\x_0\mid\x_1)\,/\,\varphi_{\sqrt V}(\x_1-\x_0)$ is normalisable
+(e.g.\ under Assumption~\ref{ass:prior}). Then, with $\sigma_f(t)^2 = Vt$,
+\begin{equation}
+  \D(\x_t,t,\x_1) = \E[\x_0\mid\x_t,\x_1]
+  = \x_t + \sigma_f(t)^2\,\grad_{\x_t}\log\pi_{\sigma_f(t)}(\x_t\mid\x_1),
+  \qquad \pi_\sigma = \pi * \varphi_\sigma .
+  \label{eq:tilt}
+\end{equation}
+\end{proposition}
+\begin{proof}
+Given $(\x_0,\x_1)$ the bridge is a Brownian motion from $\x_0$ conditioned to hit $\x_1$, so
+$q(\x_t\mid\x_0,\x_1) = \varphi_{\sigma_f(t)}(\x_t-\x_0)\,\varphi_{\sqrt{V(1-t)}}(\x_1-\x_t)
+\,/\,\varphi_{\sqrt V}(\x_1-\x_0)$. The middle factor does not involve $\x_0$, so
+$p(\x_0\mid\x_t,\x_1)\propto\pi(\x_0\mid\x_1)\,\varphi_{\sigma_f(t)}(\x_t-\x_0)$: a Gaussian
+denoising problem with noise variance $Vt$ and prior $\pi$. Apply
+Proposition~\ref{prop:tweedie} to it.
+\end{proof}
+
+\eqref{eq:tilt} uses $\x_t$ itself, with no $1/(1-t)$, and is finite at $t=1$:
+$\D(\x_1,1,\x_1) = \x_1 + V\grad\log\pi_{\sqrt V}(\x_1\mid\x_1) = \E[\x_0\mid\x_1]$. The
+reweighting divides the data coupling by the Brownian reference coupling, the construction
+behind the Schr\"odinger bridge. If the pairs were themselves Brownian,
+$\x_1 = \x_0 + \sqrt V\eps$, then $\pi = p(\x_0)$ and I$^2$SB would be unconditional VE
+diffusion started at $\x_1$ at noise $2\tau$: SDEdit~\cite{meng2022} with no noise added,
+because $\x_1$ already carries it. A 1-D quadrature check of \eqref{eq:tilt} with a multimodal
+$p(\x_0\mid\x_1)$ agrees to $4\cdot10^{-8}$, including $t=1$.
+
+\paragraph{A toy experiment.} One dimension, target $p$ a two-component Gaussian mixture
+(means $-0.5$, $2.0$, std $0.35$), all scores analytic at every $\sigma$. \emph{Unpaired:}
+the source $q$ is $p$ shifted by $-1.5$, so the correct output for a source point is the point
+plus $1.5$. \emph{Paired:} $\x_1 = \x_0 - 1.5 + \nn$ with $\nn\sim\N(0,0.6^2)$, so
+$p(\x_0\mid\x_1)$ is genuinely ambiguous. 1000 (unpaired) or 2000 (paired) source points,
+W1 is the Wasserstein-1 distance to target samples (sampling floor $\approx0.02$--$0.11$), and
+``right mode'' is the mass in the target mode at $2.0$, which should be $\approx50\%$.
+
+\begin{table}[h]
+\centering
+\scriptsize
+\begin{tabular}{@{}llccl@{}}
+\toprule
+& method & W1 & right mode & notes \\
+\midrule
+unpaired, & target MAP only, $\gamma=0$ & 1.05 & 13\% & all to nearest mode \\
+point-wise & ratio \eqref{eq:ratio}, $\gamma=0.5$ & 1.22 & 13\% & right mode at $3.5$
+  (overshoot) \\
+& ratio \eqref{eq:ratio}, $\gamma=1$ & 68 & 0\% & 14\% diverge \\
+\midrule
+unpaired, & KL flow, $\grad\log p - \grad\log\rho_t$ & 0.88 & 14\% & stalls between modes \\
+distribution & same, annealed $\sigma: 2\to0$ & 0.37 & 34\% & short of $50\%$ \\
+& DDIB~\cite{su2023} ($q$ up, $p$ down) & 0.04 & 50\% & matches the true map \\
+\midrule
+paired & source $\x_1$ unchanged & 1.50 & 18\% & \\
+& ascent on $p_\sigma(\x_0)$ from $\x_1$, $\sigma_0 = 0.3$ & 1.19 & 19\% &
+  SDEdit-type, faithful \\
+& \quad same, $\sigma_0 = 3$ & 0.22 & 42\% & pair's mode only 57\% \\
+& ascent on $p_\sigma(\x_0\mid\x_1)$, $\sigma_0\in\{0.3,1,3\}$ & 0.02--0.04 &
+  49--50\% & pair's mode 94--96\% \\
+& exact samples of $p(\x_0\mid\x_1)$ & 0.015 & 50\% & pair's mode 94\% \\
+\bottomrule
+\end{tabular}
+\caption{Ratios, pairs and annealing on a 1-D toy. The annealed ascents are the
+Kadkhodaie--Simoncelli / ImMAP step \eqref{eq:grad_step} with injection, $h = 0.1$,
+$\beta\in\{0.5,1\}$ (rows pooled where they agree). Scripts: \code{ratio\_toy.py},
+\code{paired\_toy.py}.}
+\label{tab:pairs_toy}
+\end{table}
+
+The table supports three statements. Point-wise objectives, with or without the source term,
+send most of the source mode at $0.5$ to the nearest target mode, $-0.5$, rather than to its
+partner at $2.0$. A distribution-level flow can repair the assignment, but only when it is
+annealed, and best when it is annealed all the way, as in DDIB, which needs separate source
+and target models. Unpaired annealing from the source (SDEdit) trades realism against
+faithfulness through $\sigma_0$ and cannot have both. With pairs, the same annealed ascent on
+the conditional prior matches exact posterior sampling, both in distribution and in which mode
+each pair lands in, at every start level. The residual pair error ($\approx0.3$) is the
+posterior's own width.
+
+So the ratio intuition specifies \emph{what} to maximise. Made principled with pairs
+(Proposition~\ref{prop:pmi}), it is the target prior plus the mutual information with the
+guide, which is $\log p(\x_0\mid\x_1)$, the objective \eqref{eq:map}. Annealing specifies
+\emph{how}: the continuation of Sections 2--5. Together they are ImMAP-SB.
+
+%=============================================================================================
 \section{Summary}
 %=============================================================================================
 
@@ -669,6 +818,10 @@ probability flow, resampling, ImMAP & $h = 1-r$; $h = 1$; free $h_k$, $\beta$ &
 I$^2$SB's iterate & precision-weighted average of the $\vv^{(k)}$ & Prop.~\ref{prop:average} \\
 data & Tweedie on $p_\sigma(\cdot\mid\x_1,\y)$; CG prox, $\lambda = \sigma_n^2/(c\sigma^2)$ &
   Props.~\ref{prop:tweedie_y}, \ref{prop:prox} \\
+why condition on $\x_1$ & pairs add $\grad\log p(\x_1\mid\x_0)$; $p/q$ misassigns modes &
+  Prop.~\ref{prop:pmi}, Tab.~\ref{tab:pairs_toy} \\
+bridge without debiasing & $\D = \x_t + Vt\,\grad\log\pi_{\sqrt{Vt}}(\x_t\mid\x_1)$ &
+  Prop.~\ref{prop:tilt} \\
 \bottomrule
 \end{tabular}
 \caption{From the MAP objective to the bridge sampler. Code: \code{sb/base.py}
@@ -699,6 +852,14 @@ B.~Efron. Tweedie's formula and selection bias.
 \bibitem{miyasawa1961}
 K.~Miyasawa. An empirical Bayes estimator of the mean of a normal population.
 \emph{Bulletin of the International Statistical Institute}, 38, 1961.
+
+\bibitem{meng2022}
+C.~Meng, Y.~He, Y.~Song, J.~Song, J.~Wu, J.-Y.~Zhu, S.~Ermon. SDEdit: Guided image synthesis
+and editing with stochastic differential equations. \emph{ICLR}, 2022.
+
+\bibitem{su2023}
+X.~Su, J.~Song, C.~Meng, S.~Ermon. Dual diffusion implicit bridges for image-to-image
+translation. \emph{ICLR}, 2023.
 \end{thebibliography}
 
 \end{document}
