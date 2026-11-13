@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (MiKTeX 26.5) (preloaded format=pdflatex 2026.10.21)  13 NOV 2026 15:08
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (MiKTeX 26.5) (preloaded format=pdflatex 2026.10.21)  13 NOV 2026 16:10
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -803,24 +803,24 @@ File: l3backend-pdftex.def 2026-09-09 L3 backend support: PDF output (pdfTeX)
 ) (immap_guided_ascent.aux)
 \openout1 = `immap_guided_ascent.aux'.
 
-LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
-LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 50.
-LaTeX Font Info:    ... okay on input line 50.
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
+LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 53.
+LaTeX Font Info:    ... okay on input line 53.
 
 *geometry* driver: auto-detecting
 *geometry* detected driver: pdftex
@@ -856,13 +856,13 @@ LaTeX Font Info:    ... okay on input line 50.
 * \@reversemarginfalse
 * (1in=72.27pt=25.4mm, 1cm=28.453pt)
 
-LaTeX Info: Redefining \microtypecontext on input line 50.
-Package microtype Info: Applying patch `item' on input line 50.
-Package microtype Info: Applying patch `toc' on input line 50.
-Package microtype Info: Applying patch `eqnum' on input line 50.
-Package microtype Info: Applying patch `footnote' on input line 50.
-Package microtype Info: Applying patch `verbatim' on input line 50.
-LaTeX Info: Redefining \microtypesetup on input line 50.
+LaTeX Info: Redefining \microtypecontext on input line 53.
+Package microtype Info: Applying patch `item' on input line 53.
+Package microtype Info: Applying patch `toc' on input line 53.
+Package microtype Info: Applying patch `eqnum' on input line 53.
+Package microtype Info: Applying patch `footnote' on input line 53.
+Package microtype Info: Applying patch `verbatim' on input line 53.
+LaTeX Info: Redefining \microtypesetup on input line 53.
 Package microtype Info: Generating PDF output.
 Package microtype Info: Character protrusion enabled (level 2).
 Package microtype Info: Using default protrusion set `alltext'.
@@ -902,42 +902,42 @@ Package epstopdf-base Info: Redefining graphics rule for `.eps' on input line 4
 fg
 File: epstopdf-sys.cfg 2021/03/18 v2.0 Configuration of epstopdf for MiKTeX
 ))
-Package hyperref Info: Link coloring ON on input line 50.
+Package hyperref Info: Link coloring ON on input line 53.
  (immap_guided_ascent.out) (immap_guided_ascent.out)
 \@outlinefile=\write4
 \openout4 = `immap_guided_ascent.out'.
 
 LaTeX Font Info:    Trying to load font information for OT1+lmr on input line 5
-4.
+7.
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/lm\ot1lmr.fd
 File: ot1lmr.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    Trying to load font information for OML+lmm on input line 5
-4.
+7.
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/lm\omllmm.fd
 File: omllmm.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    Trying to load font information for OMS+lmsy on input line 
-54.
+57.
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/lm\omslmsy.fd
 File: omslmsy.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    Trying to load font information for OMX+lmex on input line 
-54.
+57.
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/lm\omxlmex.fd
 File: omxlmex.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <10> on input line 54.
+(Font)              <10> on input line 57.
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <7> on input line 54.
+(Font)              <7> on input line 57.
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <5> on input line 54.
-LaTeX Font Info:    Trying to load font information for U+msa on input line 54.
+(Font)              <5> on input line 57.
+LaTeX Font Info:    Trying to load font information for U+msa on input line 57.
 
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/amsfonts\umsa.fd
@@ -946,7 +946,7 @@ File: umsa.fd 2013/01/14 v3.01 AMS symbols A
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/microtype\mt-msa.cfg
 File: mt-msa.cfg 2006/02/04 v1.1 microtype config. file: AMS symbols (a) (RS)
 )
-LaTeX Font Info:    Trying to load font information for U+msb on input line 54.
+LaTeX Font Info:    Trying to load font information for U+msb on input line 57.
 
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/amsfonts\umsb.fd
@@ -956,11 +956,11 @@ File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 File: mt-msb.cfg 2005/06/01 v1.0 microtype config. file: AMS symbols (b) (RS)
 )
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <10.95> on input line 66.
+(Font)              <10.95> on input line 69.
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <8> on input line 66.
+(Font)              <8> on input line 69.
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <6> on input line 66.
+(Font)              <6> on input line 69.
 
 [1
 
@@ -971,17 +971,17 @@ pData/Local/Programs/MiKTeX/fonts/enc/dvips/lm/lm-rm.enc}{C:/Users/erice/AppDat
 a/Local/Programs/MiKTeX/fonts/enc/dvips/lm/lm-mathsy.enc}{C:/Users/erice/AppDat
 a/Local/Programs/MiKTeX/fonts/enc/dvips/lm/lm-mathex.enc}]
 LaTeX Font Info:    Trying to load font information for TS1+lmr on input line 1
-09.
+12.
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/lm\ts1lmr.fd
 File: ts1lmr.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 ) [2{C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/enc/dvips/lm/lm-ts1.enc
 }]
 Package hyperref Info: bookmark level for unknown algorithm defaults to 0 on in
-put line 206.
+put line 209.
  [3]
 LaTeX Font Info:    Trying to load font information for T1+lmtt on input line 2
-71.
+74.
 
 (C:\Users\erice\AppData\Local\Programs\MiKTeX\tex/latex/lm\t1lmtt.fd
 File: t1lmtt.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
@@ -992,34 +992,67 @@ Package microtype Info: Loading generic protrusion settings for font family
 (microtype)             See the microtype manual for details.
  [4]
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <9> on input line 403.
+(Font)              <9> on input line 406.
 
 [5] [6]
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <14.4> on input line 453.
+(Font)              <14.4> on input line 456.
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <12> on input line 471.
- [7] [8] [9] [10] [11] (immap_guided_ascent.aux)
+(Font)              <12> on input line 474.
+ [7]
+Underfull \hbox (badness 1354) in paragraph at lines 571--576
+ []\T1/lmr/bx/n/10.95 (+20) In the repos-i-tory.[] \T1/lmtt/m/n/10.95 debiased_
+ascent \T1/lmr/m/n/10.95 (+20) (\T1/lmtt/m/n/10.95 sb/i2sb_recon.py\T1/lmr/m/n/
+10.95 (+20) ) is the left col-umn of Al-go-
+ []
+
+
+Underfull \hbox (badness 1558) in paragraph at lines 587--589
+\T1/lmr/m/n/10.95 (+20) Both columns of Al-go-rithm [][]2[][] were run with the
+ same noise on 256 held-out im-ages
+ []
+
+<equivalence_toy/trajectory.png, id=209, 733.32794pt x 332.442pt>
+File: equivalence_toy/trajectory.png Graphic file (type png)
+<use equivalence_toy/trajectory.png>
+Package pdftex.def Info: equivalence_toy/trajectory.png  used on input line 607
+.
+(pdftex.def)             Requested size: 469.75502pt x 212.95491pt.
+[8]
+<equivalence_toy/samples.png, id=223, 812.82494pt x 585.387pt>
+File: equivalence_toy/samples.png Graphic file (type png)
+<use equivalence_toy/samples.png>
+Package pdftex.def Info: equivalence_toy/samples.png  used on input line 653.
+(pdftex.def)             Requested size: 469.75502pt x 338.3099pt.
+ [9 <./equivalence_toy/trajectory.png>] [10 <./equivalence_toy/samples.png>]
+<equivalence_toy/nfe_sweep.png, id=242, 1084.05pt x 578.16pt>
+File: equivalence_toy/nfe_sweep.png Graphic file (type png)
+<use equivalence_toy/nfe_sweep.png>
+Package pdftex.def Info: equivalence_toy/nfe_sweep.png  used on input line 746.
+
+(pdftex.def)             Requested size: 469.75502pt x 250.53596pt.
+[11] [12 <./equivalence_toy/nfe_sweep.png>] [13] [14] [15]
+(immap_guided_ascent.aux)
  ***********
 LaTeX2e <2026-06-01>
 L3 programming layer <2026-09-09>
  ***********
 Package rerunfilecheck Info: File `immap_guided_ascent.out' has not changed.
-(rerunfilecheck)             Checksum: C5A261700B91BB117E1C9281096599CD;2343.
+(rerunfilecheck)             Checksum: AB978BFD138882A11DDAA319B8DB8736;2798.
  ) 
 Here is how much of TeX's memory you used:
- 25686 strings out of 467392
- 473125 string characters out of 5405638
- 906462 words of memory out of 5000000
- 54275 multiletter control sequences out of 15000+600000
- 749671 words of font info for 254 fonts, out of 8000000 for 9000
+ 25788 strings out of 467392
+ 474867 string characters out of 5405638
+ 908266 words of memory out of 5000000
+ 54316 multiletter control sequences out of 15000+600000
+ 754476 words of font info for 275 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 102i,15n,107p,1018b,828s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 102i,15n,107p,1018b,826s stack positions out of 10000i,1000n,20000p,200000b,200000s
 <C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmbx10.pf
 b><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmbx12.pf
-b><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmex10.pf
-b><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmmi10.pf
-b><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmmi5.pfb
+b><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmbx9.pfb
+><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmex10.pfb
+><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmmi10.pfb
 ><C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmmi6.pfb>
 <C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmmi7.pfb><
 C:/Users/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/lm/lmmi8.pfb><C
@@ -1045,9 +1078,9 @@ Data/Local/Programs/MiKTeX/fonts/type1/public/lm/lmtt9.pfb><C:/Users/erice/AppD
 ata/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/symbols/msbm10.pfb><C:/Us
 ers/erice/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/symbols/msb
 m7.pfb>
-Output written on immap_guided_ascent.pdf (11 pages, 529331 bytes).
+Output written on immap_guided_ascent.pdf (15 pages, 1280215 bytes).
 PDF statistics:
- 392 PDF objects out of 1000 (max. 8388607)
- 71 named destinations out of 1000 (max. 500000)
- 66693 words of extra memory for PDF output out of 74296 (max. 10000000)
+ 458 PDF objects out of 1000 (max. 8388607)
+ 91 named destinations out of 1000 (max. 500000)
+ 68772 words of extra memory for PDF output out of 74296 (max. 10000000)
 

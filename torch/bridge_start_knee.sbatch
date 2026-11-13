@@ -37,7 +37,8 @@
 # Submit:          CASCADES=8 sbatch --export=ALL torch/bridge_start_knee.sbatch
 # One start:       CASCADES=8 sbatch --array=0 --export=ALL torch/bridge_start_knee.sbatch    (guide)
 # Fewer starts:    CASCADES=8 STARTS="guide acs" sbatch --array=0-1 --export=ALL torch/bridge_start_knee.sbatch
-# Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
+# Noise:           default U[0, 0.001] (vlow, since 2026-11-13); NOISE=low|grid|none ... sbatch --export=ALL ...
+#                  for U[0, 0.01] / U[0.01, 0.02] / none;
 #                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Calibrate only:  CASCADES=8 CALIBRATE_ONLY=1 sbatch --time=01:00:00 --export=ALL torch/bridge_start_knee.sbatch
 # Other cells:     any i2sb_recon cell of make_guided_recon_configs.py by name (CASCADES not
@@ -69,7 +70,7 @@ fi
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels 1)
 if [ -n "${NOISE:-}" ]; then
-    GEN+=(--noise "${NOISE}")   # added noise preset: grid (default) | low | none; own run tag
+    GEN+=(--noise "${NOISE}")   # added noise preset: vlow (default) | low | grid | none; own run tag
 fi
 CELLS="$("${GEN[@]}" --list-cells)"
 N_TOTAL="$(echo "${CELLS}" | wc -l)"

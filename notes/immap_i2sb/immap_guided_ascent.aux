@@ -46,35 +46,55 @@
 \@writefile{toc}{\contentsline {paragraph}{Relation to unconditional diffusion.}{6}{section*.9}\protected@file@percent }
 \newlabel{eq:bayes}{{10}{6}{Relation to unconditional diffusion}{equation.10}{}}
 \citation{liu2023}
+\citation{liu2023}
 \@writefile{toc}{\contentsline {section}{\numberline {8}Case study: I$^2$SB}{7}{section.8}\protected@file@percent }
 \newlabel{sec:i2sb}{{8}{7}{Case study: I\texorpdfstring {$^2$}{2}SB}{section.8}{}}
 \@writefile{toc}{\contentsline {paragraph}{The objective.}{7}{section*.10}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {8.1}The ascent I$^2$SB runs}{7}{subsection.8.1}\protected@file@percent }
 \newlabel{eq:ustep}{{11}{7}{The ascent I\texorpdfstring {$^2$}{2}SB runs}{equation.11}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Line by line into I$^2$SB}{7}{subsection.8.2}\protected@file@percent }
-\newlabel{prop:lines}{{3}{7}{}{proposition.3}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {2}{\ignorespaces The same sampler in two coordinates}}{7}{algorithm.2}\protected@file@percent }
+\newlabel{alg:side}{{2}{7}{Line by line into I\texorpdfstring {$^2$}{2}SB}{algorithm.2}{}}
+\newlabel{prop:lines}{{3}{8}{}{proposition.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Numerical check}{8}{subsection.8.3}\protected@file@percent }
+\newlabel{sec:check}{{8.3}{8}{Numerical check}{subsection.8.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{In the repository.}{8}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{On a trained network.}{8}{section*.12}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces One I$^2$SB run (10 steps), shown in both coordinates of Algorithm~\ref {alg:side}, with the same noise draws. \emph  {Top:} the bridge state $\bm  {x}_t$, which is what the network is fed; it starts at $\bm  {x}_1$ and its noise never exceeds $\tau $. \emph  {Middle:} the ascent state $\bm  {u}=(\bm  {x}_t-t\bm  {x}_1)/(1-t)$, the target plus noise $\sigma $. It is arbitrary at $\sigma =\infty $, and saturated noise (clipped for display) at the first finite levels. \emph  {Bottom:} the estimate, identical in both coordinates. The first estimate is the one-shot regression $\mathbb  {E}[\bm  {x}_0\mid \bm  {x}_1]$, and detail appears as $\sigma $ falls.}}{9}{figure.2}\protected@file@percent }
+\newlabel{fig:trajectory}{{2}{9}{One I$^2$SB run (10 steps), shown in both coordinates of Algorithm~\ref {alg:side}, with the same noise draws. \emph {Top:} the bridge state $\x _t$, which is what the network is fed; it starts at $\x _1$ and its noise never exceeds $\tau $. \emph {Middle:} the ascent state $\uu =(\x _t-t\x _1)/(1-t)$, the target plus noise $\sigma $. It is arbitrary at $\sigma =\infty $, and saturated noise (clipped for display) at the first finite levels. \emph {Bottom:} the estimate, identical in both coordinates. The first estimate is the one-shot regression $\E [\x _0\mid \x _1]$, and detail appears as $\sigma $ falls}{figure.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{The warm start is not needed.}{9}{section*.13}\protected@file@percent }
 \citation{meng2022}
 \citation{chung2022}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}A run, from $\bm  {x}_1$ to $\bm  {x}_0$}{8}{subsection.8.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Four uniform steps at $\tau = 0.19$ ($V = 0.144$). At the first step the weight $0.75$ falls on $\bm  {x}_t = \bm  {x}_1$, so $\bm  {x}_{t_{N-1}} = 0.25\,\mathbb  {E}[\bm  {x}_0\mid \bm  {x}_1] + 0.75\,\bm  {x}_1 + 0.165\,\bm  {z}$. Uniform steps in $t$ give equal ratios $r$ in the middle of the ladder.}}{8}{table.1}\protected@file@percent }
-\newlabel{tab:i2sb_run}{{1}{8}{Four uniform steps at $\tau = 0.19$ ($V = 0.144$). At the first step the weight $0.75$ falls on $\x _t = \x _1$, so $\x _{t_{N-1}} = 0.25\,\E [\x _0\mid \x _1] + 0.75\,\x _1 + 0.165\,\zz $. Uniform steps in $t$ give equal ratios $r$ in the middle of the ladder}{table.1}{}}
-\@writefile{toc}{\contentsline {paragraph}{A sample, not the MAP estimate.}{8}{section*.11}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Held-out examples, 50 steps, from the same trained network. \emph  {Columns 1--3:} the target, the start $\bm  {x}_1$, and the one-shot regression $\mathbb  {E}[\bm  {x}_0\mid \bm  {x}_1]$ (the first step of either sampler), which is blurry. \emph  {Columns 4--6:} two I$^2$SB samples (start $\bm  {x}_1$, $\sigma =\infty $) and the per-pixel standard deviation over 8 samples. \emph  {Columns 7--9:} the same for the ascent started at pure noise ($\sigma =80$). The two starts produce samples of the same character, and their uncertainty concentrates on the same edges and textures that the low-resolution start cannot resolve.}}{10}{figure.3}\protected@file@percent }
+\newlabel{fig:samples}{{3}{10}{Held-out examples, 50 steps, from the same trained network. \emph {Columns 1--3:} the target, the start $\x _1$, and the one-shot regression $\E [\x _0\mid \x _1]$ (the first step of either sampler), which is blurry. \emph {Columns 4--6:} two I$^2$SB samples (start $\x _1$, $\sigma =\infty $) and the per-pixel standard deviation over 8 samples. \emph {Columns 7--9:} the same for the ascent started at pure noise ($\sigma =80$). The two starts produce samples of the same character, and their uncertainty concentrates on the same edges and textures that the low-resolution start cannot resolve}{figure.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}A run, from $\bm  {x}_1$ to $\bm  {x}_0$}{10}{subsection.8.4}\protected@file@percent }
+\citation{karras2022}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Four uniform steps at $\tau = 0.19$ ($V = 0.144$). At the first step the weight $0.75$ falls on $\bm  {x}_t = \bm  {x}_1$, so $\bm  {x}_{t_{N-1}} = 0.25\,\mathbb  {E}[\bm  {x}_0\mid \bm  {x}_1] + 0.75\,\bm  {x}_1 + 0.165\,\bm  {z}$. Uniform steps in $t$ give equal ratios $r$ in the middle of the ladder.}}{11}{table.1}\protected@file@percent }
+\newlabel{tab:i2sb_run}{{1}{11}{Four uniform steps at $\tau = 0.19$ ($V = 0.144$). At the first step the weight $0.75$ falls on $\x _t = \x _1$, so $\x _{t_{N-1}} = 0.25\,\E [\x _0\mid \x _1] + 0.75\,\x _1 + 0.165\,\zz $. Uniform steps in $t$ give equal ratios $r$ in the middle of the ladder}{table.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{A sample, not the MAP estimate.}{11}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What the $\bm  {u}$-form frees.}{11}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.5}Few steps, other starts, and a self-paced ladder}{11}{subsection.8.5}\protected@file@percent }
+\newlabel{sec:sweep}{{8.5}{11}{Few steps, other starts, and a self-paced ladder}{subsection.8.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Step-count sweep on the CIFAR task. \emph  {Top:} the two networks on the two ladders: I$^2$SB's $t$-grid from $\bm  {x}_1$, and a $\rho =7$ $\sigma $-ladder from noise at $\sigma =80$. \emph  {Bottom:} the bridge network with a different start and ladder. It regresses at $\sigma =\infty $, re-noises to $\sigma _0$, then follows geometric target levels, either open loop or self-paced (Section~\ref {sec:sweep}). The dotted line marks the one-shot regression's detail. Note the narrow range of the bottom-left panel.}}{12}{figure.4}\protected@file@percent }
+\newlabel{fig:sweep}{{4}{12}{Step-count sweep on the CIFAR task. \emph {Top:} the two networks on the two ladders: I$^2$SB's $t$-grid from $\x _1$, and a $\rho =7$ $\sigma $-ladder from noise at $\sigma =80$. \emph {Bottom:} the bridge network with a different start and ladder. It regresses at $\sigma =\infty $, re-noises to $\sigma _0$, then follows geometric target levels, either open loop or self-paced (Section~\ref {sec:sweep}). The dotted line marks the one-shot regression's detail. Note the narrow range of the bottom-left panel}{figure.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Few steps collapse toward the regression.}{12}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The bridge pays off in the first steps.}{12}{section*.17}\protected@file@percent }
 \citation{wang2024}
-\@writefile{toc}{\contentsline {paragraph}{What the $\bm  {u}$-form frees.}{9}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Adding the measurement: I$^2$SB-Recon and ImMAP2}{9}{section.9}\protected@file@percent }
-\newlabel{sec:recon}{{9}{9}{Adding the measurement: I\texorpdfstring {$^2$}{2}SB-Recon and ImMAP2}{section.9}{}}
-\@writefile{toc}{\contentsline {paragraph}{I$^2$SB-Recon and I$^2$SB-Inversion~\cite  {wang2024}.}{9}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The step is ImMAP2's.}{9}{section*.14}\protected@file@percent }
-\newlabel{eq:immap2}{{12}{9}{The step is ImMAP2's}{equation.12}{}}
+\@writefile{toc}{\contentsline {paragraph}{Self-pacing does not help at matched NFE.}{13}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Adding the measurement: I$^2$SB-Recon and ImMAP2}{13}{section.9}\protected@file@percent }
+\newlabel{sec:recon}{{9}{13}{Adding the measurement: I\texorpdfstring {$^2$}{2}SB-Recon and ImMAP2}{section.9}{}}
+\@writefile{toc}{\contentsline {paragraph}{I$^2$SB-Recon and I$^2$SB-Inversion~\cite  {wang2024}.}{13}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The step is ImMAP2's.}{14}{section*.20}\protected@file@percent }
+\newlabel{eq:immap2}{{12}{14}{The step is ImMAP2's}{equation.12}{}}
 \bibcite{ks2021}{1}
 \bibcite{liu2023}{2}
 \bibcite{wang2024}{3}
 \bibcite{song2021}{4}
 \bibcite{karras2022}{5}
-\@writefile{toc}{\contentsline {section}{\numberline {10}The methods as instances}{10}{section.10}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Every method is Algorithm~\ref {alg:ascent}. The first two columns say what is estimated; the last is how the ascent is run.}}{10}{table.2}\protected@file@percent }
-\newlabel{tab:methods}{{2}{10}{Every method is Algorithm~\ref {alg:ascent}. The first two columns say what is estimated; the last is how the ascent is run}{table.2}{}}
 \bibcite{meng2022}{6}
 \bibcite{chung2022}{7}
 \bibcite{chung2023}{8}
-\gdef \@abspage@last{11}
+\@writefile{toc}{\contentsline {section}{\numberline {10}The methods as instances}{15}{section.10}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Every method is Algorithm~\ref {alg:ascent}. The first two columns say what is estimated; the last is how the ascent is run.}}{15}{table.2}\protected@file@percent }
+\newlabel{tab:methods}{{2}{15}{Every method is Algorithm~\ref {alg:ascent}. The first two columns say what is estimated; the last is how the ascent is run}{table.2}{}}
+\gdef \@abspage@last{15}

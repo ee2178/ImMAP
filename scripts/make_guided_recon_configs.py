@@ -99,12 +99,14 @@ NOISE_PRESETS = {
     "vlow": dict(noise_std=[0.0, 0.001]),             # 10x below "low" (2026-11-13: artifacts)
     "none": dict(noise_std=[0.0, 0.0]),
 }
-NOISE = "low"                       # the default since 2026-11-10: U[0, 0.01], user's call
+NOISE = "vlow"                      # the default since 2026-11-13: U[0, 0.001], user's call
+                                    # (was "low", U[0, 0.01], from 2026-11-10); every launcher,
+                                    # torch and bigpurple, inherits it unless NOISE is set
 # VALIDATION ADDS NO NOISE, whatever the training preset (2026-11-10): the measurement as scanned,
 # its own thermal noise only -- the realistic case, and the one the i2sb samplers are judged on
 # (the added noise was dragging their val metrics down as training went on, through the sampler
 # and the CG step). Nets trained on the grid's U[0.01, 0.02] then see sigma_n = 0 at validation,
-# just outside their training range; "low" and "none" include it.
+# just outside their training range; "low", "vlow" and "none" include it.
 VAL_NOISE_STD = 0.0
 
 
@@ -599,7 +601,7 @@ def main():
     p.add_argument("--list-cells", action="store_true",
                    help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name<TAB>tau file' "
                         "and exit (tau file: a bridge cell's calibration path, else '-')")
-    p.add_argument("--noise", choices=list(NOISE_PRESETS), default="low",
+    p.add_argument("--noise", choices=list(NOISE_PRESETS), default="vlow",
                    help="added TRAINING noise: grid U[0.01, 0.02], low U[0, 0.01], "
                         "vlow U[0, 0.001], none; "
                         "validation adds none (VAL_NOISE_STD); non-grid presets get their own "

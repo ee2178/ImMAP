@@ -9,11 +9,14 @@
 \usepackage{enumitem}
 \usepackage{xcolor}
 \usepackage{tikz}
+\usepackage{graphicx}
 \usepackage{float}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage[colorlinks=true, linkcolor=blue!50!black, citecolor=blue!50!black,
             urlcolor=blue!50!black]{hyperref}
+
+\emergencystretch=3em  % long \texttt paths: stretch the line instead of overrunning the margin
 
 \newtheorem{proposition}{Proposition}
 \theoremstyle{remark}
@@ -490,33 +493,59 @@ $r^2\sigma_t = r\sigma_s$ back up to exactly $\sigma_s$. This is \code{debiased\
 
 \subsection{Line by line into I\texorpdfstring{$^2$}{2}SB}
 
-Map every state to the network's coordinates with \eqref{eq:x}, $\x_t = (1-t)\,\uu_t + t\,\x_1$:
+Map every state to the network's coordinates with \eqref{eq:x}, $\x_t = (1-t)\,\uu_t + t\,\x_1$.
+Algorithm~\ref{alg:side} sets the two samplers side by side: each numbered line on the left
+becomes the same-numbered line on the right. Both run on the grid $1=t_N>\dots>t_0=0$, with
+$t=t_k$, $s=t_{k-1}$ and $r^2 = \sigma_s^2/\sigma_t^2 = \frac{s(1-t)}{t(1-s)}$, and both draw
+the same noise $\zz_k$.
 
-\begin{center}
-\small
-\begin{tabular}{@{}lll@{}}
-\toprule
-line & ascent in $\uu$ (Algorithm~\ref{alg:ascent}) & I$^2$SB in $\x$ \\
-\midrule
-start & $\sigma_N=\infty$, $\uu_N$ arbitrary & $\x_{t_N} = \x_1$ \\
-denoise & $\vv = \Dg(\uu_t,\sigma_t)$ & $\hat\x_0 = \D(\x_t,t,\x_1)$ \\
-step & $\uu_s = r^2\uu_t + (1-r^2)\vv + \sigma_s\sqrt{1-r^2}\,\zz$
-  & $\x_s = \tfrac st\x_t + \big(1-\tfrac st\big)\hat\x_0 + \sqrt{V\tfrac{s(t-s)}{t}}\,\zz$ \\
-return & $\uu_0 = \vv$ at $\sigma_0=0$ & $\x_0 = \hat\x_0$ at $t_0=0$ \\
-\bottomrule
-\end{tabular}
-\end{center}
+\begin{algorithm}[H]
+\caption{The same sampler in two coordinates}
+\label{alg:side}
+\footnotesize
+\begin{minipage}[t]{0.47\linewidth}
+\textbf{Ascent in $\uu$} (Algorithm~\ref{alg:ascent})
+\begin{algorithmic}[1]
+\State $\uu \gets$ anything \Comment{$\sigma_N=\infty$}
+\For{$k = N,\dots,1$}
+  \State $\vv \gets \D\big(\x_1 + (1-t)(\uu-\x_1),\,t,\,\x_1\big)$
+  \State $\uu \gets r^2\uu + (1-r^2)\,\vv + \sigma_s\sqrt{1-r^2}\;\zz_k$
+\EndFor
+\State \Return $\uu$
+\end{algorithmic}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.50\linewidth}
+\textbf{I$^2$SB in $\x$}~\cite{liu2023}
+\begin{algorithmic}[1]
+\State $\x \gets \x_1$
+\For{$k = N,\dots,1$}
+  \State $\hat\x_0 \gets \D(\x,\,t,\,\x_1)$
+  \State $\x \gets \tfrac st\,\x + \big(1-\tfrac st\big)\hat\x_0 + \sqrt{V\tfrac{s(t-s)}{t}}\;\zz_k$
+\EndFor
+\State \Return $\x$
+\end{algorithmic}
+\end{minipage}
+\end{algorithm}
+
+\noindent No branches are needed at the ends:
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item at $k=N$ ($t=1$, $\sigma_t=\infty$, $r=0$), line~4 is $\uu = \vv + \sigma_s\zz_N$ on the
+        left, and its image on the right;
+  \item at $k=1$ ($s=0$, $\sigma_s = 0$, $r=0$), line~4 returns the last estimate, $\vv$ or
+        $\hat\x_0$.
+\end{itemize}
 
 \begin{proposition}\label{prop:lines}
-Each row of the table is the same operation in two coordinates. The right column is I$^2$SB's
+Each line of Algorithm~\ref{alg:side} is the same operation in two coordinates. The right
+column is I$^2$SB's
 reverse step~\cite{liu2023}: the DDPM posterior of the bridge, $\x_s\sim\N\big(\tfrac st\x_t +
 (1-\tfrac st)\hat\x_0,\ V\tfrac{s(t-s)}{t}\Id\big)$.
 \end{proposition}
 \begin{proof}
-\emph{Start.} At $t=1$, $c=0$, so $\x_t=\x_1$ for every $\uu_N$.
-\emph{Denoise.} $\x_t$ is the input \eqref{eq:x} of $\uu_t$, so $\vv=\hat\x_0$ by
-Proposition~\ref{prop:bridge}.
-\emph{Step.} Multiply \eqref{eq:ustep} by $1-s$ and add $s\x_1$. The coefficients are
+\emph{Line 1.} At $t=1$, $c=0$, so $\x_t=\x_1$ for every $\uu_N$.
+\emph{Line 3.} The left network input is $\x_t$ by \eqref{eq:x}, so $\vv=\hat\x_0$
+(Proposition~\ref{prop:bridge}).
+\emph{Line 4.} Multiply \eqref{eq:ustep} by $1-s$ and add $s\x_1$. The coefficients are
 \[
   (1-s)\,r^2 = \tfrac{s(1-t)}{t},\qquad (1-s)(1-r^2) = \tfrac{t-s}{t}.
 \]
@@ -530,14 +559,108 @@ The noise variance is
   (1-s)^2\sigma_s^2(1-r^2) = (1-s)^2\cdot\tfrac{Vs}{1-s}\cdot\tfrac{t-s}{t(1-s)}
   = V\tfrac{s(t-s)}{t}.
 \]
-\emph{Return.} At $t_0=0$, $\x=\uu$.
+\emph{Line 6.} At $t_0=0$, $\x=\uu$.
 \end{proof}
 
 \noindent For a general I$^2$SB schedule, replace $t$ by $m_n = \sigma_{\mathrm{fwd}}[n]^2/
 \sigma_{\mathrm{fwd}}[N]^2$ and use $\sigma_n^2 = \sigma_{\mathrm{fwd}}[N]^2\,m_n/(1-m_n)$; the
-proof is unchanged. With I$^2$SB's step size and seed, \code{debiased\_ascent} reproduces
-\code{reverse\_sample} iterate for iterate, to $2\cdot10^{-5}$ relative or better, with and
-without the CG step.
+proof is unchanged.
+
+\subsection{Numerical check}\label{sec:check}
+
+\paragraph{In the repository.} \code{debiased\_ascent} (\code{sb/i2sb\_recon.py}) is the left
+column of Algorithm~\ref{alg:side}, and \code{reverse\_sample} is the right. With the same seed
+they agree iterate for iterate (\code{tests/test\_i2sb\_recon.py}). The test uses a perturbed
+recon UNet, so the estimates are far from zero. The agreement is $2\cdot10^{-5}$ relative
+without the CG step and $2\cdot10^{-6}$ with 7 CG iterations.
+
+\paragraph{On a trained network.} A small image-to-image task, run with the script
+\code{equivalence\_toy.py} in \code{notes/immap\_i2sb}:
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item \textbf{Task.} $4\times$ super-resolution on CIFAR-10 ($32\times32$, colour, in
+        $[-1,1]$). The target is the image. The start $\x_1$ is its $4\times$ average-pooled
+        version, upsampled bilinearly; the measurement is the pooling.
+  \item \textbf{Network.} A 1.9M-parameter UNet given $\x_1$, trained with the bridge loss on
+        10k images for 20k steps. $\tau = 0.10$, so that $\sqrt V = 2\tau$ is the measured
+        spread of $\x_0-\x_1$ (0.20).
+\end{itemize}
+Both columns of Algorithm~\ref{alg:side} were run with the same noise on 256 held-out images
+(\code{equivalence\_toy\_iterates.py}). After mapping $\uu\mapsto\x$, every iterate agrees:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+steps & worst iterate, relative difference & final PSNR, $\uu$-ascent & final PSNR, I$^2$SB \\
+\midrule
+5  & $7.6\cdot10^{-7}$ & 21.64 dB & 21.64 dB \\
+50 & $7.8\cdot10^{-7}$ & 20.25 dB & 20.25 dB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent That is float32 rounding: the two algorithms are one computation.
+Figure~\ref{fig:trajectory} shows one such run in both coordinates.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{equivalence_toy/trajectory.png}
+\caption{One I$^2$SB run (10 steps), shown in both coordinates of Algorithm~\ref{alg:side},
+with the same noise draws.
+\emph{Top:} the bridge state $\x_t$, which is what the network is fed; it starts at $\x_1$ and
+its noise never exceeds $\tau$.
+\emph{Middle:} the ascent state $\uu=(\x_t-t\x_1)/(1-t)$, the target plus noise $\sigma$. It is
+arbitrary at $\sigma=\infty$, and saturated noise (clipped for display) at the first finite
+levels.
+\emph{Bottom:} the estimate, identical in both coordinates. The first estimate is the one-shot
+regression $\E[\x_0\mid\x_1]$, and detail appears as $\sigma$ falls.}
+\label{fig:trajectory}
+\end{figure}
+
+\paragraph{The warm start is not needed.} Algorithm~\ref{alg:ascent} does not have to start at
+$\x_1$. The same trained network was run as the ascent from pure noise at $\sigma=80$, on a
+$\rho=7$ ladder in $\sigma$ with $h=1-r^2$, and compared with native I$^2$SB. Each run draws 8
+posterior samples for each of 512 held-out images, with 50 steps:
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & sample PSNR & mean PSNR & consistency & posterior std & mean vs.\ I$^2$SB \\
+\midrule
+I$^2$SB (start $\x_1$, $\sigma=\infty$) & 20.30 & 21.99 & 0.0119 & 0.122 & -- \\
+ascent from noise ($\sigma=80$) & 20.26 & 21.84 & 0.0131 & 0.122 & 0.92 \\
+I$^2$SB, network retrained (other seed) & 20.19 & 21.90 & 0.0112 & 0.123 & 0.74 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The columns are:
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item \textbf{mean PSNR}: the PSNR of the 8-sample mean;
+  \item \textbf{consistency}: the RMSE of the pooled sample against the measurement;
+  \item \textbf{mean vs.\ I$^2$SB}: the RMS difference between posterior means, in units of the
+        Monte-Carlo noise of a difference of two 8-sample means; about 1 means
+        indistinguishable.
+\end{itemize}
+The two starts give the same posterior. Their means are as close as Monte-Carlo noise allows,
+and their spreads agree to $0.2\%$; retraining the network moves the result about as much.
+Starting at $\x_1$ is the $\sigma=\infty$ end of the same ascent, not a different algorithm.
+Figure~\ref{fig:samples} shows examples.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{equivalence_toy/samples.png}
+\caption{Held-out examples, 50 steps, from the same trained network.
+\emph{Columns 1--3:} the target, the start $\x_1$, and the one-shot regression
+$\E[\x_0\mid\x_1]$ (the first step of either sampler), which is blurry.
+\emph{Columns 4--6:} two I$^2$SB samples (start $\x_1$, $\sigma=\infty$) and the per-pixel
+standard deviation over 8 samples.
+\emph{Columns 7--9:} the same for the ascent started at pure noise ($\sigma=80$).
+The two starts produce samples of the same character, and their uncertainty concentrates on the
+same edges and textures that the low-resolution start cannot resolve.}
+\label{fig:samples}
+\end{figure}
 
 \subsection{A run, from \texorpdfstring{$\x_1$}{x1} to \texorpdfstring{$\x_0$}{x0}}
 
@@ -595,6 +718,133 @@ $h\in[1-r,1]$, any ladder (including ImMAP2's self-paced one), or a finite-$\sig
 noise. On a fixed $t$-grid every $\sigma_k$ scales with $\sqrt V = 2\tau$, so $\tau$ decides how
 warm the start is: at 20 uniform steps, $\sigma(0.95)\approx1.7$ for $\tau=0.19$ and
 $\approx0.8$ for $\tau=0.09$, against image intensities $\sim1$.
+
+\subsection{Few steps, other starts, and a self-paced ladder}\label{sec:sweep}
+
+The CIFAR task of Section~\ref{sec:check} tests those freedoms. Every run draws 8 samples for
+each of 512 held-out images, at a budget of 2 to 50 network calls (NFE, counting every call).
+Three measures:
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item \textbf{consistency}: the RMSE of the pooled sample against the measurement;
+  \item \textbf{detail}: the energy of the band the measurement cannot see,
+        $\|\x-\x_1(\x)\|^2$, relative to the target's. The one-shot regression has $0.29$; a
+        perfect posterior sample would have $1$;
+  \item \textbf{posterior std}: the spread over the 8 samples.
+\end{itemize}
+Single-sample PSNR is not used. It \emph{rises} as steps are removed, because the samples
+collapse toward the posterior mean (the regression alone scores 22.3 dB, against 20.3 dB for
+50-step I$^2$SB).
+
+Besides the bridge network, the comparison uses a second network: a standard conditional
+diffusion network with EDM preconditioning~\cite{karras2022}. It has the same architecture,
+data, $\x_1$-conditioning and budget, and is trained on log-normal $\sigma$. Its estimates at
+$\sigma=80$ are 33\% worse than the bridge network's, which is flat all the way to
+$\sigma=\infty$. At $\sigma\le0.05$ it is better, thanks to its skip connection.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{equivalence_toy/nfe_sweep.png}
+\caption{Step-count sweep on the CIFAR task.
+\emph{Top:} the two networks on the two ladders: I$^2$SB's $t$-grid from $\x_1$, and a
+$\rho=7$ $\sigma$-ladder from noise at $\sigma=80$.
+\emph{Bottom:} the bridge network with a different start and ladder. It regresses at
+$\sigma=\infty$, re-noises to $\sigma_0$, then follows geometric target levels, either open loop
+or self-paced (Section~\ref{sec:sweep}).
+The dotted line marks the one-shot regression's detail. Note the narrow range of the bottom-left
+panel.}
+\label{fig:sweep}
+\end{figure}
+
+\paragraph{Few steps collapse toward the regression.} With 2 steps, every sampler returns close
+to $\E[\x_0\mid\x_1]$: I$^2$SB's detail is $0.33$ (the regression has $0.29$) and its spread is
+$0.036$ (against $0.122$ at 50 steps). Detail and spread grow with the step count and have not
+saturated at 50 steps, where samples carry $0.71$ of the target's detail.
+
+\paragraph{The bridge pays off in the first steps.}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+ & \multicolumn{4}{c}{consistency ($\times10^{-3}$), NFE} & \multicolumn{2}{c}{detail, NFE} \\
+\cmidrule(lr){2-5}\cmidrule(l){6-7}
+ & 2 & 3 & 5 & 50 & 2 & 50 \\
+\midrule
+I$^2$SB (bridge net, $t$-ladder from $\x_1$) & 10.3 & 10.5 & 10.8 & 11.9 & 0.33 & 0.71 \\
+bridge net, $\sigma$-ladder from noise & 10.3 & 10.2 & 10.5 & 13.1 & 0.29 & 0.74 \\
+EDM net, $\sigma$-ladder from noise & 42.5 & 17.3 & 10.9 & 9.4 & 0.49 & 0.72 \\
+EDM net, $t$-ladder & 18.2 & 14.2 & 11.1 & 9.9 & 0.34 & 0.70 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item \textbf{With 2 steps the EDM network fails.} From noise, its consistency error is
+        $4\times$ the bridge network's, and its high detail ($0.49$) is leftover noise: its first
+        estimate, at $\sigma=80$, is poor. I$^2$SB's ladder helps it ($18\cdot10^{-3}$) but does
+        not close the gap.
+  \item \textbf{The bridge network is equally good from $\x_1$ or from noise.} It is accurate up to
+        $\sigma=\infty$, so its first estimate is right whatever the start.
+  \item \textbf{From 5 steps on, the curves merge.} Past 10 steps the EDM network is slightly
+        more consistent, through its advantage at small $\sigma$.
+\end{itemize}
+This is Section~\ref{sec:bridge}'s conditioning argument in practice. The bridge input matters
+where the high-$\sigma$ estimates matter, which is when there are few steps. With the bridge
+network, the ladder itself matters little: I$^2$SB's $t$-grid and the $\sigma$-ladder from noise
+nearly overlap in every panel.
+
+\paragraph{Self-pacing does not help at matched NFE.} The self-paced ladder:
+\begin{enumerate}[leftmargin=1.5em, itemsep=1pt]
+  \item regresses at $\sigma=\infty$;
+  \item re-noises to a start $\sigma_0$;
+  \item at each step, estimates the level actually present and steps from it to the next
+        target level, with $h=1-r^2$ and $r = \sigma_{\mathrm{target}}/\hat\sigma$;
+  \item tells the network $\hat\sigma$.
+\end{enumerate}
+The level estimate is either ImMAP2's, $\hat\sigma^2 = \|D-\uu\|^2/n$, or the corrected
+$\hat\sigma^2 = \|D-\uu\|^2/(n-\operatorname{div}D)$. The correction follows from
+$\E\|D-\uu\|^2 = n\sigma^2-\mathrm{mmse}$ and $\mathrm{mmse} = \sigma^2\E[\operatorname{div}D]$,
+and costs one extra call per step. The open-loop control uses the same start and targets with no
+estimate.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+start $\sigma_0$ & ladder & first $\hat\sigma/\sigma_0$ & \multicolumn{2}{c}{NFE 10: std, detail}
+  & \multicolumn{2}{c}{NFE 50: std, detail} \\
+\midrule
+$\infty\to\sigma(0.98)$ & I$^2$SB & -- & 0.084 & 0.49 & 0.122 & 0.71 \\
+\addlinespace
+$\sigma(0.99)\approx2.0$ & open loop & -- & 0.105 & 0.60 & 0.130 & 0.76 \\
+ & self-paced, ImMAP2 estimate & 0.995 & 0.109 & 0.61 & 0.141 & 0.82 \\
+ & self-paced, corrected & 0.998 & 0.078 & 0.47 & 0.120 & 0.69 \\
+\addlinespace
+$0.5$ & open loop & -- & 0.078 & 0.46 & 0.088 & 0.51 \\
+ & self-paced, ImMAP2 estimate & 0.971 & 0.083 & 0.48 & 0.096 & 0.55 \\
+ & self-paced, corrected & 0.989 & 0.066 & 0.42 & 0.083 & 0.49 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt]
+  \item \textbf{ImMAP2's estimate reads low}, more so at lower $\sigma$ ($0.995$ at $\sigma_0=2.0$,
+        $0.971$ at $0.5$); the correction removes most of the bias. A low $\hat\sigma$ makes each
+        step remove too little noise. The extra spread and ``detail'' at 50 steps
+        ($0.141$, $0.82$, above the open loop's $0.130$, $0.76$) are leftover noise.
+  \item \textbf{The corrected estimate tracks I$^2$SB}, at about half the steps per NFE: at 50
+        NFE it has 24 steps and matches 50-step I$^2$SB's spread and detail. At matched NFE it
+        gains nothing over the open loop or I$^2$SB.
+  \item \textbf{The start level matters more than the pacing.} From $\sigma_0=0.5$, about three
+        times the regression's RMS error, all three variants plateau near the regression: spread
+        about $0.09$ and detail about $0.5$, even at 50 NFE. That noise is too little to leave the
+        neighbourhood of $\E[\x_0\mid\x_1]$ (the SDEdit trade-off). From $\sigma(0.99)$ the
+        variants reach I$^2$SB's spread. I$^2$SB's own first re-noise, at 50 steps, is
+        $\sigma(0.98)\approx1.4$.
+\end{itemize}
+
+\noindent Limits: one task, small networks, and no perceptual metric. Detail has not saturated
+at 50 steps, so these samplers are compared short of convergence.
 
 %=============================================================================================
 \section{Adding the measurement: I\texorpdfstring{$^2$}{2}SB-Recon and ImMAP2}

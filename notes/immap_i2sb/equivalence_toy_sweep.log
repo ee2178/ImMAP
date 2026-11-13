@@ -14,3 +14,140 @@ C:\Users\erice\Desktop\ImMAP\notes\immap_i2sb\equivalence_toy.py:662: FutureWarn
   bridge, Karras from noise                nfe   5  psnr_s 21.95  detail 0.372  (6.1s)
   bridge, Karras from noise                nfe  10  psnr_s 21.48  detail 0.464  (12.4s)
   bridge, Karras from noise                nfe  20  psnr_s 20.99  detail 0.565  (24.6s)
+  bridge, Karras from noise                nfe  50  psnr_s 20.26  detail 0.741  (60.2s)
+  EDM: EDM, Karras from noise              nfe   2  psnr_s 20.73  detail 0.491  (2.4s)
+  EDM: EDM, Karras from noise              nfe   3  psnr_s 22.04  detail 0.386  (3.5s)
+  EDM: EDM, Karras from noise              nfe   5  psnr_s 22.02  detail 0.406  (6.0s)
+  EDM: EDM, Karras from noise              nfe  10  psnr_s 21.63  detail 0.484  (12.1s)
+  EDM: EDM, Karras from noise              nfe  20  psnr_s 21.17  detail 0.578  (24.3s)
+  EDM: EDM, Karras from noise              nfe  50  psnr_s 20.53  detail 0.715  (60.1s)
+  EDM, I2SB ladder                         nfe   2  psnr_s 21.99  detail 0.335  (2.4s)
+  EDM, I2SB ladder                         nfe   3  psnr_s 21.95  detail 0.353  (3.5s)
+  EDM, I2SB ladder                         nfe   5  psnr_s 21.75  detail 0.394  (5.9s)
+  EDM, I2SB ladder                         nfe  10  psnr_s 21.36  detail 0.473  (11.8s)
+  EDM, I2SB ladder                         nfe  20  psnr_s 20.92  detail 0.573  (23.9s)
+  EDM, I2SB ladder                         nfe  50  psnr_s 20.43  detail 0.704  (58.6s)
+  bridge, open loop, t=0.99                nfe   2  psnr_s 21.96  detail 0.362  (2.4s)
+  bridge, open loop, t=0.99                nfe   3  psnr_s 21.88  detail 0.377  (3.6s)
+  bridge, open loop, t=0.99                nfe   5  psnr_s 21.37  detail 0.479  (5.9s)
+  bridge, open loop, t=0.99                nfe  10  psnr_s 20.82  detail 0.595  (11.9s)
+  bridge, open loop, t=0.99                nfe  20  psnr_s 20.44  detail 0.680  (23.4s)
+  bridge, open loop, t=0.99                nfe  50  psnr_s 20.12  detail 0.760  (59.0s)
+  bridge, self-paced, t=0.99               nfe   2  psnr_s 21.96  detail 0.362  (2.3s)
+  bridge, self-paced, t=0.99               nfe   3  psnr_s 21.88  detail 0.377  (3.5s)
+  bridge, self-paced, t=0.99               nfe   5  psnr_s 21.35  detail 0.482  (5.9s)
+  bridge, self-paced, t=0.99               nfe  10  psnr_s 20.72  detail 0.614  (11.8s)
+  bridge, self-paced, t=0.99               nfe  20  psnr_s 20.24  detail 0.722  (24.4s)
+  bridge, self-paced, t=0.99               nfe  50  psnr_s 19.83  detail 0.824  (75.3s)
+  bridge, self-paced corrected, t=0.99     nfe   3  psnr_s 21.96  detail 0.362  (2.4s)
+  bridge, self-paced corrected, t=0.99     nfe   5  psnr_s 21.92  detail 0.370  (4.8s)
+  bridge, self-paced corrected, t=0.99     nfe  10  psnr_s 21.45  detail 0.465  (9.7s)
+  bridge, self-paced corrected, t=0.99     nfe  20  psnr_s 20.87  detail 0.585  (21.7s)
+  bridge, self-paced corrected, t=0.99     nfe  50  psnr_s 20.39  detail 0.694  (57.9s)
+  bridge, open loop, sigma0=0.5            nfe   2  psnr_s 21.87  detail 0.373  (2.4s)
+  bridge, open loop, sigma0=0.5            nfe   3  psnr_s 21.81  detail 0.386  (3.6s)
+  bridge, open loop, sigma0=0.5            nfe   5  psnr_s 21.59  detail 0.425  (6.0s)
+  bridge, open loop, sigma0=0.5            nfe  10  psnr_s 21.37  detail 0.465  (14.5s)
+  bridge, open loop, sigma0=0.5            nfe  20  psnr_s 21.24  detail 0.487  (37.3s)
+  bridge, open loop, sigma0=0.5            nfe  50  psnr_s 21.10  detail 0.511  (60.3s)
+  bridge, self-paced, sigma0=0.5           nfe   2  psnr_s 21.87  detail 0.373  (2.3s)
+  bridge, self-paced, sigma0=0.5           nfe   3  psnr_s 21.81  detail 0.387  (3.6s)
+  bridge, self-paced, sigma0=0.5           nfe   5  psnr_s 21.55  detail 0.430  (6.2s)
+  bridge, self-paced, sigma0=0.5           nfe  10  psnr_s 21.26  detail 0.481  (12.2s)
+  bridge, self-paced, sigma0=0.5           nfe  20  psnr_s 21.07  detail 0.513  (24.2s)
+  bridge, self-paced, sigma0=0.5           nfe  50  psnr_s 20.88  detail 0.546  (66.1s)
+  bridge, self-paced corrected, sigma0=0.5 nfe   3  psnr_s 21.87  detail 0.373  (2.4s)
+  bridge, self-paced corrected, sigma0=0.5 nfe   5  psnr_s 21.85  detail 0.379  (4.8s)
+  bridge, self-paced corrected, sigma0=0.5 nfe  10  psnr_s 21.64  detail 0.416  (9.7s)
+  bridge, self-paced corrected, sigma0=0.5 nfe  20  psnr_s 21.41  detail 0.455  (23.2s)
+  bridge, self-paced corrected, sigma0=0.5 nfe  50  psnr_s 21.20  detail 0.492  (62.5s)
+
+regression E[x0|x1] (1 NFE): psnr 22.30  detail 0.293;  MC noise 0.0658
+
+I2SB: bridge, I2SB ladder
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         22.1134         22.3257          0.0103          0.0359          0.3252          0.8294
+    3         21.9577         22.3137          0.0105          0.0476          0.3543          0.8219
+    5         21.6916         22.2719          0.0108          0.0627          0.4032          0.8198
+   10         21.2571         22.2068          0.0111          0.0837          0.4890          0.8172
+   20         20.8033         22.1216          0.0114          0.1028          0.5863          0.8333
+   50         20.2958         21.9851          0.0119          0.1224          0.7078          0.8318
+
+bridge, Karras from noise
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         22.3061         22.3065          0.0103          0.0016          0.2936          0.8160
+    3         22.0697         22.3028          0.0102          0.0412          0.3510          0.8135
+    5         21.9491         22.2939          0.0105          0.0492          0.3717          0.7961
+   10         21.4816         22.2107          0.0116          0.0747          0.4641          0.8073
+   20         20.9886         22.0778          0.0124          0.0954          0.5650          0.8255
+   50         20.2585         21.8381          0.0131          0.1222          0.7415          0.9266
+
+EDM: EDM, Karras from noise
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         20.7338         21.9058          0.0425          0.0912          0.4911          1.2291
+    3         22.0380         22.3610          0.0173          0.0482          0.3860          1.0363
+    5         22.0181         22.4228          0.0109          0.0532          0.4058          1.0062
+   10         21.6299         22.4048          0.0077          0.0757          0.4838          1.0299
+   20         21.1689         22.3409          0.0084          0.0963          0.5783          1.0612
+   50         20.5307         22.2124          0.0094          0.1207          0.7151          1.1220
+
+EDM, I2SB ladder
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         21.9932         22.3304          0.0182          0.0470          0.3351          1.0140
+    3         21.9451         22.3700          0.0142          0.0532          0.3532          0.9972
+    5         21.7528         22.3746          0.0111          0.0652          0.3942          0.9995
+   10         21.3575         22.3369          0.0097          0.0843          0.4732          1.0169
+   20         20.9158         22.2755          0.0097          0.1032          0.5729          1.0220
+   50         20.4268         22.2120          0.0099          0.1234          0.7042          1.0575
+
+bridge, open loop, t=0.99
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         21.9585         22.2893          0.0120          0.0493          0.3624          0.8664
+    3         21.8785         22.3025          0.0103          0.0548          0.3773          0.8306
+    5         21.3698         22.2369          0.0106          0.0812          0.4788          0.8456
+   10         20.8219         22.1465          0.0111          0.1045          0.5952          0.8600
+   20         20.4378         22.0561          0.0115          0.1189          0.6802          0.8680
+   50         20.1204         21.9560          0.0120          0.1302          0.7604          0.8485
+
+bridge, self-paced, t=0.99
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         21.9585         22.2893          0.0120          0.0493          0.3624          0.8664
+    3         21.8783         22.3025          0.0103          0.0548          0.3774          0.8306   sigma_hat/sigma0 0.995
+    5         21.3526         22.2343          0.0106          0.0820          0.4818          0.8474   sigma_hat/sigma0 0.995
+   10         20.7211         22.1299          0.0112          0.1085          0.6145          0.8721   sigma_hat/sigma0 0.995
+   20         20.2364         22.0218          0.0117          0.1264          0.7221          0.8949   sigma_hat/sigma0 0.995
+   50         19.8345         21.9069          0.0122          0.1406          0.8244          0.8848   sigma_hat/sigma0 0.995
+
+bridge, self-paced corrected, t=0.99
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    3         21.9585         22.2893          0.0120          0.0493          0.3624          0.8664
+    5         21.9191         22.3060          0.0103          0.0525          0.3698          0.8276   sigma_hat/sigma0 0.998
+   10         21.4470         22.2537          0.0106          0.0779          0.4653          0.8348   sigma_hat/sigma0 0.998
+   20         20.8674         22.1451          0.0112          0.1023          0.5846          0.8606   sigma_hat/sigma0 0.997
+   50         20.3891         22.0203          0.0118          0.1203          0.6940          0.8675   sigma_hat/sigma0 0.997
+
+bridge, open loop, sigma0=0.5
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         21.8703         22.3065          0.0105          0.0541          0.3734          0.8469
+    3         21.8113         22.3045          0.0104          0.0577          0.3863          0.8273
+    5         21.5935         22.2621          0.0108          0.0682          0.4245          0.8249
+   10         21.3736         22.2209          0.0111          0.0781          0.4647          0.8087
+   20         21.2369         22.1802          0.0114          0.0831          0.4865          0.7961
+   50         21.0995         22.1177          0.0118          0.0875          0.5113          0.7624
+
+bridge, self-paced, sigma0=0.5
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    2         21.8703         22.3065          0.0105          0.0541          0.3734          0.8469
+    3         21.8066         22.3038          0.0104          0.0579          0.3870          0.8277   sigma_hat/sigma0 0.971
+    5         21.5548         22.2563          0.0108          0.0701          0.4301          0.8291   sigma_hat/sigma0 0.971
+   10         21.2641         22.2050          0.0113          0.0829          0.4810          0.8215   sigma_hat/sigma0 0.971
+   20         21.0656         22.1560          0.0116          0.0902          0.5129          0.8181   sigma_hat/sigma0 0.971
+   50         20.8844         22.0902          0.0119          0.0963          0.5456          0.7889   sigma_hat/sigma0 0.971
+
+bridge, self-paced corrected, sigma0=0.5
+  nfe     psnr_sample       psnr_mean  consistency_rm   posterior_std    detail_ratio  mean_vs_ref_ov
+    3         21.8703         22.3065          0.0105          0.0541          0.3734          0.8469
+    5         21.8494         22.3056          0.0104          0.0553          0.3787          0.8226   sigma_hat/sigma0 0.989
+   10         21.6404         22.2669          0.0109          0.0658          0.4164          0.8156   sigma_hat/sigma0 0.989
+   20         21.4058         22.2125          0.0112          0.0759          0.4554          0.8069   sigma_hat/sigma0 0.988
+   50         21.2045         22.1361          0.0118          0.0832          0.4918          0.7869   sigma_hat/sigma0 0.988

@@ -537,7 +537,10 @@ def test_noise_presets():
     the bridge tau calibration file) for every preset but the grid's."""
     import yaml
     want = {"grid": ([0.01, 0.02], 0.0, "s3"), "low": ([0.0, 0.01], 0.0, "s3_noise-low"),
-            "none": ([0.0, 0.0], 0.0, "s3_noise-none")}
+            "vlow": ([0.0, 0.001], 0.0, "s3_noise-vlow"), "none": ([0.0, 0.0], 0.0, "s3_noise-none")}
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    assert gen.NOISE == "vlow"                    # the default every launcher inherits
     with tempfile.TemporaryDirectory() as out:
         for preset, (rng, val, tag) in want.items():
             d = os.path.join(out, preset)

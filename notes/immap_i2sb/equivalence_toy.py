@@ -588,37 +588,52 @@ def sweep_figure(res, out):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from matplotlib.ticker import NullFormatter
+
     nfe = res["nfe"]
-    panels = [("psnr_sample", "single-sample PSNR (dB)"), ("consistency_rmse", "consistency RMSE"),
-              ("detail_ratio", "detail energy / that of $x_0$"), ("posterior_std", "posterior std"),
-              ("mean_vs_ref_over_mc", "posterior-mean distance to ref (MC units)")]
-    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 4.2))
-    def style(label):
-        if label.startswith(("I2SB", "bridge, Karras")):
-            return "C0", "-" if label.startswith("I2SB") else "--"
-        if "EDM" in label:
-            return "C2", "-" if label.startswith("EDM:") else "--"
-        c = {"open loop": "C7", "self-paced,": "C1", "corrected": "C3"}
-        col = next(v for k, v in c.items() if k in label)
-        return col, "-" if "t=0.99" in label else ":"
-    for ax, (key, title) in zip(axes, panels):
-        for label, rows in res["runs"].items():
-            c, ls = style(label)
-            pts = [(n, r[key]) for n, r in zip(nfe, rows) if r is not None]
-            ax.plot(*zip(*pts), color=c, ls=ls, marker="o", ms=3, label=label)
-        if key == "detail_ratio":
-            ax.axhline(1.0, color="gray", lw=0.8)
-            ax.axhline(res["regression_detail"], color="gray", lw=0.8, ls=":")
-        if key == "mean_vs_ref_over_mc":
-            ax.axhline(1.0, color="gray", lw=0.8)
-            ax.set_yscale("log")
-        ax.set_xscale("log")
-        ax.set_xticks(nfe)
-        ax.set_xticklabels([str(n) for n in nfe])
-        ax.set(xlabel="NFE", title=title)
-    fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncol=5, fontsize=7)
-    fig.tight_layout(rect=(0, 0.14, 1, 1))
-    fig.savefig(os.path.join(out, "nfe_sweep.png"), dpi=140)
+    panels = [("consistency_rmse", "consistency RMSE"),
+              ("detail_ratio", "detail energy / that of $x_0$"),
+              ("posterior_std", "posterior std")]
+    groups = [  # row label, runs shown in that row: label -> (colour, linestyle, legend name)
+        ("network and ladder", {
+            "I2SB: bridge, I2SB ladder": ("C0", "-", "I$^2$SB (bridge net, $t$-ladder from $x_1$)"),
+            "bridge, Karras from noise": ("C0", "--", "bridge net, $\\sigma$-ladder from noise"),
+            "EDM: EDM, Karras from noise": ("C2", "-", "EDM net, $\\sigma$-ladder from noise"),
+            "EDM, I2SB ladder": ("C2", "--", "EDM net, $t$-ladder")}),
+        ("start and self-pacing (bridge net)", {
+            "I2SB: bridge, I2SB ladder": ("C0", "-", "I$^2$SB"),
+            "bridge, open loop, t=0.99": ("C7", "-", "open loop, $\\sigma_0=\\sigma(0.99)$"),
+            "bridge, self-paced, t=0.99": ("C1", "-", "self-paced, ImMAP2 est., $\\sigma(0.99)$"),
+            "bridge, self-paced corrected, t=0.99": ("C3", "-", "self-paced, corrected, $\\sigma(0.99)$"),
+            "bridge, open loop, sigma0=0.5": ("C7", ":", "open loop, $\\sigma_0=0.5$"),
+            "bridge, self-paced, sigma0=0.5": ("C1", ":", "self-paced, ImMAP2 est., $0.5$"),
+            "bridge, self-paced corrected, sigma0=0.5": ("C3", ":", "self-paced, corrected, $0.5$")}),
+    ]
+    fig, axes = plt.subplots(len(groups), len(panels), figsize=(15, 8))
+    for gi, (gname, runs) in enumerate(groups):
+        for pj, (key, title) in enumerate(panels):
+            ax = axes[gi, pj]
+            for label, (c, ls, name) in runs.items():
+                rows = res["runs"].get(label)
+                if rows is None:
+                    continue
+                pts = [(n, r[key]) for n, r in zip(nfe, rows) if r is not None]
+                ax.plot(*zip(*pts), color=c, ls=ls, marker="o", ms=3.5, lw=1.6, label=name)
+            if key == "detail_ratio":
+                ax.axhline(res["regression_detail"], color="gray", lw=0.8, ls=":")
+            ax.set_xscale("log")
+            ax.set_xticks(nfe)
+            ax.set_xticklabels([str(n) for n in nfe])
+            ax.xaxis.set_minor_formatter(NullFormatter())
+            ax.tick_params(labelsize=13)
+            ax.set_title(title if gi == 0 else "", fontsize=16)
+            if gi == len(groups) - 1:
+                ax.set_xlabel("NFE", fontsize=14)
+            if pj == 0:
+                ax.set_ylabel(gname, fontsize=14)
+        axes[gi, -1].legend(fontsize=12, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, "nfe_sweep.png"), dpi=150)
 
 
 def main():
