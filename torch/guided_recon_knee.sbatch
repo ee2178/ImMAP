@@ -13,18 +13,21 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-5           # MUST equal the cell count; checked at runtime
+#SBATCH --array=0-2           # MUST equal the cell count; checked at runtime
 #
 # THE KNEE R8 SWEEP: PDFS main contrast, PD guide (fully sampled). One training budget for every
 # cell. A cell is (main R, model, guide R):
 #
 #     python scripts/make_guided_recon_configs.py --list-cells
 #     0 lpdsnet_R8        LPDSNet, NO guide (unguided baseline)          task recon
-#     1 lggs_R8_g1        LGGS, Sljiva's grid point, pidistance (triton)  task recon
-#     2 tgvn_c12_R8_g1    TGVN, 12 cascades (E2E-VarNet width)           task recon
-#     3 tgvn_c10_R8_g1    TGVN, 10 cascades                              task recon
-#     4 tgvn_c8_R8_g1     TGVN,  8 cascades                              task recon
-#     5 tgvn_c6_R8_g1     TGVN,  6 cascades                              task recon
+#     1 lggs_R8_g1        vanilla LGGS, Sljiva's grid point (triton)     task recon
+#     2 tgvn_c6_R8_g1     TGVN, 6 cascades (E2E-VarNet width)            task recon
+#
+# 2026-11-13 (user's call): vanilla LGGS only (the guide-W / guide-conv / transfer variants showed
+# no visual difference) and TGVN at 6 cascades only (deeper TGVN is noticeably slower than LGGS);
+# tgvn_c12 / c10 / c8 still run by name. Added training noise U[0, 0.001] (NOISE=vlow, 10x below
+# the earlier "low") to cut the artifacts seen across the board; its own run tag, s3_noise-vlow,
+# so these are fresh runs, never resumes of the U[0, 0.01] ones in s3_noise-low.
 #
 # Runs land in trained_nets/guided_recon/knee/s3/<cell> (RUN_TAG "s3" in the generator): earlier
 # sets' run dirs (s1 shared 5e3 scale + eig-0.95 maps; s2 fixed per-contrast scale) are NOT resumed. Bridge starting points for i2sb-TGVN
@@ -51,7 +54,8 @@
 # One cell:        sbatch --array=1 torch/guided_recon_knee.sbatch          (lggs_R8_g1)
 # Other cells:     MODELS="tgvn_c8" GUIDE_ACCELS="1 2 4" sbatch --array=0-2 --export=ALL torch/guided_recon_knee.sbatch
 # Smoke test:      sbatch --array=0 --time=00:30:00 torch/guided_recon_knee.sbatch
-# Noise:           default U[0, 0.01] (low); NOISE=grid|none ... sbatch --export=ALL ... for U[0.01, 0.02] / none;
+# Noise:           default U[0, 0.001] (vlow); NOISE=low|grid|none ... sbatch --export=ALL ... for
+#                  U[0, 0.01] / U[0.01, 0.02] / none;
 #                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
 # Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
 # Multicontrast LGGS, no extra network: the knee LGGS cell with the guide's own W_phi, W_alpha
@@ -66,7 +70,8 @@
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
 ACCELS="${ACCELS:-8}"
-MODELS="${MODELS:-lpdsnet lggs tgvn_c12 tgvn_c10 tgvn_c8 tgvn_c6}"
+MODELS="${MODELS:-lpdsnet lggs tgvn_c6}"
+NOISE="${NOISE:-vlow}"          # added training noise U[0, 0.001]; see the header
 GUIDE_ACCELS="${GUIDE_ACCELS:-1}"
 REGENERATE="${REGENERATE:-1}"
 FORCE_RESTART="${FORCE_RESTART:-}"
@@ -81,7 +86,7 @@ mkdir -p torch/logs
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels ${GUIDE_ACCELS})
 if [ -n "${NOISE:-}" ]; then
-    GEN+=(--noise "${NOISE}")   # added noise preset: grid (default) | low | none; own run tag
+    GEN+=(--noise "${NOISE}")   # added noise preset: vlow (default here) | low | grid | none; own run tag
 fi
 CELLS="$("${GEN[@]}" --list-cells)"
 N_TOTAL="$(echo "${CELLS}" | wc -l)"

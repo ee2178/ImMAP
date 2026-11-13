@@ -1,0 +1,16 @@
+train (10000, 3, 32, 32)  test (10000, 3, 32, 32)  std(x0 - x1) = 0.202  tau_a = 0.101  tau_b = 0.303  device cuda
+[bridge_a] 1.94M params
+C:\Users\erice\Desktop\ImMAP\notes\immap_i2sb\equivalence_toy.py:662: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  m.load_state_dict(torch.load(os.path.join(args.out, "ckpt", f"{name}.pt"), map_location=dev))
+[edm] 1.94M params
+  I2SB: bridge, I2SB ladder                nfe   2  psnr_s 22.11  detail 0.325  (2.4s)
+  I2SB: bridge, I2SB ladder                nfe   3  psnr_s 21.96  detail 0.354  (3.6s)
+  I2SB: bridge, I2SB ladder                nfe   5  psnr_s 21.69  detail 0.403  (5.9s)
+  I2SB: bridge, I2SB ladder                nfe  10  psnr_s 21.26  detail 0.489  (11.9s)
+  I2SB: bridge, I2SB ladder                nfe  20  psnr_s 20.80  detail 0.586  (24.5s)
+  I2SB: bridge, I2SB ladder                nfe  50  psnr_s 20.30  detail 0.708  (61.8s)
+  bridge, Karras from noise                nfe   2  psnr_s 22.31  detail 0.294  (2.5s)
+  bridge, Karras from noise                nfe   3  psnr_s 22.07  detail 0.351  (3.8s)
+  bridge, Karras from noise                nfe   5  psnr_s 21.95  detail 0.372  (6.1s)
+  bridge, Karras from noise                nfe  10  psnr_s 21.48  detail 0.464  (12.4s)
+  bridge, Karras from noise                nfe  20  psnr_s 20.99  detail 0.565  (24.6s)

@@ -470,8 +470,7 @@ def test_generator_cells_and_config_keys():
     assert gen.LGGS_PARAMS == lggs_defaults(attn_backend="triton")[0]
     assert gen.LGGS_PARAMS["sim_fun"] == "pidistance"
     names = [gen.cell_name(*c) for c in gen.cells()]
-    assert names == ["lpdsnet_R8", "lggs_R8_g1", "tgvn_c12_R8_g1", "tgvn_c10_R8_g1",
-                     "tgvn_c8_R8_g1", "tgvn_c6_R8_g1"], names
+    assert names == ["lpdsnet_R8", "lggs_R8_g1", "tgvn_c6_R8_g1"], names
     bridge = [f"sbtgvn_c8_{s}" for s in gen.BRIDGE_STARTS] + \
         [f"sblggs_{s}" for s in gen.BRIDGE_STARTS]
     assert [gen.cell_name(8, m, 1) for m in bridge] == [

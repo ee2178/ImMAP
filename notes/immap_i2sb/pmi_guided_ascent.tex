@@ -32,17 +32,16 @@
 \newcommand{\Id}{\bm{I}}
 \newcommand{\Op}{\bm{E}}
 \newcommand{\grad}{\nabla}
-\newcommand{\Cov}{\operatorname{Cov}}
 \newcommand{\PMI}{\operatorname{PMI}}
+\newcommand{\ssb}{\sigma_{\mathrm{sb}}}
 \newcommand{\code}[1]{\texttt{#1}}
-% the conditional expectations
 \newcommand{\Dz}{D_{\varnothing}}
 \newcommand{\Dg}{D_{\x_1}}
 \newcommand{\Dy}{D_{\y}}
 \newcommand{\Dgy}{D_{\x_1,\y}}
 
 \title{Guided ImMAP ascent:\\[2pt]
-       \large one gradient step, a chain of conditional expectations}
+       \large MAP with side information, one conditional expectation at a time}
 \author{ImMAP project notes}
 \date{November 2026}
 
@@ -50,208 +49,160 @@
 \maketitle
 
 \begin{abstract}
-We want a target image $\x_0$ given side information: a paired source image $\x_1$, a
-measurement $\y$, or both. The log-posterior splits along any order in which the side
-information is revealed. It becomes the target prior plus one pointwise mutual information
-(PMI) term per revealed variable, conditional on what was revealed before. This split survives
-Gaussian smoothing exactly. By Tweedie's formula, the gradient of each PMI term is the
-difference of the two conditional expectations it links. So one ascent step,
-$\uu^+ = (1-h)\uu + h\vv$, handles any combination of guide and measurement. The estimate
-$\vv = D_{\cc_0} + \sum_k w_k(D_{\cc_k} - D_{\cc_{k-1}})$ is a weighted telescoping sum of
-denoisers $D_{\cc}(\uu) = \E[\x_0\mid\uu,\cc]$. The algorithms below assume nothing about how
-each expectation is computed: a trained network, an approximation, or an oracle. We give the
-weights that guarantee ascent, and show that I$^2$SB, I$^2$SB-Recon, SDEdit and
-classifier-free guidance differ only in the conditioning chain, the weights and the step size.
+We want the MAP estimate of a target image $\x_0$ given all available side information: a
+guide image $\x_1$ (a paired scan, typically of another contrast), a measurement $\y$, or
+both. Revealing the side information one variable at a time splits the log-posterior exactly
+into the target prior plus one pointwise mutual information (PMI) term per variable, and each
+PMI term is a likelihood. The split survives Gaussian smoothing, and by Tweedie's formula the
+gradient of each term is the difference of two conditional expectations. So a single ascent
+step handles any set of side information. The chain matters in practice because it says how
+to \emph{build} the needed expectation from the ones we can estimate: e.g.\ $\E[\x_0\mid
+\uu,\x_1,\y]$ from a guide-conditioned network plus a data step. I$^2$SB, I$^2$SB-Recon,
+ImMAP2 and SDEdit are this one ascent with different conditioning sets, estimators and step
+schedules.
 \end{abstract}
 
-\paragraph{Setting.} Real vectors in $\R^n$; the complex case follows as in the main note on
-ImMAP-SB. Pairs $(\x_0,\x_1)$ have joint law $p(\x_0,\x_1)$. The measurement is
-$\y = \Op\x_0 + \nn$ with $\nn$ independent of $(\x_0,\x_1)$; nothing below uses its form.
-$\varphi_\sigma$ is the $\N(\bm0,\sigma^2\Id)$ density and $\uu = \x_0 + \sigma\eps$, with
-$\eps$ independent of $(\x_0,\x_1,\y)$. On the bridge, $\uu$ is the debiased state
-$(\x_t - t\x_1)/(1-t)$ at $\sigma^2 = Vt/(1-t)$.
-
-\paragraph{Conditional expectations.} For any conditioning variable $\cc$ (a subset of
-$\{\x_1,\y\}$, possibly empty),
+\paragraph{Setting.} Real vectors in $\R^n$ (the complex case is identical with Wirtinger
+gradients). Pairs $(\x_0,\x_1)$ have a joint law; the measurement is $\y = \Op\x_0 + \nn$,
+$\nn\sim\N(\bm0,\sigma_n^2\Id)$, independent of $(\x_0,\x_1)$, so $\y$ and $\x_1$ are
+conditionally independent given $\x_0$. $\uu = \x_0 + \sigma\eps$ with $\eps\sim\N(\bm0,\Id)$
+independent of everything else; on the bridge it is the debiased state
+$(\x_t - t\x_1)/(1-t)$ at $\sigma^2 = Vt/(1-t)$. For a set $\cc\subseteq\{\x_1,\y\}$ of
+conditioning variables,
 \[
-  D_{\cc}(\uu) \coloneqq \E[\x_0\mid\uu,\cc],\qquad\text{at the current noise level }\sigma .
+  D_{\cc}(\uu) \coloneqq \E[\x_0\mid\uu,\cc]\quad\text{at the current noise level } \sigma .
 \]
-The four that appear are $\Dz = \E[\x_0\mid\uu]$, $\Dg = \E[\x_0\mid\uu,\x_1]$,
-$\Dy = \E[\x_0\mid\uu,\y]$ and $\Dgy = \E[\x_0\mid\uu,\x_1,\y]$. The derivation treats each as
-exact. In practice each is replaced by an estimator (Section~\ref{sec:estimators}), and the
-algorithms do not depend on which.
 
 %=============================================================================================
-\section{The objective along a conditioning chain}
+\section{The objective}
 %=============================================================================================
 
-Reveal the side information in some order, giving a nested chain
-$\cc_0\subset\cc_1\subset\dots\subset\cc_K$ with $\cc_0$ the variables that are always
-conditioned on (often none). Repeated Bayes gives the exact telescoping identity
+Given side information $\cc$, the goal is
 \begin{equation}
-  \log p(\x_0\mid\cc_K) = \log p(\x_0\mid\cc_0)
-  + \sum_{k=1}^K \underbrace{\log\frac{p(\x_0\mid\cc_k)}{p(\x_0\mid\cc_{k-1})}}
-    _{\PMI(\x_0;\,\cc_k\setminus\cc_{k-1}\,\mid\,\cc_{k-1})}.
-  \label{eq:chain}
+  \hat\x_0 = \arg\max_{\x_0}\ \log p(\x_0\mid\cc),
+  \qquad \cc\in\big\{\varnothing,\ \{\x_1\},\ \{\y\},\ \{\x_1,\y\}\big\}.
+  \label{eq:map}
 \end{equation}
-Each term is the pointwise mutual information between the target and the newly revealed
-variable, given what was already known. We weight each term and maximise
-\begin{equation}
-  \max_{\x_0}\ \log p(\x_0\mid\cc_0) + \sum_{k=1}^K w_k\,
-  \PMI(\x_0;\cc_k\setminus\cc_{k-1}\mid\cc_{k-1}),
-  \label{eq:guided}
-\end{equation}
-where $w_k = 1$ for all $k$ is the posterior given $\cc_K$, $w_k = 0$ ignores the $k$-th
-variable, and $w_k>1$ over-weights it as in classifier-free guidance~\cite{ho2021}. The two
-chains used here:
-\begin{itemize}[leftmargin=1.5em, itemsep=2pt]
-  \item \textbf{No measurement:} $\varnothing\subset\{\x_1\}$, i.e.\
-        $\log p(\x_0) + w\,\PMI(\x_0;\x_1)$.
-  \item \textbf{With measurement:} $\varnothing\subset\{\x_1\}\subset\{\x_1,\y\}$, i.e.\
-        $\log p(\x_0) + w\,\PMI(\x_0;\x_1) + w_y\,\PMI(\x_0;\y\mid\x_1)$.
-        The other order, $\varnothing\subset\{\y\}\subset\{\x_1,\y\}$, gives the same
-        posterior at unit weights but a different family when the weights differ.
-\end{itemize}
+We always condition on every independent source of information available. A variable that is
+a function of others adds nothing: e.g.\ the zero-filled image $\Op^H\y$ is a function of
+$\y$, so conditioning on it as well as $\y$ is conditioning on $\y$. A guide scan is not, so
+$p(\x_0\mid\x_1,\y)\ne p(\x_0\mid\y)$ in general.
+
+%=============================================================================================
+\section{Decomposing along a chain}
+%=============================================================================================
+
+Reveal the variables of $\cc$ one at a time, in some order. With two variables, guide first:
+\begin{align}
+  \log p(\x_0\mid\x_1,\y)
+  &= \log p(\x_0)
+   + \underbrace{\log\frac{p(\x_0\mid\x_1)}{p(\x_0)}}_{\PMI(\x_0;\,\x_1)}
+   + \underbrace{\log\frac{p(\x_0\mid\x_1,\y)}{p(\x_0\mid\x_1)}}_{\PMI(\x_0;\,\y\mid\x_1)}
+  \label{eq:chain}\\
+  &= \log p(\x_0) + \log p(\x_1\mid\x_0) + \log p(\y\mid\x_0) + \mathrm{const}.
+  \label{eq:likelihoods}
+\end{align}
+\eqref{eq:chain} is an identity: the ratios telescope. Each PMI term measures how much the
+newly revealed variable says about $\x_0$, given what was revealed before. In
+\eqref{eq:likelihoods} each becomes a likelihood, by Bayes,
+$\PMI(\x_0;\bm a\mid\bm b) = \log p(\bm a\mid\x_0,\bm b) - \log p(\bm a\mid\bm b)$, where the
+last term does not depend on $\x_0$, and by the conditional independence
+$p(\y\mid\x_0,\x_1) = p(\y\mid\x_0)$. So the objective is
+\begin{center}
+  \emph{target prior} $+$ \emph{guide likelihood} $+$ \emph{measurement likelihood},
+\end{center}
+whichever order the variables are revealed in, and dropping a variable drops its term. With
+one variable the chain has one step, and with none \eqref{eq:map} is the prior alone.
+
+The order does not change the objective. It changes the intermediate conditional
+expectations that appear below, i.e.\ which estimators the gradient is assembled from:
+guide-first uses $\Dz,\Dg,\Dgy$; measurement-first uses $\Dz,\Dy,\Dgy$.
 
 %=============================================================================================
 \section{Smoothing, and the gradient}
 %=============================================================================================
 
-As in ImMAP, we ascend the Gaussian smoothing of the objective while lowering the smoothing.
-Write $p_\sigma(\uu\mid\cc) = \int\varphi_\sigma(\uu-\x)\,p(\x\mid\cc)\,d\x$ for the law of the
-noisy target given $\cc$, and
-\begin{equation}
-  J_\sigma(\uu) \coloneqq \log p_\sigma(\uu\mid\cc_0)
-  + \sum_{k=1}^K w_k\,\log\frac{p_\sigma(\uu\mid\cc_k)}{p_\sigma(\uu\mid\cc_{k-1})}.
-  \label{eq:J}
-\end{equation}
+As in ImMAP, we ascend a Gaussian smoothing of the objective while lowering the smoothing. Let
+$p_\sigma(\uu\mid\cc) = \int\varphi_\sigma(\uu-\x)\,p(\x\mid\cc)\,d\x$, the law of the noisy
+target given $\cc$, and
+\[
+  J_\sigma(\uu) \coloneqq \log p_\sigma(\uu\mid\cc),\qquad J_\sigma\to\log p(\cdot\mid\cc)
+  \ \text{as}\ \sigma\to0 .
+\]
 
-\begin{proposition}[The chain survives smoothing]\label{prop:split}
-Each ratio in \eqref{eq:J} is the PMI between the \emph{noisy} target $\uu$ and the newly
-revealed variable given $\cc_{k-1}$. At unit weights
-$J_\sigma = \log p_\sigma(\uu\mid\cc_K)$, and $J_\sigma\to$ \eqref{eq:guided} as $\sigma\to0$.
+\begin{proposition}[The chain survives smoothing; each term is a difference of expectations]
+\label{prop:grad}
+Along the chain $\varnothing\subset\cc_1\subset\dots\subset\cc_K = \cc$,
+\begin{equation}
+  J_\sigma(\uu) = \log p_\sigma(\uu)
+  + \sum_{k=1}^K \log\frac{p_\sigma(\uu\mid\cc_k)}{p_\sigma(\uu\mid\cc_{k-1})},
+  \qquad
+  \sigma^2\grad J_\sigma(\uu) = \underbrace{\Dz + \sum_{k=1}^K\big(D_{\cc_k}-D_{\cc_{k-1}}\big)}
+  _{=\ D_{\cc}(\uu)} -\ \uu ,
+  \label{eq:grad}
+\end{equation}
+and each ratio is the PMI between the \emph{noisy} target $\uu$ and the $k$-th variable.
 \end{proposition}
 \begin{proof}
-Since $\eps$ is independent of all side information, Bayes applies to $(\uu,\cc_k)$ exactly as
-to $(\x_0,\cc_k)$, and each ratio equals
-$p(\cc_k\setminus\cc_{k-1}\mid\uu,\cc_{k-1})/p(\cc_k\setminus\cc_{k-1}\mid\cc_{k-1})$. At unit
-weights the sum telescopes. As $\sigma\to0$, $p_\sigma(\cdot\mid\cc)\to p(\cdot\mid\cc)$.
+The telescoping is the same as in \eqref{eq:chain}, with $\uu$ in place of $\x_0$; Bayes applies
+to $(\uu,\cc_k)$ because $\eps$ is independent of the side information. Tweedie's formula,
+$\sigma^2\grad\log p_\sigma(\uu\mid\cc_k) = D_{\cc_k}(\uu) - \uu$, holds for any such $\cc_k$
+(differentiate the convolution under the integral). Apply it to every term; the $-\uu$'s cancel
+inside each ratio.
 \end{proof}
 
-The smoothed terms are not the unsmoothed ones evaluated at a noisy image. For the
-measurement, for instance,
-$p(\y\mid\uu,\x_1) = \int p(\y\mid\x)\,p(\x\mid\uu,\x_1)\,d\x$: the likelihood averaged over
-the targets that the noisy state still allows. It is weak at large $\sigma$ and sharpens to
-$p(\y\mid\uu)$ as $\sigma\to0$.
+\emph{What a variable contributes to the gradient is how far revealing it moves the
+conditional expectation}, $D_{\cc_k} - D_{\cc_{k-1}}$; it vanishes when the variable is
+uninformative given the others. Summed, the chain gives back $D_{\cc}$, so with an estimator of
+$D_{\cc}$ itself nothing else is needed. The decomposition earns its keep when $D_{\cc}$ is
+\emph{not} directly available: then one estimates a less-conditioned expectation and adds the
+last increment separately. That is exactly what a data-consistency step does,
+\[
+  \Dgy = \Dg + \underbrace{(\Dgy - \Dg)}_{\text{measurement term}},
+\]
+with the increment estimated from the measurement model (Section~\ref{sec:estimators}).
 
-\begin{proposition}[Each information term is a difference of expectations]\label{prop:grad}
-\begin{equation}
-  \sigma^2\grad J_\sigma(\uu) = \vv - \uu,\qquad
-  \vv = D_{\cc_0}(\uu) + \sum_{k=1}^K w_k\,\big(D_{\cc_k}(\uu) - D_{\cc_{k-1}}(\uu)\big).
-  \label{eq:v}
-\end{equation}
-\end{proposition}
-\begin{proof}
-Tweedie's formula, $\sigma^2\grad\log p_\sigma(\uu\mid\cc) = D_{\cc}(\uu) - \uu$, holds for any
-$\cc$ independent of $\eps$ (differentiate the convolution under the integral). Apply it to
-every log-density in \eqref{eq:J}; the $-\uu$ terms cancel inside each ratio.
-\end{proof}
-
-\emph{The information a variable carries about the target, at noise level $\sigma$, is how far
-revealing it moves the conditional expectation.} The term vanishes when the variable is
-uninformative given the rest. Equivalently, regrouping \eqref{eq:v} with
-$w_0 \coloneqq 1$ and $w_{K+1}\coloneqq 0$,
-\begin{equation}
-  \vv = \sum_{k=0}^{K} a_k\,D_{\cc_k}(\uu),\qquad a_k = w_k - w_{k+1},\qquad \sum_k a_k = 1,
-  \label{eq:affine}
-\end{equation}
-an affine combination of the conditional expectations along the chain. The two chains give
-\begin{align}
-  \text{no measurement:}\quad & \vv = \Dz + w\,(\Dg - \Dz)
-    = (1-w)\,\Dz + w\,\Dg, \label{eq:v_nomeas}\\
-  \text{with measurement:}\quad & \vv = \Dz + w\,(\Dg - \Dz) + w_y\,(\Dgy - \Dg)
-    \label{eq:v_meas}\\
-  & \phantom{\vv} = (1-w)\,\Dz + (w-w_y)\,\Dg + w_y\,\Dgy . \nonumber
-\end{align}
-At unit weights only the last expectation survives: $\vv = \Dg$ without a measurement and
-$\vv = \Dgy$ with one.
+The smoothed terms are not the unsmoothed likelihoods at a noisy image. The measurement term,
+for instance, involves $p(\y\mid\uu,\x_1) = \int p(\y\mid\x)\,p(\x\mid\uu,\x_1)\,d\x$: the
+likelihood averaged over the targets the noisy state still allows. It is weak at large $\sigma$
+and sharpens to $p(\y\mid\x_0)$ as $\sigma\to0$.
 
 %=============================================================================================
-\section{The gradient step, and when it ascends}
+\section{The step}
 %=============================================================================================
 
-Gradient ascent on $J_\sigma$ with step size $h\sigma^2$ is, by \eqref{eq:v},
+Gradient ascent on $J_\sigma$ with step size $h\sigma^2$ is, by \eqref{eq:grad},
 \begin{equation}
-  \boxed{\;\uu^+ = \uu + h\sigma^2\grad J_\sigma(\uu) = (1-h)\,\uu + h\,\vv .\;}
+  \boxed{\;\uu^+ = \uu + h\sigma^2\grad J_\sigma(\uu) = (1-h)\,\uu + h\,\vv,
+  \qquad \vv = D_{\cc}(\uu).\;}
   \label{eq:step}
 \end{equation}
-Written out, the step moves along a sum of independent pulls, one per term of the objective:
-\[
-  \uu^+ - \uu = h\,\big(D_{\cc_0} - \uu\big) + \sum_{k=1}^K h\,w_k\,\big(D_{\cc_k} -
-  D_{\cc_{k-1}}\big),
-\]
-where the first pulls toward the always-known conditional mean, and the $k$-th by what the
-$k$-th variable adds.
+By Tweedie's second-order identity, $-\grad^2 J_\sigma = (\sigma^2\Id -
+\operatorname{Cov}[\x_0\mid\uu,\cc])/\sigma^4\preceq\sigma^{-2}\Id$, so every
+$h\in(0,2)$ increases $J_\sigma$ (descent lemma), whatever $\cc$ is.
 
-\begin{proposition}[Ascent]\label{prop:ascent}
-Let $R$ bound the support radius of $p(\x_0\mid\cc_0)$, and let $a_k$ be as in
-\eqref{eq:affine}. Then $-\grad^2 J_\sigma\preceq L\Id$ with
+The step runs inside the ImMAP continuation~\cite{ks2021}: after each step, fresh noise is
+injected so that the iterate is again a noisy target at the next, smaller level. With the
+contraction $\sigma' = (1-\beta h)\sigma$, $\beta\in(0,1]$, an accurate step leaves noise
+$(1-h)\sigma$, so the injection is
 \begin{equation}
-  L = \frac{\sigma^2 + R^2\sum_{k:\,a_k<0}|a_k|}{\sigma^4},
-  \label{eq:L}
-\end{equation}
-and every step with $0<h\sigma^2<2/L$ increases $J_\sigma$:
-$J_\sigma(\uu^+)\ge J_\sigma(\uu) + h\sigma^2(1-\tfrac12h\sigma^2L)\|\grad J_\sigma(\uu)\|^2$.
-In particular, if the weights are non-increasing along the chain,
-$1\ge w_1\ge\dots\ge w_K\ge0$, then all $a_k\ge0$, $L = \sigma^{-2}$, and every $h\in(0,2)$
-ascends.
-\end{proposition}
-\begin{proof}
-By \eqref{eq:J}, $J_\sigma = \sum_k a_k\log p_\sigma(\uu\mid\cc_k)$. Tweedie's second-order
-identity gives $\grad^2\log p_\sigma(\uu\mid\cc) = (C_{\cc} - \sigma^2\Id)/\sigma^4$ with
-$C_{\cc} = \Cov[\x_0\mid\uu,\cc]\succeq0$. Hence
-$-\grad^2J_\sigma = (\sigma^2\Id - \sum_k a_kC_{\cc_k})/\sigma^4$, using $\sum_ka_k = 1$. Drop
-the terms with $a_k\ge0$ and bound $C_{\cc_k}\preceq R^2\Id$ in the others. The inequality is
-the descent lemma along $h\sigma^2\grad J_\sigma$.
-\end{proof}
-
-Over-weighting a variable ($w_k > w_{k-1}$) makes some $a_k$ negative: $J_\sigma$ then pushes
-\emph{away} from a less-conditioned expectation. The safe step shrinks by
-$R^2\sum|a_k|/\sigma^2$, most at small $\sigma$, so a guidance weight is best kept for the
-large-$\sigma$ part of the anneal.
-
-%=============================================================================================
-\section{The algorithms}
-%=============================================================================================
-
-The step \eqref{eq:step} runs inside the ImMAP continuation~\cite{ks2021}. After each step,
-fresh noise is injected so that the iterate is again a noisy target at the next, smaller level,
-and $\sigma$ is lowered. With the contraction $\sigma' = (1-\beta h)\sigma$, $\beta\in(0,1]$,
-an accurate step leaves noise $(1-h)\sigma\eps$, so the injection is
-\begin{equation}
-  \gamma = \sqrt{(1-\beta h)^2 - (1-h)^2}\;\sigma .
+  \gamma = \sigma\sqrt{(1-\beta h)^2 - (1-h)^2}.
   \label{eq:inject}
 \end{equation}
-$\beta = 1$ injects nothing and ascends deterministically toward the MAP estimate; $\beta<1$
-samples. Algorithm~\ref{alg:generic} is the general form. Algorithms~\ref{alg:nomeas}
-and~\ref{alg:meas} are its two instances, written out. Every $D$ is a call to whatever
-estimates that conditional expectation.
+$\beta = 1$ injects nothing (a deterministic continuation toward the MAP estimate); $\beta<1$
+samples the posterior.
 
 \begin{algorithm}[H]
-\caption{Guided ImMAP ascent, general conditioning chain}
+\caption{Guided ImMAP ascent for $\max_{\x_0}\log p(\x_0\mid\cc)$}
 \label{alg:generic}
 \begin{algorithmic}[1]
-\Require chain $\cc_0\subset\dots\subset\cc_K$; estimators of $D_{\cc_k}(\uu) =
-         \E[\x_0\mid\uu,\cc_k]$; weights $w_1,\dots,w_K$; start $\uu_0$ at level $\sigma_0$;
-         $\beta\in(0,1]$; steps $h_k$ (Prop.~\ref{prop:ascent}); $\sigma_{\min}$
+\Require side information $\cc$; an estimator of $D_{\cc}(\uu) = \E[\x_0\mid\uu,\cc]$ (directly,
+         or assembled along a chain, \eqref{eq:grad}); start $\uu_0$ at level $\sigma_0$;
+         steps $h_k\in(0,2)$; $\beta\in(0,1]$; $\sigma_{\min}$
 \State $\uu\gets\uu_0$, $\sigma\gets\sigma_0$
 \While{$\sigma>\sigma_{\min}$}
-  \State $\vv \gets D_{\cc_0}(\uu)$ \Comment{$\E[\x_0\mid\uu,\cc_0]$}
-  \For{$k = 1,\dots,K$}
-    \State $\vv \gets \vv + w_k\,\big(D_{\cc_k}(\uu) - D_{\cc_{k-1}}(\uu)\big)$
-           \Comment{$+\,w_k\,\sigma^2\grad\PMI_\sigma(\uu;\cc_k\setminus\cc_{k-1}\mid\cc_{k-1})$}
-  \EndFor
-  \Comment{now $\vv = \uu + \sigma^2\grad J_\sigma(\uu)$}
+  \State $\vv \gets D_{\cc}(\uu)$
+         \Comment{$=\uu + \sigma^2\grad J_\sigma(\uu)$}
   \State $\uu \gets (1-h)\,\uu + h\,\vv + \gamma\,\zz$, \ $\zz\sim\N(\bm0,\Id)$
          \Comment{step \eqref{eq:step}, injection \eqref{eq:inject}}
   \State $\sigma \gets (1-\beta h)\,\sigma$
@@ -260,292 +211,217 @@ estimates that conditional expectation.
 \end{algorithmic}
 \end{algorithm}
 
-\noindent Expectations with weight-difference $a_k = 0$ need not be evaluated: at unit weights
-the loop reduces to the single call $\vv\gets D_{\cc_K}(\uu)$.
-
-\begin{algorithm}[H]
-\caption{\textbf{No measurement}: maximise $\log p(\x_0) + w\,\PMI(\x_0;\x_1)$}
-\label{alg:nomeas}
-\begin{algorithmic}[1]
-\Require source $\x_1$; estimators of $\Dz$ and $\Dg$; weight $w$; $\uu_0$, $\sigma_0$,
-         $\beta$, $h_k$, $\sigma_{\min}$
-\State $\uu\gets\uu_0$, $\sigma\gets\sigma_0$
-\While{$\sigma>\sigma_{\min}$}
-  \State $\vv_{\varnothing} \gets \Dz(\uu)$ \Comment{$\E[\x_0\mid\uu]$
-         \hfill (skip if $w=1$)}
-  \State $\vv_{1} \gets \Dg(\uu)$ \Comment{$\E[\x_0\mid\uu,\x_1]$}
-  \State $\vv \gets \vv_{\varnothing} + w\,(\vv_1 - \vv_{\varnothing})$
-         \Comment{prior pull $+$ $w\times$ guide information}
-  \State $\uu \gets (1-h)\,\uu + h\,\vv + \gamma\,\zz$;\quad $\sigma \gets (1-\beta h)\,\sigma$
-\EndWhile
-\State \Return $\vv$
-\end{algorithmic}
-\end{algorithm}
-
-\begin{algorithm}[H]
-\caption{\textbf{With measurement}: maximise $\log p(\x_0) + w\,\PMI(\x_0;\x_1) +
-w_y\,\PMI(\x_0;\y\mid\x_1)$}
-\label{alg:meas}
-\begin{algorithmic}[1]
-\Require source $\x_1$; measurement $\y$; estimators of $\Dz$, $\Dg$ and $\Dgy$; weights
-         $w, w_y$; $\uu_0$, $\sigma_0$, $\beta$, $h_k$, $\sigma_{\min}$
-\State $\uu\gets\uu_0$, $\sigma\gets\sigma_0$
-\While{$\sigma>\sigma_{\min}$}
-  \State $\vv_{\varnothing} \gets \Dz(\uu)$ \Comment{$\E[\x_0\mid\uu]$
-         \hfill (skip if $w=1$)}
-  \State $\vv_{1} \gets \Dg(\uu)$ \Comment{$\E[\x_0\mid\uu,\x_1]$
-         \hfill (skip if $w = w_y$)}
-  \State $\vv_{1y} \gets \Dgy(\uu)$ \Comment{$\E[\x_0\mid\uu,\x_1,\y]$}
-  \State $\vv \gets \vv_{\varnothing} + w\,(\vv_1 - \vv_{\varnothing})
-         + w_y\,(\vv_{1y} - \vv_1)$
-         \Comment{prior $+$ guide $+$ measurement information}
-  \State $\uu \gets (1-h)\,\uu + h\,\vv + \gamma\,\zz$;\quad $\sigma \gets (1-\beta h)\,\sigma$
-\EndWhile
-\State \Return $\vv$
-\end{algorithmic}
-\end{algorithm}
-
-\noindent The two algorithms share the step, the injection and the anneal. They differ only in
-how many conditional expectations enter $\vv$, and with which weights. A natural start is
-$\uu_0 = D_{\cc_K}$ evaluated at $\sigma=\infty$ (e.g.\ $\E[\x_0\mid\x_1]$), re-noised to
-$\sigma_0$.
+\noindent A natural start is the posterior mean, $D_{\cc}$ at $\sigma = \infty$, i.e.\
+$\E[\x_0\mid\cc]$, re-noised to $\sigma_0$. An end-to-end reconstruction network (TGVN, LGGS)
+that regresses $\E[\x_0\mid\y,\x_1]$ in one shot is exactly that start: the first step of the
+ascent, without the rest.
 
 %=============================================================================================
-\section{I\texorpdfstring{$^2$}{2}SB as an instance}\label{sec:i2sb}
+\section{Estimating the expectations}\label{sec:estimators}
 %=============================================================================================
 
-I$^2$SB~\cite{liu2023} is Algorithm~\ref{alg:nomeas} with every choice fixed. Two are about
-\emph{what} is estimated, the rest are hyperparameters.
+The algorithm consumes $D_{\cc}$ and is indifferent to its source:
+\begin{itemize}[leftmargin=1.5em, itemsep=2pt]
+  \item $\Dz$: a target-only denoiser, trained with the squared loss on $(\uu,\x_0)$.
+  \item $\Dg$: the paired bridge regressor, trained with the squared loss on bridge states and
+        called on $\x_t = (1-t)\uu + t\x_1$ at $t = \sigma^2/(\sigma^2+V)$.
+  \item $\Dgy$, learned: a bridge regressor that also sees $(\y,\Op)$ and the guide (SB-TGVN,
+        BridgeLGGS).
+  \item $\Dgy$ (or $\Dy$) from $\Dg$ (or $\Dz$) by a \textbf{data step}: approximate the
+        posterior given $\uu$ and the other variables by $\N(D, \varsigma^2\Id)$ around the
+        estimator's output $D$; with the Gaussian likelihood, the posterior mean given $\y$ too
+        is the proximal point
+        \begin{equation}
+          (\Op^H\Op + \lambda\Id)^{-1}(\Op^H\y + \lambda D),\qquad
+          \lambda = \sigma_n^2/\varsigma^2,
+          \label{eq:prox}
+        \end{equation}
+        solved by CG warm-started at $D$. Since the posterior variance is at most $\sigma^2$ on
+        average ($\E\|\x_0 - D\|^2 = \mathrm{mmse}(\sigma)\le n\sigma^2$), the principled
+        weight follows the noise level, $\lambda(\sigma) = \sigma_n^2/(c\sigma^2)$, $c\le1$.
+\end{itemize}
 
-\paragraph{Conditioning.} The chain is $\varnothing\subset\{\x_1\}$ with $w = 1$, so by
-\eqref{eq:v_nomeas} $\vv = \Dg(\uu) = \E[\x_0\mid\uu,\x_1]$. The target-only expectation
-$\Dz$ has weight $1-w = 0$ and is never evaluated. The objective is the conditional prior
-$\log p(\x_0\mid\x_1)$; nothing is over- or under-weighted.
+%=============================================================================================
+\section{Worked case: standard I\texorpdfstring{$^2$}{2}SB}\label{sec:i2sb}
+%=============================================================================================
 
-\paragraph{Estimator.} $\Dg$ is the paired bridge regressor, trained with the squared loss.
-It is called on the bridge state: $\Dg(\uu) = D_\theta(\x_t,t,\x_1)$ with
-$\x_t = (1-t)\uu + t\x_1$ and $t = \sigma^2/(\sigma^2+V)$.
+The source image $\x_1$ is the only side information; there is no measurement.
 
-\paragraph{Noise ladder.} Fixed in advance: $\text{NFE}+1$ bridge times
-$1 = t_0 > t_1 > \dots > t_K = 0$, uniform in the discrete step index, and
-$\sigma_k = \sigma(t_k)$, $\sigma^2(t) = Vt/(1-t)$. So the ladder runs from $\sigma_0 = \infty$
-to $\sigma_K = 0$, and $V = 4\tau^2$ sets its scale.
-
-\paragraph{Step size and injection.} With $r_k = \sigma_{k+1}/\sigma_k$, the step removes
-exactly the variance between consecutive rungs, and $\beta$ is set so that the contraction
-lands on the next rung:
-\begin{equation}
-  h_k = 1 - r_k^2 \quad\big(h_k\sigma_k^2 = \sigma_k^2 - \sigma_{k+1}^2\big),\qquad
-  \beta_k = \frac{1}{1+r_k},\qquad \gamma_k^2 = \sigma_{k+1}^2\,(1-r_k^2).
-  \label{eq:i2sb_hyper}
-\end{equation}
-
-\begin{proposition}[I$^2$SB's reverse step]\label{prop:i2sb}
-With \eqref{eq:i2sb_hyper}, one step of Algorithm~\ref{alg:nomeas} at $w=1$ is
+\paragraph{The objective.} $\cc = \{\x_1\}$, and the chain $\varnothing\subset\{\x_1\}$ has
+one step:
 \[
-  \uu_{k+1} = r_k^2\,\uu_k + (1-r_k^2)\,\Dg(\uu_k) + \sigma_{k+1}\sqrt{1-r_k^2}\,\zz,
+  \max_{\x_0}\ \log p(\x_0\mid\x_1)
+  = \log p(\x_0) + \underbrace{\log p(\x_1\mid\x_0)}_{\PMI(\x_0;\,\x_1)\,+\,\mathrm{const}} .
 \]
-which in bridge coordinates is I$^2$SB's reverse (DDPM-posterior) step. At the two ends:
-the first step ($\sigma_0=\infty$, $r_0=0$) is $\uu_1 = \E[\x_0\mid\x_1] + \sigma_1\zz$, so
-I$^2$SB's ``start at $\x_1$'' is the warm start of Algorithm~\ref{alg:nomeas}, and the starting
-$\uu_0$ is irrelevant. The last step ($\sigma_K = 0$, $r_{K-1} = 0$) returns
-$\vv = \Dg(\uu_{K-1})$ with no injected noise.
-\end{proposition}
-\begin{proof}
-$1-\beta_kh_k = 1-(1-r_k)(1+r_k)/(1+r_k) = r_k$, so $\sigma_{k+1} = r_k\sigma_k$ as required,
-and $\gamma_k^2 = [r_k^2 - r_k^4]\sigma_k^2 = \sigma_{k+1}^2(1-r_k^2)$. Substituting in
-\eqref{eq:step} gives the displayed step. Mapping both sides to
-$\x = (1-t)\uu + t\x_1$ gives I$^2$SB's posterior mean $(1-\tfrac st)\Dg + \tfrac st\x_t$ and
-variance $V\tfrac{s(t-s)}{t}$, as shown in the main note (proposition \emph{I$^2$SB}). At
-$r=0$: $h=1$ removes the current state entirely, and $\gamma = \sigma_{k+1}$.
-\end{proof}
+A target that is plausible on its own and consistent with this particular source. Smoothed
+and differentiated (Proposition~\ref{prop:grad}),
+\[
+  \sigma^2\grad J_\sigma(\uu)
+  = \underbrace{\big(\Dz - \uu\big)}_{\text{prior pull}}
+  + \underbrace{\big(\Dg - \Dz\big)}_{\text{what } \x_1 \text{ adds}}
+  = \Dg(\uu) - \uu .
+\]
+I$^2$SB never splits the two pulls: its network estimates their sum, $\Dg$, directly.
 
-\paragraph{I$^2$SB-Recon.} The same, one level further down the chain:
-$\varnothing\subset\{\x_1\}\subset\{\x_1,\y\}$ with $w = w_y = 1$, so
-$\vv = \Dgy = \E[\x_0\mid\uu,\x_1,\y]$, with the ladder, step sizes and injection of
-\eqref{eq:i2sb_hyper}. The only new choice is the estimator: $\Dgy$ is obtained from $\Dg$ by
-7 CG iterations on the proximal problem with $\lambda = 7\cdot10^{-5}$
-(Section~\ref{sec:estimators}). When $\x_1 = \Op^H\y$ (the zero-filled start), $\x_1$ is a
-sufficient statistic for $\x_0$ given $\y$, so $\Dgy = \Dg$ exactly. Then the measurement
-term $\PMI(\x_0;\y\mid\x_1)$ vanishes, and the CG step corrects only the network's errors.
+\paragraph{What the network estimates.} Training draws a pair $(\x_0,\x_1)$, a time
+$t\sim\mathcal U[0,1]$ and a bridge state
+\[
+  \x_t = (1-t)\,\x_0 + t\,\x_1 + \ssb(t)\,\eps,\qquad \ssb(t)^2 = Vt(1-t),\quad V = 4\tau^2,
+\]
+and regresses $\x_0$ with the squared loss, so $D_\theta(\x_t,t,\x_1) = \E[\x_0\mid\x_t,\x_1]$.
+Removing the known $\x_1$ part of the state turns it into a noisy target,
+\[
+  \uu = \frac{\x_t - t\,\x_1}{1-t} = \x_0 + \sigma\eps,\qquad \sigma^2 = \frac{Vt}{1-t},
+\]
+and $(\x_t,\x_1)\mapsto(\uu,\x_1)$ is invertible, so
+$D_\theta(\x_t,t,\x_1) = \E[\x_0\mid\uu,\x_1] = \Dg(\uu)$ at $\sigma(t)$. \emph{Calling the
+network at bridge time $t$ evaluates the gradient of the objective smoothed at
+$\sigma(t)$}: $\sigma(t)^2\grad J_{\sigma(t)} = D_\theta - \uu$. The bridge time is the
+smoothing level, from $\sigma = 0$ at $t=0$ to $\sigma=\infty$ at $t=1$.
 
-%=============================================================================================
-\section{ImMAP2 as an instance}\label{sec:immap2}
-%=============================================================================================
+\paragraph{One step, in both coordinates.} From time $t$ to $s<t$, with
+$r = \sigma(s)/\sigma(t)$, i.e.\ $r^2 = \frac{s(1-t)}{t(1-s)}$, I$^2$SB takes the step
+\eqref{eq:step} with $h = 1-r^2$ and the injection \eqref{eq:inject} with
+$\beta = 1/(1+r)$:
+\[
+  \uu_s = \uu_t + (\sigma_t^2-\sigma_s^2)\,\grad J_{\sigma_t}(\uu_t) + \sigma_s\sqrt{1-r^2}\,\zz
+        = r^2\,\uu_t + (1-r^2)\,\Dg(\uu_t) + \sigma_s\sqrt{1-r^2}\,\zz .
+\]
+The step size is the variance removed, and the injection tops the leftover noise
+$r^2\sigma_t = r\sigma_s$ back up to exactly $\sigma_s$. Mapped back with
+$\x_s = (1-s)\uu_s + s\,\x_1$, the $\x_1$ terms cancel and
+\[
+  \x_s = \tfrac{s}{t}\,\x_t + \big(1-\tfrac{s}{t}\big)\,\hat\x_0 + \sqrt{V\tfrac{s(t-s)}{t}}\;\zz,
+  \qquad \hat\x_0 = D_\theta(\x_t,t,\x_1),
+\]
+which is I$^2$SB's reverse step: the bridge posterior between $\x_t$ and the predicted
+$\hat\x_0$.
 
-ImMAP2 (\code{diffusion/immap.py}, \code{immap2}) is Algorithm~\ref{alg:generic} on a
-different chain, with the ImMAP choices of hyperparameters.
-
-\paragraph{Conditioning.} There is no guide. The chain is $\varnothing\subset\{\y\}$ with
-$w_y = 1$, so $\vv = \Dy(\uu) = \E[\x_0\mid\uu,\y]$, and the objective is the posterior
-$\log p(\x_0\mid\y)$.
-
-\paragraph{Estimator.} $\Dy$ is obtained from the target-only denoiser $\Dz$ by the isotropic
-Gaussian projection of Section~\ref{sec:estimators}, applied to $\Dz$ instead of $\Dg$:
-\begin{equation}
-  \Dy(\uu)\approx(\Op^H\Op + \lambda_k\Id)^{-1}\big(\Op^H\y + \lambda_k\Dz(\uu)\big),\qquad
-  \lambda_k = \lambda_0\,\sigma_n^2\,\frac{1+\sigma_k^2}{\sigma_k^2}.
-  \label{eq:immap2_lambda}
-\end{equation}
-This is the prox with posterior variance $\varsigma_k^2 = \sigma_k^2/(1+\sigma_k^2)$, scaled by
-$1/\lambda_0$. That is the posterior variance of a unit-variance Gaussian signal observed at
-noise $\sigma_k$ (the $\Pi$GDM rule), so $\lambda_k$ follows the noise level. It is solved by CG
-essentially to convergence (up to 500 iterations, tolerance $10^{-3}$).
-
-\paragraph{Noise ladder.} Self-paced rather than fixed. Each iteration re-estimates the level
-from the denoiser residual,
-\begin{equation}
-  \sigma_k^2 = \tfrac1n\,\|\Dz(\uu_k) - \uu_k\|^2 ,
-  \label{eq:immap2_sigma}
-\end{equation}
-which is close to $\sigma_k^2$ when the denoiser's error is small next to the noise: by the
-orthogonality of the MMSE error, $\E\|\Dz(\uu)-\uu\|^2 = n\sigma^2 - \mathrm{mmse}(\sigma)$. It
-replaces the open-loop
-contraction $\sigma\gets(1-\beta h)\sigma$ of Algorithm~\ref{alg:generic}. The iteration
-stops once $\sigma_k < \sigma_{\min} = 0.01$.
-
-\paragraph{Step size and injection.} The Kadkhodaie--Simoncelli schedule~\cite{ks2021} and a
-fixed, small $\beta$:
-\begin{equation}
-  h_k = \frac{h_0\,k}{1 + h_0(k-1)},\quad h_0 = 0.01,\qquad \beta = 0.05,\qquad
-  \gamma_k = \sigma_k\sqrt{(1-\beta h_k)^2 - (1-h_k)^2}.
-  \label{eq:immap2_hyper}
-\end{equation}
-The step starts tiny and grows toward $1$. $\beta = 0.05$ re-injects most of the noise each
-step removes, so the iteration is a slow, strongly stochastic ascent.
-
-\paragraph{Start and output.} $\uu_0 = \mathrm{mean}(\Op^H\y)\,\bm1 + \sigma_{\max}\zz$ with
-$\sigma_{\max} = 1$, or a warm start $\uu_0 = \x_{\mathrm{ws}} + \sigma_{\max}\zz$. The
-implementation returns the final state $\uu$.
-
-\begin{algorithm}[H]
-\caption{ImMAP2 as an instance: chain $\varnothing\subset\{\y\}$, $w_y = 1$}
-\label{alg:immap2}
-\begin{algorithmic}[1]
-\Require $\y,\Op,\sigma_n$; target-only denoiser $\Dz$; $\lambda_0$; $h_0 = 0.01$;
-         $\beta = 0.05$; $\sigma_{\max} = 1$; $\sigma_{\min} = 0.01$
-\State $\uu \gets \mathrm{mean}(\Op^H\y)\,\bm1 + \sigma_{\max}\zz$;\quad $\sigma\gets\sigma_{\max}$;
-       \quad $k\gets1$
-\While{$\sigma>\sigma_{\min}$}
-  \State $\vv_\varnothing \gets \Dz(\uu)$ \Comment{$\E[\x_0\mid\uu]$}
-  \State $\sigma^2 \gets \tfrac1n\|\vv_\varnothing - \uu\|^2$ \Comment{self-paced level
-         \eqref{eq:immap2_sigma}}
-  \State $\vv \gets (\Op^H\Op + \lambda_k\Id)^{-1}(\Op^H\y + \lambda_k\vv_\varnothing)$
-         \Comment{$\approx\E[\x_0\mid\uu,\y]$, \eqref{eq:immap2_lambda}}
-  \State $h_k \gets h_0k/(1+h_0(k-1))$;\quad
-         $\gamma\gets\sigma\sqrt{(1-\beta h_k)^2-(1-h_k)^2}$
-  \State $\uu \gets (1-h_k)\,\uu + h_k\,\vv + \gamma\,\zz$;\quad $k\gets k+1$
-         \Comment{step \eqref{eq:step}}
-\EndWhile
-\State \Return $\uu$
-\end{algorithmic}
-\end{algorithm}
-
-\paragraph{I$^2$SB-Recon and ImMAP2 side by side.} Both maximise a smoothed posterior with the
-same step \eqref{eq:step}. Every difference is a choice of conditioning or a hyperparameter:
+\paragraph{A run, from $\x_1$ to $\x_0$.} On a ladder $1 = t_0 > t_1 > \dots > t_K = 0$:
+\begin{itemize}[leftmargin=1.5em, itemsep=2pt]
+  \item \textbf{First step} ($t_0 = 1$, $\x_t = \x_1$, $\sigma = \infty$, $r = 0$, $h = 1$). The
+        state carries no information beyond $\x_1$, so the network returns the posterior mean
+        $\hat\x_0 = \E[\x_0\mid\x_1]$: a blurry average of every target consistent with $\x_1$.
+        The step jumps to it and re-noises:
+        $\x_{t_1} = (1-t_1)\,\E[\x_0\mid\x_1] + t_1\x_1 + \ssb(t_1)\zz$. This is a warm start
+        at noise level $\sigma(t_1)$, not ``starting at $\x_1$''.
+  \item \textbf{Middle steps} ($0<h<1$). Each moves the state the fraction $1-r^2$ toward the
+        current estimate and re-injects noise. The fresh noise commits the run to one of the
+        targets the estimate was averaging over; the next estimate, at lower $\sigma$, is
+        sharper. Unrolled, the state is a precision-weighted average of all estimates so far.
+  \item \textbf{Last step} ($s = 0$, $\sigma = 0$, $r = 0$, $h = 1$). No noise is injected and
+        the output is the final estimate $\hat\x_0 = D_\theta(\x_{t_{K-1}},t_{K-1},\x_1)$.
+\end{itemize}
 
 \begin{table}[H]
 \centering
 \footnotesize
-\begin{tabular}{@{}p{2.9cm}p{5.6cm}p{5.6cm}@{}}
+\begin{tabular}{@{}lcccccccc@{}}
 \toprule
-choice & I$^2$SB-Recon & ImMAP2 \\
+step $t\to s$ & $\sigma(t)$ & $\sigma(s)$ & $r$ & $h = 1-r^2$ & $\beta$ & injected (in $\uu$) &
+  $\x_s$: weight on $\x_t$, $\hat\x_0$ & noise (in $\x$) \\
 \midrule
-chain, weights & $\varnothing\subset\{\x_1\}\subset\{\x_1,\y\}$, $w = w_y = 1$ &
-  $\varnothing\subset\{\y\}$, $w_y = 1$ \\
-$\vv$ estimates & $\E[\x_0\mid\uu,\x_1,\y]$ & $\E[\x_0\mid\uu,\y]$ \\
-denoiser & paired bridge regressor $\Dg$ & target-only $\Dz$ \\
-data estimator & prox from $\Dg$, $\lambda = 7\cdot10^{-5}$ fixed, 7 CG iterations &
-  prox from $\Dz$, $\lambda_k = \lambda_0\sigma_n^2(1+\sigma_k^2)/\sigma_k^2$, CG to tolerance \\
-noise ladder & fixed: $\sigma(t_k)$ on NFE uniform steps, $\infty\to0$ & self-paced:
-  residual \eqref{eq:immap2_sigma}, $1\to0.01$ \\
-step size $h_k$ & $1 - \sigma_{k+1}^2/\sigma_k^2$ (variance removed) &
-  $h_0k/(1+h_0(k-1))$, $h_0 = 0.01$ \\
-injection $\beta$ & $1/(1+r_k)\approx\tfrac12$ & $0.05$ \\
-start & $\E[\x_0\mid\x_1] + \sigma_1\zz$ (first step) & $\mathrm{mean}(\Op^H\y) + \zz$, or
-  warm start \\
-iterations & NFE (e.g.\ 20) & until $\sigma<0.01$ (hundreds) \\
+$1\to0.75$    & $\infty$ & 0.658 & 0     & 1     & 1     & 0.658 & 0.75, 0.25 & 0.165 \\
+$0.75\to0.5$  & 0.658    & 0.380 & 0.577 & 0.667 & 0.634 & 0.310 & 0.67, 0.33 & 0.155 \\
+$0.5\to0.25$  & 0.380    & 0.219 & 0.577 & 0.667 & 0.634 & 0.179 & 0.50, 0.50 & 0.134 \\
+$0.25\to0$    & 0.219    & 0     & 0     & 1     & 1     & 0     & 0, 1       & 0 \\
 \bottomrule
 \end{tabular}
-\caption{The two methods as instances of Algorithm~\ref{alg:generic}. The first three rows say
-what is estimated; the rest are hyperparameters.}
-\label{tab:i2sb_immap2}
+\caption{Four uniform steps at $\tau = 0.19$ ($V = 0.144$). At the first step the weight
+$0.75$ falls on $\x_t = \x_1$, i.e.\ $\x_{t_1} = 0.25\,\E[\x_0\mid\x_1] + 0.75\,\x_1 +
+0.165\,\zz$. Uniform steps in $t$ give equal ratios $r$ in the middle of the ladder.}
+\label{tab:i2sb_run}
 \end{table}
 
-Moving along a row turns one method into the other, which gives a set of controlled
-comparisons. Give ImMAP2 the guide (chain $\varnothing\subset\{\x_1\}\subset\{\x_1,\y\}$ with
-$\Dg$ in place of $\Dz$) and it becomes ImMAP-SB with data. Give I$^2$SB-Recon ImMAP2's
-$\lambda_k$ and the gap between them is the effect of the data weight alone. To interpolate
-between the two targets, reveal the measurement first: on the chain
-$\varnothing\subset\{\y\}\subset\{\x_1,\y\}$ with $w_y = 1$,
-$\vv = \Dy + w\,(\Dgy - \Dy)$, which is ImMAP2's $\E[\x_0\mid\uu,\y]$ at $w = 0$ and
-I$^2$SB-Recon's $\E[\x_0\mid\uu,\x_1,\y]$ at $w = 1$. (On the other order,
-$\varnothing\subset\{\x_1\}\subset\{\x_1,\y\}$, $w=0$ does not give ImMAP2: the chain order
-matters once the weights differ.)
+\paragraph{A sample, not the MAP estimate.} $\beta = 1/(1+r)<1$ re-injects noise, so I$^2$SB
+returns (approximately) a sample of $p(\x_0\mid\x_1)$. The approximation is the point estimate:
+the exact reverse step would also carry the spread
+$(1-r^2)^2\operatorname{Cov}[\x_0\mid\uu_t,\x_1]$ of the endpoint, which vanishes on fine
+ladders. The same network gives the deterministic continuation toward the MAP estimate with
+$\beta = 1$, i.e.\ $h = 1-r$ and no injection: the Euler step of the probability-flow ODE.
+Keeping $h = 1-r^2$ and only dropping the noise (\code{deterministic=True}) is neither: the
+state then lands at noise $r^2\sigma_t < \sigma_s$, below the level the next call is told.
 
 %=============================================================================================
-\section{What each method is}
+\section{The methods as instances}
 %=============================================================================================
+
+Every method below is Algorithm~\ref{alg:generic}. What differs is the conditioning set (what
+is estimated), the estimator, and the hyperparameters: noise ladder, $h_k$, $\beta$, start.
+
+\paragraph{I$^2$SB~\cite{liu2023}.} $\cc = \{\x_1\}$, $\vv = \Dg$, the paired bridge regressor;
+fixed ladder $\sigma_k = \sigma(t_k)$ from $\infty$ to $0$ on NFE uniform bridge steps; with
+$r_k = \sigma_{k+1}/\sigma_k$,
+\begin{equation}
+  h_k = 1 - r_k^2,\qquad \beta_k = \frac{1}{1+r_k},\qquad \gamma_k^2 = \sigma_{k+1}^2(1-r_k^2)
+  \label{eq:i2sb}
+\end{equation}
+(Section~\ref{sec:i2sb}).
+
+\paragraph{I$^2$SB-Recon and I$^2$SB-Inversion~\cite{wang2024}.} The guide is a fully sampled
+scan of \emph{another contrast} (T1 for a T2 target; PD for PDFS here), and it is the bridge
+start: $\x_1 = $ guide. The objective is the full posterior, $\cc = \{\x_1,\y\}$:
+\[
+  \log p(\x_0\mid\x_1,\y) = \log p(\x_0) + \log p(\x_1\mid\x_0) + \log p(\y\mid\x_0)
+  + \mathrm{const}.
+\]
+The network only estimates $\Dg$ (it never sees $\y$); the measurement term is added by the data
+step \eqref{eq:prox} from $\Dg$, with $\lambda = 7\cdot10^{-5}$ fixed and 7 CG iterations,
+giving $\vv\approx\Dgy$. Since the guide is a separate scan, this term is genuinely informative:
+the data step is the only place the measurement enters. Hyperparameters as I$^2$SB
+\eqref{eq:i2sb}, with 80 steps. I$^2$SB-Inversion then walks the reconstruction back up the
+bridge deterministically and runs the same ascent a second time from there.
+
+\paragraph{ImMAP2 (\code{diffusion/immap.py}).} No guide: $\cc = \{\y\}$, $\vv\approx\Dy$, the
+data step \eqref{eq:prox} applied to a target-only denoiser $\Dz$, with
+$\lambda_k = \lambda_0\sigma_n^2(1+\sigma_k^2)/\sigma_k^2$ (posterior variance
+$\sigma_k^2/(1+\sigma_k^2)$, the $\Pi$GDM rule) solved to tolerance. The ladder is self-paced,
+$\sigma_k^2 = \tfrac1n\|\Dz(\uu_k)-\uu_k\|^2$ (slightly low on average:
+$\E\|\Dz-\uu\|^2 = n\sigma^2 - \mathrm{mmse}$); $h_k = h_0k/(1+h_0(k-1))$ with $h_0 = 0.01$,
+$\beta = 0.05$; start $\mathrm{mean}(\Op^H\y) + \zz$ at $\sigma = 1$. The implementation
+returns the final state $\uu$, not $\vv$.
+
+\paragraph{SDEdit.} $\cc = \varnothing$, $\vv = \Dz$: the source image enters only as the start
+$\uu_0 = \x_1 + \sigma_0\zz$, not as conditioning.
+
+\paragraph{A zero-filled bridge start.} If $\x_1 = \Op^H\y$ (our \code{sbunet} baseline), $\x_1$
+is a function of $\y$, so $\cc = \{\x_1,\y\}$ is the same information as $\{\y\}$: the target is
+the unguided posterior $p(\x_0\mid\y)$. The data step then adds no information in exact
+arithmetic and only corrects the network's errors.
 
 \begin{table}[H]
 \centering
 \footnotesize
-\begin{tabular}{@{}p{3.3cm}p{3.0cm}p{2.5cm}p{3.6cm}p{2.0cm}@{}}
+\begin{tabular}{@{}p{3.6cm}p{2.0cm}p{4.3cm}p{4.6cm}@{}}
 \toprule
-method & chain & weights & $\vv$ estimates & step, noise \\
+method & conditions on & estimator of $D_{\cc}$ & ladder, $h$, $\beta$ \\
 \midrule
-SDEdit, ImMAP sampler & $\varnothing\subset\{\x_1\}$ & $w=0$ & $\E[\x_0\mid\uu]$ & free \\
-ImMAP2 (Sec.~\ref{sec:immap2}) & $\varnothing\subset\{\y\}$ & $w_y = 1$ &
-  $\E[\x_0\mid\uu,\y]$ & KS $h_k$, $\beta = 0.05$ \\
-I$^2$SB (Sec.~\ref{sec:i2sb}) & $\varnothing\subset\{\x_1\}$ & $w=1$ & $\E[\x_0\mid\uu,\x_1]$ &
-  $h = 1-r^2$,
-  $\beta = \tfrac1{1+r}$ \\
-ImMAP-SB & $\varnothing\subset\{\x_1\}$ & $w=1$ & $\E[\x_0\mid\uu,\x_1]$ & free \\
-guided (CFG on the guide) & $\varnothing\subset\{\x_1\}$ & $w>1$ & $(1-w)\Dz + w\Dg$ &
-  Prop.~\ref{prop:ascent} \\
-I$^2$SB-Recon, ImMAP-SB with data, SB-TGVN & $\varnothing\subset\{\x_1\}\subset\{\x_1,\y\}$
-  & $w = w_y = 1$ & $\E[\x_0\mid\uu,\x_1,\y]$ & I$^2$SB's or free \\
-guided recon & same & $w\ne1$ and/or $w_y\ne1$ & \eqref{eq:v_meas} & Prop.~\ref{prop:ascent} \\
+SDEdit & nothing & $\Dz$ & free \\
+ImMAP2 & $\y$ & data step on $\Dz$, $\lambda_k\propto(1+\sigma_k^2)/\sigma_k^2$ &
+  self-paced; KS $h_k$; $\beta = 0.05$ \\
+I$^2$SB & guide & $\Dg$ (bridge regressor) & fixed ladder; $h = 1-r^2$; $\beta = \frac1{1+r}$ \\
+I$^2$SB-Recon / -Inversion & guide, $\y$ & data step on $\Dg$, $\lambda = 7\cdot10^{-5}$ &
+  as I$^2$SB, 80 steps \\
+SB-TGVN, BridgeLGGS (any start) & guide, $\y$ & learned $\Dgy$ (the net sees both) &
+  as I$^2$SB \\
+\code{sbunet} (zero-filled start) & $\y$ & $\Dg$ with $\x_1 = \Op^H\y$, + data step & as I$^2$SB \\
+TGVN, LGGS end-to-end & guide, $\y$ & learned $\E[\x_0\mid\y,\x_1]$ & one step from
+  $\sigma = \infty$ \\
 \bottomrule
 \end{tabular}
-\caption{Every method is the step \eqref{eq:step} with a different chain and weights. The
-methods sharing a row differ only in how they \emph{estimate} the same expectation
-(Section~\ref{sec:estimators}). ``Free'' is the ImMAP choice of $h_k$ and $\beta$.}
+\caption{Every method is Algorithm~\ref{alg:generic}. The first two columns say what is
+estimated; the last is how the ascent is run.}
 \label{tab:methods}
 \end{table}
 
-\paragraph{Ingredients for an experiment.} Varying $w$ needs $\Dz$ and $\Dg$ at the
-\emph{same} noise level $\sigma$, in the \emph{same} coordinates $\uu$. A target-only denoiser
-(e.g.\ LPDS trained on PDFS over a range of $\sigma$) takes $\uu$ directly. The paired bridge
-regressor is called on $\x_t = (1-t)\uu + t\x_1$ at $t = \sigma^2/(\sigma^2+V)$. The start
-$\sigma_0$ must lie inside the target denoiser's training range.
-
-%=============================================================================================
-\section{Estimating the expectations (outside the algorithm)}\label{sec:estimators}
-%=============================================================================================
-
-The algorithms consume estimates of $D_{\cc}$ and are indifferent to their source. The current
-options, for reference:
-\begin{itemize}[leftmargin=1.5em, itemsep=2pt]
-  \item $\Dz$: a target-only denoiser trained with the squared loss on $(\uu,\x_0)$.
-  \item $\Dg$: the paired bridge regressor, trained with the squared loss on bridge states.
-  \item $\Dgy$, learned: a bridge regressor that also sees $(\y,\Op)$ (SB-TGVN, BridgeLGGS),
-        trained toward exactly $\E[\x_0\mid\uu,\x_1,\y]$.
-  \item $\Dgy$, derived from $\Dg$: if $p(\x_0\mid\uu,\x_1)\approx\N(\Dg,\bm C)$ and
-        $\y = \Op\x_0 + \nn$, $\nn\sim\N(\bm0,\sigma_n^2\Id)$, then Gaussian conditioning gives
-        $\Dgy\approx\Dg + \bm C\Op^H(\Op\bm C\Op^H + \sigma_n^2\Id)^{-1}(\y - \Op\Dg)$. Tweedie's
-        second-order identity supplies $\bm C = \sigma^2\partial\Dg/\partial\uu$. The
-        isotropic choice $\bm C = c\sigma^2\Id$ reduces it to the proximal step
-        $(\Op^H\Op + \lambda\Id)^{-1}(\Op^H\y + \lambda\Dg)$, $\lambda = \sigma_n^2/(c\sigma^2)$.
-        I$^2$SB-Recon~\cite{wang2024} uses that step with $\lambda$ fixed at $7\cdot10^{-5}$ and 7
-        CG iterations.
-\end{itemize}
+Two consequences. First, I$^2$SB-Recon and ImMAP2 differ in what they condition on (the guide)
+as well as in the estimator and hyperparameters, so comparing them conflates the three; the
+table says which single change isolates each. Giving ImMAP2 the guide means replacing $\Dz$ by
+$\Dg$; giving I$^2$SB-Recon ImMAP2's $\lambda_k$ isolates the data weight. Second, for SB-TGVN the
+bridge start is a parameterisation, not an objective: whatever $\x_1$ is, the net conditions on
+the guide and $\y$, so the three starts target the same posterior and differ only in the path.
 
 \begin{thebibliography}{9}
-\bibitem{ho2021}
-J.~Ho, T.~Salimans. Classifier-free diffusion guidance. \emph{NeurIPS Workshop on Deep
-Generative Models and Downstream Applications}, 2021.
-
 \bibitem{ks2021}
 Z.~Kadkhodaie, E.~P.~Simoncelli. Stochastic solutions for linear inverse problems using the
 prior implicit in a denoiser. \emph{NeurIPS}, 2021.

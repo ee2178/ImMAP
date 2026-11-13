@@ -10,11 +10,12 @@ that cell. Runs land in trained_nets/guided_recon/knee/<RUN_TAG>/<cell>.
 THE R8 SWEEP (the default cells; torch/guided_recon_knee.sbatch):
 
     lpdsnet_R8          LPDSNet, NO guide (the unguided baseline, on the same PDFS data)
-    lggs_R8_g1          LGGS at Sljiva's grid point, phase-invariant similarity (triton)
-    tgvn_c12_R8_g1      TGVN, E2E-VarNet width, 12 / 10 / 8 / 6 cascades,
-    tgvn_c10_R8_g1        fully-sampled guide
-    tgvn_c8_R8_g1
-    tgvn_c6_R8_g1
+    lggs_R8_g1          vanilla LGGS at Sljiva's grid point, phase-invariant similarity (triton)
+    tgvn_c6_R8_g1       TGVN, E2E-VarNet width, 6 cascades, fully-sampled guide
+
+Since 2026-11-13 (user's call): vanilla LGGS only -- the guide-W / guide-conv / transfer variants
+showed no visual difference -- and TGVN at 6 cascades only (deeper TGVN is noticeably slower than
+LGGS). The 12 / 10 / 8 cascade cells (tgvn_c12, tgvn_c10, tgvn_c8) stay available by name.
 
 BRIDGE STARTS (after the TGVN depth is settled; torch/bridge_start_knee.sbatch): i2sb-TGVN at
 one depth N from each starting point,
@@ -80,7 +81,7 @@ sys.path.insert(0, REPO)
 ANATOMY = "knee"
 ACCELS = (8,)
 GUIDE_ACCELS = (1,)
-DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c12", "tgvn_c10", "tgvn_c8", "tgvn_c6")
+DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c6")
 # Run namespace. "s3" = PER-VOLUME normalization + eig-0.9 offline maps (2026-11-06; "s2" was the
 # per-contrast fixed scale_fac). A new tag means new run directories: the launchers RESUME any run
 # dir that has a checkpoint, so reusing an earlier set's would silently continue those runs.
@@ -95,6 +96,7 @@ RUN_TAG = "s3"
 NOISE_PRESETS = {
     "grid": None,                                     # inherit the grid's training U[0.01, 0.02]
     "low": dict(noise_std=[0.0, 0.01]),
+    "vlow": dict(noise_std=[0.0, 0.001]),             # 10x below "low" (2026-11-13: artifacts)
     "none": dict(noise_std=[0.0, 0.0]),
 }
 NOISE = "low"                       # the default since 2026-11-10: U[0, 0.01], user's call
@@ -598,7 +600,8 @@ def main():
                    help="print 'index<TAB>R<TAB>model<TAB>guide R<TAB>name<TAB>tau file' "
                         "and exit (tau file: a bridge cell's calibration path, else '-')")
     p.add_argument("--noise", choices=list(NOISE_PRESETS), default="low",
-                   help="added TRAINING noise: grid U[0.01, 0.02], low U[0, 0.01], none; "
+                   help="added TRAINING noise: grid U[0.01, 0.02], low U[0, 0.01], "
+                        "vlow U[0, 0.001], none; "
                         "validation adds none (VAL_NOISE_STD); non-grid presets get their own "
                         "run tag")
     p.add_argument("--tau", type=float, default=None,

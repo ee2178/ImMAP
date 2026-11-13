@@ -51,7 +51,7 @@ to convergence with lam -> 0, so `dc_iters` is the effective regularizer as much
 import torch
 
 from physics.object_mask import otsu_threshold
-from sb.base import forward_std, reverse_sample
+from sb.base import _per_sample, forward_std, n_steps, reverse_sample, space_indices
 from solvers.cg import batched_cg
 
 
@@ -289,6 +289,112 @@ def i2sb_inversion_sample(net, y, E, sched, x1, sigma_n=None, nfe=80, dc_iters=D
                              n_steps_inv=n_steps_inv, verbose=verbose)
     recon = recon_from(b_hat)
     return recon, {"recon_1": recon_1, "b_hat": b_hat}
+
+
+STEP_SIZES = ("i2sb", "ode")
+
+
+@torch.no_grad()
+def debiased_ascent(net, x1, sched, y=None, E=None, sigma_n=None, guide=None, nfe=None,
+                    h="i2sb", start="bridge", start_step=None, u0=None, dc_iters=0,
+                    dc_lam=DC_LAM, noise_scale=None, trace=None):
+    """The ImMAP ascent run in the DEBIASED coordinate u = x0 + sigma eps -- no bridge
+    reparameterisation of the steps; the bridge regressor is only how E[x0 | u, x1(, y)] is
+    evaluated (notes/immap_i2sb/pmi_guided_ascent.tex, "Worked case").
+
+    Coordinates. At a ladder step n the regressor is called on the bridge state that u
+    corresponds to,
+
+        x_n = (1 - m_n) u + m_n x1,   m_n = std_fwd[n]^2 / std_fwd[-1]^2,
+        sigma_n^2 = std_fwd[-1]^2 m_n / (1 - m_n)              (the level of the noise in u)
+
+    (the continuous t = sigma_f^2 / V; the map I2SB's ddpm posterior implies). u is held, never
+    formed from x, so nothing divides by 1 - m.
+
+    Step, from rung n to the next rung p (r = sigma_p / sigma_n):
+
+        v = D(u)                     regressor at x_n (+ CG data step if dc_iters > 0)
+        u <- (1 - h) u + h v + gamma z,     gamma^2 = sigma_p^2 - (1 - h)^2 sigma_n^2
+
+    i.e. gradient ascent on log p_sigma(u | x1(, y)) with step size h sigma_n^2, and the injection
+    that leaves u a noisy target at the next level exactly (for an exact denoiser). `h`:
+        "i2sb"   h = 1 - r^2, the variance removed -- with start="bridge" this is
+                 reverse_sample(posterior="ddpm") iterate for iterate (x_n = (1 - m_n) u_n + m_n x1)
+        "ode"    h = 1 - r, gamma = 0: the probability-flow Euler step (deterministic)
+        a float or callable(k, r) -> h, in [1 - r, 1]
+    As in reverse_sample, nothing is injected on the step into the last rung (step 0).
+
+    Start. "bridge": the ladder begins at the last step (sigma = inf, m = 1), the first call sees
+    x1 itself and the first step (r = 0, h = 1) is the warm start E[x0 | x1(, y)] + sigma_1 z.
+    "noise": begin at the finite rung `start_step` from u0 (default pure noise, sigma z) -- the
+    ascent recovers x0 from random noise; as start_step -> the top it forgets u0.
+
+    The ladder is reverse_sample's: space_indices(n, nfe + 1), walked downward (with "noise", the
+    rungs above start_step dropped). Returns (x, v): the final state mapped to x at step 0 (what
+    reverse_sample returns) and the last estimate v. `trace` (a list) gets one dict per step,
+    {"step", "u", "x", "v"} after the update, on the CPU."""
+    device = sched.std_fwd.device
+    interval = n_steps(sched)
+    nfe = nfe or interval - 1
+    steps = space_indices(interval, nfe + 1)[::-1]                 # descending, top first
+    if start == "noise":
+        if start_step is None:
+            raise ValueError("start='noise' needs start_step, the rung to start from")
+        steps = [int(start_step)] + [s for s in steps if s < int(start_step)]
+    elif start != "bridge":
+        raise ValueError(f"start must be 'bridge' or 'noise', got {start!r}")
+    total = sched.std_fwd[-1].double() ** 2
+    m = (sched.std_fwd.double() ** 2 / total).to(device)
+
+    def level(n):                                              # sigma_n; inf at the top
+        return float("inf") if float(m[n]) >= 1.0 else float((total * m[n] / (1 - m[n])).sqrt())
+
+    x1 = x1.to(device)
+    kappa = 1.0 if noise_scale is None else _per_sample(noise_scale, x1.shape[0], x1.shape[1:],
+                                                        x1.real)
+    n0 = steps[0]
+    if start == "noise":
+        if not level(n0) < float("inf"):
+            raise ValueError("start='noise' needs a finite start level (start_step below the top)")
+        u = level(n0) * torch.randn_like(x1) if u0 is None else u0.to(device)
+    else:
+        u = None                                               # sigma = inf: no u yet
+    v = None
+    for k, (n, p) in enumerate(zip(steps[:-1], steps[1:])):
+        x_n = x1 if u is None else (1 - float(m[n])) * u + float(m[n]) * x1
+        step_t = torch.full((x1.shape[0],), n, device=device, dtype=torch.long)
+        sigma = forward_std(sched, step_t, xdim=x1.shape[1:])
+        v = predict_x0_recon(net, x_n, sigma, x1=x1, y=y, E=E, sigma_n=sigma_n, guide=guide)
+        if dc_iters:
+            v = cg_data_consistency(v, y, E, dc_lam, dc_iters)
+        s_n, s_p = level(n), level(p)
+        r = 0.0 if s_n == float("inf") else s_p / s_n
+        if h == "i2sb":
+            hk = 1.0 - r * r
+        elif h == "ode":
+            hk = 1.0 - r
+        else:
+            hk = float(h(k, r) if callable(h) else h)
+            if not (1.0 - r - 1e-9 <= hk <= 1.0 + 1e-9):
+                raise ValueError(f"step size h = {hk} outside [1 - r, 1] = [{1 - r:.4f}, 1] at "
+                                 f"rung {n} -> {p}: the injection would need negative variance")
+        if u is None:
+            if hk != 1.0:
+                raise ValueError("the first step from sigma = inf must be h = 1")
+            u = torch.zeros_like(v)
+        # noise left in u after the step: (1 - h) sigma_n (none at h = 1, also from sigma = inf);
+        # the injection tops it up to sigma_p. "ode" injects nothing by construction (from
+        # sigma = inf its first step lands on the estimate, as the probability-flow limit in x).
+        left = 0.0 if hk == 1.0 else (1.0 - hk) * s_n
+        g2 = 0.0 if (p == 0 or h == "ode") else max(s_p ** 2 - left ** 2, 0.0)
+        u = (1.0 - hk) * u + hk * v
+        if g2 > 0.0:
+            u = u + kappa * g2 ** 0.5 * torch.randn_like(u)
+        if trace is not None:
+            trace.append(dict(step=int(p), u=u.detach().cpu(), v=v.detach().cpu(),
+                              x=((1 - float(m[p])) * u + float(m[p]) * x1).detach().cpu()))
+    x = (1 - float(m[steps[-1]])) * u + float(m[steps[-1]]) * x1
+    return x, v
 
 
 def online_support(y, mask, acs_lines, thresh=0.9, **kws):

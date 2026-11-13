@@ -472,6 +472,85 @@ def test_bridge_inversion_is_their_update():
         assert float((v - image).abs().max() / image.abs().max()) < 0.05
 
 
+def test_debiased_ascent_is_i2sb_iterate_for_iterate():
+    """The ImMAP ascent run in u = x0 + sigma eps, with I2SB's step size (h = 1 - r^2) and the
+    same noise draws, IS I2SB: every iterate maps to reverse_sample's bridge state through
+    x = (1 - m) u + m x1, and the final recons agree -- with and without the CG data step, for a
+    real (random-init) UNet and per-sample noise scales."""
+    from sb.i2sb_recon import debiased_ascent
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    x1 = E.adjoint(y)
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    net = make_net().eval()
+    with torch.no_grad():                    # the ADM output layer starts at zero: make D non-trivial
+        g = torch.Generator().manual_seed(0)
+        for p in net.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=g))
+    nfe = 8
+    for dc in (0, 7):
+        for kappa in (None, torch.tensor([1.0, 0.5])):
+            torch.manual_seed(3)
+            ref, xs, _ = reverse_sample_ref(net, y, E, sched, x1, nfe, dc, kappa)
+            torch.manual_seed(3)
+            trace = []
+            x, v = debiased_ascent(net, x1, sched, y=y, E=E, nfe=nfe, dc_iters=dc,
+                                   noise_scale=kappa, trace=trace)
+            scale = float(ref.abs().max())
+            assert scale > 0.1, scale                                  # a non-trivial recon
+            assert float((x - ref).abs().max()) < 1e-4 * scale, (dc, kappa)
+            # iterate for iterate: reverse_sample logs newest-first
+            ours = [t["x"] for t in trace]
+            theirs = list(torch.flip(xs, dims=(1,)).unbind(1))
+            assert len(ours) == len(theirs) == nfe
+            for a, b in zip(ours, theirs):
+                assert float((a - b).abs().max()) < 1e-4 * scale
+
+
+def reverse_sample_ref(net, y, E, sched, x1, nfe, dc, kappa):
+    """i2sb_recon_sample with every iterate logged."""
+    from sb.base import reverse_sample, forward_std as fstd
+    from sb.i2sb_recon import predict_x0_recon
+
+    def pred(x_t, step):
+        st = torch.full((x_t.shape[0],), step, dtype=torch.long)
+        x0 = predict_x0_recon(net, x_t, fstd(sched, st, xdim=x_t.shape[1:]), x1=x1, y=y, E=E)
+        return cg_data_consistency(x0, y, E, 7e-5, dc)
+    return reverse_sample(sched, pred, x1, nfe=nfe, log_count=nfe, verbose=False,
+                          noise_scale=kappa)
+
+
+def test_debiased_ascent_from_noise_and_step_sizes():
+    """Started from PURE NOISE at a finite level, the same ascent recovers the target (oracle
+    regressor); h = "ode" injects nothing, so from the bridge start it is deterministic; a step
+    size below 1 - r is refused (the injection would need negative variance)."""
+    from sb.i2sb_recon import debiased_ascent
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    x1 = E.adjoint(y)
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+
+    def oracle(x_t, sigma=None, **_):
+        return image, None
+    for h in ("i2sb", "ode", 1.0):
+        torch.manual_seed(0)
+        x, v = debiased_ascent(oracle, x1, sched, nfe=10, h=h, start="noise", start_step=700)
+        assert float((v - image).abs().max()) < 1e-6
+        assert float((x - image).abs().max() / image.abs().max()) < 0.05, h
+
+    def shrink(x_t, sigma=None, **_):                       # a smooth, non-oracle regressor
+        return 0.5 * x_t + 0.1, None
+    outs = []
+    for seed in (0, 1):
+        torch.manual_seed(seed)
+        outs.append(debiased_ascent(shrink, x1, sched, nfe=10, h="ode")[0])
+    assert torch.equal(outs[0], outs[1])                    # no injected noise anywhere
+    raises(ValueError, lambda: debiased_ascent(shrink, x1, sched, nfe=10, h=0.01), "outside")
+    raises(ValueError, lambda: debiased_ascent(shrink, x1, sched, start="noise"), "start_step")
+
+
 def test_support_and_trace():
     """`support`: every x0 prediction (so the recon) is 0 outside it, also with CG; with
     `support_state` the state is too. `trace`: one entry per evaluation, pre / post DC."""

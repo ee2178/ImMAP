@@ -1,0 +1,40 @@
+train (10000, 3, 32, 32)  test (10000, 3, 32, 32)  std(x0 - x1) = 0.202  tau_a = 0.101  tau_b = 0.303  device cuda
+[bridge_a] 1.94M params
+C:\Users\erice\Desktop\ImMAP\notes\immap_i2sb\equivalence_toy.py:243: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  model.load_state_dict(torch.load(path, map_location=dev))
+[bridge_a] loaded C:\Users\erice\Desktop\ImMAP\notes\immap_i2sb\equivalence_toy\ckpt\bridge_a.pt
+[bridge_a_s1] 1.94M params
+[bridge_a_s1] loaded C:\Users\erice\Desktop\ImMAP\notes\immap_i2sb\equivalence_toy\ckpt\bridge_a_s1.pt
+[edm] 1.94M params
+[edm] it 1000/20000 loss 0.2128 14.4 it/s eta 22.0 min
+[edm] it 2000/20000 loss 0.1800 14.6 it/s eta 20.6 min
+[edm] it 3000/20000 loss 0.1681 14.7 it/s eta 19.3 min
+[edm] it 4000/20000 loss 0.1672 14.7 it/s eta 18.1 min
+[edm] it 5000/20000 loss 0.1582 14.7 it/s eta 17.0 min
+[edm] it 6000/20000 loss 0.1542 14.7 it/s eta 15.8 min
+[edm] it 7000/20000 loss 0.1494 14.7 it/s eta 14.7 min
+[edm] it 8000/20000 loss 0.1509 14.7 it/s eta 13.6 min
+[edm] it 9000/20000 loss 0.1483 14.8 it/s eta 12.4 min
+[edm] it 10000/20000 loss 0.1488 14.8 it/s eta 11.3 min
+[edm] it 11000/20000 loss 0.1421 14.8 it/s eta 10.2 min
+[edm] it 12000/20000 loss 0.1441 14.8 it/s eta 9.0 min
+[edm] it 13000/20000 loss 0.1402 14.8 it/s eta 7.9 min
+[edm] it 14000/20000 loss 0.1406 14.7 it/s eta 6.8 min
+[edm] it 15000/20000 loss 0.1413 14.7 it/s eta 5.7 min
+[edm] it 16000/20000 loss 0.1391 14.7 it/s eta 4.5 min
+[edm] it 17000/20000 loss 0.1381 14.7 it/s eta 3.4 min
+[edm] it 18000/20000 loss 0.1369 14.7 it/s eta 2.3 min
+[edm] it 19000/20000 loss 0.1365 14.7 it/s eta 1.1 min
+[edm] it 20000/20000 loss 0.1387 14.7 it/s eta 0.0 min
+
+sigma               0.01    0.02    0.05     0.1     0.2     0.5       1       2       5      20      80
+MSE bridge_a      0.0006  0.0006  0.0011  0.0022  0.0046  0.0109  0.0175  0.0232  0.0267  0.0275  0.0276
+bridge_a_s1        0.708   0.595   0.322   0.188   0.126   0.088   0.076   0.067   0.060   0.055   0.054
+edm                0.879   0.701   0.372   0.211   0.138   0.100   0.094   0.095   0.101   0.114   0.406
+
+config                               psnr_s  psnr_mean  consist  post_std  mean-vs-I2SB/MC  std-ratio
+I2SB (bridge_a, I2SB ladder)          20.30     21.99   0.0119   0.1224            0.00     1.000
+bridge_a, Karras from noise           20.26     21.84   0.0131   0.1222            0.92     0.998
+EDM, Karras from noise                20.53     22.21   0.0094   0.1207            1.10     0.986
+EDM, I2SB ladder                      20.43     22.21   0.0099   0.1234            0.94     1.008
+bridge_a seed 1, I2SB ladder          20.19     21.90   0.0112   0.1232            0.74     1.007

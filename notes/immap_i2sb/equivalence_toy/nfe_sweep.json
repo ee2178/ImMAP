@@ -1,0 +1,84 @@
+{
+ "nfe": [
+  2,
+  5
+ ],
+ "reference_nfe": 5,
+ "mc_noise": 0.06575235005775427,
+ "regression_psnr": 21.862648010253906,
+ "regression_detail": 0.2859333457722354,
+ "runs": {
+  "I2SB: bridge, I2SB ladder": [
+   {
+    "psnr_sample": 21.71381664276123,
+    "psnr_mean": 21.836620330810547,
+    "consistency_rmse": 0.010030670091509819,
+    "posterior_std": 0.03804776445031166,
+    "detail_ratio": 0.3191454991346082,
+    "mean_vs_ref_over_mc": 0.6055961071347677
+   },
+   {
+    "psnr_sample": 21.296932220458984,
+    "psnr_mean": 21.61768341064453,
+    "consistency_rmse": 0.010526211000978947,
+    "posterior_std": 0.06575234979391098,
+    "detail_ratio": 0.39470900287009114,
+    "mean_vs_ref_over_mc": 0.0
+   }
+  ],
+  "bridge, Karras from noise": [
+   {
+    "psnr_sample": 21.86213493347168,
+    "psnr_mean": 21.862335205078125,
+    "consistency_rmse": 0.01019834354519844,
+    "posterior_std": 0.0016052922001108527,
+    "detail_ratio": 0.28712536827023044,
+    "mean_vs_ref_over_mc": 0.7424183815185461
+   },
+   {
+    "psnr_sample": 21.50544261932373,
+    "psnr_mean": 21.689918518066406,
+    "consistency_rmse": 0.010326503776013851,
+    "posterior_std": 0.052053190767765045,
+    "detail_ratio": 0.3657150482991934,
+    "mean_vs_ref_over_mc": 0.756709840704127
+   }
+  ],
+  "EDM: EDM, Karras from noise": [
+   {
+    "psnr_sample": 20.471428871154785,
+    "psnr_mean": 21.044729232788086,
+    "consistency_rmse": 0.041607219725847244,
+    "posterior_std": 0.09092219918966293,
+    "detail_ratio": 0.4699512437689733,
+    "mean_vs_ref_over_mc": 1.4487500467354213
+   },
+   {
+    "psnr_sample": 21.635815620422363,
+    "psnr_mean": 21.850072860717773,
+    "consistency_rmse": 0.009024386294186115,
+    "posterior_std": 0.05526954308152199,
+    "detail_ratio": 0.4009300168030345,
+    "mean_vs_ref_over_mc": 0.9679648909145931
+   }
+  ],
+  "EDM, I2SB ladder": [
+   {
+    "psnr_sample": 21.628786087036133,
+    "psnr_mean": 21.802608489990234,
+    "consistency_rmse": 0.016407940536737442,
+    "posterior_std": 0.04694211483001709,
+    "detail_ratio": 0.32679943339603323,
+    "mean_vs_ref_over_mc": 0.9054226467501466
+   },
+   {
+    "psnr_sample": 21.36730194091797,
+    "psnr_mean": 21.698776245117188,
+    "consistency_rmse": 0.009610563516616821,
+    "posterior_std": 0.06702642887830734,
+    "detail_ratio": 0.3881236295991767,
+    "mean_vs_ref_over_mc": 0.801347478198604
+   }
+  ]
+ }
+}
