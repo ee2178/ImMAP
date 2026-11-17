@@ -221,8 +221,10 @@ def test_generator_protocols():
           mri["kspace_type"] == "measurement_awgn")
     check("measured: ground truth is the stored SENSE combination (no target key)",
           "target" not in data, f"target={data.get('target')!r}")
-    check("measured: Julia masks (center_frac 0.04, adjust_accel)",
-          mri.get("center_frac") == 0.04 and mri.get("adjust_accel") is True)
+    # adjust_accel OFF since 2026-11-17 (user's call, as Sljiva's runs): the key is not written
+    check("measured: Julia masks (center_frac 0.04), adjust_accel off",
+          mri.get("center_frac") == 0.04 and not mri.get("adjust_accel", False),
+          f"adjust_accel={mri.get('adjust_accel', 'absent')!r}")
     check("measured: operator maps estimated online with ESPIRiT",
           mri.get("online_smaps") == "espirit")
     check("measured: online ESPIRiT runs at thresh_eig 0, kernel 4x4, maxit 10",

@@ -1,7 +1,7 @@
 {
     "task": "i2sb_recon",
     "experiment": {
-        "name": "guided_knee_PDFS_from_PD_sbtgvn_R8_g1"
+        "name": "knee_PDFS_from_PD_sbtgvn_R8_g1_s4_noise-vlow"
     },
     "model": {
         "type": "BridgeTGVN",
@@ -20,7 +20,7 @@
         }
     },
     "paths": {
-        "save_dir": "trained_nets/guided_recon/knee/sbtgvn_R8_g1",
+        "save_dir": "trained_nets/guided_recon/knee/s4_noise-vlow/sbtgvn_R8_g1",
         "ckpt": null
     },
     "data": {
@@ -35,8 +35,10 @@
             "start_slice": 12,
             "end_slice": 25,
             "organ_mask_source": "none",
-            "scale_fac": 15000.0,
-            "side_scale_fac": 2900.0,
+            "volume_scales": "config/knee/guided/volume_scales.json",
+            "volume_stat": "acs_p95",
+            "side_volume_stat": "full_p95",
+            "volume_target": 1.0,
             "target": "sense",
             "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9",
             "pad_multiple": 1,
@@ -53,8 +55,10 @@
             "start_slice": 12,
             "end_slice": 13,
             "organ_mask_source": "none",
-            "scale_fac": 15000.0,
-            "side_scale_fac": 2900.0,
+            "volume_scales": "config/knee/guided/volume_scales.json",
+            "volume_stat": "acs_p95",
+            "side_volume_stat": "full_p95",
+            "volume_target": 1.0,
             "target": "sense",
             "smap_root": "../datasets/fastmri_preprocessed/knee_coil_combined/pdfs_espirit_acs32_eig0.9",
             "pad_multiple": 1,
@@ -66,11 +70,11 @@
         "steps_per_epoch": 50,
         "val_every_epochs": 100,
         "noise_std": [
-            0.01,
-            0.02
+            0.0,
+            0.001
         ],
         "noise_dist": "uniform",
-        "val_noise_std": 0.015,
+        "val_noise_std": 0.0,
         "val_seed": 1234,
         "loss_type": "complex-mse",
         "clip_grad": 0.05,
@@ -87,7 +91,6 @@
         "kspace_type": "measurement_awgn",
         "whiten_kspace": false,
         "center_frac": 0.04,
-        "adjust_accel": true,
         "online_smaps": "espirit",
         "online_smaps_kws": {
             "thresh_eig": 0.0,
@@ -124,11 +127,13 @@
         "posterior": "ddpm",
         "x1_source": "adjoint",
         "x0_source": "operator",
-        "tau_scale": "x1_rms",
-        "tau_ref": 0.4443,
+        "tau_scale": "none",
+        "tau_ref": null,
         "val_mode": "full_recon",
         "val_nfe": 20,
         "dc_iters": 7,
-        "dc_lam": 7.0e-5
+        "dc_lam": 7.0e-5,
+        "support_thresh": 0.9,
+        "support_state": false
     }
 }

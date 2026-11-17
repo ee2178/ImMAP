@@ -536,8 +536,8 @@ def test_noise_presets():
     """--noise: the training range and val sigma per preset, and a run tag of its own (also for
     the bridge tau calibration file) for every preset but the grid's."""
     import yaml
-    want = {"grid": ([0.01, 0.02], 0.0, "s3"), "low": ([0.0, 0.01], 0.0, "s3_noise-low"),
-            "vlow": ([0.0, 0.001], 0.0, "s3_noise-vlow"), "none": ([0.0, 0.0], 0.0, "s3_noise-none")}
+    want = {"grid": ([0.01, 0.02], 0.0, "s4"), "low": ([0.0, 0.01], 0.0, "s4_noise-low"),
+            "vlow": ([0.0, 0.001], 0.0, "s4_noise-vlow"), "none": ([0.0, 0.0], 0.0, "s4_noise-none")}
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import make_guided_recon_configs as gen
     assert gen.NOISE == "vlow"                    # the default every launcher inherits
@@ -551,14 +551,16 @@ def test_noise_presets():
             cfg = yaml.safe_load(open(os.path.join(d, "knee", "guided", "tgvn_c8_R8_g1.json")))
             t = cfg["training"]
             assert t["noise_std"] == rng and t["val_noise_std"] == val, (preset, t["noise_std"])
+            # adjust_accel OFF on every run (2026-11-17): absent or false, never true
+            assert not cfg["mri"].get("adjust_accel", False), cfg["mri"].get("adjust_accel")
             assert cfg["paths"]["save_dir"] == f"trained_nets/guided_recon/knee/{tag}/tgvn_c8_R8_g1"
             cells = subprocess.run(
                 [sys.executable, os.path.join(REPO, "scripts", "make_guided_recon_configs.py"),
                  "--models", "sbtgvn_c8_guide", "--noise", preset, "--list-cells"],
                 check=True, cwd=REPO, capture_output=True, text=True).stdout.splitlines()
             tau_file = cells[0].split(chr(9))[5]
-            assert tau_file.endswith("guide_R8_volume.json" if preset == "grid"
-                                     else f"guide_R8_volume_noise-{preset}.json"), tau_file
+            assert tau_file.endswith("guide_R8_volume_s4.json" if preset == "grid"
+                                     else f"guide_R8_volume_s4_noise-{preset}.json"), tau_file
 
 
 def test_zero_added_noise_trains():
@@ -908,7 +910,8 @@ def test_one_tau_for_every_start():
 def test_bridge_tau_is_read_per_start_and_normalization():
     """Volume norm: tau = TAU_MARGIN_ABS x the absolute gap rule, no tau_ref. Fixed norm:
     TAU_MARGIN x the relative gap rule, tau_ref calibrated. Files keyed by start, R and
-    normalization; no file -> the zero-filled fallback, flagged uncalibrated."""
+    normalization, run set and noise preset; no file -> the zero-filled fallback, flagged
+    uncalibrated."""
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import make_guided_recon_configs as gen
     with tempfile.TemporaryDirectory() as root:
@@ -919,7 +922,7 @@ def test_bridge_tau_is_read_per_start_and_normalization():
         os.makedirs(os.path.join(root, gen.BRIDGE_TAU_DIR))
         cal = {"tau_abs": 0.1, "tau_rel": 0.2, "tau_ref": 0.9}
         for norm in ("volume", "fixed"):
-            with open(os.path.join(root, gen.BRIDGE_TAU_DIR, f"guide_R8_{norm}{gen._noise_suffix()}.json"), "w") as f:
+            with open(os.path.join(root, gen.BRIDGE_TAU_DIR, f"guide_R8_{norm}_{gen.RUN_TAG}{gen._noise_suffix()}.json"), "w") as f:
                 json.dump(cal, f)
         tau, tau_ref, ok = gen.bridge_tau("guide", 8, root=root, normalization="volume")
         assert ok and abs(tau - gen.TAU_MARGIN_ABS * 0.1) < 1e-3 and tau_ref is None
@@ -927,7 +930,7 @@ def test_bridge_tau_is_read_per_start_and_normalization():
         assert ok and abs(tau - gen.TAU_MARGIN * 0.2) < 1e-3 and tau_ref == 0.9
         assert gen.bridge_tau("acs", 8, root=root, normalization="volume")[2] is False
     assert gen.bridge_tau_path(8, "sbtgvn_c8_acs") == \
-        f"{gen.BRIDGE_TAU_DIR}/acs_R8_{gen.NORMALIZATION}{gen._noise_suffix()}.json"
+        f"{gen.BRIDGE_TAU_DIR}/acs_R8_{gen.NORMALIZATION}_{gen.RUN_TAG}{gen._noise_suffix()}.json"
     assert gen.bridge_tau_path(8, "tgvn_c8") is None
 
 

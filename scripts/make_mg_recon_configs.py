@@ -14,8 +14,8 @@ its own cell list via `--list-cells --anatomy <a>`, so the two stay in sync.
 TWO PROTOCOLS (`--protocol`, default "measured" since 2026-09-22):
 
   measured  MEASURED k-space plus known AWGN (`kspace_type: "measurement_awgn"`),
-            masks with Sljiva's heuristics (`center_frac: 0.04`,
-            `adjust_accel: true` -- R is the EFFECTIVE rate), and the
+            masks with Sljiva's heuristics (`center_frac: 0.04`; `adjust_accel`
+            OFF since 2026-11-17, as Sljiva's own runs -- see _apply_protocol), and the
             OPERATOR's coil maps estimated from each measurement's ACS
             (`online_smaps: "walsh"`, as Sljiva's multigrid runs; "espirit"
             via --online-smaps). The ground truth is the stored SENSE
@@ -1176,7 +1176,14 @@ def _apply_protocol(args):
                              "own. Use 'espirit' or 'walsh'.")
         if args.center_frac is None:
             args.center_frac = 0.04
-        args.adjust_accel = True
+        # adjust_accel OFF (2026-11-17, user's call; the measured protocol used to force it on).
+        # On, the outer spacing round((N - Nc) / (N/R - Nc)) depends on the image width, so the
+        # nets see different sampling -- and aliasing -- patterns and must generalize across
+        # them: on the 368-wide knee at R=8 it gave spacing 11 (effective R 7.7) where Sljiva's
+        # runs (synthmri_closure.yaml: adjust_accel false) sample every 8th line (effective
+        # R ~6.1). It was the likely source of the horizontal blur in the knee recons. Leave
+        # it off unless explicitly asked for; _opt_mri then writes no key at all.
+        args.adjust_accel = False
         if args.online_smaps is None:
             # ESPIRiT again since 2026-09-28, at ONLINE_ESPIRIT_KWS
             # (thresh_eig 0.95, maxit 10) -- the user's finding that this is

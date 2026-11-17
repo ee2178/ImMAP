@@ -32,7 +32,7 @@ no-guide E2E-VarNet).
 
 What is inherited, from what scripts/make_mg_recon_configs.py writes TODAY for knee at that R:
     mri          the measured protocol: measured k-space + AWGN, online ESPIRiT, center_frac,
-                 adjust_accel, uniform mask (taken from the lpdsnet cell)
+                 adjust_accel OFF (2026-11-17), uniform mask (taken from the lpdsnet cell)
     training     steps, epochs, val cadence, noise range, val noise / seed, loss, clip
     optimizer    Adam at the grid's lpdsnet LR for EVERY cell (LGGS included, not mggrouplpds' 2e-4)
     scheduler    cosine over the grid's step count
@@ -82,10 +82,13 @@ ANATOMY = "knee"
 ACCELS = (8,)
 GUIDE_ACCELS = (1,)
 DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c6")
-# Run namespace. "s3" = PER-VOLUME normalization + eig-0.9 offline maps (2026-11-06; "s2" was the
-# per-contrast fixed scale_fac). A new tag means new run directories: the launchers RESUME any run
-# dir that has a checkpoint, so reusing an earlier set's would silently continue those runs.
-RUN_TAG = "s3"
+# Run namespace. "s4" (2026-11-17) = "s3" with adjust_accel OFF: the masks sample every R-th line
+# plus the ACS (effective R ~6.1 at R=8 on the 368-wide knee) instead of widening the spacing to 11
+# (effective R 7.7) -- a different sampling problem, so a new set. "s3" = PER-VOLUME normalization
+# + eig-0.9 offline maps (2026-11-06; "s2" was the per-contrast fixed scale_fac). A new tag means
+# new run directories: the launchers RESUME any run dir that has a checkpoint, so reusing an
+# earlier set's would silently continue those runs under the old protocol.
+RUN_TAG = "s4"
 
 # ADDED MEASUREMENT NOISE (the protocol is measured k-space + AWGN): training sigma range and the
 # fixed validation sigma, per preset. "grid" is the mg grid's (what every run so far used); the
@@ -413,8 +416,9 @@ for _name, _p in TRANSFER_NETS.items():
 BRIDGE_TAU_DIR = "config/knee/guided/bridge_tau"
 TAU_MARGIN = 0.03 / 0.0212          # on the intensity-relative gap rule (tau_scale "x1_rms")
 TAU_MARGIN_ABS = 0.03 / 0.0234      # on the absolute gap rule (tau_scale "none")
-# The calibration files are keyed by NORMALIZATION too: a gap measured under one intensity
-# convention is not the gap under another.
+# The calibration files are keyed by NORMALIZATION, the RUN_TAG and the noise preset too: a gap
+# measured under one intensity convention, sampling protocol (s4: adjust_accel off) or noise level
+# is not the gap under another.
 
 
 def bridge_tau(start, r, root=REPO, normalization=None):
@@ -422,7 +426,7 @@ def bridge_tau(start, r, root=REPO, normalization=None):
     absolute tau (tau_scale "none"). No file -> the zero-filled fallback TAU / TAU_REF."""
     norm = normalization or NORMALIZATION
     absolute = norm != "fixed"
-    p = os.path.join(root, BRIDGE_TAU_DIR, f"{start}_R{r}_{norm}{_noise_suffix()}.json")
+    p = os.path.join(root, BRIDGE_TAU_DIR, f"{start}_R{r}_{norm}_{RUN_TAG}{_noise_suffix()}.json")
     if not os.path.exists(p):
         return TAU, (None if absolute else TAU_REF), False
     with open(p) as f:
@@ -479,7 +483,8 @@ def bridge_tau_path(r, model):
     spec = MODELS[model]
     if spec["task"] != "i2sb_recon" or TAU_OVERRIDE is not None:
         return None
-    return f"{BRIDGE_TAU_DIR}/{spec.get('x1_source', X1_SOURCE)}_R{r}_{NORMALIZATION}{_noise_suffix()}.json"
+    return (f"{BRIDGE_TAU_DIR}/{spec.get('x1_source', X1_SOURCE)}_R{r}_{NORMALIZATION}_{RUN_TAG}"
+            f"{_noise_suffix()}.json")
 
 
 def cell_name(r, model, g):

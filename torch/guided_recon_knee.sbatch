@@ -26,10 +26,12 @@
 # 2026-11-13 (user's call): vanilla LGGS only (the guide-W / guide-conv / transfer variants showed
 # no visual difference) and TGVN at 6 cascades only (deeper TGVN is noticeably slower than LGGS);
 # tgvn_c12 / c10 / c8 still run by name. Added training noise U[0, 0.001] (NOISE=vlow, 10x below
-# the earlier "low") to cut the artifacts seen across the board; its own run tag, s3_noise-vlow,
+# the earlier "low") to cut the artifacts seen across the board; its own run tag, s4_noise-vlow,
 # so these are fresh runs, never resumes of the U[0, 0.01] ones in s3_noise-low.
+# 2026-11-17: adjust_accel OFF for every run (RUN_TAG s4): masks sample every R-th line plus the
+# ACS, as Sljiva's runs do, instead of a width-dependent wider spacing (11 at R=8 on the knee).
 #
-# Runs land in trained_nets/guided_recon/knee/s3/<cell> (RUN_TAG "s3" in the generator): earlier
+# Runs land in trained_nets/guided_recon/knee/s4_noise-vlow/<cell> (RUN_TAG "s4" in the generator): earlier
 # sets' run dirs (s1 shared 5e3 scale + eig-0.95 maps; s2 fixed per-contrast scale) are NOT resumed. Bridge starting points for i2sb-TGVN
 # have their own launcher, torch/bridge_start_knee.sbatch, once the TGVN depth is settled.
 #
@@ -56,7 +58,7 @@
 # Smoke test:      sbatch --array=0 --time=00:30:00 torch/guided_recon_knee.sbatch
 # Noise:           default U[0, 0.001] (vlow); NOISE=low|grid|none ... sbatch --export=ALL ... for
 #                  U[0, 0.01] / U[0.01, 0.02] / none;
-#                  runs go to trained_nets/guided_recon/knee/s3_noise-<preset>/, grid to s3/)
+#                  runs go to trained_nets/guided_recon/knee/s4_noise-<preset>/, grid to s4/)
 # Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
 # Multicontrast LGGS, no extra network: the knee LGGS cell with the guide's own W_phi, W_alpha
 #                  (lggs_guide_w) or its own analysis conv per layer (lggs_guide_conv):

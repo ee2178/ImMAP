@@ -91,7 +91,6 @@
         "kspace_type": "measurement_awgn",
         "whiten_kspace": false,
         "center_frac": 0.04,
-        "adjust_accel": true,
         "online_smaps": "espirit",
         "online_smaps_kws": {
             "thresh_eig": 0.0,
