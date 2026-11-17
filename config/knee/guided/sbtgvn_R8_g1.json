@@ -115,7 +115,7 @@
         }
     },
     "wandb": {
-        "project": "guided_recon",
+        "project": "guided_recon_sb",
         "id": null
     },
     "i2sb": {
@@ -129,7 +129,8 @@
         "x0_source": "operator",
         "tau_scale": "none",
         "tau_ref": null,
-        "val_mode": "full_recon",
+        "val_mode": "single_pass",
+        "val_step": -1,
         "val_nfe": 20,
         "dc_iters": 7,
         "dc_lam": 7.0e-5,

@@ -180,6 +180,15 @@ I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
 # support_state also masks the bridge state after every step (off: the net then sees states
 # like its training ones).
 I2SB_SUPPORT = {"support_thresh": 0.9, "support_state": False}
+# VALIDATION of every i2sb cell (2026-11-17, user's call): SINGLE PASS at the top step, t = 999 of
+# 1000 (val_step -1), where x_t = 0.999 x1 + 0.001 x0 + a little bridge noise -- in effect the
+# net's one-shot E[x0 | x1]: how well it does at the start of the ladder. The full sampler's validation was slow, and its CG step
+# (I2SB_DC, kept above for when full_recon comes back) amplifies noise until its parameters are
+# tuned. val_nfe / I2SB_DC / I2SB_SUPPORT only act under val_mode "full_recon".
+I2SB_VAL = {"val_mode": "single_pass", "val_step": -1, "val_nfe": 20}
+# i2sb runs log to their own wandb project (2026-11-17), apart from the one-shot recon cells.
+WANDB_PROJECT = "guided_recon"
+WANDB_PROJECT_SB = "guided_recon_sb"
 # Bridge start (sb/i2sb_recon.py): "adjoint" = zero-filled E^H y (aliased); "acs" = only the
 # mask's contiguous centre block, an alias-free low-pass image -- the bridge then deblurs, with
 # the guide supplying structure. Its width is the mask's centre (center_frac). Uniform
@@ -526,7 +535,8 @@ def make_config(r, model, g, grid):
         "mri": mri,
         "optimizer": base["optimizer"],
         "scheduler": base["scheduler"],
-        "wandb": {"project": "guided_recon", "id": None},
+        "wandb": {"project": WANDB_PROJECT_SB if spec["task"] == "i2sb_recon" else WANDB_PROJECT,
+                  "id": None},
     }
     if speed.get("params"):
         cfg["model"]["params"].update(speed["params"])
@@ -569,7 +579,7 @@ def make_config(r, model, g, grid):
         cfg["i2sb"] = {**SCHEDULE, "tau": tau, "deterministic": False, "posterior": "ddpm",
                        "x1_source": start, "x0_source": "operator",
                        "tau_scale": TAU_SCALE, "tau_ref": tau_ref,
-                       "val_mode": "full_recon", "val_nfe": 20, **I2SB_DC, **I2SB_SUPPORT}
+                       **I2SB_VAL, **I2SB_DC, **I2SB_SUPPORT}
         cfg["i2sb"].update(spec.get("i2sb") or {})
     return cfg
 

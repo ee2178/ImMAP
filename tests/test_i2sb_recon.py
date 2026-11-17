@@ -282,6 +282,38 @@ def test_single_pass_validation_and_resume():
             ckpt=os.path.join(d, "net.ckpt"))
 
 
+def test_single_pass_at_the_top_step():
+    """val_step=-1: every val slice is evaluated at the top training step -- std_fwd the
+    bridge's last, x_t = mu_x1 x1 + mu_x0 x0 + std_sb noise with mu_x1 = 0.999 on the 1000-step
+    grid, so in effect the net's one-shot E[x0 | x1]. Training steps stay random."""
+    import training.i2sb_recon as tir
+    from sb.base import bridge_coeffs
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    seen, real = [], tir.predict_x0_recon
+
+    def spy(net, x_t, std_fwd, **kw):
+        if not net.training:
+            seen.append((x_t.clone(), kw["x1"].clone(), std_fwd.flatten().clone()))
+        return real(net, x_t, std_fwd, **kw)
+
+    tir.predict_x0_recon = spy
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            run(make_net(), d, num_epochs=1, val_mode="single_pass", val_step=-1)
+    finally:
+        tir.predict_x0_recon = real
+    assert seen, "validation never called the net"
+    _, mu_x1, std_sb = bridge_coeffs(sched)
+    assert float(mu_x1[-1]) > 0.998                       # the top step is (almost) all x1
+    for x_t, x1, s in seen:
+        assert torch.allclose(s, sched.std_fwd[-1].expand_as(s))
+        rel = float((x_t - x1).norm() / x1.norm())         # 0.1% of x0 - x1, plus std_sb noise
+        assert rel < 0.1, rel
+    with tempfile.TemporaryDirectory() as d:
+        raises(ValueError, lambda: run(make_net(), d, val_mode="full_recon", val_step=-1),
+               "single_pass setting")
+
+
 def test_refuses_schedule_mismatch_and_embedding():
     with tempfile.TemporaryDirectory() as d:
         raises(ValueError, lambda: run(make_net(tau=0.2), d), "schedule mismatch")

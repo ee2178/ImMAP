@@ -52,7 +52,11 @@ one-shot grid is scored on -- which "operator" leaves unchanged wherever the off
 support (their |.| agree there; outside it the stored image is exactly 0).
 
 Validation (`val_mode`, cfg["i2sb"]):
-    "single_pass"   one random bridge step per slice, one forward -- the training objective
+    "single_pass"   one bridge step per slice, one forward -- the training objective. The step
+                    is random, or `val_step` for every slice (negative counts from the end, so
+                    -1 is the top training step: on the 1000-step grid x_t = 0.999 x1 + 0.001 x0
+                    + a little bridge noise, the closest the grid gets to t = 1 -- in effect
+                    the net's one-shot E[x0 | x1])
     "full_recon"    the full `val_nfe`-step reverse sampler, i.e. the reconstruction itself
 Both log val/zf_* (the zero-filled x1 scored the same way) as the floor to beat.
 """
@@ -234,6 +238,10 @@ def train_i2sb_recon(
                                      # see sb/i2sb_recon.py::bridge_noise_scale
     val_mode="full_recon",
     val_nfe=20,
+    val_step=None,                   # single_pass: None = a random step per slice (the training
+                                     # objective); an int = that step for every slice, negative
+                                     # from the end (-1: the top step, x_t ~ x1: in effect the
+                                     # net's one-shot E[x0 | x1])
     dc_iters=0,                      # sampling-time CG data consistency on every x0_hat
     dc_lam=DC_LAM,                   # (I2SB-Recon, arXiv 2411.14269); full_recon val only, see
                                      # sb/i2sb_recon.py::cg_data_consistency. With dc_iters > 0
@@ -275,6 +283,8 @@ def train_i2sb_recon(
     kappa_fn = lambda x1: bridge_noise_scale(x1, tau_scale, tau_ref)    # noqa: E731
     if val_mode not in ("single_pass", "full_recon"):
         raise ValueError(f"val_mode must be 'single_pass' or 'full_recon', got {val_mode!r}")
+    if val_step is not None and val_mode != "single_pass":
+        raise ValueError(f"val_step={val_step} is a single_pass setting; val_mode is {val_mode!r}")
     if accum_steps < 1:
         raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
     if int(dc_iters) < 0 or float(dc_lam) < 0:
@@ -422,7 +432,8 @@ def train_i2sb_recon(
             with val_ctx:
                 val = _validate(
                     net, bridge, val_loader, device, interval=interval, val_mode=val_mode,
-                    val_nfe=val_nfe, val_seed=val_seed, deterministic=deterministic,
+                    val_nfe=val_nfe, val_step=val_step, val_seed=val_seed,
+                    deterministic=deterministic,
                     posterior=posterior, loss_fn=loss_fn, loss_type=loss_type,
                     use_organ_mask=use_organ_mask, residual_gain=residual_gain,
                     kspace_type=val_kspace_type or kspace_type,
@@ -495,7 +506,7 @@ def _validate(net, bridge, val_loader, device, *, val_seed, **kws):
 
 
 def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, val_nfe,
-                   deterministic, posterior, loss_fn, loss_type, use_organ_mask, residual_gain,
+                   deterministic, val_step=None, posterior, loss_fn, loss_type, use_organ_mask, residual_gain,
                    kspace_type, noise_std, meas, kappa_fn, wandb, global_step, epoch,
                    dc_iters=0, dc_lam=DC_LAM, metric_range=1.0, support_thresh=None,
                    support_state=False):
@@ -528,7 +539,10 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
             pred = sample(dc_iters)
             std_fwd = torch.zeros(bs, 1, 1, 1, device=device)
         else:
-            step = torch.randint(0, interval, (bs,), generator=gen, device=device)
+            if val_step is None:
+                step = torch.randint(0, interval, (bs,), generator=gen, device=device)
+            else:
+                step = torch.full((bs,), int(val_step) % interval, dtype=torch.long, device=device)
             x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic,
                                  noise_scale=kappa_fn(x1))
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
@@ -562,7 +576,9 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
         panel, pstats = recon_panel(img[:1], rec[:1], zero_filled=zf[:1], gain=residual_gain,
                                     guides=gimgs)
         dc = f", CG-DC {dc_iters} it lam={dc_lam:g}" if dc_iters > 0 else ""
-        how = f"I2SB recon, nfe={val_nfe}{dc}" if val_mode == "full_recon" else "single-pass x0_hat"
+        how = (f"I2SB recon, nfe={val_nfe}{dc}" if val_mode == "full_recon"
+               else "single-pass x0_hat" + ("" if val_step is None
+                                             else f" at step {int(val_step) % interval}"))
         caption = (f"epoch {epoch} | zero-filled x1 | {how} | ground truth | "
                    f"|residual| x{pstats['gain']:g}"
                    + "".join(f" | {lab} (own scale)" for lab, _ in gtiles)
