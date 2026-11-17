@@ -34,9 +34,9 @@
 # protocol (vlow noise, adjust_accel off, per-volume normalization, offline SENSE target), run
 # dirs trained_nets/guided_recon/knee/<RUN_TAG>_noise-<preset>/<cell>, resume, FORCE_RESTART.
 #
-# NOTE the two masks share their phase at validation (both offset 0): the target's lines every
-# 8th are a subset of the guide's every 4th, so the two aliasing patterns line up. Complementary
-# offsets would decorrelate them -- a later experiment.
+# Validation samples the guide on COMPLEMENTARY lines (mri.guide_val_offset = R_g / 2 = 2, since
+# 2026-11-17): the target keeps every 8th line from 0, the guide every 4th from 2, so no line is
+# shared and the two aliasing patterns do not line up. Training redraws the guide's phase.
 #
 # Submit:          sbatch torch/guide_accel_knee.sbatch
 # Some cells:      MODELS="lggs_trust tgvn_c6" sbatch --array=0-1 --export=ALL torch/guide_accel_knee.sbatch

@@ -374,6 +374,10 @@ def train_recon(
     guide_R=1,
     guide_acs_lines=0,
     guide_mask_dist="uniform",
+    # the accelerated guide's line phase AT VALIDATION (training redraws it every step). 0 puts
+    # its lines on the target's (offset 0) lines; R_g / 2 puts them midway between -- the
+    # complementary sampling a joint reconstruction needs (2026-11-17).
+    guide_val_offset=0,
     noise_std=(0.0, 0.01),
     noise_dist="uniform",
     # Validation noise. `val_noise_std=None` redraws from `noise_std` like
@@ -830,7 +834,8 @@ def train_recon(
                     E_v = Mask(mask_v) @ FFT2D() @ Sense(smaps_v)
                     E_v, T_v = _embed(net, E_v, image_v, pad_hw_v)
                     guide_v = _guide(net, side_v, smaps_v, T_v, device, guide_R,
-                                     guide_acs_lines, guide_mask_dist, guide_offset=0)
+                                     guide_acs_lines, guide_mask_dist,
+                                     guide_offset=guide_val_offset)
 
                     recon_v, _ = _forward(net, y_v, E_v, sigma_v, guide_v)
                     recon_v = T_v.forward(recon_v)

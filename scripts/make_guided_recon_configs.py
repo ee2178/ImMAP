@@ -225,6 +225,13 @@ LGGS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
                    degrees=0, prox_degrees=1,       # noise-adaptive threshold, constant steps
                    dK=5, nheads=1, init_strategy="semi_orthogonal", is_complex=True,
                    preproc="kspace", attn_backend="triton")
+# Joint LGGS (models/joint_lggs.py) at LGGS's grid point: the same depth, dictionary, attention
+# width, thresholds and refresh schedule; the joint window is LGGS's guide window. K0 = 10 of the
+# 30 layers are the independent-LPDS warm-up (a third, while both images are still aliased).
+JOINT_LGGS_PARAMS = dict(K=30, K0=10, M=169, P=7, s=2, Mh=64, window=15, lam0=1e-3, tau0=0.5,
+                         theta0=0.0, degrees=0, prox_degrees=1, dK=5, nheads=1,
+                         sim_fun="pidistance", init_strategy="semi_orthogonal",
+                         attn_backend="triton")
 
 # How LGGS RUNS, not what it is: each changes no parameter and, to fp roundoff, no output or
 # gradient (checked against the original triton path beside an fp32 noise floor:
@@ -304,6 +311,12 @@ MODELS = {
     "lggs_trust": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
                        model=dict(type="LGGS", params=dict(LGGS_PARAMS, trust_codes=True)),
                        speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING)),
+    # JOINT LGGS (2026-11-17; models/joint_lggs.py): target and guide reconstructed together from
+    # EQUALLY accelerated scans -- per-contrast dictionaries, one group threshold on both images'
+    # codes, after K0 independent-LPDS warm-up layers. LGGS's grid point otherwise (its guide
+    # window is the joint window). Run with an accelerated guide: torch/joint_lggs_knee.sbatch.
+    "joint_lggs": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                       model=dict(type="JointLGGS", params=JOINT_LGGS_PARAMS)),
 }
 
 # Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,
@@ -528,6 +541,11 @@ def make_config(r, model, g, grid):
     training.update(spec.get("training") or {})
     mri = dict(grid["lpdsnet"]["mri"], guide_R=int(g), guide_acs_lines=0,
                guide_mask_dist="uniform")
+    if int(g) > 1 and spec["task"] == "recon":
+        # COMPLEMENTARY validation sampling (2026-11-17): the target keeps lines at offset 0, the
+        # accelerated guide samples midway between its own spacing, so the two scans' lines
+        # interleave instead of coinciding (training redraws the guide's phase every step)
+        mri["guide_val_offset"] = int(g) // 2
     name = cell_name(r, model, g)
     run = f"{ANATOMY}_PDFS_from_PD_{name}" if spec["guided"] else f"{ANATOMY}_PDFS_{name}"
     cfg = {

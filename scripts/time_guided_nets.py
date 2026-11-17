@@ -119,7 +119,7 @@ def _count_gram(E):
 
 
 def time_cell(name, cfg, batch, meas, device, warmup, iters, attn_backend=None):
-    if attn_backend and cfg["model"]["type"] in ("LGGS", "BridgeLGGS"):
+    if attn_backend and cfg["model"]["type"] in ("LGGS", "BridgeLGGS", "JointLGGS"):
         cfg = json.loads(json.dumps(cfg))
         cfg["model"]["params"]["attn_backend"] = attn_backend
         cfg["model"]["params"].pop("triton_materialize", None)

@@ -1374,6 +1374,102 @@ def test_trust_codes_large_delta_is_lggs_and_trains_delta():
     assert gen.MODELS["lggs_trust"]["model"]["params"] == dict(gen.LGGS_PARAMS, trust_codes=True)
 
 
+def _joint_net(**over):
+    from models.joint_lggs import JointLGGSNet
+    kw = dict(K=4, K0=2, M=8, P=3, s=2, Mh=4, window=3, attn_backend="gather", dK=2)
+    kw.update(over)
+    torch.manual_seed(0)
+    return JointLGGSNet(**kw)
+
+
+def test_joint_lggs_structure_warmup_and_gradients():
+    """JointLGGSNet: per-contrast (grouped) codes; the guide operator carries the guide's own
+    lines; with K0 = K (all warm-up) the target ignores the guide entirely, with joint layers it
+    does not; both reconstructions come back; gradients reach both dictionaries and the W's."""
+    from models.joint_lggs import JointLGGSNet
+    maps = torch.from_numpy(MAPS)[None]
+    E = Mask(_line_mask(R=4, acs=4)) @ FFT2D() @ Sense(maps)
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64)
+    w = torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64)
+    gmask = torch.roll(_line_mask(R=4, acs=0), 2, dims=-1)        # complementary lines, no ACS
+    side = gmask * (FFT2D() @ Sense(maps))(w)
+    y = E(x)
+    sig = torch.tensor(0.05)
+
+    Eg = JointLGGSNet.guide_operator(E, side)
+    from operators.accessors import get_mask
+    assert torch.equal(get_mask(Eg)[0, 0, 0].bool(), gmask[0, 0, 0].bool())
+
+    net = _joint_net()
+    a = net.layers[0].analysis(torch.cat([x, torch.zeros_like(x)], dim=1))
+    assert a[:, net.M:].abs().max() == 0 and a[:, :net.M].abs().max() > 0   # untied per contrast
+
+    xh, extra = net(y, E=E, sigma=sig, guide=side)
+    assert xh.shape == (1, 1, H, W) and extra["guide_recon"].shape == (1, 1, H, W)
+    side2 = gmask * (FFT2D() @ Sense(maps))(torch.randn(1, 1, H, W, generator=g,
+                                                         dtype=torch.complex64))
+    assert not torch.allclose(net(y, E=E, sigma=sig, guide=side2)[0], xh, atol=1e-6)
+    indep = _joint_net(K0=4)                                       # all LPDS: no cross-talk
+    assert torch.allclose(indep(y, E=E, sigma=sig, guide=side)[0],
+                          indep(y, E=E, sigma=sig, guide=side2)[0], atol=1e-6)
+
+    (xh.abs().pow(2).mean() + extra["guide_recon"].abs().pow(2).mean()).backward()
+    an = net.layers[-2].analysis            # the LAST layer's z is never read: no gradient there
+    gw = torch.complex(an.conv_real.weight.grad, an.conv_imag.weight.grad)
+    assert gw[:net.M].abs().sum() > 0 and gw[net.M:].abs().sum() > 0
+    th = net.layers[-1].prox.prox.Wtheta
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in th.parameters())
+    assert net.layers[-1].prox.prox.Wtheta is net.layers[-2].prox.prox.Wtheta    # tied
+    net.project()
+    raises(ValueError, lambda: _joint_net(K0=5), "K0")
+    raises(ValueError, lambda: net(y, E=E, sigma=sig, guide=None), "side k-space")
+
+
+def test_joint_lggs_cell_config():
+    """The generator's joint_lggs cell at an equally accelerated guide: complementary validation
+    lines (guide_val_offset = R_g / 2, recon cells only), every key a train_recon argument, and
+    the model block builds (shrunk, on the gather backend)."""
+    from models import build_model
+    with tempfile.TemporaryDirectory() as out:
+        subprocess.run([sys.executable, os.path.join(REPO, "scripts", "make_guided_recon_configs.py"),
+                        "--out", out, "--models", "joint_lggs", "lggs", "--guide-accels", "1", "8"],
+                       check=True, cwd=REPO, stdout=subprocess.DEVNULL)
+        cfgs = {n: json.load(open(os.path.join(out, "knee", "guided", f"{n}.json")))
+                for n in ("joint_lggs_R8_g8", "lggs_R8_g8", "lggs_R8_g1")}
+    cfg = cfgs["joint_lggs_R8_g8"]
+    assert cfg["model"]["type"] == "JointLGGS"
+    assert (cfg["mri"]["guide_R"], cfg["mri"]["guide_val_offset"]) == (8, 4)
+    assert cfgs["lggs_R8_g8"]["mri"]["guide_val_offset"] == 4
+    assert "guide_val_offset" not in cfgs["lggs_R8_g1"]["mri"]        # fully sampled: no key
+    params = inspect.signature(tr.train_recon).parameters
+    for block in ("training", "mri", "paths"):
+        for k in cfg[block]:
+            if block == "training" and k in TRAIN_PY_KEYS:
+                continue
+            assert k in params, f"{block}.{k} is not a train_recon argument"
+    small = dict(cfg["model"]["params"], K=3, K0=1, M=8, P=3, Mh=4, window=3,
+                 attn_backend="gather")
+    net = build_model({"model": {"type": "JointLGGS", "params": small}})
+    assert net.K0 == 1 and net.guide_domain == "kspace"
+
+
+def test_train_recon_end_to_end_joint_lggs_with_accelerated_guide():
+    """train_recon drives JointLGGSNet with an ACCELERATED k-space guide and its own operator."""
+    import physics.online_smaps as osm
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, maps = make_data(root)
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.full_like(y, C ** -0.5)  # no LAPACK here
+        try:
+            spy = Spy(_joint_net())
+            run_recon(spy, csv, root, d, online_smaps="espirit", guide_R=4)
+        finally:
+            osm.online_smaps = real
+        assert spy.guides and all(g == (1, C, H, W) for g in spy.guides), spy.guides
+        assert os.path.exists(os.path.join(d, "net.ckpt"))
+
+
 def main():
     tests = sorted((n, f) for n, f in globals().items() if n.startswith("test_") and callable(f))
     failed = 0

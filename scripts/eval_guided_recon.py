@@ -87,7 +87,8 @@ def measure(run, item, noise=None, seed=0):
     E0 = Mask(mask) @ FFT2D() @ Sense(maps)
     E, T = embed_for_net(net, E0, image, pad_hw)
     guide = _guide(net, side, maps, T, dev, mri.get("guide_R", 1), mri.get("guide_acs_lines", 0),
-                   mri.get("guide_mask_dist", "uniform"), guide_offset=0)
+                   mri.get("guide_mask_dist", "uniform"),
+                   guide_offset=mri.get("guide_val_offset", 0))
     return dict(y=y, E=E, T=T, sigma=sigma, guide=guide, gt=image, zf=E0.adjoint(y), mask=mask,
                 smaps=maps, side=side, acs_lines=acs)
 

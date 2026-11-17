@@ -257,6 +257,13 @@ def build_model(cfg):
     # `window` is the SELF window and is 1 in every published LGGS config (the
     # guide window carries the nonlocality), so unlike MGGroupLPDS it is not an
     # error here.
+    # JOINT LGGS (models/joint_lggs.py): the target and an equally accelerated guide reconstructed
+    # together, per-contrast convs, one group threshold on both images' codes after K0
+    # independent-LPDS warm-up layers. Takes the side k-space as its guide.
+    elif model_type in ("JointLGGS", "JointLGGSNet"):
+        from .joint_lggs import JointLGGSNet
+        return JointLGGSNet(**params)
+
     elif model_type in ("LGGS", "GuidedLPDSNet", "LGGSNet"):
         params = dict(params)
         if params.get("guide_window", 1) <= 1:
