@@ -388,8 +388,10 @@ def test_one_recipe_for_every_cell(recipe, monkeypatch):
         assert set(lrs.values()) == {4e-4}
     else:
         assert set(clips.values()) == {0.05} and set(etas.values()) == {1e-6}
-        for m in models:                                  # the grid's own per-model LR
-            assert lrs[m] == grid[gen.MODELS[m]["grid_base"]]["optimizer"]["params"]["lr"], m
+        # ONE grid LR, the lpdsnet template's -- not each template's own: LGGS's mggrouplpds
+        # template carries 2e-4, and inheriting it put LGGS out of line (fixed 2026-11-17)
+        assert set(lrs.values()) == {grid["lpdsnet"]["optimizer"]["params"]["lr"]}, lrs
+        assert grid["mggrouplpds"]["optimizer"]["params"]["lr"] != lrs["lggs"]
     assert lrs["lggs"] == lrs["lggs_paper"]               # the paper cell is no exception
 
 

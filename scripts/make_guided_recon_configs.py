@@ -34,7 +34,7 @@ What is inherited, from what scripts/make_mg_recon_configs.py writes TODAY for k
     mri          the measured protocol: measured k-space + AWGN, online ESPIRiT, center_frac,
                  adjust_accel, uniform mask (taken from the lpdsnet cell)
     training     steps, epochs, val cadence, noise range, val noise / seed, loss, clip
-    optimizer    Adam at the grid LR (LGGS: the grid's group-attention LR, from mggrouplpds)
+    optimizer    Adam at the grid's lpdsnet LR for EVERY cell (LGGS included, not mggrouplpds' 2e-4)
     scheduler    cosine over the grid's step count
     (LR, eta_min and clip are replaced by Sljiva's for EVERY cell when TRAIN_RECIPE="sljiva")
     data         slice ranges, organ_mask_source (NOT scale_fac: per contrast, set below)
@@ -243,8 +243,9 @@ LGGS_PAPER_PARAMS = dict(
 LGGS_PAPER_DATA = dict(guide_slices=3)          # N_g = 3 slices centred on the target (III-E)
 
 # THE OPTIMISATION RECIPE -- ONE SWITCH, THE SAME FOR EVERY CELL, so the comparison stays fair:
-#   "grid"    the mg grid's values, inherited per model (Adam 5e-4, LGGS 2e-4; cosine to 1e-6;
-#             clip 0.05). IN FORCE (2026-11-09): the running sweep was launched with it.
+#   "grid"    the mg grid's values: Adam at the grid's lpdsnet LR (5e-4) for EVERY cell, cosine
+#             to 1e-6, clip 0.05. IN FORCE. (Until 2026-11-17 LGGS inherited its mggrouplpds
+#             template's 2e-4 instead -- the one cell out of line.)
 #   "sljiva"  Sljiva's config/train.yaml, the recipe of its LGGS runs and the paper: cosine
 #             4e-4 -> 2e-6 over 3e5 steps, warmup 0, global-norm clip 1 (torch's
 #             clip_grad_norm_ is the same rule).
@@ -536,7 +537,13 @@ def make_config(r, model, g, grid):
             cfg["optimizer"]["params"], lr=SLJIVA_RECIPE["lr"]))
         cfg["scheduler"] = dict(cfg["scheduler"], params=dict(
             cfg["scheduler"]["params"], eta_min=SLJIVA_RECIPE["eta_min"]))
-    elif TRAIN_RECIPE != "grid":
+    elif TRAIN_RECIPE == "grid":
+        # ONE grid LR for every cell: the lpdsnet template's (5e-4, which the varnet template
+        # shares). The mggrouplpds template LGGS is built from carries the grid's group-attention
+        # LR, 2e-4 -- inherited as is, LGGS trained at a different LR from everything else.
+        lr = grid["lpdsnet"]["optimizer"]["params"]["lr"]
+        cfg["optimizer"] = dict(cfg["optimizer"], params=dict(cfg["optimizer"]["params"], lr=lr))
+    else:
         raise ValueError(f"TRAIN_RECIPE must be 'grid' or 'sljiva', got {TRAIN_RECIPE!r}")
     # a cell's OWN recipe (sbunet_inv: I2SB-Inversion's; the transfer nets) beats the shared one
     if spec.get("optimizer"):

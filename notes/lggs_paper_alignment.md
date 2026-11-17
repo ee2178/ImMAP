@@ -35,7 +35,7 @@ are the better reference** for anything compared against the paper's results.
 | Initialisation | cold start, K - 1 sweeps | **same** (`lpds_iters`: layer 1 cold start, layers 2..K sweeps) | z(0) = 0, K sweeps (Eq. 13) | cold start in `lggs`; zero in `lggs_paper` |
 | Guide mean | per guide | **per guide** (`preprocess` per guide) | joint over N_g slices (App. B) | per guide in `lggs`; joint in `lggs_paper` |
 | M, p, K, stride, M_h | 169, 7, 30, 2, 64 | 169, 7, 30, 2, 64 | 169, 7, 30, -, 64 | unchanged |
-| Optimiser recipe | grid: LR 5e-4 (LGGS 2e-4) -> 1e-6, clip 0.05 | **LR 4e-4 -> 2e-6 cosine, 3e5 steps, no warmup, global-norm clip 1** | same | grid for now; **Sljiva's at the next sweep** (`TRAIN_RECIPE`) |
+| Optimiser recipe | grid: LR 5e-4 (LGGS 2e-4 until 2026-11-17; now 5e-4 like every cell) -> 1e-6, clip 0.05 | **LR 4e-4 -> 2e-6 cosine, 3e5 steps, no warmup, global-norm clip 1** | same | grid for now; **Sljiva's at the next sweep** (`TRAIN_RECIPE`) |
 
 ## Changes on 2026-11-09
 
@@ -77,8 +77,10 @@ threshold (B, M, 1, 1), so the fast path is kept.
 For a short while on 2026-11-09 every cell carried Sljiva's recipe. That was **reverted**: the
 running sweep was launched with the grid's, and what matters is that every cell shares one
 recipe. `scripts/make_guided_recon_configs.py` now has `TRAIN_RECIPE`:
-- **`"grid"` (in force):** the mg grid's per-model values, exactly as before. Adam 5e-4 (LGGS
-  2e-4), cosine to 1e-6, clip 0.05.
+- **`"grid"` (in force):** the mg grid's values, with **one** LR for every cell: Adam at the
+  grid's lpdsnet LR (5e-4), cosine to 1e-6, clip 0.05. Until 2026-11-17 LGGS inherited its
+  `mggrouplpds` template's 2e-4 instead, the only cell out of line. It now uses 5e-4 like the
+  rest.
 - **`"sljiva"`:** Sljiva's `config/train.yaml` for every cell at once. Cosine 4e-4 -> 2e-6 over
   3e5 steps, warmup 0, global-norm clip 1 (torch's `clip_grad_norm_` is the same rule).
 
