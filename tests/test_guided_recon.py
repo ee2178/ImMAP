@@ -1302,6 +1302,78 @@ def test_guide_bridge_start_is_the_side_image_with_the_nets_guide_lines():
         osm.online_smaps = real
 
 
+def _line_mask(R=4, acs=4, dtype=torch.float32):
+    """Equispaced phase-encode lines every R plus a centre block, as a (1, 1, H, W) mask."""
+    m = torch.zeros(1, 1, H, W, dtype=dtype)
+    m[..., ::R] = 1
+    m[..., W // 2 - acs // 2: W // 2 + acs // 2] = 1
+    return m
+
+
+def test_trust_projector_solves_and_differentiates():
+    """trust_project: (I + s E^H E) p = r to CG precision, and its custom backward (one more
+    solve; -Re<P' g, E^H E p> for s) matches finite differences."""
+    from models.guided_lpds import trust_project
+    maps = torch.from_numpy(MAPS)[None].to(torch.complex128)
+    E = Mask(_line_mask(dtype=torch.float64)) @ FFT2D() @ Sense(maps)
+    g = torch.Generator().manual_seed(0)
+    r = torch.randn(2, 1, H, W, generator=g, dtype=torch.complex128)
+    s = torch.tensor(7.0, dtype=torch.float64)
+    p = trust_project(r, s, E, 60)
+    res = (p + s * E.gram(p) - r).abs().max() / r.abs().max()
+    assert float(res) < 1e-8, float(res)
+    p_warm = trust_project(r, s, E, 2, p0=p)                     # a converged start stays put
+    assert torch.allclose(p_warm, p, atol=1e-9)
+    small = torch.randn(1, 1, 8, 8, generator=g, dtype=torch.complex128, requires_grad=True)
+    Es = Mask(_line_mask(dtype=torch.float64)[..., :8, :8]) @ FFT2D()
+    sd = torch.tensor(3.0, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(lambda a, b: trust_project(a, b, Es, 40), (small, sd))
+
+
+def test_trust_codes_large_delta_is_lggs_and_trains_delta():
+    """LGGSNet(trust_codes=True): delta -> inf makes the composite the guide itself, so the net
+    equals plain LGGS with the same weights; at TGVN's delta0 it differs, delta gets a gradient,
+    and P'x is solved only on adjacency-rebuild layers (dK), not every layer."""
+    import models.guided_lpds as gl
+    from models.guided_lpds import LGGSNet
+    kw = dict(K=7, M=8, P=3, s=2, Mh=4, guide_window=3, attn_backend="gather", dK=3)
+    maps = torch.from_numpy(MAPS)[None]
+    E = Mask(_line_mask()) @ FFT2D() @ Sense(maps)
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64)
+    guide = torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64)
+    y = E(x)
+
+    def build(**extra):
+        torch.manual_seed(0)
+        return LGGSNet(**kw, **extra)
+
+    def out(net):
+        return net(y, guide=guide, E=E, sigma=torch.tensor(0.05))[0]
+
+    ref = out(build()).detach()
+    big = build(trust_codes=True, trust_delta0=1e6)
+    assert torch.allclose(out(big), ref, atol=1e-4), float((out(big) - ref).abs().max())
+    net = build(trust_codes=True)                                 # delta0 = 0.1, TGVN's
+    assert abs(float(net.trust_delta()) - 0.1) < 1e-6
+    calls, real = [], gl.trust_project
+    gl.trust_project = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        o = out(net)
+    finally:
+        gl.trust_project = real
+    assert not torch.allclose(o, ref, atol=1e-3)
+    assert 1 < len(calls) < 1 + kw["K"], len(calls)               # P'w once + rebuild layers
+    o.abs().pow(2).mean().backward()
+    gd = net.trust_log_delta.grad
+    assert gd is not None and torch.isfinite(gd) and float(gd.abs()) > 0, gd
+    for flag in ("is_complex",):
+        raises(ValueError, lambda: LGGSNet(**kw, trust_codes=True, **{flag: False}), "complex")
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    assert gen.MODELS["lggs_trust"]["model"]["params"] == dict(gen.LGGS_PARAMS, trust_codes=True)
+
+
 def main():
     tests = sorted((n, f) for n, f in globals().items() if n.startswith("test_") and callable(f))
     failed = 0

@@ -62,6 +62,7 @@ reconstruction setting (`E` = SENSE/Fourier) and the synthesis setting
 from __future__ import annotations
 
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -85,6 +86,75 @@ def _primal_step(x, data, Bz, tau, theta):
     """`x+ = x - tau (data + B z)`, `xb = x+ + theta (x+ - x)` -- pure, for `compile_glue`."""
     x_new = x - tau * (data + Bz)
     return x_new, x_new + theta * (x_new - x)
+
+
+# ---------------------------------------------------------------------------
+# TRUST-GUIDED CODES (LGGSNet(trust_codes=True); 2026-11-17). TGVN's ambiguous-space projector
+#
+#     P'_delta = (I + E^H E / delta^2)^{-1}
+#
+# is ~1 on what the measurement barely constrains and ~delta^2/(1 + delta^2) on what it measures.
+# LGGS's guide codes are taken from the composite x~ = x + P'_delta (w - x): the target's own
+# estimate where the data constrain it, the guide where they do not. delta -> inf gives x~ = w
+# (exactly LGGS); delta -> 0 fills only the null space of E from the guide.
+def _cdot(a, b):
+    """Per-sample Re<a, b> over (C, H, W) -> (B, 1, 1, 1)."""
+    return (a.conj() * b).real.sum(dim=(-3, -2, -1), keepdim=True)
+
+
+def _trust_cg(E, r, inv_d2, p0, iters):
+    """Solve (I + inv_d2 E^H E) p = r by CG, per sample, from p0 (None: from r)."""
+    def apply(v):
+        return v + inv_d2 * gram(E, v)
+
+    p = r.clone() if p0 is None else p0.clone()
+    res = r - apply(p)
+    d = res.clone()
+    rs = _cdot(res, res)
+    tiny = torch.finfo(rs.dtype).tiny
+    for _ in range(int(iters)):
+        Ad = apply(d)
+        alpha = rs / _cdot(d, Ad).clamp_min(tiny)
+        p = p + alpha * d
+        res = res - alpha * Ad
+        rs_new = _cdot(res, res)
+        d = res + (rs_new / rs.clamp_min(tiny)) * d
+        rs = rs_new
+    return p
+
+
+class _TrustProject(torch.autograd.Function):
+    """p = P' r by CG, differentiable in r and in s = 1/delta^2 without keeping the CG graph.
+
+    P' is Hermitian, so grad_r = P' grad_p (one more solve), and dp/ds = -P' E^H E p gives
+    grad_s = -Re<P' grad_p, E^H E p>. The forward may be warm-started (p0); the backward solve
+    starts cold with `iters_bwd` iterations."""
+
+    @staticmethod
+    def forward(ctx, r, inv_d2, E, iters, p0, iters_bwd):
+        with torch.no_grad():
+            p = _trust_cg(E, r, inv_d2, p0, iters)
+        ctx.E, ctx.iters_bwd = E, int(iters_bwd)
+        ctx.save_for_backward(p, inv_d2)
+        return p
+
+    @staticmethod
+    def backward(ctx, gp):
+        p, inv_d2 = ctx.saved_tensors
+        with torch.no_grad():
+            gr = _trust_cg(ctx.E, gp, inv_d2, None, ctx.iters_bwd)
+            gs = None
+            if ctx.needs_input_grad[1]:
+                gs = (-_cdot(gr, gram(ctx.E, p)).sum()).reshape(inv_d2.shape).to(inv_d2.dtype)
+        return (gr if ctx.needs_input_grad[0] else None), gs, None, None, None, None
+
+
+def trust_project(r, inv_d2, E, iters, p0=None, iters_bwd=None):
+    """P'_delta r = (I + inv_d2 E^H E)^{-1} r (complex image r, inv_d2 = 1/delta^2 a 0-dim
+    tensor); `iters` CG iterations from `p0` (detached; None = from r)."""
+    p0 = None if p0 is None else p0.detach()
+    return _TrustProject.apply(r, inv_d2, E, int(iters), p0,
+                               int(iters if iters_bwd is None else iters_bwd))
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +240,15 @@ class GuidedLPDSLayer(LPDSLayer):
 
         `guide` is a list / stacked tensor of image-domain guides (or None, in
         which case the prox falls back to its unguided self-only form and this
-        layer is an ordinary `LPDSLayer`).
+        layer is an ordinary `LPDSLayer`). It may also be a CALLABLE
+        `guide(x, cache) -> [guide images]`, evaluated at this layer's fresh primal iterate,
+        between the primal and the dual step (the cold start: at its x) -- LGGSNet's
+        trust-guided codes, whose guide is a composite of the current estimate and w.
         """
         if cache is None:
             cache = {}
-        guides = as_guide_list(guide)
+        guide_fn = guide if callable(guide) else None
+        guides = [] if guide_fn is not None else as_guide_list(guide)
 
         hint = cache.pop("_gram_x", None)
         # state = (x, None): start the iteration at x instead of y~ (a bridge state, BridgeLGGS)
@@ -194,6 +268,8 @@ class GuidedLPDSLayer(LPDSLayer):
         if state is None and getattr(self, "z_init", "prox") == "prox":
             # cold start (lpds.jl): x = y~, z = GGT*(A y~) -- this layer makes no primal step
             x = x_start
+            if guide_fn is not None:
+                v = self.guide_latents(guide_fn(x, cache), planar=planar)
             z, cache = self.prox(self.analysis(x), v, sigma, cache)
             return (x, z), cache
 
@@ -229,6 +305,8 @@ class GuidedLPDSLayer(LPDSLayer):
 
             x_bar = x_new + theta * (x_new - x)
 
+        if guide_fn is not None:                  # the guide at THIS layer's fresh iterate
+            v = self.guide_latents(guide_fn(x_new, cache), planar=planar)
         u = z + self.analysis(x_bar)
         if pi_z is not None:
             u = u - pi_z
@@ -345,7 +423,8 @@ class LGGSNet(nn.Module):
                  triton_materialize=False, z_init="prox",
                  guide_mean="per_guide", self_sim_fun=None, adj_blend=True,
                  similarity_scale="learned", prox_degrees=None, guide_transfer=None,
-                 separate_guide_w=False, separate_guide_conv=False):
+                 separate_guide_w=False, separate_guide_conv=False, trust_codes=False,
+                 trust_delta0=0.1, trust_cg_iters=5, trust_cg_iters0=10):
         """W_theta, W_phi, W_alpha, W_beta and gamma are ONE set shared by the K layers (as in
         Sljiva's LGGS runs, `share:` in config/guided_lpdsnet.yaml, and the paper, Sec. IV-A);
         eta, theta, A, B, tau and rho stay per layer. There is no untied variant. A checkpoint
@@ -372,6 +451,21 @@ class LGGSNet(nn.Module):
                              across layers like the other W's (models/guided_prox.py)
         separate_guide_conv  the guide's own analysis conv A_g per layer, v = A_g w (A stays
                              per layer as well), projected onto the unit ball like A
+
+        TRUST-GUIDED CODES (`trust_codes`, 2026-11-17; option 1 of the trust-guidance note).
+        The guide still enters only through the grouping, but each layer's guide codes come from
+        the composite
+
+            x~_k = x_{k+1} + P'_delta (w - x_{k+1}),   P'_delta = (I + E^H E / delta^2)^{-1}
+
+        (TGVN's ambiguous-space projector): the target's own fresh estimate where the data
+        constrain it, the guide where they do not. delta is ONE learned scalar (init
+        `trust_delta0`, TGVN's 0.1); delta -> inf is exactly LGGS. P'_delta w is solved once per
+        forward (`trust_cg_iters0` CG iterations); P'_delta x only on the layers where the prox
+        rebuilds its adjacencies (every dK), `trust_cg_iters` iterations warm-started from the
+        previous solve, and the composite is reused in between. No transfer net: the learned
+        analysis convs (and `separate_guide_conv`) absorb the contrast difference. Needs a
+        complex net and a linear operator.
         """
         super().__init__()
         if z_init not in ("prox", "zero"):
@@ -380,6 +474,14 @@ class LGGSNet(nn.Module):
             raise ValueError(f"guide_mean must be 'per_guide' or 'joint'; got {guide_mean!r}")
         self.z_init = z_init
         self.guide_mean = guide_mean
+        self.trust_codes = bool(trust_codes)
+        self.trust_cg_iters, self.trust_cg_iters0 = int(trust_cg_iters), int(trust_cg_iters0)
+        if self.trust_codes:
+            if not is_complex:
+                raise ValueError("trust_codes needs is_complex=True (the projector is complex)")
+            if not (float(trust_delta0) > 0):
+                raise ValueError(f"trust_delta0 must be > 0, got {trust_delta0}")
+            self.trust_log_delta = nn.Parameter(torch.tensor(math.log(float(trust_delta0))))
         # guide_transfer: {"params": {...}, "ckpt": path} -- a PRETRAINED contrast-transfer net
         # (models/contrast_transfer.py, task "contrast_transfer"), frozen, applied to every guide
         # before anything else sees it: LGGS then pools by similarity in the TRANSFERRED guide
@@ -504,13 +606,46 @@ class LGGSNet(nn.Module):
             if state is not None:
                 state = tuple(None if t is None else to_planar(t) for t in state)
         cache = {}
+        guide_arg = guides
+        if self.trust_codes and guides:
+            guide_arg = self._trust_guides(guides, E)
         for layer in self.layers:
-            state, cache = layer(state, y_tilde, guide=guides, E=E,
+            state, cache = layer(state, y_tilde, guide=guide_arg, E=E,
                                  sigma=sigma, cache=cache)
         x, z = state
         if planar:
             x, z = to_complex(x), to_complex(z)
         return x, z
+
+    def trust_delta(self):
+        """The learned trust scale delta (None without trust_codes)."""
+        return torch.exp(self.trust_log_delta) if self.trust_codes else None
+
+    def _trust_guides(self, guides, E):
+        """`guide(x, cache)` for the layers: the composites x + P'(w - x) = x - P'x + P'w, one per
+        guide. P'w once; P'x on adjacency-rebuild layers only (the prox's own schedule, every dK
+        layers), warm-started from the previous solve; the last composite otherwise."""
+        if isinstance(E, Identity) or getattr(E, "nonlinear", False):
+            raise ValueError("trust_codes needs the linear measurement operator E")
+        inv_d2 = torch.exp(-2.0 * self.trust_log_delta)
+        it, it0 = self.trust_cg_iters, self.trust_cg_iters0
+        w_hat = [trust_project(w, inv_d2, E, it0, None, it0) for w in guides]
+        dK = int(getattr(getattr(self.layers[0].prox, "prox", None), "dK", 1) or 1)
+        memo = {"p": None, "g": None}
+
+        def composite(x, cache):
+            refresh = (memo["g"] is None or cache.get("Phi") is None
+                       or cache.get("gdupdate", 0) % dK == 0)
+            if not refresh:
+                return memo["g"]
+            if not x.is_complex() and x.shape[1] == 2 * self.C:       # the planar state
+                x = to_complex(x)
+            p = trust_project(x, inv_d2, E, it, memo["p"], it0)
+            memo["p"] = p
+            memo["g"] = [x - p + wh for wh in w_hat]
+            return memo["g"]
+
+        return composite
 
     def planar_state_active(self):
         """Carry the iterates planar? The process-wide switch `MGLPDSNet.PLANAR_STATE`
@@ -598,7 +733,9 @@ class LGGSNet(nn.Module):
         return (f"K={self.K}, M={self.M}, C={self.C}, s={self.s}, "
                 f"preproc={self.preproc}, "
                 f"z_init={self.z_init}, guide_mean={self.guide_mean}, "
-                f"prox_degrees={self.prox_degrees}")
+                f"prox_degrees={self.prox_degrees}"
+                + (f", trust_codes (cg {self.trust_cg_iters}/{self.trust_cg_iters0})"
+                   if self.trust_codes else ""))
 
 
 class BridgeLGGS(BridgeScheduleMixin, LGGSNet):

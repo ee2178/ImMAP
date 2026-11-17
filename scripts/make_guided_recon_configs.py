@@ -297,6 +297,13 @@ MODELS = {
                                        params=dict(LGGS_PARAMS, separate_guide_conv=True)),
                             speed=dict(params=LGGS_SPEED_PARAMS,
                                        training=LGGS_SPEED_TRAINING)),
+    # TRUST-GUIDED CODES (2026-11-17; models/guided_lpds.py, trust_codes): the knee LGGS cell whose
+    # guide codes come from x + P'_delta (w - x), TGVN's ambiguous-space projector -- the target's
+    # own estimate where its data constrain it, the guide where they do not. One learned delta
+    # (init 0.1, TGVN's); no transfer net. Meant for an ACCELERATED guide (torch/guide_accel_knee.sbatch).
+    "lggs_trust": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                       model=dict(type="LGGS", params=dict(LGGS_PARAMS, trust_codes=True)),
+                       speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING)),
 }
 
 # Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,

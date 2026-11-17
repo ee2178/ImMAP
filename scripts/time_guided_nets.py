@@ -5,6 +5,8 @@ fastMRI knee size, on a synthetic batch -- the number that decides what fits the
     python scripts/time_guided_nets.py                                  # the TGVN sweep + LGGS
     python scripts/time_guided_nets.py --cells tgvn_c8_R8_g1 lggs_R8_g1 --iters 20
     python scripts/time_guided_nets.py --no-measure                     # skip the ESPIRiT row
+    python scripts/time_guided_nets.py --cells lggs_R8_g4 lggs_trust_R8_g4 tgvn_c6_R8_g4
+                                                                        # the guide-accel sweep
 
 Configs are generated fresh (scripts/make_guided_recon_configs.py into a temp dir), so each net
 is built exactly as a launch would build it: same model block, same loss-free forward path
@@ -14,12 +16,21 @@ separately, once, as a shared overhead row: prepare_measurement with the config'
 -- every cell pays it every step, so it shifts all rows equally.
 
 Reported per cell: ms / step (median over --iters after --warmup), peak GPU memory, parameters,
-and the hours that many steps would take at the config's num_epochs x steps_per_epoch.
+the hours that many steps would take at the config's num_epochs x steps_per_epoch, and E^H E:
+how many times one step applies the operator's normal map (an FFT + inverse FFT over every coil)
+OUTSIDE autograd's own backward -- the forward data terms plus any CG solves (LGGS's trust-guided
+codes run theirs in a custom backward, so those count too). The guide is undersampled per the
+cell's guide R (`_g<R>` in its name).
+
+Local runs (no triton, a smaller GPU): --attn-backend gather swaps LGGS's attention backend and
+--size / --coils shrink the synthetic batch. Absolute times then do not transfer to the cluster;
+the ratios between cells are what to read.
 """
 
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -38,15 +49,18 @@ from physics.mask import get_mask_cached, resolve_acs_lines           # noqa: E4
 from training.common import embed_for_net, prepare_measurement        # noqa: E402
 from training.recon import _forward, _guide                           # noqa: E402
 
-DEFAULT_CELLS = ("tgvn_c12_R8_g1", "tgvn_c10_R8_g1", "tgvn_c8_R8_g1", "tgvn_c6_R8_g1",
-                 "lggs_R8_g1", "lpdsnet_R8", "sbtgvn_c8_adjoint_R8_g1")
+DEFAULT_CELLS = ("lpdsnet_R8", "lggs_R8_g1", "tgvn_c6_R8_g1",           # the recon sweep
+                 "lggs_R8_g4", "lggs_trust_R8_g4", "tgvn_c6_R8_g4")       # the guide-accel sweep
 H, W, NC = 640, 368, 15
 
 
 def gen_configs(cells, out):
     models = sorted({c.split("_R")[0] for c in cells})
+    gaccels = sorted({int(m.group(1)) for c in cells for m in [re.search(r"_g(\d+)", c)] if m}
+                     | {1})
     subprocess.run([sys.executable, os.path.join(REPO, "scripts", "make_guided_recon_configs.py"),
-                    "--out", out, "--models", *models, "--guide-accels", "1"],
+                    "--out", out, "--models", *models,
+                    "--guide-accels", *[str(g) for g in gaccels]],
                    check=True, cwd=REPO, stdout=subprocess.DEVNULL)
     cfgs = {}
     for c in cells:
@@ -91,7 +105,24 @@ def sync(device):
         torch.cuda.synchronize()
 
 
-def time_cell(name, cfg, batch, meas, device, warmup, iters):
+def _count_gram(E):
+    """Wrap E.gram on this instance with a call counter -> the counter dict."""
+    n = {"gram": 0}
+    real = E.gram
+
+    def counted(x):
+        n["gram"] += 1
+        return real(x)
+
+    E.gram = counted
+    return n
+
+
+def time_cell(name, cfg, batch, meas, device, warmup, iters, attn_backend=None):
+    if attn_backend and cfg["model"]["type"] in ("LGGS", "BridgeLGGS"):
+        cfg = json.loads(json.dumps(cfg))
+        cfg["model"]["params"]["attn_backend"] = attn_backend
+        cfg["model"]["params"].pop("triton_materialize", None)
     net = build_model(cfg).to(device).train()
     params = sum(p.numel() for p in net.parameters())
     opt = torch.optim.Adam(net.parameters(), lr=1e-4)
@@ -100,7 +131,10 @@ def time_cell(name, cfg, batch, meas, device, warmup, iters):
     (y, sigma_n, extra), mask = meas
     E = Mask(mask) @ FFT2D() @ Sense(extra["smaps"])
     E, T = embed_for_net(net, E, img, None)
-    guide = _guide(net, side, extra["smaps"], T, device, 1)
+    mri = cfg["mri"]
+    guide = _guide(net, side, extra["smaps"], T, device, int(mri.get("guide_R", 1)),
+                   int(mri.get("guide_acs_lines", 0)), mri.get("guide_mask_dist", "uniform"))
+    grams = _count_gram(E)
     sigma = torch.as_tensor(sigma_n, device=device, dtype=torch.float32).reshape(-1, 1, 1, 1)
     sigma = sigma.expand(img.shape[0], 1, 1, 1)
     bridge = cfg["task"] == "i2sb_recon"
@@ -134,10 +168,13 @@ def time_cell(name, cfg, batch, meas, device, warmup, iters):
         sync(device)
         times.append(time.perf_counter() - t0)
     peak = torch.cuda.max_memory_allocated(device) / 2 ** 30 if device.type == "cuda" else 0.0
+    grams["gram"] = 0
+    step()                                                  # one more, counted
+    n_gram = grams["gram"]
     del net, opt
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    return statistics.median(times), peak, params
+    return statistics.median(times), peak, params, n_gram
 
 
 def main():
@@ -149,8 +186,18 @@ def main():
     ap.add_argument("--no-measure", action="store_true",
                     help="skip online ESPIRiT entirely (the nets get the synthetic maps)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--attn-backend", default=None,
+                    help="override LGGS's attention backend (e.g. gather where triton is absent)")
+    ap.add_argument("--size", type=int, nargs=2, default=None, metavar=("H", "W"),
+                    help="synthetic image size (default 640 368, fastMRI knee)")
+    ap.add_argument("--coils", type=int, default=None, help="synthetic coil count (default 15)")
     args = ap.parse_args()
     device = torch.device(args.device)
+    global H, W, NC
+    if args.size:
+        H, W = args.size
+    if args.coils:
+        NC = args.coils
 
     with tempfile.TemporaryDirectory() as d:
         cfgs = gen_configs(args.cells, d)
@@ -173,20 +220,22 @@ def main():
               f"({first['mri'].get('online_smaps') or 'stored'} maps) "
               f"{1e3 * statistics.median(ts):.0f} ms")
 
-    print(f"\n{'cell':<18}{'ms/step':>9}{'peak GB':>9}{'params':>9}{'steps':>9}{'hours':>8}")
+    print(f"\n{'cell':<20}{'ms/step':>9}{'peak GB':>9}{'params':>9}{'steps':>9}{'hours':>8}"
+          f"{'E^H E':>7}")
     for name in args.cells:
         cfg = cfgs[name]
         try:
-            sec, peak, params = time_cell(name, cfg, batch, meas, device, args.warmup, args.iters)
+            sec, peak, params, n_gram = time_cell(name, cfg, batch, meas, device, args.warmup,
+                                                  args.iters, args.attn_backend)
         except Exception as e:                                            # noqa: BLE001
-            print(f"{name:<18}  FAILED: {type(e).__name__}: {str(e)[:120]}")
+            print(f"{name:<20}  FAILED: {type(e).__name__}: {str(e)[:120]}")
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             continue
         tr = cfg["training"]
         steps = int(tr["num_epochs"]) * int(tr["steps_per_epoch"]) * int(tr.get("accum_steps", 1))
-        print(f"{name:<18}{1e3 * sec:9.0f}{peak:9.2f}{params / 1e6:8.2f}M{steps:9d}"
-              f"{steps * sec / 3600:8.1f}")
+        print(f"{name:<20}{1e3 * sec:9.0f}{peak:9.2f}{params / 1e6:8.2f}M{steps:9d}"
+              f"{steps * sec / 3600:8.1f}{n_gram:7d}")
     print("\nhours = network fwd+bwd only; add the shared overhead x steps for the measurement.")
 
 
