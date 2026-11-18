@@ -32,6 +32,17 @@ EXTENSIONS (all off by default, so the default is upstream TGVN):
                output that shares a phase reference with anything outside the net.
   output       "magnitude" (upstream) or "complex" (requires use_smaps).
 
+NUMERICAL GUARDS (always on; 2026-11-18). Identical to upstream wherever upstream is finite:
+
+  * the trust-guidance CG (TGVN_Block) divides by inner(p, Ap) and rs_old with no floor. When it
+    converges EXACTLY -- delta large, so C = I + S^H M S / delta^2 ~ I and the first residual is
+    0 -- the next step is 0/0 and the image turns NaN. A TGVN with an ACCELERATED guide learns to
+    distrust it (delta grows), and at guide R = 8 this killed a run after 13.6k steps (the NaN
+    surfaced as the next cascade's Cholesky failure). _GuardedTGVNBlock floors both divisors and
+    delta^2.
+  * NormUnet's Cholesky whitening of the 2x2 (re, im) covariance gets a tiny relative ridge, so a
+    constant (or numerically degenerate) input cannot fail the factorisation.
+
 BridgeTGVN is the I2SB regressor: known maps, complex output, the cascades started at the bridge
 state x_t instead of E^H y, and Phi conditioned on the bridge position (and on sigma_n).
 
@@ -43,9 +54,75 @@ import torch
 import torch.nn as nn
 
 from models.sb_schedule import BridgeScheduleMixin
-from models.tgvn._upstream import (NormUnet, TGVN_1S, VarNetImage, complex_abs,
-                                   sens_reduce)
+from models.tgvn._upstream import (NormUnet, TGVN_1S, TGVN_Block, VarNetImage, complex_abs,
+                                   inner, sens_expand, sens_reduce)
 from operators.accessors import get_mask, get_sensitivity_map
+
+
+_TINY = 1e-30        # float32-safe floor for the CG's divisors
+_RIDGE = 1e-6        # relative ridge on the whitening covariance
+
+
+def _stable_norm(self, x):
+    """NormUnet.norm with cov + _RIDGE * (tr cov / 2 + tiny) I before the Cholesky factor."""
+    b, c, h, w = x.shape
+    x = x.contiguous().view(b, 2, c // 2 * h * w)
+    mean = torch.mean(x, dim=2, keepdim=True)
+    x = x - mean
+    cov = torch.bmm(x, x.permute(0, 2, 1)) / (c // 2 * h * w - 1)
+    eye = torch.eye(2, dtype=cov.dtype, device=cov.device)
+    scale = cov.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(0)[:, None, None] / 2
+    cov = cov + (_RIDGE * scale + 1e-20) * eye
+    L = torch.linalg.cholesky(cov)
+    x = torch.bmm(torch.linalg.inv(L), x).contiguous().view(b, c, h, w)
+    return x, mean, L
+
+
+class _StableNormUnet(NormUnet):
+    """Upstream NormUnet with the guarded whitening (swapped in by class, parameters kept)."""
+    norm = _stable_norm
+
+
+class _GuardedTGVNBlock(TGVN_Block):
+    """Upstream TGVN_Block.forward with the trust-guidance CG's divisions floored."""
+
+    def forward(self, current_image, ref_kspace, mask, second_kspace, sens_maps, delta,
+                sens_maps_second=None, num_iter=10):
+        current_kspace = sens_expand(current_image, sens_maps)
+        zero = torch.zeros(1, 1, 1, 1, 1).to(current_kspace)
+        soft_dc = torch.where(mask, current_kspace - ref_kspace, zero)
+        soft_dc = soft_dc * torch.abs(self.dc_weight)
+        soft_dc = sens_reduce(soft_dc, sens_maps)
+        model_term = self.model(current_image)
+        maps2 = sens_maps if sens_maps_second is None else sens_maps_second
+        b = current_image - self.asc_model(sens_reduce(second_kspace, maps2))
+
+        mask_delta = 1 + mask / (delta ** 2).clamp_min(1e-12)
+        mask_delta_inv = 1 / mask_delta
+        x = sens_reduce(mask_delta_inv * sens_expand(b, sens_maps), sens_maps)
+        r = b - sens_reduce(mask_delta * sens_expand(x, sens_maps), sens_maps)
+        p = r.clone()
+        rs_old = inner(r, r)
+        for _ in range(num_iter):
+            Ap = sens_reduce(mask_delta * sens_expand(p, sens_maps), sens_maps)
+            alpha = rs_old / inner(p, Ap).clamp_min(_TINY)
+            x = x + alpha * p
+            r = r - alpha * Ap
+            rs_new = inner(r, r)
+            p = r + rs_new / rs_old.clamp_min(_TINY) * p
+            rs_old = rs_new
+        soft_asc = torch.abs(self.asc_weight) * x
+        return current_image - soft_dc - soft_asc - model_term
+
+
+def _guard_(net):
+    """Swap in the guarded block and whitening, in place (parameters and state dict unchanged)."""
+    for m in net.modules():
+        if type(m) is TGVN_Block:
+            m.__class__ = _GuardedTGVNBlock
+        elif type(m) is NormUnet:
+            m.__class__ = _StableNormUnet
+    return net
 
 
 class CondNormUnet(NormUnet):
@@ -54,6 +131,8 @@ class CondNormUnet(NormUnet):
     `.cond` is (B, n_cond). Channels listed in `noise_channels` are noise stds (complex, total)
     and are divided by sqrt(tr Cov) of the input -- the scale the Cholesky whitening removes --
     before they become planes; the rest (e.g. a bridge position in [-1, 1]) go in as given."""
+
+    norm = _stable_norm                    # the guarded whitening (module docstring)
 
     def __init__(self, chans, num_pools, n_cond, noise_channels=()):
         super().__init__(chans, num_pools, in_chans=2 + int(n_cond), out_chans=2)
@@ -112,6 +191,7 @@ class TGVN(nn.Module):
                 cascade.model = CondNormUnet(chans, pools, n_cond, noise_ch)
         if self.use_smaps:
             self.net.sens_net = None
+        _guard_(self.net)
 
     # -- conditioning ---------------------------------------------------------
     def _cond_layout(self):

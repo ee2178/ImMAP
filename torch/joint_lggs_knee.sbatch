@@ -32,8 +32,9 @@
 # guide), all in torch/guided_recon_knee.sbatch. Everything else is that launcher, which this
 # runs: generator, protocol (vlow noise, adjust_accel off, per-volume normalization, offline
 # SENSE target), run dirs trained_nets/guided_recon/knee/<RUN_TAG>_noise-<preset>/<cell>, resume,
-# FORCE_RESTART. The guide is scored only through the target; JointLGGSNet also returns its guide
-# reconstruction (second output), which training does not supervise yet.
+# FORCE_RESTART. joint_lggs trains in its own loop (task "joint_recon", training/joint_recon.py):
+# loss = l(target) + guide_loss_weight (1.0) * l(guide, its fully-sampled scan), and validation
+# logs both images (val/psnr, val/guide_psnr) next to their zero-filled floors.
 #
 # Submit:          sbatch torch/joint_lggs_knee.sbatch
 # Some cells:      MODELS="joint_lggs tgvn_c6" sbatch --array=0-1 --export=ALL torch/joint_lggs_knee.sbatch

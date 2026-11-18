@@ -466,6 +466,25 @@ def main(config_path):
             **cfg["i2sb"],
             **cfg["paths"],
             )
+    elif task == "joint_recon":
+        # target + accelerated guide reconstructed together, both supervised
+        # (training/joint_recon.py; models/joint_lggs.py)
+        from training.joint_recon import train_joint_recon
+        steps_per_epoch = cfg["training"]["steps_per_epoch"]
+        train_joint_recon(
+            net=model,
+            opt=optimizer,
+            sched=scheduler,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            wandb=wandb,
+            start_epoch=start_step // steps_per_epoch,
+            **backtrack_state,
+            **train_kws,
+            **cfg["mri"],
+            **cfg["paths"],
+            )
     elif task == "contrast_transfer":
         # a tiny guide contrast-transfer net, pretrained before a guided net uses it frozen
         # (training/contrast_transfer.py, models/contrast_transfer.py)

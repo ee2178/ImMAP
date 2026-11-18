@@ -1374,6 +1374,36 @@ def test_trust_codes_large_delta_is_lggs_and_trains_delta():
     assert gen.MODELS["lggs_trust"]["model"]["params"] == dict(gen.LGGS_PARAMS, trust_codes=True)
 
 
+def test_tgvn_trust_cg_survives_a_large_delta():
+    """Upstream TGVN's trust CG divides 0/0 once it converges exactly (delta large, C ~ I) and the
+    image turns NaN (a guide-R8 run died of it, 2026-11-17). The guarded block is finite there and
+    identical to upstream wherever upstream is finite; the state dict is unchanged."""
+    import copy as _copy
+    import models.tgvn._upstream as up
+    from models.tgvn.adapter import TGVN, _GuardedTGVNBlock
+    maps = torch.from_numpy(MAPS)[None]
+    E = Mask(_line_mask(R=4, acs=4)) @ FFT2D() @ Sense(maps)
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64)
+    side = (FFT2D() @ Sense(maps))(torch.randn(1, 1, H, W, generator=g, dtype=torch.complex64))
+    torch.manual_seed(0)
+    net = TGVN(guided=True, num_cascades=2, chans=8, pools=2, sens_chans=4, sens_pools=2,
+               use_smaps=True, output="complex", cond_sigma=True)
+    assert all(isinstance(c, _GuardedTGVNBlock) for c in net.net.cascades)
+    ref = _copy.deepcopy(net)
+    for m in ref.net.modules():
+        if isinstance(m, _GuardedTGVNBlock):
+            m.__class__ = up.TGVN_Block
+    run = lambda n: n(E(x), E=E, sigma=torch.tensor(0.0), guide=side)[0]       # noqa: E731
+    with torch.no_grad():
+        assert torch.equal(run(net), run(ref))                                    # delta = 0.1
+        for n in (net, ref):
+            n.net.delta.fill_(1e6)
+        assert not torch.isfinite(run(ref)).all()          # the upstream failure, reproduced
+        assert torch.isfinite(run(net)).all()
+    assert set(net.state_dict()) == set(ref.state_dict())
+
+
 def _joint_net(**over):
     from models.joint_lggs import JointLGGSNet
     kw = dict(K=4, K0=2, M=8, P=3, s=2, Mh=4, window=3, attn_backend="gather", dK=2)
@@ -1437,37 +1467,64 @@ def test_joint_lggs_cell_config():
                        check=True, cwd=REPO, stdout=subprocess.DEVNULL)
         cfgs = {n: json.load(open(os.path.join(out, "knee", "guided", f"{n}.json")))
                 for n in ("joint_lggs_R8_g8", "lggs_R8_g8", "lggs_R8_g1")}
+    from training.joint_recon import train_joint_recon
     cfg = cfgs["joint_lggs_R8_g8"]
-    assert cfg["model"]["type"] == "JointLGGS"
+    assert cfg["model"]["type"] == "JointLGGS" and cfg["task"] == "joint_recon"
+    assert cfg["training"]["guide_loss_weight"] == 1.0
     assert (cfg["mri"]["guide_R"], cfg["mri"]["guide_val_offset"]) == (8, 4)
     assert cfgs["lggs_R8_g8"]["mri"]["guide_val_offset"] == 4
     assert "guide_val_offset" not in cfgs["lggs_R8_g1"]["mri"]        # fully sampled: no key
-    params = inspect.signature(tr.train_recon).parameters
+    params = inspect.signature(train_joint_recon).parameters
     for block in ("training", "mri", "paths"):
         for k in cfg[block]:
             if block == "training" and k in TRAIN_PY_KEYS:
                 continue
-            assert k in params, f"{block}.{k} is not a train_recon argument"
+            assert k in params, f"{block}.{k} is not a train_joint_recon argument"
     small = dict(cfg["model"]["params"], K=3, K0=1, M=8, P=3, Mh=4, window=3,
                  attn_backend="gather")
     net = build_model({"model": {"type": "JointLGGS", "params": small}})
     assert net.K0 == 1 and net.guide_domain == "kspace"
 
 
-def test_train_recon_end_to_end_joint_lggs_with_accelerated_guide():
-    """train_recon drives JointLGGSNet with an ACCELERATED k-space guide and its own operator."""
+def test_train_joint_recon_end_to_end():
+    """train_joint_recon: an accelerated k-space guide, BOTH losses (target + guide), validation
+    of both images against their zero-filled floors, checkpoints at validation."""
     import physics.online_smaps as osm
+    from training.joint_recon import train_joint_recon
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
         csv, maps = make_data(root)
+        loader = lambda: get_paired_knee_loader(csv, [root], batch_size=1, shuffle=False,
+                                                drop_last=False, scale_fac=1.0, start_slice=1,
+                                                end_slice=3, num_workers=0)
         real = osm.online_smaps
         osm.online_smaps = lambda y, mask, **kw: torch.full_like(y, C ** -0.5)  # no LAPACK here
         try:
-            spy = Spy(_joint_net())
-            run_recon(spy, csv, root, d, online_smaps="espirit", guide_R=4)
+            net = _joint_net()
+            wb = FakeWandb()
+            train_joint_recon(net, torch.optim.Adam(net.parameters(), lr=1e-4), None, "cpu",
+                              loader(), loader(), wandb=wb, num_epochs=1, steps_per_epoch=2,
+                              val_every_epochs=1, R=4, acs_lines=4, online_smaps="espirit",
+                              guide_R=4, guide_val_offset=2, guide_loss_weight=0.5,
+                              noise_std=(0.0, 0.001), val_seed=0, save_dir=d)
+
+            class NoGuideRecon(torch.nn.Module):          # a net that reconstructs no guide
+                guided, guide_domain, pad_stride = True, "kspace", 1
+
+                def forward(self, y, E=None, sigma=None, guide=None):
+                    return E.adjoint(y), {}
+
+            raises(ValueError, lambda: train_joint_recon(
+                NoGuideRecon(), None, None, "cpu", loader(), None, num_epochs=1,
+                steps_per_epoch=1, R=4, acs_lines=4, online_smaps="espirit", guide_R=4,
+                save_dir=d), "guide_recon")
         finally:
             osm.online_smaps = real
-        assert spy.guides and all(g == (1, C, H, W) for g in spy.guides), spy.guides
+        logged = {k for c in wb.calls for k in c}
+        for k in ("train/loss_target", "train/loss_guide", "val/psnr", "val/guide_psnr",
+                  "val/zf_psnr", "val/guide_zf_psnr"):
+            assert k in logged, k
         assert os.path.exists(os.path.join(d, "net.ckpt"))
+        assert os.path.exists(os.path.join(d, "net_bestval.ckpt"))
 
 
 def main():

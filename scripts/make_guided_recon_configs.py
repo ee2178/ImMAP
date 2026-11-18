@@ -315,8 +315,11 @@ MODELS = {
     # EQUALLY accelerated scans -- per-contrast dictionaries, one group threshold on both images'
     # codes, after K0 independent-LPDS warm-up layers. LGGS's grid point otherwise (its guide
     # window is the joint window). Run with an accelerated guide: torch/joint_lggs_knee.sbatch.
-    "joint_lggs": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
-                       model=dict(type="JointLGGS", params=JOINT_LGGS_PARAMS)),
+    # Its own loop (task "joint_recon", training/joint_recon.py) supervises the guide too:
+    # loss = l(target) + guide_loss_weight * l(guide), the guide against its fully-sampled scan.
+    "joint_lggs": dict(task="joint_recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                       model=dict(type="JointLGGS", params=JOINT_LGGS_PARAMS),
+                       training=dict(guide_loss_weight=1.0)),
 }
 
 # Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,
@@ -541,7 +544,7 @@ def make_config(r, model, g, grid):
     training.update(spec.get("training") or {})
     mri = dict(grid["lpdsnet"]["mri"], guide_R=int(g), guide_acs_lines=0,
                guide_mask_dist="uniform")
-    if int(g) > 1 and spec["task"] == "recon":
+    if int(g) > 1 and spec["task"] in ("recon", "joint_recon"):
         # COMPLEMENTARY validation sampling (2026-11-17): the target keeps lines at offset 0, the
         # accelerated guide samples midway between its own spacing, so the two scans' lines
         # interleave instead of coinciding (training redraws the guide's phase every step)
