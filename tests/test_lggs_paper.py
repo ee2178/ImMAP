@@ -421,3 +421,50 @@ def test_lggs_defaults_carry_sljivas_split():
     from models.guided_lpds import lggs_defaults
     cfg, _ = lggs_defaults()
     assert (cfg["degrees"], cfg["prox_degrees"]) == (0, 1)
+
+
+# =============================================================================================
+# the guide's own dictionary AND its own W's (cell lggs_guide_wconv)
+# =============================================================================================
+def test_separate_guide_w_and_conv_together():
+    """Both options at once: equal to plain LGGS at init (each starts as a copy of the shared
+    weights); the guide's codes go through ITS conv and ITS W's; a step trains both."""
+    from models.guided_prox import ProjectedGuide
+    torch.manual_seed(0)
+    both = small(separate_guide_w=True, separate_guide_conv=True)
+    plain = small()
+    plain.load_state_dict({k: v for k, v in both.state_dict().items()
+                           if "guide_" not in k and "_g." not in k}, strict=False)
+    y, g = cplx(1, 1, 16, 14), [cplx(1, 1, 16, 14)]
+    sig = torch.full((1, 1, 1, 1), 0.05, dtype=D)
+    a, _ = both(y, guide=g, sigma=sig)
+    b, _ = plain(y, guide=g, sigma=sig)
+    assert torch.allclose(a, b, rtol=1e-10, atol=1e-12)                 # starts as LGGS
+
+    layer = both.layers[1]
+    gt = layer.prox.prox
+    assert layer.guide_analysis is not None and layer.guide_analysis is not layer.analysis
+    with torch.no_grad():                                               # make them differ
+        for p in layer.guide_analysis.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+        gt.guide_Walpha.weight.add_(0.1 * torch.randn_like(gt.guide_Walpha.weight))
+    pg = layer.guide_latents(g)[0]
+    assert isinstance(pg, ProjectedGuide)
+    v = layer.guide_analysis(g[0])
+    assert torch.allclose(pg.alpha, gt.guide_Walpha(v), rtol=1e-10, atol=1e-12)
+    assert not torch.allclose(pg.alpha, gt.Walpha(layer.analysis(g[0])))
+
+    out, _ = both(y, guide=g, sigma=sig)
+    out.abs().pow(2).mean().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in layer.guide_analysis.parameters())
+    assert gt.guide_Walpha.weight.grad.abs().sum() > 0
+    assert gt.guide_Wphi.weight.grad.abs().sum() > 0
+
+
+def test_generator_has_the_combined_guide_cell():
+    gen = _load_generator()
+    p = gen.MODELS["lggs_guide_wconv"]["model"]["params"]
+    assert p["separate_guide_w"] is True and p["separate_guide_conv"] is True
+    base = {k: v for k, v in p.items() if k not in ("separate_guide_w", "separate_guide_conv")}
+    assert base == gen.LGGS_PARAMS                                      # LGGS otherwise

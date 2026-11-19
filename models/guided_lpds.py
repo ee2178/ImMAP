@@ -424,7 +424,7 @@ class LGGSNet(nn.Module):
                  guide_mean="per_guide", self_sim_fun=None, adj_blend=True,
                  similarity_scale="learned", prox_degrees=None, guide_transfer=None,
                  separate_guide_w=False, separate_guide_conv=False, trust_codes=False,
-                 trust_delta0=0.1, trust_cg_iters=5, trust_cg_iters0=10):
+                 trust_delta0=0.1, trust_cg_iters=5, trust_cg_iters0=10, guided=True):
         """W_theta, W_phi, W_alpha, W_beta and gamma are ONE set shared by the K layers (as in
         Sljiva's LGGS runs, `share:` in config/guided_lpdsnet.yaml, and the paper, Sec. IV-A);
         eta, theta, A, B, tau and rho stay per layer. There is no untied variant. A checkpoint
@@ -468,6 +468,11 @@ class LGGSNet(nn.Module):
         complex net and a linear operator.
         """
         super().__init__()
+        # guided=False: the SAME net with its guide switched off -- every prox runs its self-only
+        # form (GroupThreshold with the shared weights) and the trainer passes no guide
+        # (training/recon.py::_wants_guide reads this attribute). The control that separates
+        # "the guide helps" from "LGGS's grouped threshold helps" (cell lggs_noguide).
+        self.guided = bool(guided)
         if z_init not in ("prox", "zero"):
             raise ValueError(f"z_init must be 'prox' or 'zero'; got {z_init!r}")
         if guide_mean not in ("per_guide", "joint"):
@@ -574,6 +579,8 @@ class LGGSNet(nn.Module):
 
     # -- forward -------------------------------------------------------------
     def forward(self, y, guide=None, E=None, sigma=None, state=None):
+        if not self.guided:
+            guide = None
         if E is None:
             E = Identity()
         if getattr(E, "nonlinear", False):

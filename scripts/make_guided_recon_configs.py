@@ -287,6 +287,13 @@ MODELS = {
     "lggs": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
                  model=dict(type="LGGS", params=LGGS_PARAMS),
                  speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING)),
+    # THE CONTROL for every guided LGGS cell: the same net and data, trained with its guide
+    # switched off (LGGSNet(guided=False): self-only prox). LGGS minus this is what the GUIDE buys;
+    # this minus lpdsnet is what LGGS's channel-grouped threshold (and its noise adaptation) buys
+    # without any guide -- lpdsnet differs in both, so it is not this control.
+    "lggs_noguide": dict(task="recon", guided=False, grid_base="mggrouplpds", pad_multiple=2,
+                         model=dict(type="LGGS", params=dict(LGGS_PARAMS, guided=False)),
+                         speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING)),
     "lggs_paper": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
                        model=dict(type="LGGS", params=LGGS_PAPER_PARAMS),
                        speed=dict(params=LGGS_SPEED_PARAMS, training=LGGS_SPEED_TRAINING),
@@ -304,6 +311,16 @@ MODELS = {
                                        params=dict(LGGS_PARAMS, separate_guide_conv=True)),
                             speed=dict(params=LGGS_SPEED_PARAMS,
                                        training=LGGS_SPEED_TRAINING)),
+    # BOTH: the guide's own analysis conv A_g (per layer) AND its own W_phi^g, W_alpha^g in the
+    # prox (tied across layers) -- its own dictionary to map PD into features comparable with
+    # the PDFS target's, and its own keys / energy weights on top. The two compose: A_g w feeds
+    # the guide W's (models/guided_prox.py::ProjectedGuide).
+    "lggs_guide_wconv": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                             model=dict(type="LGGS",
+                                        params=dict(LGGS_PARAMS, separate_guide_w=True,
+                                                    separate_guide_conv=True)),
+                             speed=dict(params=LGGS_SPEED_PARAMS,
+                                        training=LGGS_SPEED_TRAINING)),
     # TRUST-GUIDED CODES (2026-11-17; models/guided_lpds.py, trust_codes): the knee LGGS cell whose
     # guide codes come from x + P'_delta (w - x), TGVN's ambiguous-space projector -- the target's
     # own estimate where its data constrain it, the guide where they do not. One learned delta
