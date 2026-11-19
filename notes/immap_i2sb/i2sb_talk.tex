@@ -1,5 +1,6 @@
 % I2SB talk: guided diffusion as posterior ascent, warm starts, and the bridge.
-% Built from immap_guided_ascent.tex. Compile with pdflatex (twice).
+% Intuition first: the main deck keeps a handful of equations; derivations live in the backup.
+% Compile with pdflatex (twice).
 \documentclass[aspectratio=169, 11pt]{beamer}
 
 \usetheme[progressbar=frametitle, numbering=fraction]{metropolis}
@@ -22,15 +23,68 @@
 \newcommand{\tx}{\tilde{\bm{x}}}
 \newcommand{\E}{\mathbb{E}}
 \newcommand{\N}{\mathcal{N}}
-\newcommand{\Op}{\bm{E}}
 \newcommand{\ssb}{\sigma_{\mathrm{sb}}}
 \newcommand{\D}{D}
 
-\definecolor{ca}{RGB}{31, 119, 180}   % blue
+\definecolor{ca}{RGB}{31, 119, 180}   % blue: re-noise
 \definecolor{cb}{RGB}{23, 140, 120}   % teal
 \definecolor{cc}{RGB}{214, 110, 20}   % orange
-\definecolor{cmean}{RGB}{180, 40, 60}    % red: the posterior mean
+\definecolor{cmean}{RGB}{200, 40, 50} % red: denoise / the posterior mean
 \setbeamercolor{alerted text}{fg=cc}
+
+% ---- shared figure parts ---------------------------------------------------------------------
+% Blur picture: coordinates are pixels of the hand sketch (y down). Red = denoise / predict,
+% blue = re-noise. Every contour is a one-standard-deviation line, not a hard edge.
+\tikzset{
+  blurpic/.style={x=0.0088cm, y=-0.0088cm, font=\footnotesize,
+                  >={Stealth[length=4.5pt, width=3.5pt]}},
+  den/.style={->, cmean, thick, shorten <=1.5pt, shorten >=1pt},
+  ren/.style={->, ca, thick, shorten <=1.5pt, shorten >=1pt},
+  shell/.style={draw=black!55, thick, smooth cycle, tension=0.7},
+  innerblur/.style={shift={(550,320)}, scale=1.3, shift={(-550,-320)}},
+  cleanset/.style={shift={(550,320)}, scale=1.9, shift={(-550,-320)}},
+  bpath/.style={ca!60, line width=0.35pt, opacity=0.7},
+  bpathhi/.style={ca, line width=0.9pt},
+  rnoise/.style={ca, line width=0.45pt},
+  rstruct/.style={cmean, line width=1.3pt},
+}
+% image cells: \im{width}{figs/name}
+\newcommand{\im}[2]{\includegraphics[width=#1]{figs/#2}}
+\newcommand{\drawblurs}{%
+  \filldraw[shell, fill=black!5] plot coordinates {(130,195) (220,200) (300,170) (400,105)
+      (520,68) (660,60) (790,95) (890,180) (945,290) (935,400) (860,480) (790,570) (690,625)
+      (560,640) (440,625) (390,585) (270,535) (150,470) (85,380) (80,300) (105,225)};
+  \filldraw[shell, fill=black!11] plot coordinates {(215,300) (260,268) (360,250) (400,185)
+      (440,160) (570,165) (700,205) (775,260) (790,320) (750,375) (660,395) (570,435)
+      (500,505) (455,490) (410,425) (330,385) (245,370) (215,335)};
+  \begin{scope}[innerblur]
+  \filldraw[shell, fill=black!18] plot coordinates {(405,330) (428,285) (480,256) (565,245)
+      (655,262) (690,300) (668,338) (600,358) (540,382) (495,420) (478,385) (418,365)};
+  \end{scope}
+  \node at (865,300) {$t=1$};
+  \node at (575,193) {$t=0.75$};
+  \node[font=\scriptsize] at (664,322) {$t=0.5$};}
+\newcommand{\drawlikely}{%
+  \begin{scope}[cleanset]
+  \filldraw[draw=black, fill=cc!55, thick, smooth cycle, tension=0.7] plot coordinates
+      {(520,330) (535,305) (560,293) (580,310) (566,330) (548,340) (533,350)};
+  \end{scope}
+  \draw[black!60] (578,345) -- (860,600);
+  \node[anchor=north, align=center, font=\scriptsize] at (880,598) {likely images ($t=0$)};}
+% Bridge picture: X = 10 (1 - t), side information at X = 0, target at X = 10. The bridge mean
+% runs from 0.25 to -0.25; its one-std envelope is +-2.8 sqrt(t (1 - t)) (bridge_paths.py).
+\newcommand{\bridgeends}{%
+  \draw[thick] plot[smooth] coordinates {(-0.8,2.4) (-0.15,1.2) (0,0.25) (-0.12,-0.9)
+      (-0.6,-2.3)};
+  \draw[thick] plot[smooth] coordinates {(10.05,2.4) (10,1.0) (10,-0.25) (10.08,-1.2)
+      (10.5,-2.3)};
+  \node[anchor=north, align=center] at (-0.6,-2.3) {side information};
+  \node[anchor=north, align=center] at (10.5,-2.3) {target};}
+\newcommand{\bridgeenvelope}[1]{%
+  \draw[#1] plot[domain=0:10, samples=81, variable=\q]
+      (\q, {0.25-0.05*\q + 2.8*sqrt(max(0,(\q/10)*(1-\q/10)))});
+  \draw[#1] plot[domain=0:10, samples=81, variable=\q]
+      (\q, {0.25-0.05*\q - 2.8*sqrt(max(0,(\q/10)*(1-\q/10)))});}
 
 \title{I\textsuperscript{2}SB as guided posterior ascent}
 \subtitle{Guided diffusion, warm starts, and the bridge}
@@ -42,18 +96,17 @@
 \maketitle
 
 %=============================================================================================
-\begin{frame}{Three ideas}
+\begin{frame}{Four ideas}
 \begin{enumerate}
-  \setlength{\itemsep}{10pt}
+  \setlength{\itemsep}{7pt}
   \item \textbf{Guided diffusion is gradient ascent on the posterior.}\\
-        Guess the image, step part of the way toward the guess, add back a little less noise,
-        repeat.
+        Guess the clean image, add back less noise, repeat.
   \item \textbf{A warm start skips the useless first steps.}\\
-        Start from a likely image plus noise instead of from pure noise.
-  \item \textbf{A bridge is the same ascent in better coordinates.}\\
-        When the guide is paired with the target, connect them by a bridge of noisy images.
-        I\textsuperscript{2}SB is then the ascent, line by line, with a better-conditioned
-        network input.
+        Start from a likely image plus noise.
+  \item \textbf{A bridge starts from the guide.}\\
+        I\textsuperscript{2}SB walks from guide to target, a part at a time.
+  \item \textbf{Measurements plug into the same loop.}\\
+        Methods differ in side information and in how they guess.
 \end{enumerate}
 \end{frame}
 
@@ -63,35 +116,47 @@
 
 \begin{frame}{The problem}
 \begin{itemize}
-  \setlength{\itemsep}{6pt}
-  \item Recover an image $\x$ from \alert{side information} $\y$ about it: a paired scan of
-        another contrast (a guide), a measurement, or both.
-  \item Our case, knee MRI: $\x$ is the PDFS scan; $\y$ is the PD guide and the undersampled
-        PDFS $k$-space.
-  \item Probabilistically, we want the most likely image given what we know:
-        \[
-          \hx = \arg\max_{\x}\ \log p(\x\mid\y).
-        \]
-  \item An end-to-end network (TGVN, LGGS) regresses $\E[\x\mid\y]$ in one shot: the
-        \emph{average} of every image consistent with $\y$. Sharp where $\y$ pins $\x$ down,
-        blurry where it does not.
+  \setlength{\itemsep}{8pt}
+  \item Recover an image $\x$ from \alert{side information} $\y$: a guide, a measurement, or
+        both.
+  \item Want: \textbf{samples from the posterior} $p(\x\mid\y)$.
+  \item Have: \textbf{no access to it}, only training pairs $(\x,\y)$.
+  \item An end-to-end network learns its \emph{average} $\E[\x\mid\y]$: blurry wherever $\y$
+        leaves $\x$ uncertain.
+  \item The trick: add noise to make the posterior reachable.
 \end{itemize}
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
-\begin{frame}{Smooth the objective, then anneal}
+\begin{frame}{Adding noise to an image}
+\centering
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{ccccc}
+\im{2.5cm}{x0} & \im{2.5cm}{noise0} & \im{2.5cm}{noise1} & \im{2.5cm}{noise2} & \im{2.5cm}{noise3} \\
+\footnotesize clean & \footnotesize noise std $0.1$ & \footnotesize $0.3$ & \footnotesize $1$ &
+  \footnotesize $3$
+\end{tabular}
+
+\bigskip
+\raggedright
+\begin{itemize}
+  \setlength{\itemsep}{4pt}
+  \item Noise hides fine detail first, then edges, then everything.
+  \item With enough noise, a random noise image is a valid start.
+  \item Diffusion walks back from right to left.
+\end{itemize}
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Add noise: blur the distribution}
 \begin{columns}[T]
 \begin{column}{0.47\textwidth}
 \begin{itemize}
   \setlength{\itemsep}{6pt}
-  \item Noisy targets $\z = \x + \sigma\eps$ have density
-        \[
-          p_\sigma(\z\mid\y) = \textstyle\int \N(\z;\x,\sigma^2\bm I)\,p(\x\mid\y)\,d\x .
-        \]
-  \item \textbf{Large $\sigma$}: one broad hill, easy to climb.
-  \item \textbf{$\sigma\to0$}: the posterior itself, with many sharp peaks.
-  \item Climb at a large $\sigma$ and lower it as you go (ImMAP, Kadkhodaie \& Simoncelli
-        2021).
+  \item $\x_t = \x + \sigma_t\eps$: the distribution \textbf{blurred by a Gaussian}.
+  \item \textbf{A lot of noise} ($t=1$): one broad hill. Pure noise is a sample.
+  \item \textbf{Less noise}: it sharpens back.
+  \item Walk from $t=1$ to $t=0$.
 \end{itemize}
 \end{column}
 \begin{column}{0.51\textwidth}
@@ -100,13 +165,13 @@
   declare function={g(\t,\m,\v) = exp(-(\t-\m)^2/(2*\v))/sqrt(2*pi*\v);
                     p(\t,\s) = 0.55*g(\t,-1,0.03+\s*\s) + 0.45*g(\t,1.3,0.06+\s*\s);}]
 \begin{axis}[width=7.6cm, height=5.4cm, domain=-4:4, samples=301, axis lines=left,
-             xtick=\empty, ytick=\empty, ymin=0, ymax=2.0, xlabel={$\z$},
-             ylabel={$p_\sigma(\z\mid\y)$}, every axis label/.style={font=\small},
+             xtick=\empty, ytick=\empty, ymin=0, ymax=2.0, xlabel={image},
+             ylabel={how likely}, every axis label/.style={font=\small},
              legend style={draw=none, font=\footnotesize, at={(0.98,0.98)}, anchor=north east},
              legend cell align=left]
-  \addplot[thick, cc]  {p(x,0)};    \addlegendentry{$\sigma = 0$, the posterior}
-  \addplot[thick, cb]  {p(x,0.45)}; \addlegendentry{$\sigma = 0.45$}
-  \addplot[thick, ca]  {p(x,1.5)};  \addlegendentry{$\sigma = 1.5$}
+  \addplot[thick, cc]  {p(x,0)};    \addlegendentry{clean ($t=0$)}
+  \addplot[thick, cb]  {p(x,0.45)}; \addlegendentry{a little noise}
+  \addplot[thick, ca]  {p(x,1.5)};  \addlegendentry{a lot of noise ($t=1$)}
   \draw[dashed, cmean] (axis cs:0.04,0) -- (axis cs:0.04,0.62)
         node[above, font=\scriptsize, cmean] {$\E[\x\mid\y]$};
 \end{axis}
@@ -116,124 +181,95 @@
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
-\begin{frame}{A denoiser is the gradient}
-\textbf{Tweedie's formula.} With $\D(\z,\sigma,\y) \coloneqq \E[\x\mid\z,\y]$ at noise level
-$\sigma$,
-\[
-  \sigma^2\,\nabla_{\z}\log p_\sigma(\z\mid\y) = \D(\z,\sigma,\y) - \z .
-\]
-So a network trained to denoise, given $\y$, hands us the gradient of the smoothed objective.
-
-\medskip
-\textbf{One gradient step} with step size $h\sigma^2$:
-\[
-  \boxed{\ \z^+ = (1-h)\,\z + h\,\D(\z,\sigma,\y)\ }
-  \qquad\text{move the fraction $h$ of the way toward the guess.}
-\]
-Every $h\in(0,2)$ increases $\log p_\sigma$.
-
-\medskip
-\textbf{Then re-noise.} The step leaves noise $(1-h)\sigma$. Inject fresh noise $\gamma\eps$ so
-the iterate is again a noisy target, at the next, smaller level $\sigma' = r\sigma$:
-\[
-  \gamma^2 = \sigma'^2 - (1-h)^2\sigma^2 .
-\]
+\begin{frame}{A denoiser points uphill}
+\begin{itemize}
+  \setlength{\itemsep}{8pt}
+  \item A network trained to remove noise estimates $\E[\x\mid\x_t,\y]$.
+  \item \textbf{Tweedie's formula}: the step to it points uphill,
+        \[
+          \E[\x\mid\x_t,\y] - \x_t = \sigma_t^2\,\nabla\log p_t(\x_t\mid\y).
+        \]
+  \item The guess is an average, so step toward it and add back less noise.
+\end{itemize}
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
-\begin{frame}{One run, step by step}
+% The picture: nested blurs of the likely set (t = 1, 0.75, 0.5; the clean set at t = 0).
+% Coordinates are pixels of the hand sketch (y down); red = denoise, blue = re-noise.
+\begin{frame}{Down to the guess, back up onto the next blur}
 \begin{columns}[T]
-\begin{column}{0.56\textwidth}
+\begin{column}{0.6\textwidth}
 \centering
-\begin{tikzpicture}[scale=1.08, >=Stealth, font=\footnotesize]
-  \useasboundingbox (-0.2,-0.4) rectangle (7.4,4.4);
-  \clip (-0.2,-0.4) rectangle (7.4,4.4);
-  % the posterior: two modes
-  \fill[cc!25] (5.05,1.0) ellipse (0.45 and 0.22);
-  \fill[cc!25] (6.3,2.7) ellipse (0.35 and 0.3);
-  \node[cc!80!black, anchor=west] at (5.55,0.85) {likely};
-  \node[cc!80!black] at (6.3,3.2) {likely};
-  % step 1: start
-  \only<1->{
-    \draw[ca, dashed] (0.8,3.6) circle (2.9);
-    \fill[ca] (0.8,3.6) circle (2pt) node[above right] {$\z_N$};
-  }
-  % step 2: first guess = posterior mean
-  \only<2->{
-    \draw[->, ca, thick] (0.8,3.6) -- (5.6,1.87);
-    \fill[cmean] (5.67,1.85) circle (2.2pt) node[right, cmean] {$\E[\x\mid\y]$};
-  }
-  % step 3: partial step and re-noise
-  \only<3->{
-    \fill[gray] (3.62,2.52) circle (1.3pt);
-    \draw[->, gray] (3.62,2.52) -- (3.52,1.98);
-    \draw[cb, dashed] (3.5,1.9) circle (1.4);
-    \fill[cb] (3.5,1.9) circle (2pt) node[above left] {$\z_{N-1}$};
-  }
-  % step 4
-  \only<4->{
-    \draw[->, cb, thick] (3.5,1.9) -- (4.85,1.37);
-    \fill[cmean!70] (4.9,1.35) circle (1.8pt);
-    \fill[gray] (4.34,1.57) circle (1.3pt);
-    \draw[->, gray] (4.34,1.57) -- (4.44,1.28);
-    \draw[cc, dashed] (4.45,1.25) circle (0.6);
-    \fill[cc] (4.45,1.25) circle (2pt);
-  }
-  % step 5
-  \only<5->{
-    \fill[cmean!50] (4.97,1.04) circle (1.6pt);
-    \draw[->, cc, thick] (4.45,1.25) -- (4.92,1.06);
-    \fill[black] (5.02,1.0) circle (2pt) node[below right=-1pt] {$\hx$};
-  }
+\begin{tikzpicture}[blurpic]
+  \useasboundingbox (60,40) rectangle (1000,690);
+  % points on the blurs: the start (t=1), then one point on each tighter blur
+  \coordinate (P1) at (225,200);
+  \coordinate (P2) at (214,325);
+  \begin{scope}[innerblur] \coordinate (P3) at (478,257); \end{scope}
+  \begin{scope}[cleanset] \coordinate (P4) at (535,305); \end{scope}
+  % the denoiser's guesses: averages, between the blurs
+  \coordinate (G1) at (515,400);
+  \coordinate (G2) at (540,255);
+  \coordinate (G3) at (472,338);
+  \only<2->{\drawblurs}
+  \drawlikely
+  % --- pure noise: a random image ---
+  \fill (P1) circle (2.6pt);
+  \only<1>{\node[anchor=south east] at (220,192) {pure noise};}
+  \only<2->{\node[anchor=south east] at (220,192) {$\x_1$};}
+  % --- round 1 ---
+  \only<3->{\draw[den] (P1) -- (G1); \fill[cmean] (G1) circle (2pt);}
+  \only<4->{\draw[ren] (G1) -- (P2); \fill (P2) circle (2.2pt);}
+  % --- rounds 2 and 3 ---
+  \only<5->{\draw[den] (P2) -- (G2); \fill[cmean] (G2) circle (2pt);
+            \draw[ren] (G2) -- (P3); \fill (P3) circle (2.2pt);}
+  \only<6->{\draw[den] (P3) -- (G3); \fill[cmean] (G3) circle (2pt);
+            \draw[ren] (G3) -- (P4); \fill (P4) circle (2.6pt);
+            \node[anchor=west, inner sep=1pt] at ($(P4)+(14,22)$) {$\x_0$};}
 \end{tikzpicture}
+
+{\scriptsize Contours: one noise standard deviation, not hard edges.}
 \end{column}
-\begin{column}{0.42\textwidth}
-\small
+\begin{column}{0.38\textwidth}
+\footnotesize
 \begin{itemize}
   \setlength{\itemsep}{3pt}
-  \item<1-| alert@1> \textbf{Start in pure noise:} an unlikely image that says nothing beyond
-        $\y$. Circle: noise level $\sigma$.
-  \item<2-| alert@2> \textbf{Guess} $\approx\E[\x\mid\y]$, the end-to-end answer: an average,
-        \emph{between} the likely images.
-  \item<3-| alert@3> \textbf{Step part of the way}, add back less noise: a little more likely.
-  \item<4-| alert@4> \textbf{Guess again} at lower $\sigma$. The noise has committed us to one
-        option, so the guess is sharper.
-  \item<5-| alert@5> \textbf{As $\sigma\to0$} the guess lands on a likely image.
+  \item<1-| alert@1> \textbf{Likely images} (orange): a tiny region, far from pure noise.
+  \item<2-| alert@2> \textbf{Add noise}: the region blurs; the $t=1$ blur reaches pure noise.
+  \item<3-| alert@3> \textcolor{cmean}{\textbf{Denoise:}} guess $\E[\x\mid\x_t,\y]$, an
+        average.
+  \item<4-| alert@4> \textcolor{ca}{\textbf{Re-noise:}} land at random on the $t=0.75$ blur.
+  \item<5-| alert@5> \textbf{Repeat}: tighter blurs, sharper guesses.
+  \item<6-| alert@6> At $t=0$: \textbf{a likely image}.
 \end{itemize}
 \end{column}
 \end{columns}
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
-\begin{frame}{Annealed posterior ascent}
+\begin{frame}{The whole sampler is one loop}
 \begin{columns}[T]
-\begin{column}{0.5\textwidth}
+\begin{column}{0.58\textwidth}
 \begin{algorithmic}[1]
-\Require denoiser $\D$; start $\z$ at level $\sigma$ ($\infty$ allowed)
-\While{$\sigma > \sigma_{\min}$}
-  \State $\hx \gets \D(\z,\sigma,\y)$ \Comment{guess}
-  \State choose $h$, $r$ with $|1-h|\le r$
-  \State $\z \gets (1-h)\,\z + h\,\hx + \gamma\,\eps$ \Comment{step}
-  \State $\sigma \gets r\sigma$
+\Require a start $\x_t$ at level $t$
+\While{$t > 0$}
+  \State \textcolor{cmean}{denoise: $\hx \gets \E[\x\mid\x_t,\y]$}
+  \State \textcolor{ca}{re-noise: step toward $\hx$, noise for $t'$}
+  \State $t \gets t' < t$
 \EndWhile
 \State \Return $\hx$
 \end{algorithmic}
 \end{column}
-\begin{column}{0.48\textwidth}
+\begin{column}{0.38\textwidth}
 \small
-Three step sizes worth naming:
-\begin{itemize}
-  \item $h = 1-r^2$: the ancestral (DDPM / VE) sampler. Returns a posterior sample.
-  \item $h = 1-r$: no noise injected; the probability-flow ODE. Climbs to the MAP.
-  \item $h = 1$: jump to the guess and re-noise (SDEdit restarts).
-\end{itemize}
+Step size and noise pick the sampler (DDPM, DDIM, \dots). Details in the backup.
 \end{column}
 \end{columns}
 
 \bigskip
-\begin{alertblock}{The first step from $\sigma=\infty$}
-$r=0$ forces $h=1$: the step returns $\D(\cdot,\infty,\y) = \E[\x\mid\y]$, whatever $\z$ was,
-and re-noises it. An end-to-end network is exactly this first step, without the rest.
+\begin{alertblock}{The first step from pure noise}
+At $t=1$ the first guess is $\E[\x\mid\y]$, an end-to-end network's output. An end-to-end
+network is the first red arrow, alone.
 \end{alertblock}
 \end{frame}
 
@@ -241,79 +277,57 @@ and re-noises it. An end-to-end network is exactly this first step, without the 
 \section{Warm starts}
 %=============================================================================================
 
-\begin{frame}{Cold starts are wasteful}
-\begin{itemize}
-  \item At the top of the ladder ($\sigma\gg$ image intensities) the iterate is almost all
-        noise, and every guess is $\approx\E[\x\mid\y]$.
-  \item Those steps rebuild a blur we could have computed once.
-\end{itemize}
-\bigskip
+\begin{frame}{Warm start: begin closer to the centre}
+\begin{columns}[T]
+\begin{column}{0.6\textwidth}
 \centering
-\begin{tikzpicture}[>=Stealth, font=\small]
-  \draw[->, thick, gray] (0,-0.9) -- (12.4,-0.9) node[right] {$\sigma$};
-  \node[below=3pt] at (0.3,-0.9) {$\infty$};
-  \node[below=3pt] at (12,-0.9) {$0$};
-  \draw[dashed, gray] (5.7,-0.9) -- (5.7,1.5);
-  \node[below=3pt] at (5.7,-0.9) {$\sigma_0$};
-  % cold
-  \node[anchor=east] at (-0.2,1.1) {cold start};
-  \foreach \p in {0.3,1.2,2.1,3.0,3.9,4.8,5.7,6.6,7.5,8.4,9.3,10.2,11.1,12.0}
-    \fill[ca] (\p,1.1) circle (2.4pt);
-  \draw[decorate, decoration={brace, amplitude=5pt}, ca] (0.2,1.45) -- (4.9,1.45)
-        node[midway, above=6pt, ca] {from pure noise: guesses $\approx\E[\x\mid\y]$, wasted};
-  % warm
-  \node[anchor=east] at (-0.2,0) {warm start};
-  \foreach \p in {5.7,6.6,7.5,8.4,9.3,10.2,11.1,12.0}
-    \fill[cc] (\p,0) circle (2.4pt);
-  \node[anchor=east, cc!80!black] at (5.5,0) {start at $\z = \tx + \sigma_0\eps$};
+\begin{tikzpicture}[blurpic]
+  \useasboundingbox (60,40) rectangle (1000,690);
+  % the cold run (as on the earlier slide)
+  \coordinate (P1) at (225,200);
+  \coordinate (P2) at (214,325);
+  \begin{scope}[innerblur] \coordinate (P3) at (478,257); \end{scope}
+  \begin{scope}[cleanset] \coordinate (P4) at (535,305); \end{scope}
+  \coordinate (G1) at (515,400);
+  \coordinate (G2) at (540,255);
+  \coordinate (G3) at (472,338);
+  % the warm run: start at the first guess, push it onto the t0 = 0.5 blur, finish
+  \begin{scope}[innerblur] \coordinate (W1) at (405,330); \end{scope}
+  \coordinate (WG) at (440,295);
+  \begin{scope}[cleanset] \coordinate (W2) at (520,330); \end{scope}
+  \drawblurs
+  \drawlikely
+  % cold start, greyed
+  \begin{scope}[black!30]
+    \fill (P1) circle (2.4pt) node[anchor=south east, black!45] {$\x_1$};
+    \draw[den, black!30] (P1) -- (G1);
+    \draw[ren, black!30] (G1) -- (P2);  \draw[den, black!30] (P2) -- (G2);
+    \draw[ren, black!30] (G2) -- (P3);  \draw[den, black!30] (P3) -- (G3);
+    \draw[ren, black!30] (G3) -- (P4);
+  \end{scope}
+  % warm start
+  \only<2->{\fill[cb] (G1) circle (2.8pt);
+            \node[cb, anchor=north, inner sep=2pt] at ($(G1)+(0,6)$) {$\tx$};}
+  \only<3->{\draw[ren, very thick] (G1) -- (W1); \fill (W1) circle (2.4pt);}
+  \only<4->{\draw[den] (W1) -- (WG); \fill[cmean] (WG) circle (2pt);
+            \draw[ren] (WG) -- (W2); \fill (W2) circle (2.6pt);
+            \node[anchor=north east, inner sep=1pt] at ($(W2)+(-4,8)$) {$\x_0$};}
 \end{tikzpicture}
-\end{frame}
-
-%---------------------------------------------------------------------------------------------
-\begin{frame}{Start from a likelier image}
+\end{column}
+\begin{column}{0.38\textwidth}
+\footnotesize
 \begin{itemize}
-  \setlength{\itemsep}{6pt}
-  \item Sample a likelier image and add noise: $\z = \tx + \sigma_0\eps$, with $\sigma_0<\infty$.
-        Then run the same ascent from $\sigma_0$: fewer steps, at little cost
-        (SDEdit; come-closer-diffuse-faster).
-  \item Candidates for $\tx$:
-        \begin{itemize}
-          \item the adjoint (zero-filled) image $\Op^H\y$;
-          \item an end-to-end reconstruction, $\approx\E[\x\mid\y]$.
-        \end{itemize}
-  \item \textbf{Choosing $\sigma_0$.} The noise must cover the start's error:
-        $\sigma_0 \gtrsim$ RMS error of $\tx$. Too little, and the run cannot leave $\tx$'s
-        neighbourhood.
-  \item The ascent from $\sigma=\infty$ is itself warm-started: its first step re-noises
-        $\E[\x\mid\y]$. ImMAP2 starts at $\mathrm{mean}(\Op^H\y)+\z$, $\sigma=1$.
+  \setlength{\itemsep}{4pt}
+  \item<1-| alert@1> \textbf{Cold start} (grey): the first guesses are all
+        $\approx\E[\x\mid\y]$.
+  \item<2-| alert@2> \textbf{Warm start}: begin at a likelier image $\tx$, e.g.\ an
+        end-to-end output.
+  \item<3-| alert@3> \textcolor{ca}{\textbf{Push it up}}: add enough noise to land on the $t_0$
+        blur.
+  \item<4-| alert@4> \textbf{Resume} from $t_0$: fewer steps.
 \end{itemize}
-\end{frame}
-
-%---------------------------------------------------------------------------------------------
-\begin{frame}{The start level matters}
-\small
-CIFAR-10, $4\times$ super-resolution, one trained guided denoiser, 8 samples $\times$ 512 images.
-\emph{Detail}: energy in the band the low-res input cannot see, relative to the target's
-(perfect sample $=1$; the regression $\E[\x\mid\y]$ has $0.29$).
-
-\medskip
-\centering
-\begin{tabular}{@{}lcccc@{}}
-\toprule
-start & \multicolumn{2}{c}{10 network calls} & \multicolumn{2}{c}{50 network calls} \\
-\cmidrule(lr){2-3}\cmidrule(l){4-5}
- & sample spread & detail & sample spread & detail \\
-\midrule
-$\sigma=\infty$, then re-noise (I\textsuperscript{2}SB)      & 0.084 & 0.49 & 0.122 & 0.71 \\
-$\E[\x\mid\y] + \sigma_0\eps$, $\sigma_0\approx2.0$       & 0.105 & 0.60 & 0.130 & 0.76 \\
-$\E[\x\mid\y] + \sigma_0\eps$, $\sigma_0=0.5$             & 0.078 & 0.46 & 0.088 & 0.51 \\
-\bottomrule
-\end{tabular}
-
-\medskip
-\raggedright
-$\sigma_0 = 0.5$ is about $3\times$ the regression's RMS error, and still too low: samples
-plateau near the regression even at 50 calls. Warm, but not too warm.
+\end{column}
+\end{columns}
 \end{frame}
 
 %=============================================================================================
@@ -321,79 +335,245 @@ plateau near the regression even at 50 calls. Warm, but not too warm.
 %=============================================================================================
 
 \begin{frame}{A paired guide: build a bridge}
-\begin{columns}[T]
-\begin{column}{0.55\textwidth}
-\small
-\begin{itemize}
-  \setlength{\itemsep}{4pt}
-  \item Suppose the guide $\y$ is \alert{uniquely paired} with the target $\x$.
-  \item Connect them by a \textbf{Brownian bridge}, a distribution of noisy paths from $\x$
-        to $\y$:
-        \[
-          \begin{gathered}
-            \z_t = (1-t)\,\x + t\,\y + \ssb(t)\,\eps,\\
-            \ssb(t)^2 = V t(1-t).
-          \end{gathered}
-        \]
-  \item $t=0$: the target. $t=1$: exactly the guide. Noise at most $\tau = \sqrt V/2$.
-  \item A Schr\"odinger bridge between the two image distributions. With paired data each
-        pair's endpoints are pinned, and it is this Gaussian bridge (Liu et al.\ 2023).
-\end{itemize}
-\end{column}
-\begin{column}{0.43\textwidth}
 \centering
-\vspace{0.8cm}
-\begin{tikzpicture}[>=Stealth, font=\small]
-  \draw[gray, thick] (0,0) -- (5.4,0);
-  \fill (0,0) circle (2pt) node[below=3pt, align=center] {$\x$\\[-2pt]{\footnotesize target}};
-  \fill (5.4,0) circle (2pt) node[below=3pt, align=center] {$\y$\\[-2pt]{\footnotesize guide}};
-  \foreach \t/\r/\c in {0.2/0.34/ca, 0.5/0.42/cb, 0.8/0.34/cc} {
-    \fill[\c!15] (5.4*\t, 0) circle (\r);
-    \draw[\c, thick] (5.4*\t, 0) circle (\r);
-    \fill[\c] (5.4*\t, 0) circle (1.4pt);
-    \node[\c, above] at (5.4*\t, \r) {$t = \t$};
-  }
-  % two sample paths
-  \begin{scope}[opacity=0.6, xscale=0.9]
-    \draw[ca!70!black] plot[smooth] coordinates {(0,0) (0.7,0.25) (1.3,-0.15) (2.1,0.35)
-          (3.0,0.1) (3.8,-0.3) (4.6,0.2) (5.3,-0.1) (6,0)};
-    \draw[cc!80!black] plot[smooth] coordinates {(0,0) (0.6,-0.2) (1.4,0.2) (2.2,-0.3)
-          (3.0,-0.35) (3.9,0.25) (4.7,-0.15) (5.4,0.12) (6,0)};
-  \end{scope}
-  \node[font=\footnotesize, gray, align=center] at (2.7,-1.4) {two sample paths;\\
-        noise vanishes at both ends};
+\begin{tikzpicture}[x=1.08cm, y=0.66cm, font=\footnotesize]
+  \useasboundingbox (-1.6,-3.0) rectangle (11.2,2.6);
+  \bridgeends
+  \only<3->{\input{bridge_paths.tex}}
+  \only<2->{\bridgeenvelope{cmean, dashed, thick}
+            \node[cmean, anchor=south] at (5,1.45) {one standard deviation};}
+  \draw[very thick] (0,0.25) -- (10,-0.25);
+  \fill (0,0.25) circle (2.6pt) node[anchor=east, inner sep=4pt] {$\z_1 = \y$};
+  \fill (10,-0.25) circle (2.6pt) node[anchor=west, inner sep=4pt] {$\z_0 = \x_0$};
 \end{tikzpicture}
 
-\vspace{0.8cm}
+\raggedright
 \small
-\textbf{Training:} predict the target,
-\[
-  \min_{\D}\ \E\,\|\D(\z_t,t,\y)-\x\|^2,\quad t\sim\mathcal U[0,1].
-\]
+\begin{itemize}
+  \setlength{\itemsep}{2pt}
+  \item<1-> Join a guide $\y$ and its target $\x_0$ by a line, $\z_t = (1-t)\,\x_0 + t\,\y$,
+        plus noise.
+  \item<2-> \textcolor{cmean}{Dashed}: one standard deviation of the noise, zero at both ends.
+  \item<3-> \textcolor{ca}{Random paths}: a Brownian bridge (Liu et al.\ 2023).
+\end{itemize}
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{A bridge, in images}
+\centering
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{ccccc}
+\im{2.5cm}{x0} & \im{2.5cm}{bridge25} & \im{2.5cm}{bridge50} & \im{2.5cm}{bridge75} &
+  \im{2.5cm}{y} \\
+\footnotesize $t=0$: target $\x_0$ & \footnotesize $t=0.25$ & \footnotesize $t=0.5$ &
+  \footnotesize $t=0.75$ & \footnotesize $t=1$: guide $\y$
+\end{tabular}
+
+\bigskip
+\raggedright
+\begin{itemize}
+  \setlength{\itemsep}{4pt}
+  \item The target fades out, the guide fades in, plus noise.
+  \item No noise at the ends, the most in the middle.
+\end{itemize}
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{I\textsuperscript{2}SB: predict the end, walk part way, re-noise}
+\centering
+\begin{tikzpicture}[x=1.08cm, y=0.95cm, font=\footnotesize,
+                    >={Stealth[length=4.5pt, width=3.5pt]}]
+  \useasboundingbox (-1.6,-3.0) rectangle (11.4,2.9);
+  \bridgeends
+  \foreach \X/\T in {0/1, 2.5/0.75, 5/0.5, 7.5/0.25, 10/0} {
+    \draw[black!20, densely dotted] (\X,-2.1) -- (\X,2.3);
+    \node[black!60, font=\scriptsize] at (\X,2.65) {$t=\T$};
+  }
+  % the true bridge, from y to the true x_0 (unknown to the sampler)
+  \coordinate (Z1) at (0,0.25);
+  \coordinate (X0) at (10,-1.15);
+  \draw[black!30, thick] (Z1) -- (X0);
+  \draw[black!45, dashed] plot[domain=0:10, samples=81, variable=\q]
+      (\q, {0.25-0.14*\q + 2.8*sqrt(max(0,(\q/10)*(1-\q/10)))});
+  \draw[black!45, dashed] plot[domain=0:10, samples=81, variable=\q]
+      (\q, {0.25-0.14*\q - 2.8*sqrt(max(0,(\q/10)*(1-\q/10)))});
+  \node[black!55, anchor=south, font=\scriptsize] at (5,0.95) {the true bridge (1 std)};
+  \draw[thick] (X0) circle (3.6pt);
+  \node[anchor=north east, inner sep=2pt] at ($(X0)+(-0.12,-0.1)$) {true $\x_0$};
+  % Z = current point, G = predicted endpoint, W = after walking part way
+  \coordinate (G1) at (10,0.35);   \coordinate (W1) at (2.5,0.275);  \coordinate (Z2) at (2.5,0.76);
+  \coordinate (G2) at (10,-0.50);  \coordinate (W2) at (5,0.34);     \coordinate (Z3) at (5,-0.29);
+  \coordinate (G3) at (10,-0.95);  \coordinate (W3) at (7.5,-0.62);  \coordinate (Z4) at (7.5,-0.32);
+  \coordinate (G4) at (10,-1.08);
+  \tikzset{guess/.style={cmean!70, dashed}, walk/.style={cmean, very thick},
+           jump/.style={->, ca, very thick, shorten <=1pt, shorten >=1pt},
+           nbar/.style={ca!45, line width=2.2pt}}
+  \fill (Z1) circle (2.6pt) node[anchor=east, inner sep=4pt] {$\z_1 = \y$};
+  % round 1, step by step
+  \only<2->{\draw[guess] (Z1) -- (G1); \fill[cmean] (G1) circle (2.2pt);}
+  \only<2-4>{\node[cmean, anchor=south west, inner sep=3pt] at (G1) {$\E[\x_0\mid\z_t,\y]$};
+             \draw[<->, cmean, thick] (10.45,0.35) -- (10.45,-1.15);
+             \node[cmean, anchor=west, font=\scriptsize, align=left] at (10.5,-0.4)
+                  {far from\\the truth};}
+  \only<3->{\draw[walk] (Z1) -- (W1); \fill[cmean] (W1) circle (1.8pt);}
+  \only<3>{\fill[cmean] (8,0.33) circle (1.6pt);
+           \node[cmean, anchor=south, font=\scriptsize] at (8,0.38) {leaves the bridge};}
+  \only<3-4>{\draw[cmean, thick, |-|] (2.72,0.275) -- (2.72,-0.10);
+             \fill[black!45] (2.5,-0.10) circle (1.5pt);
+             \node[cmean, anchor=west, font=\scriptsize, align=left] at (2.78,-0.25)
+                  {structured error\\(from the guess)};}
+  \only<4>{\draw[nbar] (2.5,-0.935) -- (2.5,1.485);
+           \node[ca, anchor=east, font=\scriptsize, align=right] at (2.42,1.35)
+                {fresh noise\\(1 std)};}
+  \only<4->{\draw[jump] (W1) -- (Z2); \fill (Z2) circle (2.4pt);}
+  % round 2
+  \only<5->{\draw[guess] (Z2) -- (G2); \fill[cmean] (G2) circle (2.2pt);
+            \draw[walk] (Z2) -- (W2); \fill[cmean] (W2) circle (1.8pt);
+            \draw[jump] (W2) -- (Z3); \fill (Z3) circle (2.4pt);}
+  % round 3
+  \only<6->{\draw[guess] (Z3) -- (G3); \fill[cmean] (G3) circle (2.2pt);
+            \draw[walk] (Z3) -- (W3); \fill[cmean] (W3) circle (1.8pt);
+            \draw[jump] (W3) -- (Z4); \fill (Z4) circle (2.4pt);}
+  % last: walk all the way
+  \only<7->{\draw[guess] (Z4) -- (G4);
+            \draw[walk] (Z4) -- (G4); \fill (G4) circle (2.8pt);
+            \node[anchor=south west, inner sep=2pt] at ($(G4)+(0.08,0.05)$) {a sample};}
+\end{tikzpicture}
+
+\raggedright
+\small
+\begin{overprint}
+\onslide<1> Start at the guide, $\z_1 = \y$. Grey: the true bridge to the true $\x_0$
+  (unknown).
+\onslide<2> \textcolor{cmean}{\textbf{Predict the endpoint}} $\E[\x_0\mid\z_t,\y]$: early on, an
+  average, far from the truth.
+\onslide<3> \textcolor{cmean}{\textbf{Walk part way}}, to the next $t$. Our error is now
+  structured: the guess's error, shrunk.
+\onslide<4> \textcolor{ca}{\textbf{Add fresh noise}}, back to the bridge's level. It knows
+  nothing of $\x_0$; it drowns the structured error.
+\onslide<5-6> \textbf{Repeat.} The fraction walked grows ($\tfrac14, \tfrac13, \tfrac12$) and the
+  guesses improve.
+\onslide<7> Last step: walk all the way.
+\end{overprint}
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Why re-noise? Structured versus unstructured error}
+\begin{columns}[T]
+\begin{column}{0.62\textwidth}
+\centering
+\setlength{\tabcolsep}{1.5pt}
+\begin{tabular}{cccc}
+\footnotesize (a) a bridge & \footnotesize (b) all the way & \footnotesize (c) part way &
+  \footnotesize (d) part way \\[-2pt]
+\footnotesize sample at $s$ & \footnotesize to the guess & & \footnotesize $+$ fresh noise \\
+\im{2.05cm}{re_a_img} & \uncover<2->{\im{2.05cm}{re_b_img}} & \uncover<3->{\im{2.05cm}{re_c_img}} &
+  \uncover<4->{\im{2.05cm}{re_d_img}} \\
+\im{2.05cm}{re_a_err} & \uncover<2->{\im{2.05cm}{re_b_err}} & \uncover<3->{\im{2.05cm}{re_c_err}} &
+  \uncover<4->{\im{2.05cm}{re_d_err}}
+\end{tabular}
+
+{\scriptsize Bottom: error against the true bridge (mid-grey $=0$). One step,
+$t=0.75\to0.5$, toward a blurry guess.}
+\end{column}
+\begin{column}{0.36\textwidth}
+\small
+\begin{overprint}
+\onslide<1> \textbf{(a)} A true bridge sample: white-noise error. What the network has seen.
+\onslide<2> \textbf{(b)} All the way to the guess: no noise, only \textbf{structured} error.
+\onslide<3> \textbf{(c)} Part way: a third of the structured error, but too little noise.
+\onslide<4> \textbf{(d)} Re-noised: the right noise level, structured error faint. Like (a).
+\end{overprint}
 \end{column}
 \end{columns}
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
-\begin{frame}{Same skeleton: guess, step, re-noise onto the bridge}
+\begin{frame}{A real I\textsuperscript{2}SB run}
+\centering
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{rccccc}
+ & \footnotesize $t=1$ & \footnotesize $t=0.75$ & \footnotesize $t=0.5$ & \footnotesize $t=0.25$ &
+   \footnotesize $t=0$: sample \\
+\rotatebox{90}{\footnotesize\hspace{0.4cm}current $\z_t$} &
+  \im{2.0cm}{real_z100} & \im{2.0cm}{real_z075} & \im{2.0cm}{real_z050} & \im{2.0cm}{real_z025} &
+  \im{2.0cm}{real_sample0} \\
+\rotatebox{90}{\footnotesize\hspace{0.15cm}\textcolor{cmean}{guess} $\E[\x_0\mid\z_t,\y]$} &
+  \im{2.0cm}{real_g100} & \im{2.0cm}{real_g075} & \im{2.0cm}{real_g050} & \im{2.0cm}{real_g025} &
+  \im{2.0cm}{real_x0} \\
+ & \footnotesize the regression & & & & \footnotesize the true image
+\end{tabular}
+
+\medskip
+\raggedright
+\scriptsize
+A small network trained on crops of eight photos, including this one (an illustration).
+20 equispaced steps, every fifth shown.
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Two expectations}
+\begin{columns}[T]
+\begin{column}{0.6\textwidth}
+\centering
+\begin{tikzpicture}[font=\footnotesize, >={Stealth[length=4.5pt, width=3.5pt]},
+                    net/.style={draw, rounded corners=3pt, fill=black!6, minimum width=1.9cm,
+                                minimum height=0.85cm, align=center},
+                    img/.style={inner sep=0pt}]
+  % guided diffusion (top) and I2SB (bottom); the side information y feeds both
+  \node[img] (din)  at (0, 1.9)    {\im{1.95cm}{real_cmp_diff_in}};
+  \node[net] (dnet) at (2.75, 1.9) {$D_\theta(\x_t,\sigma,\y)$};
+  \node[img] (dout) at (5.5, 1.9)  {\im{1.95cm}{real_cmp_diff_out}};
+  \node[img] (bin)  at (0, -1.9)   {\im{1.95cm}{real_cmp_bridge_in}};
+  \node[net] (bnet) at (2.75, -1.9) {$f_\theta(\z_t,t,\y)$};
+  \node[img] (bout) at (5.5, -1.9) {\im{1.95cm}{real_cmp_bridge_out}};
+  \node[img] (y)    at (2.75, 0)   {\im{1.1cm}{real_y}};
+  \node[anchor=west] at ($(y.east)+(0.05,0)$) {$\y$};
+  \draw[->, thick] (din) -- (dnet);   \draw[->, thick, cmean] (dnet) -- (dout);
+  \draw[->, thick] (bin) -- (bnet);   \draw[->, thick, cmean] (bnet) -- (bout);
+  \draw[->, thick] (y) -- (dnet);     \draw[->, thick] (y) -- (bnet);
+  \node[anchor=south] at (din.north) {noisy image $\x_t$};
+  \node[anchor=south] at (dout.north) {\textcolor{cmean}{$\approx\E[\x_0\mid\x_t,\y]$}};
+  \node[anchor=north] at (bin.south) {bridge sample $\z_t$};
+  \node[anchor=north] at (bout.south) {\textcolor{cmean}{$\approx\E[\x_0\mid\z_t,\y]$}};
+  \node[anchor=east, font=\small\bfseries] at (-1.1, 1.9) {\rotatebox{90}{diffusion}};
+  \node[anchor=east, font=\small\bfseries] at (-1.1, -1.9) {\rotatebox{90}{I\textsuperscript{2}SB}};
+\end{tikzpicture}
+\end{column}
+\begin{column}{0.38\textwidth}
+\small
+\begin{itemize}
+  \setlength{\itemsep}{4pt}
+  \item Same target $\x_0$, different inputs.
+  \item $D_\theta$: $\x_t = \x_0 + \sigma\eps$, a sharp image under noise; $\y$ on the side.
+  \item $f_\theta$: $\z_t = (1-t)\,\x_0 + t\,\y$ + noise, mostly the blurry guide; $\y$ in the
+        input.
+  \item Both trained to predict $\x_0$ (squared error).
+\end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Same skeleton: guess, step, re-noise}
 \begin{columns}[T]
 \begin{column}{0.48\textwidth}
 \textbf{Guided diffusion}
 \begin{algorithmic}[1]
-\State $\z \gets$ pure noise
-\For{each level $\sigma\to\sigma'$}
-  \State $\hx \gets \D(\z,\sigma,\y)$
-  \State $\z \gets (1-h)\z + h\hx + \gamma\eps$
+\State start: pure noise
+\For{each level, $t\to t'$}
+  \State \textcolor{cmean}{$\hx \gets D_\theta(\x_t,\sigma,\y)$}
+  \State \textcolor{ca}{step toward $\hx$, re-noise to $t'$}
 \EndFor
 \end{algorithmic}
 \end{column}
 \begin{column}{0.5\textwidth}
 \textbf{I\textsuperscript{2}SB}
 \begin{algorithmic}[1]
-\State $\z \gets \y$ \Comment{the guide}
-\For{each time $t\to s$, $\ s<t$}
-  \State $\hx \gets \D(\z,t,\y)$
-  \State $\z \gets \tfrac st\,\z + \big(1-\tfrac st\big)\hx + \sqrt{V\tfrac{s(t-s)}{t}}\,\eps$
+\State start: the guide $\y$
+\For{each time, $t\to s$}
+  \State \textcolor{cmean}{$\hx \gets f_\theta(\z_t,t,\y)$}
+  \State \textcolor{ca}{walk toward $\hx$ to time $s$, re-noise}
 \EndFor
 \end{algorithmic}
 \end{column}
@@ -401,14 +581,141 @@ plateau near the regression even at 50 calls. Warm, but not too warm.
 
 \bigskip
 \begin{itemize}
-  \item \textbf{Re-noising onto the bridge.} Line 4 draws the bridge from the guess $\hx$ (at
-        time 0) to the current point $\z$ (at time $t$), at the earlier time $s$.
-  \item The first step: $\z = \y$ and the guess is $\E[\x\mid\y]$, a regression from the guide.
-        Then step down the bridge toward the target.
+  \item \textcolor{cmean}{Red: predict}; \textcolor{ca}{blue: re-noise}.
+  \item I\textsuperscript{2}SB's first guess, from $\y$ alone, is a regression.
 \end{itemize}
 \end{frame}
 
+%=============================================================================================
+\section{Adding a measurement}
+%=============================================================================================
+
+\begin{frame}{Adding a measurement: I\textsuperscript{2}SB-Recon}
+\begin{columns}[T]
+\begin{column}{0.54\textwidth}
+\small
+A guide $\y$ (the bridge's start) and a measurement $\bm b = \bm A\x_0 + \text{noise}$.
+
+\medskip
+\textbf{1.} The expectation as an argmin around a guess $\hx$:
+\[
+  \E[\x_0\mid\z_t,\y,\bm b] \approx
+  \arg\min_{\x}\, \|\bm A\x - \bm b\|^2 + \lambda\|\x - \hx\|^2
+\]
+\textbf{2.} The guess from the bridge regressor: $\ \hx = f_\theta(\z_t, t, \y)$.
+
+\smallskip
+\textbf{3.} Solve with a few CG iterations.
+
+\medskip
+$\y$ enters through the network; $\bm b$ only through CG.
+\end{column}
+\begin{column}{0.46\textwidth}
+\centering
+\begin{tikzpicture}[font=\footnotesize, >={Stealth[length=4.5pt, width=3.5pt]}, scale=0.95]
+  \useasboundingbox (-0.4,-0.6) rectangle (6.2,5.0);
+  \draw[very thick, black!70] (0,0.6) -- (6,3.6);
+  \node[anchor=south east, rotate=26.6, black!70] at (6,3.65) {images with $\bm A\x = \bm b$};
+  \fill (4.6,2.9) circle (2.4pt) node[anchor=north west] {true $\x_0$};
+  \fill[cmean] (2.0,4.2) circle (2.4pt)
+       node[anchor=south, cmean] {$\hx = f_\theta(\z_t,t,\y)$};
+  \coordinate (P) at (3.04,2.12);
+  \draw[->, very thick, black] (2.0,4.2) -- ($(2.0,4.2)!0.92!(P)$);
+  \fill (P) circle (2.4pt);
+  \node[anchor=north west, align=left] at ($(P)+(0.05,-0.08)$) {the argmin};
+  \node[anchor=east, black!60, align=right] at (2.35,3.0) {CG};
+  \draw[<->, black!45] (0.6,0.25) -- (2.2,1.05);
+  \node[anchor=north west, black!55] at (1.2,0.55) {null space of $\bm A$};
+\end{tikzpicture}
+
+{\scriptsize $\bm b$ fixes what $\bm A$ sees; the network fills the null space.}
+\end{column}
+\end{columns}
+\end{frame}
+
 %---------------------------------------------------------------------------------------------
+\begin{frame}{One loop, three knobs}
+\begin{columns}[T]
+\begin{column}{0.42\textwidth}
+\centering
+\begin{tikzpicture}[font=\footnotesize, >={Stealth[length=4.5pt, width=3.5pt]},
+                    box/.style={draw, rounded corners=3pt, minimum width=3.6cm,
+                                minimum height=0.8cm, align=center}]
+  \node[box, fill=black!6]  (cur) at (0, 2.2)  {\textbf{1} current image};
+  \node[box, fill=cmean!12] (est) at (0, 0.6)  {\textcolor{cmean}{estimate}
+      $\E[\x_0\mid\text{current},\,$\textbf{2}$]$\\[-1pt] computed by \textbf{3}};
+  \node[box, fill=ca!12]    (stp) at (0, -1.0) {\textcolor{ca}{walk part way, re-noise}};
+  \draw[->, thick] (cur) -- (est);
+  \draw[->, thick] (est) -- (stp);
+  \draw[->, thick] (stp.east) -- ++(0.45,0) |- (cur.east);
+  \node[box, draw=none] at (0, -2.2) {repeat until $t = 0$};
+\end{tikzpicture}
+\end{column}
+\begin{column}{0.56\textwidth}
+\small
+\begin{enumerate}
+  \setlength{\itemsep}{8pt}
+  \item[\textbf{1}] \textbf{Runs on}: a noisy image or a bridge sample.
+  \item[\textbf{2}] \textbf{Side information}: none, a guide, a measurement, or both.
+  \item[\textbf{3}] \textbf{Expectation}: a network alone, or a network $+$ CG.
+\end{enumerate}
+
+\bigskip
+Every method here is this loop, knobs set differently.
+\end{column}
+\end{columns}
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Same loop, different ingredients}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.5cm}>{\raggedright\arraybackslash}p{2.0cm}%
+                >{\raggedright\arraybackslash}p{2.9cm}>{\raggedright\arraybackslash}p{1.7cm}%
+                >{\raggedright\arraybackslash}p{3.3cm}@{}}
+\toprule
+method & \textbf{1} runs on & \textbf{2} network sees & measurement $\bm b$ &
+  \textbf{3} expectation \\
+\midrule
+end-to-end network & (one step) & guide and/or $\bm b$ & in the network &
+  a regressor, once \\
+guided diffusion & noisy image & guide & --- & $D_\theta(\x_t,\sigma,\y)$ \\
+ImMAP2 & noisy image & nothing & via CG & argmin, $\hx = D_\theta(\x_t,\sigma)$ \\
+I\textsuperscript{2}SB & bridge sample & guide (start) & --- & $f_\theta(\z_t,t,\y)$ \\
+I\textsuperscript{2}SB-Recon & bridge sample & guide (start) & via CG &
+  argmin, $\hx = f_\theta(\z_t,t,\y)$ \\
+\bottomrule
+\end{tabular}
+
+\bigskip
+\raggedright
+\small
+Same loop in every row.
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Takeaways}
+\begin{enumerate}
+  \setlength{\itemsep}{8pt}
+  \item Guided diffusion: guess with a denoiser, add back less noise, repeat.
+  \item A warm start skips the steps that only rebuild $\E[\x\mid\y]$.
+  \item I\textsuperscript{2}SB walks a bridge from guide to target: predict, walk part way,
+        re-noise.
+  \item Measurements enter through a CG step; the loop is unchanged.
+\end{enumerate}
+
+\bigskip
+\begin{block}{Future work}
+I\textsuperscript{2}SB as warm-started diffusion; where each pays (appendix).
+\end{block}
+\end{frame}
+
+%=============================================================================================
+\appendix
+\section*{Appendix: I\textsuperscript{2}SB as warm-started diffusion}
+%=============================================================================================
+
 {\setbeamercolor{background canvas}{bg=black!85}
 \begin{frame}[standout]
 The bridge is a change of coordinates.\\[8pt]
@@ -422,18 +729,13 @@ The bridge is a change of coordinates.\\[8pt]
 \small
 Remove the guide's share and rescale:
 \[
-  \uu = \frac{\z_t - t\,\y}{1-t} = \x + \sigma(t)\,\eps,
-\]
-\[
-  \sigma(t)^2 = \frac{Vt}{1-t}.
+  \uu = \frac{\z_t - t\,\y}{1-t} = \x + \sigma(t)\,\eps .
 \]
 \begin{itemize}
-  \setlength{\itemsep}{3pt}
-  \item $\uu$ is a noisy target: what the ascent iterates on.
-  \item For fixed $\y$ the map is a bijection, so
-        $\E[\x\mid\z_t,\y] = \E[\x\mid\uu,\y]$. The bridge network \emph{is} the guided
-        denoiser.
-  \item Bridge time is the noise level: $t=0\mapsto\sigma=0$, $t=1\mapsto\sigma=\infty$.
+  \setlength{\itemsep}{4pt}
+  \item $\uu$ is an ordinary noisy image: what the ascent works on.
+  \item Nothing is lost in the change, so the bridge network \emph{is} the guided denoiser.
+  \item Bridge time is the noise level: $t=0$ is clean, $t=1$ is infinite noise.
 \end{itemize}
 \end{column}
 \begin{column}{0.54\textwidth}
@@ -462,13 +764,25 @@ Remove the guide's share and rescale:
   \node[cc, right] at (5.76, -1.1) {$\sigma = 2$};
 \end{tikzpicture}
 
-{\scriptsize Same state, two coordinates (radii to scale, $V=1$).}
+{\scriptsize Same state, two coordinates (radii to scale).}
 \end{column}
 \end{columns}
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
-\begin{frame}{Line by line}
+\begin{frame}{Checked on a trained network}
+\centering
+\includegraphics[width=0.86\textwidth]{equivalence_toy/trajectory.png}
+
+\small
+\raggedright
+One I\textsuperscript{2}SB run (CIFAR $4\times$ SR), in both coordinates, with the same noise.
+Over 256 images the two algorithms agree to float32 rounding ($<10^{-6}$ relative). They are one
+computation. (Line-by-line proof in the backup.)
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Backup: line by line}
 \footnotesize
 Grid $1 = t_N>\dots>t_0 = 0$; $t=t_k$, $s=t_{k-1}$; $r^2 = \sigma(s)^2/\sigma(t)^2 =
 \frac{s(1-t)}{t(1-s)}$; the same noise $\eps_k$ in both.
@@ -506,50 +820,76 @@ Grid $1 = t_N>\dots>t_0 = 0$; $t=t_k$, $s=t_{k-1}$; $r^2 = \sigma(s)^2/\sigma(t)
   \item \textbf{Line 4.} Multiply by $1-s$ and add $s\y$: the coefficients become
         $\tfrac st$, $1-\tfrac st$, and the variance
         $(1-s)^2\sigma(s)^2(1-r^2) = V\tfrac{s(t-s)}{t}$.
+  \item Measured: agreement to $7.6\cdot10^{-7}$ (5 steps) and $7.8\cdot10^{-7}$ (50 steps).
 \end{itemize}
-\end{frame}
-
-%---------------------------------------------------------------------------------------------
-\begin{frame}{Checked on a trained network}
-\centering
-\includegraphics[width=0.86\textwidth]{equivalence_toy/trajectory.png}
-
-\small
-\raggedright
-One I\textsuperscript{2}SB run (CIFAR $4\times$ SR), both coordinates, same noise. Over 256 images
-the two algorithms agree to $7.6\cdot10^{-7}$ relative (5 steps) and $7.8\cdot10^{-7}$
-(50 steps): float32 rounding. They are one computation.
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
 \begin{frame}{So why a bridge?}
 \small
-The optimal outputs are equal, so in theory nothing is gained. But a finite network must fit the
-denoiser at every level, and the bridge removes the levels where that is hardest.
+The ideal outputs are equal, so in theory nothing is gained. But a finite network must fit the
+denoiser at every noise level, and the bridge removes the levels where that is hardest.
 \begin{itemize}
-  \setlength{\itemsep}{2pt}
-  \item \textbf{Bounded noise.} The network sees noise $\ssb(t)\le\tau$, while $\sigma$ runs
+  \setlength{\itemsep}{4pt}
+  \item \textbf{Bounded noise.} The network never sees much noise, while the ascent's noise runs
         from $0$ to $\infty$.
-  \item \textbf{Exact start.} At $\sigma=\infty$ the input is exactly $\y$, an image it is
-        trained on. Standard diffusion stops at a finite $\sigma_{\max}$ and starts from
-        mismatched noise.
-  \item \textbf{A Wiener-filter preconditioner.} $\z_t = \y + (1-t)(\uu-\y)$ is
-        $\E[\x\mid\uu]$ under the prior $\x\sim\N(\y,V\bm I)$. The network only learns the
-        correction, and the better $\y$ predicts $\x$, the smaller it is.
+  \item \textbf{Exact start.} At infinite noise the input is exactly $\y$, an image it is
+        trained on. Standard diffusion stops at a finite noise and starts from mismatched
+        noise.
+  \item \textbf{A head start.} The network input is the noisy image pulled toward the guide: a
+        Wiener-filter estimate of $\x$. The network learns only the correction, and the better
+        $\y$ predicts $\x$, the smaller it is.
 \end{itemize}
 
+\end{frame}
+
+%---------------------------------------------------------------------------------------------
+\begin{frame}{Backup: the bridge}
+\small
+\[
+  \z_t = (1-t)\,\x + t\,\y + \ssb(t)\,\eps,\qquad \ssb(t)^2 = Vt(1-t)\le V/4,
+\]
+the Schr\"odinger bridge between the two image distributions when every pair's endpoints are
+pinned. Training: $\min_\D \E\,\|\D(\z_t,t,\y)-\x\|^2$, $t\sim\mathcal U[0,1]$.
+
 \medskip
-\footnotesize
+I\textsuperscript{2}SB step, $t\to s$:
+$\ \z_s = \tfrac st\,\z_t + \big(1-\tfrac st\big)\hx + \sqrt{V\tfrac{s(t-s)}{t}}\,\eps$.
+
+\medskip
+Debiased state: $\uu = (\z_t - t\y)/(1-t) = \x + \sigma(t)\eps$, with
+$\sigma(t)^2 = Vt/(1-t)$. The network input is
+$\z_t = \y + (1-t)(\uu-\y) = \E[\x\mid\uu]$ under the prior $\x\sim\N(\y,V\bm I)$.
+\end{frame}
+
+%=============================================================================================
+\section*{Appendix: experiments}
+%=============================================================================================
+
+\begin{frame}{The start level matters}
+\small
+Toy task: CIFAR-10, $4\times$ super-resolution, one trained guided denoiser, 8 samples
+$\times$ 512 images. \emph{Detail}: energy in the band the low-res input cannot see, relative
+to the target's (perfect sample $=1$; the regression $\E[\x\mid\y]$ has $0.29$).
+
+\medskip
 \centering
-\begin{tabular}{@{}lll@{}}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
- & conditional diffusion (EDM) & bridge (I\textsuperscript{2}SB) \\
+start & \multicolumn{2}{c}{10 network calls} & \multicolumn{2}{c}{50 network calls} \\
+\cmidrule(lr){2-3}\cmidrule(l){4-5}
+ & sample spread & detail & sample spread & detail \\
 \midrule
-ideal denoiser & $\E[\x\mid\uu,\sigma,\y]$ & the same \\
-network input & $c_{\mathrm{in}}(\sigma)\,\uu$ & $\y + (1-t)(\uu-\y)$ \\
-top level, start & finite $\sigma_{\max}$, pure noise & $\sigma=\infty$, the guide $\y$ \\
+pure noise (cold start)                          & 0.084 & 0.49 & 0.122 & 0.71 \\
+$\E[\x\mid\y]$ + noise of std $2.0$             & 0.105 & 0.60 & 0.130 & 0.76 \\
+$\E[\x\mid\y]$ + noise of std $0.5$             & 0.078 & 0.46 & 0.088 & 0.51 \\
 \bottomrule
 \end{tabular}
+
+\medskip
+\raggedright
+Std $0.5$ is already $3\times$ the regression's RMS error, and still too little: samples
+plateau near the regression even at 50 calls. Warm, but not too warm.
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
@@ -568,8 +908,8 @@ standard conditional diffusion network (EDM). Consistency is the RMSE against th
  & 2 & 3 & 5 & 50 \\
 \midrule
 bridge net, I\textsuperscript{2}SB ladder from $\y$  & \textbf{10.3} & 10.5 & 10.8 & 11.9 \\
-bridge net, $\sigma$-ladder from noise          & \textbf{10.3} & 10.2 & 10.5 & 13.1 \\
-EDM net, $\sigma$-ladder from noise             & 42.5 & 17.3 & 10.9 & 9.4 \\
+bridge net, noise ladder from pure noise        & \textbf{10.3} & \textbf{10.2} & \textbf{10.5} & 13.1 \\
+EDM net, noise ladder from pure noise           & 42.5 & 17.3 & 10.9 & \textbf{9.4} \\
 EDM net, I\textsuperscript{2}SB ladder               & 18.2 & 14.2 & 11.1 & 9.9 \\
 \bottomrule
 \end{tabular}
@@ -577,10 +917,8 @@ EDM net, I\textsuperscript{2}SB ladder               & 18.2 & 14.2 & 11.1 & 9.9 
 \medskip
 \raggedright
 \begin{itemize}
-  \item With 2 calls the EDM network fails: its first guess, at $\sigma=80$, is poor.
-  \item The bridge network is accurate up to $\sigma=\infty$, so it works from $\y$ or from
-        noise.
-  \item From 5 calls on the curves merge. I\textsuperscript{2}SB's edge is low step counts.
+  \item With 2 calls the EDM network fails: its first guess, from finite noise, is poor.
+  \item By 5 calls they are level; at 50 EDM is better. The bridge's edge is few steps.
 \end{itemize}
 \end{frame}
 
@@ -591,32 +929,39 @@ EDM net, I\textsuperscript{2}SB ladder               & 18.2 & 14.2 & 11.1 & 9.9 
 
 \small
 \raggedright
-Same bridge network, 50 steps, 8 samples per image (512 images). From $\y$ (I\textsuperscript{2}SB)
-or from pure noise at $\sigma=80$, the posterior means differ by $0.92\times$ the Monte-Carlo
-noise and the spreads agree to 0.2\%; retraining the network moves results about as much.
-Starting at $\y$ is the $\sigma=\infty$ end of the same ascent.
+Same bridge network, 50 steps, 8 samples per image (512 images). Started from $\y$
+(I\textsuperscript{2}SB) or from pure noise, the posterior means agree to within the Monte-Carlo
+noise and the spreads to 0.2\%. Starting at $\y$ is the infinite-noise end of the same ascent.
+\end{frame}
+
+%=============================================================================================
+\section*{Appendix: details}
+%=============================================================================================
+
+\begin{frame}{Backup: step size and re-noise}
+\small
+At noise level $\sigma$, one gradient step of size $h\sigma^2$ on $\log p_\sigma$ moves the
+fraction $h$ of the way toward the guess:
+\[
+  \x^+ = (1-h)\,\x_t + h\,\D(\x_t,\sigma,\y),
+\]
+where $\D$ is the network's estimate of $\E[\x\mid\x_t,\y]$.
+It leaves noise $(1-h)\sigma$. For the next level $\sigma' = r\sigma$, inject fresh noise
+$\gamma\eps$ with $\gamma^2 = \sigma'^2 - (1-h)^2\sigma^2$, which needs $|1-h|\le r$.
+
+\medskip
+\begin{itemize}
+  \setlength{\itemsep}{3pt}
+  \item $h = 1-r^2$: the ancestral (DDPM / VE) sampler. Returns a posterior sample.
+  \item $h = 1-r$: no noise injected; the probability-flow ODE (DDIM). Deterministic: it maps
+        each start to a sample, not to the most likely image.
+  \item $h = 1$: jump to the guess and re-noise (SDEdit-style restarts).
+  \item The first step from $\sigma=\infty$ has $r=0$, forcing $h=1$: it returns
+        $\E[\x\mid\y]$ whatever the start.
+\end{itemize}
 \end{frame}
 
 %---------------------------------------------------------------------------------------------
-\begin{frame}{Takeaways}
-\begin{enumerate}
-  \setlength{\itemsep}{8pt}
-  \item Guided diffusion is annealed gradient ascent on $\log p(\x\mid\y)$: guess with a
-        denoiser, step part of the way, add back less noise. Its first step from
-        $\sigma=\infty$ is the end-to-end network.
-  \item A warm start, $\tx + \sigma_0\eps$, skips the steps that only rebuild $\E[\x\mid\y]$.
-        $\sigma_0$ must still cover the start's error.
-  \item With a paired guide, I\textsuperscript{2}SB is that same ascent in bridge coordinates,
-        line for line. The bridge changes the network's input and training, not the target.
-        It pays when steps are few.
-\end{enumerate}
-\end{frame}
-
-%=============================================================================================
-\appendix
-\section*{Backup}
-%=============================================================================================
-
 \begin{frame}{Backup: every method is one ascent}
 \footnotesize
 \centering
@@ -630,7 +975,7 @@ ImMAP2 & measurement & data step on an unconditional denoiser & self-paced; $\be
 I\textsuperscript{2}SB & guide & bridge regressor & fixed; $h = 1-r^2$ \\
 I\textsuperscript{2}SB-Recon / -Inversion & guide, meas. & data step on the bridge regressor &
   as I\textsuperscript{2}SB, 80 steps \\
-TGVN, LGGS end-to-end & guide, meas. & learned $\E[\x\mid\y]$ & one step from $\sigma=\infty$ \\
+end-to-end regression & guide, meas. & learned $\E[\x\mid\y]$ & one step from $\sigma=\infty$ \\
 \bottomrule
 \end{tabular}
 
@@ -638,8 +983,10 @@ TGVN, LGGS end-to-end & guide, meas. & learned $\E[\x\mid\y]$ & one step from $\
 \raggedright
 \small
 \textbf{ImMAP2 vs.\ I\textsuperscript{2}SB-Recon.} Not comparable as such: one is given the guide,
-the other is not. With a zero-filled start $\Op^H\y$ (sufficient for the measurement under
-Gaussian noise) the objectives coincide, and the two differ only in estimator and schedule.
+the other is not. With the measurement's adjoint image as the start (sufficient under Gaussian
+noise) the objectives coincide, and the two differ only in estimator and schedule.
 \end{frame}
+
+%=============================================================================================
 
 \end{document}
