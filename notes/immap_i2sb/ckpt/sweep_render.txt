@@ -1,0 +1,26 @@
+sweep/bridge_it01000: I2SB sample 25.23 dB vs the true cat
+sweep/bridge_it02000: I2SB sample 25.57 dB vs the true cat
+sweep/bridge_it03000: I2SB sample 25.93 dB vs the true cat
+sweep/bridge_it04000: I2SB sample 26.43 dB vs the true cat
+sweep/bridge_it05000: I2SB sample 26.91 dB vs the true cat
+sweep/bridge_it06000: I2SB sample 27.30 dB vs the true cat
+sweep/bridge_it07000: I2SB sample 27.56 dB vs the true cat
+sweep/bridge_it08000: I2SB sample 27.83 dB vs the true cat
+sweep/bridge_it09000: I2SB sample 28.04 dB vs the true cat
+sweep/bridge_it10000: I2SB sample 28.19 dB vs the true cat
+sweep/bridge_it11000: I2SB sample 28.31 dB vs the true cat
+sweep/bridge_it12000: I2SB sample 28.40 dB vs the true cat
+sweep/diffusion_it01000: diffusion sample 25.36 dB vs the true cat
+sweep/diffusion_it02000: diffusion sample 25.61 dB vs the true cat
+sweep/diffusion_it03000: diffusion sample 25.85 dB vs the true cat
+sweep/diffusion_it04000: diffusion sample 26.08 dB vs the true cat
+sweep/diffusion_it05000: diffusion sample 26.31 dB vs the true cat
+sweep/diffusion_it06000: diffusion sample 26.53 dB vs the true cat
+sweep/diffusion_it07000: diffusion sample 26.76 dB vs the true cat
+sweep/diffusion_it08000: diffusion sample 26.91 dB vs the true cat
+sweep/diffusion_it09000: diffusion sample 27.04 dB vs the true cat
+sweep/diffusion_it10000: diffusion sample 27.14 dB vs the true cat
+sweep/diffusion_it11000: diffusion sample 27.21 dB vs the true cat
+sweep/diffusion_it12000: diffusion sample 27.27 dB vs the true cat
+wrote C:\Users\Thermaltake\Desktop\ImMAP\notes\immap_i2sb\figs\sweep\contact_diffusion.png
+wrote C:\Users\Thermaltake\Desktop\ImMAP\notes\immap_i2sb\figs\sweep\contact_bridge.png

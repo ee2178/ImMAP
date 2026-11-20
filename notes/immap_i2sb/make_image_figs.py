@@ -34,17 +34,18 @@ from skimage import data
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "figs")
 CUTOFF = 1.0 / 16           # side information keeps |f| < CUTOFF (cycles / pixel)
+BRIDGE_CUTOFF = 1.0 / 64    # the guide in the bridge figures: as the talk's trained bridge network
 V = 0.16                    # bridge variance scale: sigma_sb(1/2) = sqrt(V)/2 = 0.2
 ERR_RANGE = 0.45
 SHIFTS = [(dy, dx) for dy in (-4, 0, 4) for dx in (-4, 0, 4) if (dy, dx) != (0, 0)]
 SEED = 0
 
 
-def L(x):
+def L(x, cutoff=CUTOFF):
     """Orthogonal projection onto the low spatial frequencies, per colour channel."""
     fy = np.fft.fftfreq(x.shape[0])[:, None]
     fx = np.fft.fftfreq(x.shape[1])[None, :]
-    mask = ((np.abs(fy) < CUTOFF) & (np.abs(fx) < CUTOFF)).astype(float)[..., None]
+    mask = ((np.abs(fy) < cutoff) & (np.abs(fx) < cutoff)).astype(float)[..., None]
     return np.real(np.fft.ifft2(np.fft.fft2(x, axes=(0, 1)) * mask, axes=(0, 1)))
 
 
@@ -72,8 +73,9 @@ def main():
     for k, a in enumerate(alts):
         assert np.allclose(L(a), L(x))
     xbar = np.mean(alts + [x], axis=0)
+    yb = L(x, BRIDGE_CUTOFF)                                       # the bridge figures' guide
     save("x0", x)
-    save("y", y)
+    save("y", yb)
     save("alt1", alts[0])
     save("alt2", alts[5])
     save("avg", xbar)
@@ -86,15 +88,15 @@ def main():
     # bridge samples from x (t = 0) to y (t = 1)
     eps_b = rng.standard_normal(x.shape)
     for t in (0.25, 0.5, 0.75):
-        z = (1 - t) * x + t * y + np.sqrt(V * t * (1 - t)) * eps_b
+        z = (1 - t) * x + t * yb + np.sqrt(V * t * (1 - t)) * eps_b
         save(f"bridge{int(round(100 * t))}", z)
 
     # one I2SB step t -> s toward the stand-in guess xbar
     t, s = 0.75, 0.5
     sig = lambda u: np.sqrt(V * u * (1 - u))                       # noqa: E731
-    mean_s = (1 - s) * x + s * y
+    mean_s = (1 - s) * x + s * yb
     e1, e2 = rng.standard_normal(x.shape), rng.standard_normal(x.shape)
-    z_t = (1 - t) * x + t * y + sig(t) * e1                        # a true bridge sample at t
+    z_t = (1 - t) * x + t * yb + sig(t) * e1                       # a true bridge sample at t
     walked = (s / t) * z_t + (1 - s / t) * xbar
     fresh = np.sqrt(V * s * (t - s) / t)
     renoised = walked + fresh * e2

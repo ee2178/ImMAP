@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (MiKTeX 26.5) (preloaded format=pdflatex 2026.10.19)  19 NOV 2026 13:30
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (MiKTeX 26.5) (preloaded format=pdflatex 2026.10.19)  19 NOV 2026 22:49
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -1346,496 +1346,646 @@ PNG copy)> <./figs/noise2.png (PNG copy)> <./figs/noise3.png (PNG copy)>] [6
 
 ] [7
 
-] [8
+]
+<figs/diag_x1.png, id=105, 289.08pt x 289.08pt>
+File: figs/diag_x1.png Graphic file (type png)
+<use figs/diag_x1.png>
+Package pdftex.def Info: figs/diag_x1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+ [8
 
-] [9
+ <./figs/diag_x1.png (PNG copy)>]
+File: figs/diag_x1.png Graphic file (type png)
+<use figs/diag_x1.png>
+Package pdftex.def Info: figs/diag_x1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+ [9
 
-] [10
+]
+File: figs/diag_x1.png Graphic file (type png)
+<use figs/diag_x1.png>
+Package pdftex.def Info: figs/diag_x1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+<figs/diag_g1.png, id=118, 289.08pt x 289.08pt>
+File: figs/diag_g1.png Graphic file (type png)
+<use figs/diag_g1.png>
+Package pdftex.def Info: figs/diag_g1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+ [10
 
-] [11
+ <./figs/diag_g1.png (PNG copy)>]
+File: figs/diag_x1.png Graphic file (type png)
+<use figs/diag_x1.png>
+Package pdftex.def Info: figs/diag_x1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_g1.png Graphic file (type png)
+<use figs/diag_g1.png>
+Package pdftex.def Info: figs/diag_g1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+<figs/diag_x2.png, id=125, 289.08pt x 289.08pt>
+File: figs/diag_x2.png Graphic file (type png)
+<use figs/diag_x2.png>
+Package pdftex.def Info: figs/diag_x2.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+ [11
 
-] [12
+ <./figs/diag_x2.png (PNG copy)>]
+File: figs/diag_x1.png Graphic file (type png)
+<use figs/diag_x1.png>
+Package pdftex.def Info: figs/diag_x1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_g1.png Graphic file (type png)
+<use figs/diag_g1.png>
+Package pdftex.def Info: figs/diag_g1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_x2.png Graphic file (type png)
+<use figs/diag_x2.png>
+Package pdftex.def Info: figs/diag_x2.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+ [12
 
-] [13
+]
+File: figs/diag_x1.png Graphic file (type png)
+<use figs/diag_x1.png>
+Package pdftex.def Info: figs/diag_x1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_g1.png Graphic file (type png)
+<use figs/diag_g1.png>
+Package pdftex.def Info: figs/diag_g1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_x2.png Graphic file (type png)
+<use figs/diag_x2.png>
+Package pdftex.def Info: figs/diag_x2.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+<figs/diag_g2.png, id=137, 289.08pt x 289.08pt>
+File: figs/diag_g2.png Graphic file (type png)
+<use figs/diag_g2.png>
+Package pdftex.def Info: figs/diag_g2.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+<figs/diag_x3.png, id=138, 289.08pt x 289.08pt>
+File: figs/diag_x3.png Graphic file (type png)
+<use figs/diag_x3.png>
+Package pdftex.def Info: figs/diag_x3.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+ [13
 
-] [14
+ <./figs/diag_g2.png (PNG copy)> <./figs/diag_x3.png (PNG copy)>]
+File: figs/diag_x1.png Graphic file (type png)
+<use figs/diag_x1.png>
+Package pdftex.def Info: figs/diag_x1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_g1.png Graphic file (type png)
+<use figs/diag_g1.png>
+Package pdftex.def Info: figs/diag_g1.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_x2.png Graphic file (type png)
+<use figs/diag_x2.png>
+Package pdftex.def Info: figs/diag_x2.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_g2.png Graphic file (type png)
+<use figs/diag_g2.png>
+Package pdftex.def Info: figs/diag_g2.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+File: figs/diag_x3.png Graphic file (type png)
+<use figs/diag_x3.png>
+Package pdftex.def Info: figs/diag_x3.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+<figs/diag_g3.png, id=145, 289.08pt x 289.08pt>
+File: figs/diag_g3.png Graphic file (type png)
+<use figs/diag_g3.png>
+Package pdftex.def Info: figs/diag_g3.png  used on input line 280.
+(pdftex.def)             Requested size: 36.98866pt x 36.98622pt.
+ [14
 
-] [15
+ <./figs/diag_g3.png (PNG copy)>] [15
 
-] [16
+]
+<figs/real_diff_y.png, id=156, 289.08pt x 289.08pt>
+File: figs/real_diff_y.png Graphic file (type png)
+<use figs/real_diff_y.png>
+Package pdftex.def Info: figs/real_diff_y.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_x_3.png, id=157, 289.08pt x 289.08pt>
+File: figs/real_diff_x_3.png Graphic file (type png)
+<use figs/real_diff_x_3.png>
+Package pdftex.def Info: figs/real_diff_x_3.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_x_1.png, id=158, 289.08pt x 289.08pt>
+File: figs/real_diff_x_1.png Graphic file (type png)
+<use figs/real_diff_x_1.png>
+Package pdftex.def Info: figs/real_diff_x_1.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_x_0p3.png, id=159, 289.08pt x 289.08pt>
+File: figs/real_diff_x_0p3.png Graphic file (type png)
+<use figs/real_diff_x_0p3.png>
+Package pdftex.def Info: figs/real_diff_x_0p3.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_x_0p1.png, id=160, 289.08pt x 289.08pt>
+File: figs/real_diff_x_0p1.png Graphic file (type png)
+<use figs/real_diff_x_0p1.png>
+Package pdftex.def Info: figs/real_diff_x_0p1.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_sample.png, id=161, 289.08pt x 289.08pt>
+File: figs/real_diff_sample.png Graphic file (type png)
+<use figs/real_diff_sample.png>
+Package pdftex.def Info: figs/real_diff_sample.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_g_3.png, id=162, 289.08pt x 289.08pt>
+File: figs/real_diff_g_3.png Graphic file (type png)
+<use figs/real_diff_g_3.png>
+Package pdftex.def Info: figs/real_diff_g_3.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_g_1.png, id=163, 289.08pt x 289.08pt>
+File: figs/real_diff_g_1.png Graphic file (type png)
+<use figs/real_diff_g_1.png>
+Package pdftex.def Info: figs/real_diff_g_1.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_g_0p3.png, id=164, 289.08pt x 289.08pt>
+File: figs/real_diff_g_0p3.png Graphic file (type png)
+<use figs/real_diff_g_0p3.png>
+Package pdftex.def Info: figs/real_diff_g_0p3.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_diff_g_0p1.png, id=165, 289.08pt x 289.08pt>
+File: figs/real_diff_g_0p1.png Graphic file (type png)
+<use figs/real_diff_g_0p1.png>
+Package pdftex.def Info: figs/real_diff_g_0p1.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
+<figs/real_x0.png, id=166, 289.08pt x 289.08pt>
+File: figs/real_x0.png Graphic file (type png)
+<use figs/real_x0.png>
+Package pdftex.def Info: figs/real_x0.png  used on input line 330.
+(pdftex.def)             Requested size: 51.21504pt x 51.2117pt.
 
-] [17
+Overfull \vbox (0.65112pt too high) detected at line 330
+ []
+
+[16
+
+ <./figs/real_diff_y.png (PNG copy)> <./figs/real_diff_x_3.png (PNG copy)> <./f
+igs/real_diff_x_1.png (PNG copy)> <./figs/real_diff_x_0p3.png (PNG copy)> <./fi
+gs/real_diff_x_0p1.png (PNG copy)> <./figs/real_diff_sample.png (PNG copy)> <./
+figs/real_diff_g_3.png (PNG copy)> <./figs/real_diff_g_1.png (PNG copy)> <./fig
+s/real_diff_g_0p3.png (PNG copy)> <./figs/real_diff_g_0p1.png (PNG copy)> <./fi
+gs/real_x0.png (PNG copy)>] [17
 
 ] [18
 
 ] [19
 
-]
-[20
+] [20
 
 ] [21
 
 ] [22
 
-] (bridge_paths.tex) [23
+] [23
+
+] [24
+
+]
+(bridge_paths.tex) [25
 
 ]
 File: figs/x0.png Graphic file (type png)
 <use figs/x0.png>
-Package pdftex.def Info: figs/x0.png  used on input line 379.
+Package pdftex.def Info: figs/x0.png  used on input line 436.
 (pdftex.def)             Requested size: 71.13188pt x 71.13177pt.
-<figs/bridge25.png, id=197, 289.08pt x 289.08pt>
+<figs/bridge25.png, id=225, 289.08pt x 289.08pt>
 File: figs/bridge25.png Graphic file (type png)
 <use figs/bridge25.png>
-Package pdftex.def Info: figs/bridge25.png  used on input line 379.
+Package pdftex.def Info: figs/bridge25.png  used on input line 436.
 (pdftex.def)             Requested size: 71.13188pt x 71.13177pt.
-<figs/bridge50.png, id=198, 289.08pt x 289.08pt>
+<figs/bridge50.png, id=226, 289.08pt x 289.08pt>
 File: figs/bridge50.png Graphic file (type png)
 <use figs/bridge50.png>
-Package pdftex.def Info: figs/bridge50.png  used on input line 379.
+Package pdftex.def Info: figs/bridge50.png  used on input line 436.
 (pdftex.def)             Requested size: 71.13188pt x 71.13177pt.
-<figs/bridge75.png, id=199, 289.08pt x 289.08pt>
+<figs/bridge75.png, id=227, 289.08pt x 289.08pt>
 File: figs/bridge75.png Graphic file (type png)
 <use figs/bridge75.png>
-Package pdftex.def Info: figs/bridge75.png  used on input line 379.
+Package pdftex.def Info: figs/bridge75.png  used on input line 436.
 (pdftex.def)             Requested size: 71.13188pt x 71.13177pt.
-<figs/y.png, id=200, 289.08pt x 289.08pt>
+<figs/y.png, id=228, 289.08pt x 289.08pt>
 File: figs/y.png Graphic file (type png)
 <use figs/y.png>
-Package pdftex.def Info: figs/y.png  used on input line 379.
+Package pdftex.def Info: figs/y.png  used on input line 436.
 (pdftex.def)             Requested size: 71.13188pt x 71.13177pt.
- [24
+ [26
 
  <./figs/bridge25.png (PNG copy)> <./figs/bridge50.png (PNG copy)> <./figs/brid
 ge75.png (PNG copy)> <./figs/y.png (PNG copy)>]
-Overfull \hbox (1.13864pt too wide) in paragraph at lines 458--458
- [][] 
- []
-
-[25
-
-]
-Overfull \hbox (1.13864pt too wide) in paragraph at lines 458--458
- [][] 
- []
-
-[26
-
-]
-Overfull \hbox (1.13864pt too wide) in paragraph at lines 458--458
+Overfull \hbox (1.13864pt too wide) in paragraph at lines 515--515
  [][] 
  []
 
 [27
 
 ]
-Overfull \hbox (1.13864pt too wide) in paragraph at lines 458--458
+Overfull \hbox (1.13864pt too wide) in paragraph at lines 515--515
  [][] 
  []
 
 [28
 
 ]
-Overfull \hbox (1.13864pt too wide) in paragraph at lines 458--458
+Overfull \hbox (1.13864pt too wide) in paragraph at lines 515--515
  [][] 
  []
 
 [29
 
 ]
-Overfull \hbox (1.13864pt too wide) in paragraph at lines 458--458
+Overfull \hbox (1.13864pt too wide) in paragraph at lines 515--515
  [][] 
  []
 
 [30
 
 ]
-Overfull \hbox (1.13864pt too wide) in paragraph at lines 458--458
+Overfull \hbox (1.13864pt too wide) in paragraph at lines 515--515
  [][] 
  []
 
 [31
 
 ]
-<figs/re_a_img.png, id=243, 289.08pt x 289.08pt>
-File: figs/re_a_img.png Graphic file (type png)
-<use figs/re_a_img.png>
-Package pdftex.def Info: figs/re_a_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-<figs/re_b_img.png, id=244, 289.08pt x 289.08pt>
-File: figs/re_b_img.png Graphic file (type png)
-<use figs/re_b_img.png>
-Package pdftex.def Info: figs/re_b_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-<figs/re_c_img.png, id=245, 289.08pt x 289.08pt>
-File: figs/re_c_img.png Graphic file (type png)
-<use figs/re_c_img.png>
-Package pdftex.def Info: figs/re_c_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-<figs/re_d_img.png, id=246, 289.08pt x 289.08pt>
-File: figs/re_d_img.png Graphic file (type png)
-<use figs/re_d_img.png>
-Package pdftex.def Info: figs/re_d_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-<figs/re_a_err.png, id=247, 289.08pt x 289.08pt>
-File: figs/re_a_err.png Graphic file (type png)
-<use figs/re_a_err.png>
-Package pdftex.def Info: figs/re_a_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-<figs/re_b_err.png, id=248, 289.08pt x 289.08pt>
-File: figs/re_b_err.png Graphic file (type png)
-<use figs/re_b_err.png>
-Package pdftex.def Info: figs/re_b_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-<figs/re_c_err.png, id=249, 289.08pt x 289.08pt>
-File: figs/re_c_err.png Graphic file (type png)
-<use figs/re_c_err.png>
-Package pdftex.def Info: figs/re_c_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-<figs/re_d_err.png, id=250, 289.08pt x 289.08pt>
-File: figs/re_d_err.png Graphic file (type png)
-<use figs/re_d_err.png>
-Package pdftex.def Info: figs/re_d_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-
-Underfull \hbox (badness 1028) in paragraph at lines 489--489
-[]\OT1/cmss/bx/n/10 (d) \OT1/cmss/m/n/10 Re-noised: the right noise
+Overfull \hbox (1.13864pt too wide) in paragraph at lines 515--515
+ [][] 
  []
 
 [32
 
- <./figs/re_a_img.png (PNG copy)> <./figs/re_b_img.png (PNG copy)> <./figs/re_c
-_img.png (PNG copy)> <./figs/re_d_img.png (PNG copy)> <./figs/re_a_err.png (PNG
- copy)> <./figs/re_b_err.png (PNG copy)> <./figs/re_c_err.png (PNG copy)> <./fi
-gs/re_d_err.png (PNG copy)>]
-File: figs/re_a_img.png Graphic file (type png)
-<use figs/re_a_img.png>
-Package pdftex.def Info: figs/re_a_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_b_img.png Graphic file (type png)
-<use figs/re_b_img.png>
-Package pdftex.def Info: figs/re_b_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_c_img.png Graphic file (type png)
-<use figs/re_c_img.png>
-Package pdftex.def Info: figs/re_c_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_d_img.png Graphic file (type png)
-<use figs/re_d_img.png>
-Package pdftex.def Info: figs/re_d_img.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_a_err.png Graphic file (type png)
-<use figs/re_a_err.png>
-Package pdftex.def Info: figs/re_a_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_b_err.png Graphic file (type png)
-<use figs/re_b_err.png>
-Package pdftex.def Info: figs/re_b_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_c_err.png Graphic file (type png)
-<use figs/re_c_err.png>
-Package pdftex.def Info: figs/re_c_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_d_err.png Graphic file (type png)
-<use figs/re_d_err.png>
-Package pdftex.def Info: figs/re_d_err.png  used on input line 489.
-(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-
-Underfull \hbox (badness 1028) in paragraph at lines 489--489
-[]\OT1/cmss/bx/n/10 (d) \OT1/cmss/m/n/10 Re-noised: the right noise
+]
+Overfull \hbox (1.13864pt too wide) in paragraph at lines 515--515
+ [][] 
  []
 
 [33
 
 ]
-File: figs/re_a_img.png Graphic file (type png)
-<use figs/re_a_img.png>
-Package pdftex.def Info: figs/re_a_img.png  used on input line 489.
+<figs/real_re_a_img.png, id=270, 289.08pt x 289.08pt>
+File: figs/real_re_a_img.png Graphic file (type png)
+<use figs/real_re_a_img.png>
+Package pdftex.def Info: figs/real_re_a_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_b_img.png Graphic file (type png)
-<use figs/re_b_img.png>
-Package pdftex.def Info: figs/re_b_img.png  used on input line 489.
+<figs/real_re_b_img.png, id=271, 289.08pt x 289.08pt>
+File: figs/real_re_b_img.png Graphic file (type png)
+<use figs/real_re_b_img.png>
+Package pdftex.def Info: figs/real_re_b_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_c_img.png Graphic file (type png)
-<use figs/re_c_img.png>
-Package pdftex.def Info: figs/re_c_img.png  used on input line 489.
+<figs/real_re_c_img.png, id=272, 289.08pt x 289.08pt>
+File: figs/real_re_c_img.png Graphic file (type png)
+<use figs/real_re_c_img.png>
+Package pdftex.def Info: figs/real_re_c_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_d_img.png Graphic file (type png)
-<use figs/re_d_img.png>
-Package pdftex.def Info: figs/re_d_img.png  used on input line 489.
+<figs/real_re_d_img.png, id=273, 289.08pt x 289.08pt>
+File: figs/real_re_d_img.png Graphic file (type png)
+<use figs/real_re_d_img.png>
+Package pdftex.def Info: figs/real_re_d_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_a_err.png Graphic file (type png)
-<use figs/re_a_err.png>
-Package pdftex.def Info: figs/re_a_err.png  used on input line 489.
+<figs/real_re_a_err.png, id=274, 289.08pt x 289.08pt>
+File: figs/real_re_a_err.png Graphic file (type png)
+<use figs/real_re_a_err.png>
+Package pdftex.def Info: figs/real_re_a_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_b_err.png Graphic file (type png)
-<use figs/re_b_err.png>
-Package pdftex.def Info: figs/re_b_err.png  used on input line 489.
+<figs/real_re_b_err.png, id=275, 289.08pt x 289.08pt>
+File: figs/real_re_b_err.png Graphic file (type png)
+<use figs/real_re_b_err.png>
+Package pdftex.def Info: figs/real_re_b_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_c_err.png Graphic file (type png)
-<use figs/re_c_err.png>
-Package pdftex.def Info: figs/re_c_err.png  used on input line 489.
+<figs/real_re_c_err.png, id=276, 289.08pt x 289.08pt>
+File: figs/real_re_c_err.png Graphic file (type png)
+<use figs/real_re_c_err.png>
+Package pdftex.def Info: figs/real_re_c_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_d_err.png Graphic file (type png)
-<use figs/re_d_err.png>
-Package pdftex.def Info: figs/re_d_err.png  used on input line 489.
+<figs/real_re_d_err.png, id=277, 289.08pt x 289.08pt>
+File: figs/real_re_d_err.png Graphic file (type png)
+<use figs/real_re_d_err.png>
+Package pdftex.def Info: figs/real_re_d_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+ [34
 
-Underfull \hbox (badness 1028) in paragraph at lines 489--489
-[]\OT1/cmss/bx/n/10 (d) \OT1/cmss/m/n/10 Re-noised: the right noise
- []
-
-[34
-
-]
-File: figs/re_a_img.png Graphic file (type png)
-<use figs/re_a_img.png>
-Package pdftex.def Info: figs/re_a_img.png  used on input line 489.
+ <./figs/real_re_a_img.png (PNG copy)> <./figs/real_re_b_img.png (PNG copy)> <.
+/figs/real_re_c_img.png (PNG copy)> <./figs/real_re_d_img.png (PNG copy)> <./fi
+gs/real_re_a_err.png (PNG copy)> <./figs/real_re_b_err.png (PNG copy)> <./figs/
+real_re_c_err.png (PNG copy)> <./figs/real_re_d_err.png (PNG copy)>]
+File: figs/real_re_a_img.png Graphic file (type png)
+<use figs/real_re_a_img.png>
+Package pdftex.def Info: figs/real_re_a_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_b_img.png Graphic file (type png)
-<use figs/re_b_img.png>
-Package pdftex.def Info: figs/re_b_img.png  used on input line 489.
+File: figs/real_re_b_img.png Graphic file (type png)
+<use figs/real_re_b_img.png>
+Package pdftex.def Info: figs/real_re_b_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_c_img.png Graphic file (type png)
-<use figs/re_c_img.png>
-Package pdftex.def Info: figs/re_c_img.png  used on input line 489.
+File: figs/real_re_c_img.png Graphic file (type png)
+<use figs/real_re_c_img.png>
+Package pdftex.def Info: figs/real_re_c_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_d_img.png Graphic file (type png)
-<use figs/re_d_img.png>
-Package pdftex.def Info: figs/re_d_img.png  used on input line 489.
+File: figs/real_re_d_img.png Graphic file (type png)
+<use figs/real_re_d_img.png>
+Package pdftex.def Info: figs/real_re_d_img.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_a_err.png Graphic file (type png)
-<use figs/re_a_err.png>
-Package pdftex.def Info: figs/re_a_err.png  used on input line 489.
+File: figs/real_re_a_err.png Graphic file (type png)
+<use figs/real_re_a_err.png>
+Package pdftex.def Info: figs/real_re_a_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_b_err.png Graphic file (type png)
-<use figs/re_b_err.png>
-Package pdftex.def Info: figs/re_b_err.png  used on input line 489.
+File: figs/real_re_b_err.png Graphic file (type png)
+<use figs/real_re_b_err.png>
+Package pdftex.def Info: figs/real_re_b_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_c_err.png Graphic file (type png)
-<use figs/re_c_err.png>
-Package pdftex.def Info: figs/re_c_err.png  used on input line 489.
+File: figs/real_re_c_err.png Graphic file (type png)
+<use figs/real_re_c_err.png>
+Package pdftex.def Info: figs/real_re_c_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-File: figs/re_d_err.png Graphic file (type png)
-<use figs/re_d_err.png>
-Package pdftex.def Info: figs/re_d_err.png  used on input line 489.
+File: figs/real_re_d_err.png Graphic file (type png)
+<use figs/real_re_d_err.png>
+Package pdftex.def Info: figs/real_re_d_err.png  used on input line 546.
 (pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
-
-Underfull \hbox (badness 1028) in paragraph at lines 489--489
-[]\OT1/cmss/bx/n/10 (d) \OT1/cmss/m/n/10 Re-noised: the right noise
- []
 
 [35
 
 ]
-<figs/real_z100.png, id=271, 289.08pt x 289.08pt>
+File: figs/real_re_a_img.png Graphic file (type png)
+<use figs/real_re_a_img.png>
+Package pdftex.def Info: figs/real_re_a_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_b_img.png Graphic file (type png)
+<use figs/real_re_b_img.png>
+Package pdftex.def Info: figs/real_re_b_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_c_img.png Graphic file (type png)
+<use figs/real_re_c_img.png>
+Package pdftex.def Info: figs/real_re_c_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_d_img.png Graphic file (type png)
+<use figs/real_re_d_img.png>
+Package pdftex.def Info: figs/real_re_d_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_a_err.png Graphic file (type png)
+<use figs/real_re_a_err.png>
+Package pdftex.def Info: figs/real_re_a_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_b_err.png Graphic file (type png)
+<use figs/real_re_b_err.png>
+Package pdftex.def Info: figs/real_re_b_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_c_err.png Graphic file (type png)
+<use figs/real_re_c_err.png>
+Package pdftex.def Info: figs/real_re_c_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_d_err.png Graphic file (type png)
+<use figs/real_re_d_err.png>
+Package pdftex.def Info: figs/real_re_d_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+ [36
+
+]
+File: figs/real_re_a_img.png Graphic file (type png)
+<use figs/real_re_a_img.png>
+Package pdftex.def Info: figs/real_re_a_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_b_img.png Graphic file (type png)
+<use figs/real_re_b_img.png>
+Package pdftex.def Info: figs/real_re_b_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_c_img.png Graphic file (type png)
+<use figs/real_re_c_img.png>
+Package pdftex.def Info: figs/real_re_c_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_d_img.png Graphic file (type png)
+<use figs/real_re_d_img.png>
+Package pdftex.def Info: figs/real_re_d_img.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_a_err.png Graphic file (type png)
+<use figs/real_re_a_err.png>
+Package pdftex.def Info: figs/real_re_a_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_b_err.png Graphic file (type png)
+<use figs/real_re_b_err.png>
+Package pdftex.def Info: figs/real_re_b_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_c_err.png Graphic file (type png)
+<use figs/real_re_c_err.png>
+Package pdftex.def Info: figs/real_re_c_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+File: figs/real_re_d_err.png Graphic file (type png)
+<use figs/real_re_d_err.png>
+Package pdftex.def Info: figs/real_re_d_err.png  used on input line 546.
+(pdftex.def)             Requested size: 58.32823pt x 58.32664pt.
+ [37
+
+]
+<figs/real_z100.png, id=299, 289.08pt x 289.08pt>
 File: figs/real_z100.png Graphic file (type png)
 <use figs/real_z100.png>
-Package pdftex.def Info: figs/real_z100.png  used on input line 512.
+Package pdftex.def Info: figs/real_z100.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_z075.png, id=272, 289.08pt x 289.08pt>
+<figs/real_z075.png, id=300, 289.08pt x 289.08pt>
 File: figs/real_z075.png Graphic file (type png)
 <use figs/real_z075.png>
-Package pdftex.def Info: figs/real_z075.png  used on input line 512.
+Package pdftex.def Info: figs/real_z075.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_z050.png, id=273, 289.08pt x 289.08pt>
+<figs/real_z050.png, id=301, 289.08pt x 289.08pt>
 File: figs/real_z050.png Graphic file (type png)
 <use figs/real_z050.png>
-Package pdftex.def Info: figs/real_z050.png  used on input line 512.
+Package pdftex.def Info: figs/real_z050.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_z025.png, id=274, 289.08pt x 289.08pt>
+<figs/real_z025.png, id=302, 289.08pt x 289.08pt>
 File: figs/real_z025.png Graphic file (type png)
 <use figs/real_z025.png>
-Package pdftex.def Info: figs/real_z025.png  used on input line 512.
+Package pdftex.def Info: figs/real_z025.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_sample0.png, id=275, 289.08pt x 289.08pt>
+<figs/real_sample0.png, id=303, 289.08pt x 289.08pt>
 File: figs/real_sample0.png Graphic file (type png)
 <use figs/real_sample0.png>
-Package pdftex.def Info: figs/real_sample0.png  used on input line 512.
+Package pdftex.def Info: figs/real_sample0.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_g100.png, id=276, 289.08pt x 289.08pt>
+<figs/real_g100.png, id=304, 289.08pt x 289.08pt>
 File: figs/real_g100.png Graphic file (type png)
 <use figs/real_g100.png>
-Package pdftex.def Info: figs/real_g100.png  used on input line 512.
+Package pdftex.def Info: figs/real_g100.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_g075.png, id=277, 289.08pt x 289.08pt>
+<figs/real_g075.png, id=305, 289.08pt x 289.08pt>
 File: figs/real_g075.png Graphic file (type png)
 <use figs/real_g075.png>
-Package pdftex.def Info: figs/real_g075.png  used on input line 512.
+Package pdftex.def Info: figs/real_g075.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_g050.png, id=278, 289.08pt x 289.08pt>
+<figs/real_g050.png, id=306, 289.08pt x 289.08pt>
 File: figs/real_g050.png Graphic file (type png)
 <use figs/real_g050.png>
-Package pdftex.def Info: figs/real_g050.png  used on input line 512.
+Package pdftex.def Info: figs/real_g050.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_g025.png, id=279, 289.08pt x 289.08pt>
+<figs/real_g025.png, id=307, 289.08pt x 289.08pt>
 File: figs/real_g025.png Graphic file (type png)
 <use figs/real_g025.png>
-Package pdftex.def Info: figs/real_g025.png  used on input line 512.
+Package pdftex.def Info: figs/real_g025.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
-<figs/real_x0.png, id=280, 289.08pt x 289.08pt>
 File: figs/real_x0.png Graphic file (type png)
 <use figs/real_x0.png>
-Package pdftex.def Info: figs/real_x0.png  used on input line 512.
+Package pdftex.def Info: figs/real_x0.png  used on input line 569.
 (pdftex.def)             Requested size: 56.9055pt x 56.90189pt.
 
-Overfull \vbox (8.9415pt too high) detected at line 512
+Overfull \vbox (0.48215pt too high) detected at line 569
  []
 
-[36
+[38
 
  <./figs/real_z100.png (PNG copy)> <./figs/real_z075.png (PNG copy)> <./figs/re
 al_z050.png (PNG copy)> <./figs/real_z025.png (PNG copy)> <./figs/real_sample0.
 png (PNG copy)> <./figs/real_g100.png (PNG copy)> <./figs/real_g075.png (PNG co
-py)> <./figs/real_g050.png (PNG copy)> <./figs/real_g025.png (PNG copy)> <./fig
-s/real_x0.png (PNG copy)>]
-<figs/real_cmp_diff_in.png, id=286, 289.08pt x 289.08pt>
+py)> <./figs/real_g050.png (PNG copy)> <./figs/real_g025.png (PNG copy)>]
+<figs/real_cmp_diff_in.png, id=313, 289.08pt x 289.08pt>
 File: figs/real_cmp_diff_in.png Graphic file (type png)
 <use figs/real_cmp_diff_in.png>
-Package pdftex.def Info: figs/real_cmp_diff_in.png  used on input line 555.
+Package pdftex.def Info: figs/real_cmp_diff_in.png  used on input line 612.
 (pdftex.def)             Requested size: 55.48277pt x 55.48155pt.
-<figs/real_cmp_diff_out.png, id=287, 289.08pt x 289.08pt>
+<figs/real_cmp_diff_out.png, id=314, 289.08pt x 289.08pt>
 File: figs/real_cmp_diff_out.png Graphic file (type png)
 <use figs/real_cmp_diff_out.png>
-Package pdftex.def Info: figs/real_cmp_diff_out.png  used on input line 555.
+Package pdftex.def Info: figs/real_cmp_diff_out.png  used on input line 612.
 (pdftex.def)             Requested size: 55.48277pt x 55.48155pt.
-<figs/real_cmp_bridge_in.png, id=288, 289.08pt x 289.08pt>
+<figs/real_cmp_bridge_in.png, id=315, 289.08pt x 289.08pt>
 File: figs/real_cmp_bridge_in.png Graphic file (type png)
 <use figs/real_cmp_bridge_in.png>
-Package pdftex.def Info: figs/real_cmp_bridge_in.png  used on input line 555.
+Package pdftex.def Info: figs/real_cmp_bridge_in.png  used on input line 612.
 (pdftex.def)             Requested size: 55.48277pt x 55.48155pt.
-<figs/real_cmp_bridge_out.png, id=289, 289.08pt x 289.08pt>
+<figs/real_cmp_bridge_out.png, id=316, 289.08pt x 289.08pt>
 File: figs/real_cmp_bridge_out.png Graphic file (type png)
 <use figs/real_cmp_bridge_out.png>
-Package pdftex.def Info: figs/real_cmp_bridge_out.png  used on input line 555.
+Package pdftex.def Info: figs/real_cmp_bridge_out.png  used on input line 612.
 (pdftex.def)             Requested size: 55.48277pt x 55.48155pt.
-<figs/real_y.png, id=290, 289.08pt x 289.08pt>
-File: figs/real_y.png Graphic file (type png)
-<use figs/real_y.png>
-Package pdftex.def Info: figs/real_y.png  used on input line 555.
+<figs/real_cmp_y.png, id=317, 289.08pt x 289.08pt>
+File: figs/real_cmp_y.png Graphic file (type png)
+<use figs/real_cmp_y.png>
+Package pdftex.def Info: figs/real_cmp_y.png  used on input line 612.
 (pdftex.def)             Requested size: 31.2982pt x 31.29604pt.
 
-Overfull \vbox (9.7742pt too high) detected at line 555
+Overfull \vbox (9.7742pt too high) detected at line 612
  []
 
-[37
+[39
 
  <./figs/real_cmp_diff_in.png (PNG copy)> <./figs/real_cmp_diff_out.png (PNG co
 py)> <./figs/real_cmp_bridge_in.png (PNG copy)> <./figs/real_cmp_bridge_out.png
- (PNG copy)> <./figs/real_y.png (PNG copy)>] [38
-
-] [39
-
-] [40
+ (PNG copy)> <./figs/real_cmp_y.png (PNG copy)>] [40
 
 ] [41
 
-]
-Overfull \hbox (2.70364pt too wide) in paragraph at lines 695--695
-[]|\OT1/cmss/m/n/9 measurement 
- []
-
-
-Overfull \hbox (2.47537pt too wide) in paragraph at lines 695--695
- [][] 
- []
-
-[42
+] [42
 
 ] [43
 
 ]
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\translate ' on input line 715.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\everymath' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\everymath' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\new@ifnextchar' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\ifbeamercolorempty' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\color' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\new@ifnextchar' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\ifbeamercolorempty' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\color' on input line 716.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `\beamer@orig@@textsuperscript' on input lin
-e 716.
-
 [44
 
-] [45
+]
+Overfull \hbox (2.70364pt too wide) in paragraph at lines 746--746
+[]|\OT1/cmss/m/n/9 measurement 
+ []
+
+
+Overfull \hbox (2.47537pt too wide) in paragraph at lines 746--746
+ [][] 
+ []
+
+[45
 
 ] [46
 
 ]
-<equivalence_toy/trajectory.png, id=347, 733.32794pt x 332.442pt>
-File: equivalence_toy/trajectory.png Graphic file (type png)
-<use equivalence_toy/trajectory.png>
-Package pdftex.def Info: equivalence_toy/trajectory.png  used on input line 782
-.
-(pdftex.def)             Requested size: 342.57143pt x 155.29916pt.
 
-Overfull \vbox (4.74986pt too high) detected at line 782
- []
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\translate ' on input line 767.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\everymath' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\everymath' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\new@ifnextchar' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\ifbeamercolorempty' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\color' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\new@ifnextchar' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\ifbeamercolorempty' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\color' on input line 768.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\beamer@orig@@textsuperscript' on input lin
+e 768.
 
 [47
 
- <./equivalence_toy/trajectory.png>] [48
+] [48
 
 ] [49
 
-] [50
+]
+<equivalence_toy/trajectory.png, id=380, 733.32794pt x 332.442pt>
+File: equivalence_toy/trajectory.png Graphic file (type png)
+<use equivalence_toy/trajectory.png>
+Package pdftex.def Info: equivalence_toy/trajectory.png  used on input line 834
+.
+(pdftex.def)             Requested size: 342.57143pt x 155.29916pt.
 
-] [51
+Overfull \vbox (4.74986pt too high) detected at line 834
+ []
+
+[50
+
+ <./equivalence_toy/trajectory.png>] [51
 
 ] [52
 
 ] [53
 
-]
-<equivalence_toy/samples_top4.png, id=391, 1919.17pt x 923.45pt>
-File: equivalence_toy/samples_top4.png Graphic file (type png)
-<use equivalence_toy/samples_top4.png>
-Package pdftex.def Info: equivalence_toy/samples_top4.png  used on input line 9
-35.
-(pdftex.def)             Requested size: 302.73514pt x 145.6555pt.
- [54
+] [54
 
- <./equivalence_toy/samples_top4.png>] [55
+] [55
 
 ] [56
 
 ]
-Overfull \hbox (24.61902pt too wide) in paragraph at lines 988--988
+<equivalence_toy/samples_top4.png, id=424, 1919.17pt x 923.45pt>
+File: equivalence_toy/samples_top4.png Graphic file (type png)
+<use equivalence_toy/samples_top4.png>
+Package pdftex.def Info: equivalence_toy/samples_top4.png  used on input line 9
+87.
+(pdftex.def)             Requested size: 302.73514pt x 145.6555pt.
+ [57
+
+ <./equivalence_toy/samples_top4.png>] [58
+
+] [59
+
+] [60
+
+]
+Overfull \hbox (24.61902pt too wide) in paragraph at lines 1075--1075
  [][] 
  []
 
-[57
+[61
 
 ]
 \tf@nav=\write6
@@ -1856,10 +2006,10 @@ Package rerunfilecheck Info: File `i2sb_talk.out' has not changed.
 (rerunfilecheck)             Checksum: A231401D7BE48656AD7B665A0DB791F9;1723.
  ) 
 Here is how much of TeX's memory you used:
- 39882 strings out of 467392
- 951624 string characters out of 5402722
- 1537346 words of memory out of 5000000
- 68417 multiletter control sequences out of 15000+600000
+ 40194 strings out of 467392
+ 958564 string characters out of 5402722
+ 1538351 words of memory out of 5000000
+ 68721 multiletter control sequences out of 15000+600000
  654881 words of font info for 134 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
  128i,21n,123p,2354b,2525s stack positions out of 10000i,1000n,20000p,200000b,200000s
@@ -1877,32 +2027,34 @@ s/MiKTeX/fonts/type1/public/amsfonts/cm/cmmi8.pfb><C:/Users/Thermaltake/AppData
 /Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmmi9.pfb><C:/Users/Therm
 altake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmmib10.pfb
 ><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfont
-s/cmextra/cmmib7.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/
-type1/public/amsfonts/cmextra/cmmib8.pfb><C:/Users/Thermaltake/AppData/Local/Pr
-ograms/MiKTeX/fonts/type1/public/amsfonts/cmextra/cmmib9.pfb><C:/Users/Thermalt
-ake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr10.pfb><C:/
-Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/
-cmr6.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public
-/amsfonts/cm/cmr7.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts
-/type1/public/amsfonts/cm/cmr8.pfb><C:/Users/Thermaltake/AppData/Local/Programs
-/MiKTeX/fonts/type1/public/amsfonts/cm/cmr9.pfb><C:/Users/Thermaltake/AppData/L
-ocal/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmss10.pfb><C:/Users/Therma
-ltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmss12.pfb><
-C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/
-cm/cmss8.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/pu
-blic/amsfonts/cm/cmss9.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/
-fonts/type1/public/amsfonts/cm/cmssbx10.pfb><C:/Users/Thermaltake/AppData/Local
-/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmssi10.pfb><C:/Users/Thermalta
-ke/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy10.pfb><C:/
-Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/
-cmsy6.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/publi
-c/amsfonts/cm/cmsy7.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fon
-ts/type1/public/amsfonts/cm/cmsy8.pfb><C:/Users/Thermaltake/AppData/Local/Progr
-ams/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy9.pfb><C:/Users/Thermaltake/AppDa
-ta/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/symbols/msbm10.pfb>
-Output written on i2sb_talk.pdf (57 pages, 6238091 bytes).
+s/cmextra/cmmib6.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/
+type1/public/amsfonts/cmextra/cmmib7.pfb><C:/Users/Thermaltake/AppData/Local/Pr
+ograms/MiKTeX/fonts/type1/public/amsfonts/cmextra/cmmib8.pfb><C:/Users/Thermalt
+ake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cmextra/cmmib9.pf
+b><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfon
+ts/cm/cmr10.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1
+/public/amsfonts/cm/cmr6.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTe
+X/fonts/type1/public/amsfonts/cm/cmr7.pfb><C:/Users/Thermaltake/AppData/Local/P
+rograms/MiKTeX/fonts/type1/public/amsfonts/cm/cmr8.pfb><C:/Users/Thermaltake/Ap
+pData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr9.pfb><C:/Users/T
+hermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmss10.
+pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsf
+onts/cm/cmss12.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/ty
+pe1/public/amsfonts/cm/cmss8.pfb><C:/Users/Thermaltake/AppData/Local/Programs/M
+iKTeX/fonts/type1/public/amsfonts/cm/cmss9.pfb><C:/Users/Thermaltake/AppData/Lo
+cal/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmssbx10.pfb><C:/Users/Therm
+altake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmssi10.pfb
+><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfont
+s/cm/cmsy10.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1
+/public/amsfonts/cm/cmsy6.pfb><C:/Users/Thermaltake/AppData/Local/Programs/MiKT
+eX/fonts/type1/public/amsfonts/cm/cmsy7.pfb><C:/Users/Thermaltake/AppData/Local
+/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy8.pfb><C:/Users/Thermaltake
+/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy9.pfb><C:/Use
+rs/Thermaltake/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/symbol
+s/msbm10.pfb>
+Output written on i2sb_talk.pdf (61 pages, 8088958 bytes).
 PDF statistics:
- 571 PDF objects out of 1000 (max. 8388607)
- 123 named destinations out of 1000 (max. 500000)
- 277 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 614 PDF objects out of 1000 (max. 8388607)
+ 131 named destinations out of 1000 (max. 500000)
+ 357 words of extra memory for PDF output out of 10000 (max. 10000000)
 

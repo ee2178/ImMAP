@@ -1,4 +1,4 @@
 \beamer@sectionintoc {1}{Guided diffusion as posterior ascent}{3}{0}{1}
-\beamer@sectionintoc {2}{Warm starts}{15}{0}{2}
-\beamer@sectionintoc {3}{Specialising to a bridge}{20}{0}{3}
-\beamer@sectionintoc {4}{Adding a measurement}{39}{0}{4}
+\beamer@sectionintoc {2}{Warm starts}{17}{0}{2}
+\beamer@sectionintoc {3}{Specialising to a bridge}{22}{0}{3}
+\beamer@sectionintoc {4}{Adding a measurement}{41}{0}{4}
