@@ -13,7 +13,10 @@
 #
 # Shared by every cell: a 5k-step linear warmup then cosine, clip 1.0, 320 x 320 crops,
 # train/grad_norm + train/zero_grad_frac logged, the collapse alarm (dead_grad_alarm 0.5: the run
-# stops if the net is cut off from its loss again), validation at a seeded random step per slice.
+# stops if the net is cut off from its loss again), validation at a seeded random step per slice,
+# and OFFLINE, PHASE-CORRECTED training pairs: both scans on the offline PDFS maps, each rotated by
+# its own centre-block phase, no online ESPIRiT per step (training/i2sb_recon.py "OFFLINE PAIRS");
+# the operator's online maps are phase-corrected to match.
 # The small UNets: Adam 1e-4, 4 crops per step. Other cells: sbcdl (SBCDLNet on [x_t, x1]).
 #
 # Everything else -- config generation, data checks, resume from the run dir, FORCE_RESTART -- is

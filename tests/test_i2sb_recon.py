@@ -788,6 +788,110 @@ def test_sb_recon_cdl_adapter_and_training():
         assert "val/psnr" in wb.keys()
 
 
+def paired_phantom(n, seed=0, psi=None):
+    """Paired slices (kspace, smaps, image, organ, pad_hw, side) with KNOWN smooth coil maps, two
+    objects with different smooth phases, and offline maps carrying an arbitrary per-pixel
+    convention e^{-i psi}: what the paired knee loader serves with target 'sense'."""
+    from operators.fourier import fftc, ifftc
+    g = torch.Generator().manual_seed(seed)
+    yy, xx = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, H), indexing="ij")
+    ang = torch.linspace(0, 2 * np.pi, NC + 1)[:-1]
+    S = torch.stack([torch.exp(-((yy - 0.8 * torch.sin(a)) ** 2 + (xx - 0.8 * torch.cos(a)) ** 2))
+                     * torch.exp(1j * (0.9 * torch.sin(a) * xx + 0.6 * torch.cos(a) * yy))
+                     for a in ang])
+    S = (S / S.abs().pow(2).sum(0, keepdim=True).sqrt()).to(torch.complex64)
+    disk = ((yy ** 2 + xx ** 2) < 0.7).float()
+    out = []
+    for i in range(n):
+        p = (torch.rand(5, generator=g) - 0.5).tolist()
+        mag = disk * (0.5 + 0.4 * torch.sin((3 + 2 * p[0]) * yy) * torch.cos(4 * xx))
+        fs = (mag * torch.exp(1j * (2 * p[1] + p[2] * xx + 0.5 * yy))).to(torch.complex64)
+        pd = (1.8 * mag * torch.exp(1j * (2 * p[3] + p[4] * yy - 0.7 * xx))).to(torch.complex64)
+        ps = torch.full((H, H), 0.0) if psi is None else psi
+        S_off = S * torch.exp(-1j * ps).to(torch.complex64)                 # ESPIRiT's convention
+        k, side = fftc(S * fs), fftc(S * pd)
+        image = (S_off.conj() * ifftc(k)).sum(0, keepdim=True)
+        out.append((k, S_off, image, torch.ones(1, H, H, dtype=torch.bool), torch.tensor([H, H]),
+                    side))
+    return [torch.stack(v) for v in zip(*out)], S
+
+
+def test_offline_pairs_are_phase_corrected_and_convention_free():
+    """OFFLINE PAIRS: x = x_raw conj(sgn(x_low)) per scan; independent of the maps' phase
+    convention; the same image the phase-corrected ONLINE operator combines; and the two scans
+    come out aligned."""
+    from operators.fourier import ifftc
+    from physics.online_smaps import center_mask, phase_correct_maps
+    from training.i2sb_recon import _offline_pair
+    kw = dict(acs_lines=8, center_frac=None)
+    yy, xx = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, H), indexing="ij")
+    (b0, S), (b1, _) = paired_phantom(2), paired_phantom(2, psi=2.5 * xx * yy + 1.0)
+    x0, x1, y, E, sn, org, gt, guide = _offline_pair(b0, "cpu", **kw)
+    assert x0.shape == x1.shape == (2, 1, H, H) and y is None and E is None and guide is None
+    # (1) the formula, computed independently
+    cm = center_mask(b0[0], 8)
+    raw = (b0[1].conj() * ifftc(b0[0])).sum(1, keepdim=True)
+    low = (b0[1].conj() * ifftc(b0[0] * cm)).sum(1, keepdim=True)
+    ref = raw * torch.where(low.abs() > 0, low.conj() / low.abs().clamp_min(1e-30),
+                            torch.ones_like(low))
+    assert torch.allclose(x0, ref, atol=1e-5)
+    # (2) another ESPIRiT convention psi on the maps: the SAME pair
+    y0, y1 = _offline_pair(b1, "cpu", **kw)[:2]
+    assert torch.allclose(x0, y0, atol=1e-4) and torch.allclose(x1, y1, atol=1e-4)
+    # (3) what the phase-corrected online operator combines (its own convention, calibrated on
+    # the masked measurement's centre block) is the same target image
+    mask = torch.zeros(1, 1, 1, H)
+    mask[..., ::4] = 1
+    mask[..., H // 2 - 4:H // 2 + 4] = 1
+    S_on = S * torch.exp(-1j * (1.3 * yy - 0.4)).to(torch.complex64)
+    Sp = phase_correct_maps(S_on.expand_as(b0[1]), ifftc(mask * b0[0] * cm))
+    x0_online = Sense(Sp).adjoint(ifftc(b0[0]))
+    assert torch.allclose(x0, x0_online, atol=1e-4)
+    # (4) the two scans: their phase difference on the object shrinks
+    sup = (gt.abs() > 0.2 * gt.abs().max())
+
+    def rms_phase(a, b):
+        c = (a * b.conj())[sup]
+        return float((c.abs() * torch.angle(c) ** 2).sum() / c.abs().sum()) ** 0.5
+    raw1 = (b0[1].conj() * ifftc(b0[5])).sum(1, keepdim=True)
+    assert rms_phase(x1, x0) < 0.3 * rms_phase(raw1, raw), (rms_phase(x1, x0), rms_phase(raw1, raw))
+    assert torch.allclose(x0.abs(), raw.abs(), atol=1e-5)                 # magnitudes untouched
+
+
+def test_training_on_offline_pairs():
+    """The loop trains on offline pairs (full grid and cropped to batch), no measurement, and
+    refuses the setups the pairs do not fit."""
+    (b, _) = paired_phantom(4)
+    dl = DataLoader(TensorDataset(*b), batch_size=2, shuffle=False)
+    base = dict(num_epochs=1, steps_per_epoch=2, val_every_epochs=1, kind="brownian", tau=TAU,
+                n_points=N, R=4, acs_lines=8, kspace_type="measurement_awgn",
+                online_smaps="espirit", online_smaps_kws={"phase_correct": True},
+                x1_source="guide", guide_maps="operator", train_pairs="offline")
+
+    def go(net, d, **kw):
+        opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+        return train_i2sb_recon(net, opt, None, "cpu", dl, None, save_dir=d, **dict(base, **kw))
+    for extra in ({}, dict(crop=(24, 24), crop_batch=2)):
+        with tempfile.TemporaryDirectory() as d:
+            net = make_net(cond_x1=True)
+            before = [p.detach().clone() for p in net.parameters()]
+            go(net, d, **extra)
+            assert any(not torch.equal(a, c) for a, c in zip(before, net.parameters())), extra
+    with tempfile.TemporaryDirectory() as d:
+        raises(ValueError, lambda: go(make_net(), d, x1_source="adjoint"), "x1_source 'guide'")
+        raises(ValueError, lambda: go(make_net(), d, online_smaps_kws={}), "phase-corrected")
+        net = make_net()
+        net.image_domain_only = False
+        raises(ValueError, lambda: go(net, d), "image-domain")
+        raises(ValueError, lambda: go(make_net(), d, train_pairs="cached"), "train_pairs")
+        flat = list(b)
+        flat[1] = torch.full_like(b[1], NC ** -0.5)                         # placeholder maps
+        dl_flat = DataLoader(TensorDataset(*flat), batch_size=2, shuffle=False)
+        raises(ValueError, lambda: train_i2sb_recon(
+            make_net(), torch.optim.Adam(make_net().parameters()), None, "cpu", dl_flat, None,
+            save_dir=d, **base), "placeholder")
+
+
 def main():
     tests = sorted((n, f) for n, f in globals().items() if n.startswith("test_") and callable(f))
     failed = 0

@@ -442,13 +442,21 @@ MODELS["sbunet_inv_crop"] = dict(
 # train/zero_grad_frac logged and dead_grad_alarm stopping the run if the net is cut off again, and
 # validation at a seeded RANDOM step per slice (val_step None) instead of t = 1 only -- which
 # picked sbunet_inv's first check.
+# PHASE-CORRECTED, OFFLINE PAIRS (2026-11-20; training/i2sb_recon.py "OFFLINE PAIRS"): training
+# pairs come from the offline PDFS maps applied to BOTH scans (the user found PD and PDFS maps
+# practically identical), each rotated by the phase of its own centre-block image -- no online
+# ESPIRiT per step, so training runs at network speed. To keep one phase convention end to end,
+# the operator's online maps are phase-corrected too (phase_correct) and the guide is combined under
+# them at validation (guide_maps "operator", the same maps for both scans, as in training).
 RETRAIN_WARMUP, RETRAIN_CROP_BATCH = 5000, 4
 RETRAIN_TRAINING = dict(crop=[320, 320], crop_batch=RETRAIN_CROP_BATCH, clip_grad=1.0,
                         dead_grad_alarm=0.5)
 RETRAIN_OPTIM = dict(type="Adam", params=dict(lr=1e-4))
 RETRAIN_SCHED = dict(type="WarmupCosine",
                      params=dict(warmup_steps=RETRAIN_WARMUP, T_max=300000, eta_min=1e-6))
-RETRAIN_I2SB = dict(guide_maps="own", support_thresh=None, support_state=False, val_step=None)
+RETRAIN_I2SB = dict(guide_maps="operator", train_pairs="offline", support_thresh=None,
+                    support_state=False, val_step=None)
+RETRAIN_SMAPS_KWS = dict(phase_correct=True)
 SBUNET_SMALL = dict(cond_x1=False, guided=False, predict="x0", model_channels=64,
                     num_res_blocks=2, channel_mult=[1, 2, 3, 4], attention_resolutions=[80, 40],
                     image_size=320, num_heads=4, num_head_channels=32, dropout=0.0,
@@ -456,8 +464,8 @@ SBUNET_SMALL = dict(cond_x1=False, guided=False, predict="x0", model_channels=64
                     t0=1e-4, T=1.0)
 SBCDL_PARAMS = dict(K=30, M=169, P=7, s=2, t0=0.0, deg_eta=2, deg_tau=2, init=True)
 _RETRAIN = dict(task="i2sb_recon", guided=True, grid_base="varnet", pad_multiple=1,
-                x1_source="guide", i2sb=RETRAIN_I2SB, training=RETRAIN_TRAINING,
-                optimizer=RETRAIN_OPTIM, scheduler=RETRAIN_SCHED)
+                x1_source="guide", i2sb=RETRAIN_I2SB, online_smaps_kws=RETRAIN_SMAPS_KWS,
+                training=RETRAIN_TRAINING, optimizer=RETRAIN_OPTIM, scheduler=RETRAIN_SCHED)
 for _name, _cx1 in (("sbunet_small", False), ("sbunet_small_x1", True)):
     MODELS[_name] = dict(_RETRAIN, model=dict(
         type="SBReconUnet", params=dict(SBUNET_SMALL, cond_x1=_cx1, **SCHEDULE)))
@@ -472,10 +480,12 @@ MODELS["sbcdl"] = dict(_RETRAIN, model=dict(type="SBReconCDL",
 #   EMA      0.99, theirs; validation and net_bestval.ckpt use the average
 #   crop     320 x 320, SBINV_STABLE_BATCH slices per step: 2 x 320^2 is fewer pixels than the one
 #            640 x 368 slice the original run fit in memory
-#   + the shared retraining settings: clip 1.0, the collapse alarm, random-step validation
+#   + the shared retraining settings: clip 1.0, the collapse alarm, random-step validation, and
+#     the phase-corrected offline pairs (so its guide is on the operator's maps, not its own)
 SBINV_STABLE_BATCH = 2
 MODELS["sbunet_inv_stable"] = dict(
-    MODELS["sbunet_inv"], i2sb=dict(MODELS["sbunet_inv"]["i2sb"], val_step=None),
+    MODELS["sbunet_inv"], i2sb=dict(MODELS["sbunet_inv"]["i2sb"], **RETRAIN_I2SB),
+    online_smaps_kws=RETRAIN_SMAPS_KWS,
     training=dict(RETRAIN_TRAINING, crop_batch=SBINV_STABLE_BATCH, ema_decay=0.99),
     optimizer=dict(type="Adam", params=dict(lr=1e-5)),
     scheduler=dict(type="WarmupCosine",
@@ -625,6 +635,10 @@ def make_config(r, model, g, grid):
     training.update(spec.get("training") or {})
     mri = dict(grid["lpdsnet"]["mri"], guide_R=int(g), guide_acs_lines=0,
                guide_mask_dist="uniform")
+    if spec.get("online_smaps_kws"):
+        # a cell's own online-map options on top of the grid's (e.g. phase_correct)
+        mri["online_smaps_kws"] = dict(mri.get("online_smaps_kws") or {},
+                                       **spec["online_smaps_kws"])
     if int(g) > 1 and spec["task"] in ("recon", "joint_recon"):
         # COMPLEMENTARY validation sampling (2026-11-17): the target keeps lines at offset 0, the
         # accelerated guide samples midway between its own spacing, so the two scans' lines

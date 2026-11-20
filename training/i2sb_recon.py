@@ -61,6 +61,23 @@ loss is an average over anatomy rather than over a FOV that is half background. 
 is taken from each slice's FULL x1, so the bridge noise is what the uncropped sampler injects.
 Validation and sampling stay on the full grid (the sampler needs E); the net is fully convolutional.
 
+OFFLINE PAIRS (`train_pairs`, cfg["i2sb"]; "measured" by default). An image-domain regressor never
+reads y or E: of the measurement it uses only the two images the coil maps define, and those are
+the same every time a slice comes back (a fully sampled guide; the target's ACS is the mask's fixed
+centre block). So "offline" builds the pair WITHOUT a measurement or any online ESPIRiT, from the
+loader's offline PDFS maps (data target "sense") applied to BOTH scans, each rotated by the phase
+of its own low-resolution image -- the same `phase_correct_maps` the online maps use:
+
+    x0 = S'^H F^-1 k_PDFS,   S' = phase_correct_maps(S_PDFS, F^-1(cm k_PDFS))
+    x1 = S''^H F^-1 k_PD,    S'' = phase_correct_maps(S_PDFS, F^-1(cm k_PD))
+
+with cm the test mask's centre block (resolve_acs_lines: center_frac / acs_lines, box window). The
+rotation removes each ESPIRiT run's map-phase convention exactly and each scan's smooth object phase,
+so both images come out near-real and aligned with each other. For training and testing to agree,
+the operator's online maps must be phase-corrected too (mri.online_smaps_kws.phase_correct, which is
+enforced): then E, validation and the sampler work in the same convention as the training pairs.
+Measurement noise does not enter the pair; validation still measures (the sampler needs y and E).
+
 Validation (`val_mode`, cfg["i2sb"]):
     "single_pass"   one bridge step per slice, one forward -- the training objective. The step
                     is random, or `val_step` for every slice (negative counts from the end, so
@@ -105,6 +122,7 @@ BESTVAL_CKPT = "net_bestval.ckpt"
 LATEST_CKPT = "net.ckpt"            # the latest state, every validation (sample from its EMA)
 X0_SOURCES = ("operator", "stored")
 GUIDE_MAPS = ("operator", "own")    # x1_source "guide": which coil maps combine the side scan
+TRAIN_PAIRS = ("measured", "offline")   # how a TRAINING pair is built; see "OFFLINE PAIRS"
 LOSS_TARGETS = ("x0", "eps")
 
 
@@ -184,6 +202,33 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
     guide = _guide(net, side, extra["smaps"], T, device, guide_R, guide_acs_lines,
                    guide_mask_dist, guide_offset)
     return x0, x1, y, E, sigma_n, organ_mask, image, guide
+
+
+def _offline_pair(batch, device, *, acs_lines, center_frac):
+    """One paired batch -> the "OFFLINE PAIRS" training pair, no measurement and no ESPIRiT:
+    (x0, x1, None, None, sigma_n = 0, organ_mask, gt, None), shaped like `_measure`'s output.
+
+    Both scans are combined under the loader's offline PDFS maps, each after
+    `phase_correct_maps` with its own centre-block calibration image (module docstring). gt is the
+    stored image, as `_measure` returns it (metrics read its magnitude)."""
+    from physics.online_smaps import center_mask, phase_correct_maps
+    kspace, smaps, image, organ_mask, _, side = _unpack(batch)
+    if side is None or isinstance(side, dict):
+        raise ValueError("train_pairs='offline' needs a paired loader with ONE guide slice "
+                         "(data name 'fastmri_paired', guide_slices 1)")
+    k, S, g = kspace.to(device), smaps.to(device), side.to(device)
+    if bool((S.abs().flatten(1).std(dim=1) == 0).any()):
+        raise ValueError("train_pairs='offline' needs the offline coil maps, but the loader served "
+                         "flat placeholder maps: set the data target to 'sense' (smap_root)")
+    W = k.shape[-1]
+    cm = center_mask(k, resolve_acs_lines(W, acs_lines, center_frac))
+
+    def corrected(kk):
+        return Sense(phase_correct_maps(S, ifftc(kk * cm))).adjoint(ifftc(kk))
+
+    x0, x1 = corrected(k), corrected(g)
+    return (x0, x1, None, None, torch.zeros(x0.shape[0], device=device),
+            organ_mask.to(device), image.to(device), None)
 
 
 def _cat0(vs):
@@ -275,6 +320,9 @@ def train_i2sb_recon(
     x0_source="operator",            # bridge target in E's phase convention; see module doc
     guide_maps="operator",           # x1_source "guide": "operator" (the target's maps) or "own"
                                      # (the side scan's own online ESPIRiT, I2SB-Inversion's x1)
+    train_pairs="measured",          # "offline": training pairs from the offline maps, phase-
+                                     # corrected, no measurement ("OFFLINE PAIRS"); image-domain
+                                     # nets with the guide start only. Validation still measures
     loss_target="x0",                # "eps": I2SB(-Inversion)'s eps-matching MSE,
                                      # |(x0_hat - x0) / std_fwd|^2 -- for a net that predicts eps
     tau_scale="none",                # "x1_rms": each sample's tau follows its zero-filled
@@ -339,6 +387,20 @@ def train_i2sb_recon(
         raise ValueError(f"crop needs a purely image-domain net (image_domain_only): "
                          f"{type(net).__name__} reads y / E on the measured grid")
     n_slices = int(crop_batch) if crop is not None else 1
+    if train_pairs not in TRAIN_PAIRS:
+        raise ValueError(f"train_pairs {train_pairs!r} not in {TRAIN_PAIRS}")
+    if train_pairs == "offline":
+        if not getattr(net, "image_domain_only", False) or getattr(net, "guided", False):
+            raise ValueError(f"train_pairs='offline' builds no measurement: it needs an unguided, "
+                             f"image-domain net (image_domain_only), not {type(net).__name__}")
+        if x1_source != "guide" or int(guide_R) != 1:
+            raise ValueError("train_pairs='offline' builds x1 from the fully sampled guide: needs "
+                             f"x1_source 'guide' and guide_R 1 (got {x1_source!r}, {guide_R})")
+        if not (online_smaps and (online_smaps_kws or {}).get("phase_correct")):
+            raise ValueError("train_pairs='offline' trains on phase-corrected pairs, so the "
+                             "operator's online maps must be phase-corrected too "
+                             "(mri.online_smaps_kws.phase_correct: true) -- otherwise validation "
+                             "and sampling work in another phase convention")
     if dead_grad_alarm is not None and not 0.0 < float(dead_grad_alarm) <= 1.0:
         raise ValueError(f"dead_grad_alarm is a fraction in (0, 1], got {dead_grad_alarm}")
     if int(dc_iters) < 0 or float(dc_lam) < 0:
@@ -413,9 +475,11 @@ def train_i2sb_recon(
                     except StopIteration:
                         train_iter = iter(train_loader)
                         batch = next(train_iter)
-                    parts.append(_measure(
-                        batch, net, device, kspace_type=kspace_type, noise_std=noise_std,
-                        guide_offset="random", **meas))
+                    parts.append(
+                        _offline_pair(batch, device, acs_lines=acs_lines, center_frac=center_frac)
+                        if train_pairs == "offline" else _measure(
+                            batch, net, device, kspace_type=kspace_type, noise_std=noise_std,
+                            guide_offset="random", **meas))
                 if crop is None:
                     x0, x1, y, E, sigma_n, organ_mask, gt, guide = parts[0]
                     kappa = kappa_fn(x1)
