@@ -25,6 +25,7 @@ from .sb_multigrid import SBMGCDLNet
 from .sb_unet import SBUnet
 from .sb_unet_lggs import SBUnetLGGS
 from .sb_recon_unet import SBReconUnet
+from .sb_recon_cdl import SBReconCDL
 from .tgvn import TGVN, BridgeTGVN
 from .guided_lpds import BridgeLGGS
 from .unsb_nets import PatchDiscriminator, PatchEncoder, FeatureTap, PatchNCE, build_critics
@@ -103,6 +104,11 @@ def build_model(cfg):
     # zero-filled x1) in as planar channels, complex x0_hat out. Ignores y / E.
     elif model_type == "SBReconUnet":
         return SBReconUnet(**params)
+
+    # SBCDLNet as an I2SB RECONSTRUCTION regressor: complex filters on [x_t, x1], x1 the prior
+    # fidelity's input. Ignores y / E (image_domain_only). Schedule params match cfg["i2sb"].
+    elif model_type == "SBReconCDL":
+        return SBReconCDL(**params)
 
     # TGVN (models/tgvn/): the trust-guided variational network, vendored. `guided: false` is the
     # paper's matched image-domain E2E-VarNet (no side information).

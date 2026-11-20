@@ -416,6 +416,70 @@ MODELS["sbunet_inv"] = dict(
     task="i2sb_recon", guided=True, grid_base="varnet", pad_multiple=1, x1_source="guide",
     model=dict(type="SBReconUnet", params=dict(I2SBINV_UNET, **SCHEDULE)),
     i2sb=dict(guide_maps="own", support_thresh=None, support_state=False))
+# "sbunet_inv_crop": the same net, trained CROPPED TO BATCH (training/i2sb_recon.py "CROP TO
+# BATCH"): each slice's image-domain pair centre-cropped to 320 x 320 (the readout oversampling
+# dropped) and SBINV_CROP_BATCH slices stacked per step, instead of one full 640 x 368 slice.
+# Its own cell name, so it never resumes the uncropped run's directory. SUPERSEDED by
+# sbunet_inv_stable below: this one keeps the recipe that collapsed (Adam 5e-4, no warmup).
+SBINV_CROP_BATCH = 4
+MODELS["sbunet_inv_crop"] = dict(
+    MODELS["sbunet_inv"], training=dict(crop=[320, 320], crop_batch=SBINV_CROP_BATCH))
+
+# RETRAINING THE I2SB BASELINE after the sbunet_inv collapse (2026-11-20): its activations grew to
+# ~1e17 through the residual stream, the final GroupNorm overflowed, and from ~5k steps on every
+# tensor but the output head got EXACTLY zero gradient -- a silent failure, the loss stayed finite.
+# These cells take the recipe of the BraTS bridge regressors that did train, unchanged otherwise
+# (the guide as the bridge start, on its own maps). Launch: bigpurple/i2sb_retrain_knee.sbatch.
+#   sbunet_small     a SMALL I2SB UNet, the BraTS one's size (config/BraTS/i2sb_unet_t1.json: 64
+#                    channels, mult 1-2-3-4, 2 res blocks, attention at downsample 4 and 8, x0
+#                    head), ~23M parameters; it sees x_t only, as I2SB-Inversion's net does
+#   sbunet_small_x1  the same UNet that ALSO sees the guide x1 at every step (cond_x1: x1's two
+#                    planar channels concatenated to x_t's)
+#   sbcdl            SBCDLNet (models/sb_recon_cdl.py) at the BraTS SBCDL's size (K 30, M 169, P 7,
+#                    s 2), complex filters on [x_t, x1]
+# All: Adam 1e-4, clip 1.0, linear warmup over RETRAIN_WARMUP steps then cosine (scheduler
+# "WarmupCosine"), cropped to batch (320 x 320 x RETRAIN_CROP_BATCH), train/grad_norm +
+# train/zero_grad_frac logged and dead_grad_alarm stopping the run if the net is cut off again, and
+# validation at a seeded RANDOM step per slice (val_step None) instead of t = 1 only -- which
+# picked sbunet_inv's first check.
+RETRAIN_WARMUP, RETRAIN_CROP_BATCH = 5000, 4
+RETRAIN_TRAINING = dict(crop=[320, 320], crop_batch=RETRAIN_CROP_BATCH, clip_grad=1.0,
+                        dead_grad_alarm=0.5)
+RETRAIN_OPTIM = dict(type="Adam", params=dict(lr=1e-4))
+RETRAIN_SCHED = dict(type="WarmupCosine",
+                     params=dict(warmup_steps=RETRAIN_WARMUP, T_max=300000, eta_min=1e-6))
+RETRAIN_I2SB = dict(guide_maps="own", support_thresh=None, support_state=False, val_step=None)
+SBUNET_SMALL = dict(cond_x1=False, guided=False, predict="x0", model_channels=64,
+                    num_res_blocks=2, channel_mult=[1, 2, 3, 4], attention_resolutions=[80, 40],
+                    image_size=320, num_heads=4, num_head_channels=32, dropout=0.0,
+                    use_scale_shift_norm=True, resblock_updown=False, conv_resample=True,
+                    t0=1e-4, T=1.0)
+SBCDL_PARAMS = dict(K=30, M=169, P=7, s=2, t0=0.0, deg_eta=2, deg_tau=2, init=True)
+_RETRAIN = dict(task="i2sb_recon", guided=True, grid_base="varnet", pad_multiple=1,
+                x1_source="guide", i2sb=RETRAIN_I2SB, training=RETRAIN_TRAINING,
+                optimizer=RETRAIN_OPTIM, scheduler=RETRAIN_SCHED)
+for _name, _cx1 in (("sbunet_small", False), ("sbunet_small_x1", True)):
+    MODELS[_name] = dict(_RETRAIN, model=dict(
+        type="SBReconUnet", params=dict(SBUNET_SMALL, cond_x1=_cx1, **SCHEDULE)))
+MODELS["sbcdl"] = dict(_RETRAIN, model=dict(type="SBReconCDL",
+                                            params=dict(SBCDL_PARAMS, **SCHEDULE)))
+# "sbunet_inv_stable": the BASELINE again -- I2SB-Inversion's 553M ADM, eps head, x_t only,
+# exactly sbunet_inv's network -- trained so that it cannot repeat the collapse. What blew up was
+# the activations (time embedding -> FiLM -> residual stream, ~10x per level), and under Adam the
+# per-parameter step is ~lr whatever the gradient or the clip, so the LEARNING RATE is the lever:
+#   lr       1e-5, I2SB-Inversion's own (train.py: their AdamW at l2_norm 0, i.e. Adam), not the
+#            grid's 5e-4; RETRAIN_WARMUP-step linear warmup, then cosine to 1e-7
+#   EMA      0.99, theirs; validation and net_bestval.ckpt use the average
+#   crop     320 x 320, SBINV_STABLE_BATCH slices per step: 2 x 320^2 is fewer pixels than the one
+#            640 x 368 slice the original run fit in memory
+#   + the shared retraining settings: clip 1.0, the collapse alarm, random-step validation
+SBINV_STABLE_BATCH = 2
+MODELS["sbunet_inv_stable"] = dict(
+    MODELS["sbunet_inv"], i2sb=dict(MODELS["sbunet_inv"]["i2sb"], val_step=None),
+    training=dict(RETRAIN_TRAINING, crop_batch=SBINV_STABLE_BATCH, ema_decay=0.99),
+    optimizer=dict(type="Adam", params=dict(lr=1e-5)),
+    scheduler=dict(type="WarmupCosine",
+                   params=dict(warmup_steps=RETRAIN_WARMUP, T_max=300000, eta_min=1e-7)))
 
 # GUIDE CONTRAST TRANSFER (models/contrast_transfer.py; task "contrast_transfer",
 # training/contrast_transfer.py): tiny nets mapping the PD guide -- as a guided net receives it,

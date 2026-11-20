@@ -686,6 +686,108 @@ def test_training_with_acs_bridge_start():
         assert "val/psnr" in wb.keys()
 
 
+def test_crop_to_batch():
+    """CROP TO BATCH: slices measured on their own grids, cropped and stacked; image-domain nets
+    only; kappa from the FULL x1; validation still on the full grid."""
+    from training.i2sb_recon import _crop_stack
+    # the stack: 2 parts of batch 2 -> one batch of 4, every image-domain tensor cropped
+    parts = []
+    for s in range(2):
+        x0 = torch.randn(2, 1, H, H, dtype=torch.complex64)
+        x1 = torch.randn(2, 1, H, H, dtype=torch.complex64)
+        x1[..., :4, :] *= 10                                   # rows the crop removes
+        parts.append((x0, x1, "y", "E", torch.full((2,), 0.01 * (s + 1)),
+                      torch.ones(2, 1, H, H, dtype=torch.bool), x0.abs(), None))
+    kfn = lambda v: v.abs().flatten(1).mean(1)                 # noqa: E731
+    x0, x1, y, E, sn, org, gt, guide, kappa = _crop_stack(parts, (24, 20), kfn)
+    assert x0.shape == x1.shape == org.shape == gt.shape == (4, 1, 24, 20)
+    assert y is None and E is None and guide is None and sn.shape == (4,)
+    full = torch.cat([kfn(p[1]) for p in parts])
+    assert torch.allclose(kappa, full), "kappa must come from the uncropped x1"
+    assert torch.equal(x0[2:], parts[1][0][..., 4:28, 6:26])   # the centre crop, in order
+    # the loop: trains on stacked crops, validates on the full grid
+    with tempfile.TemporaryDirectory() as d:
+        net = make_net()
+        before = [p.detach().clone() for p in net.parameters()]
+        wb = FakeWandb()
+        run(net, d, num_epochs=1, wandb=wb, crop=(24, 24), crop_batch=2, val_mode="single_pass")
+        assert any(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
+        assert "val/psnr" in wb.keys()
+    # guard rails
+    with tempfile.TemporaryDirectory() as d:
+        raises(ValueError, lambda: run(make_net(), d, num_epochs=1, crop_batch=2), "set crop")
+        net = make_net()
+        net.image_domain_only = False
+        raises(ValueError, lambda: run(net, d, num_epochs=1, crop=(24, 24)), "image-domain")
+
+
+def test_warmup_cosine_schedule():
+    """Scheduler "WarmupCosine": linear warmup to the base LR, cosine to eta_min, and a backtrack
+    rescale (training/common.py::rescale_schedule) only scales its amplitude."""
+    from training.common import rescale_schedule, warmup_cosine
+    p = torch.nn.Parameter(torch.zeros(1))
+    opt = torch.optim.SGD([p], lr=1e-3)
+    sch = warmup_cosine(opt, warmup_steps=10, T_max=110, eta_min=1e-5)
+    lrs = []
+    for _ in range(130):
+        lrs.append(opt.param_groups[0]["lr"])
+        opt.step()
+        sch.step()
+    assert abs(lrs[0] - 1e-4) < 1e-12 and abs(lrs[9] - 1e-3) < 1e-12        # (k+1)/10 of base
+    assert all(a <= b + 1e-15 for a, b in zip(lrs[:10], lrs[1:10]))          # rising warmup
+    assert abs(lrs[60] - (1e-5 + (1e-3 - 1e-5) * 0.5)) < 1e-9                # cosine midpoint
+    assert all(abs(v - 1e-5) < 1e-12 for v in lrs[110:])                     # held at eta_min
+    new = rescale_schedule(opt, sch, [5e-4])
+    assert abs(new[0] - 0.5 * opt.param_groups[0]["lr"] / 0.5) < 1e-12
+    raises(ValueError, lambda: warmup_cosine(opt, warmup_steps=0, T_max=10), "warmup_steps")
+
+
+def test_grad_stats_and_dead_grad_alarm():
+    """train/grad_norm (pre-clip) and train/zero_grad_frac are logged; dead_grad_alarm stops a run
+    whose trunk is cut off from the loss (here: the final GroupNorm's output detached, as an
+    overflowed GroupNorm does to sbunet_inv), and lets a healthy one through."""
+    alarm = dict(val_mode="single_pass", dead_grad_alarm=0.5, dead_grad_after=4)
+    with tempfile.TemporaryDirectory() as d:
+        wb = FakeWandb()
+        run(make_net(), d, num_epochs=3, wandb=wb, clip_grad=1.0, **alarm)    # healthy: no alarm
+        logs = [c[1] for c in wb.calls if "train/grad_norm" in c[1]]
+        assert len(logs) == 3 and all(g["train/grad_norm"] > 0 for g in logs)
+        # ADM's zero-initialized branch outputs: most tensors start at exactly zero gradient
+        # (hence dead_grad_after), and wake up within the first steps
+        assert logs[0]["train/zero_grad_frac"] > 0.5 > logs[-1]["train/zero_grad_frac"], logs
+    with tempfile.TemporaryDirectory() as d:
+        net = make_net()
+        net.unet.out[0].register_forward_hook(lambda m, i, o: o.detach())
+        raises(RuntimeError, lambda: run(net, d, num_epochs=3, **alarm), "EXACTLY zero gradient")
+        raises(ValueError, lambda: run(make_net(), d, num_epochs=1, dead_grad_alarm=2.0),
+               "fraction")
+
+
+def test_sb_recon_cdl_adapter_and_training():
+    """SBReconCDL: SBCDLNet on complex [x_t, x1] behind the recon interface; trains cropped to
+    batch, calls project(), refuses what it cannot use."""
+    from models.sb_recon_cdl import SBReconCDL
+    torch.manual_seed(0)
+    net = SBReconCDL(K=2, M=8, P=3, s=2, deg_eta=0, deg_tau=1, kind="brownian", tau=TAU,
+                     n_points=N)
+    assert net.image_domain_only and net.cond_x1
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    x = torch.randn(2, 1, H, H, dtype=torch.complex64)
+    out, _ = net(x, sigma=sched.std_fwd[[3, 500]].view(-1, 1, 1, 1), x1=x)
+    assert out.shape == x.shape and out.is_complex()
+    raises(ValueError, lambda: net(x, sigma=sched.std_fwd[:2]), "needs x1")
+    raises(ValueError, lambda: net(x, sigma=sched.std_fwd[:2], x1=x, guide=x), "unguided")
+    raises(TypeError, lambda: net(x.real, sigma=sched.std_fwd[:2], x1=x), "complex")
+    raises(ValueError, lambda: SBReconCDL(complex=False), "sets SBCDLNet's")
+    with tempfile.TemporaryDirectory() as d:
+        before = [p.detach().clone() for p in net.parameters()]
+        wb = FakeWandb()
+        run(net, d, num_epochs=1, wandb=wb, crop=(24, 24), crop_batch=2,
+            val_mode="single_pass", dead_grad_alarm=0.5)
+        assert any(not torch.equal(a, b) for a, b in zip(before, net.parameters()))
+        assert "val/psnr" in wb.keys()
+
+
 def main():
     tests = sorted((n, f) for n, f in globals().items() if n.startswith("test_") and callable(f))
     failed = 0

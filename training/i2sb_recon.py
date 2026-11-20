@@ -51,6 +51,16 @@ METRICS are always taken on the MAGNITUDE against the stored `image` -- the grou
 one-shot grid is scored on -- which "operator" leaves unchanged wherever the offline maps have
 support (their |.| agree there; outside it the stored image is exactly 0).
 
+CROP TO BATCH (`crop`, `crop_batch`, cfg["training"]; off by default). Volumes differ in matrix
+size, so the loader serves one slice and every slice is measured on its own grid. A PURELY
+IMAGE-DOMAIN regressor (one that never reads y or E: `image_domain_only`, e.g. SBReconUnet) does not
+need that grid, so each measured slice's image-domain tensors (x0, x1, guide, gt, organ mask) are
+CENTER-CROPPED to `crop` and `crop_batch` slices are stacked into one batch per step -- as
+training/contrast_transfer.py does. The crop drops the empty readout oversampling, so every slice's
+loss is an average over anatomy rather than over a FOV that is half background. kappa (tau_scale)
+is taken from each slice's FULL x1, so the bridge noise is what the uncropped sampler injects.
+Validation and sampling stay on the full grid (the sampler needs E); the net is fully convolutional.
+
 Validation (`val_mode`, cfg["i2sb"]):
     "single_pass"   one bridge step per slice, one forward -- the training objective. The step
                     is random, or `val_step` for every slice (negative counts from the end, so
@@ -176,6 +186,29 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
     return x0, x1, y, E, sigma_n, organ_mask, image, guide
 
 
+def _cat0(vs):
+    """Concatenate per-slice tensors along the batch dim; 0-d values become (1,)."""
+    return torch.cat([v.reshape(1) if v.dim() == 0 else v for v in vs], dim=0)
+
+
+def _crop_stack(parts, crop, kappa_fn):
+    """`_measure` outputs of several slices -> ONE image-domain batch (see "CROP TO BATCH").
+
+    x0, x1, the guide, gt and the organ mask are centre-cropped to `crop` and stacked. y and E stay
+    on each slice's own grid and cannot be stacked, so they come back None: only an
+    `image_domain_only` net takes this path. kappa is each slice's own, from its FULL x1.
+    -> (x0, x1, None, None, sigma_n, organ_mask, gt, guide, kappa)"""
+    from training.contrast_transfer import _center_crop
+    x0, x1, _, _, sigma_n, organ, gt, guide = zip(*parts)
+    kap = [kappa_fn(v) for v in x1]
+    kappa = None if all(k is None for k in kap) else _cat0(
+        [torch.as_tensor(k, device=v.device).reshape(-1) for k, v in zip(kap, x1)])
+    crop_cat = lambda vs: torch.cat([_center_crop(v, crop) for v in vs], dim=0)   # noqa: E731
+    guide = None if all(g is None for g in guide) else crop_cat(guide)
+    return (crop_cat(x0), crop_cat(x1), None, None, _cat0(sigma_n), crop_cat(organ),
+            crop_cat(gt), guide, kappa)
+
+
 def train_i2sb_recon(
     net, opt, sched, device,
     train_loader,
@@ -197,6 +230,17 @@ def train_i2sb_recon(
     use_organ_mask=False,            # mask the loss AND the metrics/panel, as train_recon does
     metric_range=1.0,                # PSNR/SSIM data range: a number, or "gt_max" (per slice)
     accum_steps=1,
+    crop=None,                       # (H, W): centre-crop the image-domain pair and stack
+    crop_batch=1,                    # slices per step (needs crop); image-domain nets only, see
+                                     # "CROP TO BATCH" in the module docstring
+    dead_grad_alarm=None,            # stop the run when at least this fraction of the trainable
+                                     # tensors gets EXACTLY zero gradient (checked on each epoch's
+                                     # last step): a net cut off from its loss, as sbunet_inv was
+                                     # (2026-11-20). None = off. train/grad_norm (pre-clip, mean and
+                                     # max) and train/zero_grad_frac are logged either way
+    dead_grad_after=1000,            # ... but only from this step on: ADM zero-initializes every
+                                     # residual branch's output conv, so at the start most tensors
+                                     # get exactly zero gradient until those convs move off zero
     ema_decay=None,
     ema_warmup=True,
     noise_std=(0.0, 0.01),           # measurement noise, as train_recon
@@ -287,6 +331,16 @@ def train_i2sb_recon(
         raise ValueError(f"val_step={val_step} is a single_pass setting; val_mode is {val_mode!r}")
     if accum_steps < 1:
         raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
+    if int(crop_batch) < 1:
+        raise ValueError(f"crop_batch must be >= 1, got {crop_batch}")
+    if crop is None and int(crop_batch) != 1:
+        raise ValueError("crop_batch > 1 stacks CROPPED slices; set crop (H, W) too")
+    if crop is not None and not getattr(net, "image_domain_only", False):
+        raise ValueError(f"crop needs a purely image-domain net (image_domain_only): "
+                         f"{type(net).__name__} reads y / E on the measured grid")
+    n_slices = int(crop_batch) if crop is not None else 1
+    if dead_grad_alarm is not None and not 0.0 < float(dead_grad_alarm) <= 1.0:
+        raise ValueError(f"dead_grad_alarm is a fraction in (0, 1], got {dead_grad_alarm}")
     if int(dc_iters) < 0 or float(dc_lam) < 0:
         raise ValueError(f"need dc_iters >= 0 and dc_lam >= 0, got {dc_iters}, {dc_lam}")
 
@@ -340,27 +394,39 @@ def train_i2sb_recon(
     pbar = tqdm(total=num_epochs * steps_per_epoch, initial=start_epoch * steps_per_epoch,
                 desc="I2SB-recon", dynamic_ncols=True)
 
+    trainable = [p for p in net.parameters() if p.requires_grad]
     for epoch in range(start_epoch, num_epochs):
         net.train()
         running_loss, n_batches = 0.0, 0
+        gnorm_sum = torch.zeros((), device=device)
+        gnorm_max = torch.zeros((), device=device)
+        zero_frac = torch.zeros((), device=device)
 
         for _ in range(steps_per_epoch):
             opt.zero_grad(set_to_none=True)
             step_loss = 0.0
             for _ in range(accum_steps):
-                try:
-                    batch = next(train_iter)
-                except StopIteration:
-                    train_iter = iter(train_loader)
-                    batch = next(train_iter)
-                x0, x1, y, E, sigma_n, organ_mask, gt, guide = _measure(
-                    batch, net, device, kspace_type=kspace_type, noise_std=noise_std,
-                    guide_offset="random", **meas)
+                parts = []
+                for _ in range(n_slices):
+                    try:
+                        batch = next(train_iter)
+                    except StopIteration:
+                        train_iter = iter(train_loader)
+                        batch = next(train_iter)
+                    parts.append(_measure(
+                        batch, net, device, kspace_type=kspace_type, noise_std=noise_std,
+                        guide_offset="random", **meas))
+                if crop is None:
+                    x0, x1, y, E, sigma_n, organ_mask, gt, guide = parts[0]
+                    kappa = kappa_fn(x1)
+                else:
+                    x0, x1, y, E, sigma_n, organ_mask, gt, guide, kappa = _crop_stack(
+                        parts, crop, kappa_fn)
 
                 b = x0.shape[0]
                 step = torch.randint(0, interval, (b,), device=device)
                 x_t = forward_sample(bridge, step, x0, x1, deterministic=deterministic,
-                                     noise_scale=kappa_fn(x1))
+                                     noise_scale=kappa)
                 std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
                 pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
                                         guide=guide)
@@ -377,8 +443,22 @@ def train_i2sb_recon(
                 (loss / accum_steps).backward()
                 step_loss = step_loss + loss.detach() / accum_steps
 
+            # the gradient BEFORE clipping (clip_grad_norm_ returns it), kept on the device
             if clip_grad is not None:
-                nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
+                gnorm = nn.utils.clip_grad_norm_(trainable, clip_grad)
+            else:
+                gnorm = torch.linalg.vector_norm(torch.stack(
+                    [torch.linalg.vector_norm(p.grad.detach()) for p in trainable
+                     if p.grad is not None] or [torch.zeros((), device=device)]))
+            gnorm_sum = gnorm_sum + gnorm.detach()
+            gnorm_max = torch.maximum(gnorm_max, gnorm.detach())
+            if n_batches == steps_per_epoch - 1:
+                # the epoch's last step: the share of tensors whose gradient is EXACTLY zero (or
+                # absent). A healthy net has ~none; a trunk cut off from the loss has nearly all
+                zero_frac = torch.stack(
+                    [(p.grad.detach().abs().amax() == 0) if p.grad is not None
+                     else torch.ones((), dtype=torch.bool, device=device)
+                     for p in trainable]).float().mean()
             opt.step()
             if ema is not None:
                 ema.update()
@@ -396,6 +476,17 @@ def train_i2sb_recon(
         global_step = (epoch + 1) * steps_per_epoch
         avg_loss = float(running_loss) / max(n_batches, 1)
         nonfinite = not math.isfinite(avg_loss)
+        grad_stats = {"grad_norm": float(gnorm_sum) / max(n_batches, 1),
+                      "grad_norm_max": float(gnorm_max), "zero_grad_frac": float(zero_frac)}
+        if (dead_grad_alarm is not None and global_step >= int(dead_grad_after)
+                and grad_stats["zero_grad_frac"] >= float(dead_grad_alarm)):
+            raise RuntimeError(
+                f"[epoch {epoch}, step {global_step}] {grad_stats['zero_grad_frac']:.0%} of the "
+                f"trainable tensors got EXACTLY zero gradient (dead_grad_alarm "
+                f"{dead_grad_alarm}): the network is cut off from the loss -- e.g. activations "
+                f"overflowing a normalization -- and cannot recover. Stopping; pre-clip gradient "
+                f"norm this epoch: mean {grad_stats['grad_norm']:.3e}, max "
+                f"{grad_stats['grad_norm_max']:.3e}.")
 
         with torch.no_grad():
             x0_m, pred_m = apply_loss_mask(gt, pred, organ_mask, use_organ_mask)
@@ -421,9 +512,10 @@ def train_i2sb_recon(
 
         if wandb and not nonfinite:
             wandb.log({"train/loss": avg_loss, "train/lr": get_lr(opt)[0], "train/epoch": epoch,
-                       **{f"train/{k}": v for k, v in train_metrics.items()}}, step=global_step)
+                       **{f"train/{k}": v for k, v in train_metrics.items()},
+                       **{f"train/{k}": v for k, v in grad_stats.items()}}, step=global_step)
         elif not wandb:
-            print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics})
+            print({"epoch": epoch, "avg_loss": avg_loss, **train_metrics, **grad_stats})
 
         at_val = bool(val_every_epochs) and (epoch + 1) % val_every_epochs == 0
         if val_loader is not None and at_val:

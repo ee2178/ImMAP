@@ -68,6 +68,11 @@ def build_scheduler(optimizer, cfg):
             **sched_cfg["params"]
         )
 
+    if sched_cfg["type"] == "WarmupCosine":
+        # linear warmup, then cosine to eta_min (training/common.py::warmup_cosine)
+        from training.common import warmup_cosine
+        return warmup_cosine(optimizer, **sched_cfg["params"])
+
     if sched_cfg["type"] == "StepLR":
         return torch.optim.lr_scheduler.StepLR(
             optimizer,

@@ -405,6 +405,34 @@ def load_ckpt_meta(path, device="cpu"):
 # for the cosine, lr_new - lr_old = ((1 + cos)/2) * base * (factor - 1) < 0.
 
 
+def warmup_cosine(optimizer, warmup_steps, T_max, eta_min=0.0):
+    """
+    Linear warmup, then cosine decay: scheduler type "WarmupCosine" (train.py).
+
+    The LR rises linearly from base / warmup_steps to the base LR over the first `warmup_steps`
+    steps, then follows the cosine from the base LR down to `eta_min` at step `T_max` (and stays
+    there). A LambdaLR, so `rescale_schedule` (backtracking) re-points it like any other; one
+    lambda per param group, since `eta_min` is a floor relative to that group's base.
+    """
+    import math
+
+    warmup_steps, T_max = int(warmup_steps), int(T_max)
+    if warmup_steps < 1 or T_max <= warmup_steps:
+        raise ValueError(f"WarmupCosine needs 1 <= warmup_steps < T_max, got {warmup_steps}, {T_max}")
+
+    def make(base):
+        floor = float(eta_min) / base if base > 0 else 0.0
+
+        def factor(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            p = min(1.0, (step - warmup_steps) / (T_max - warmup_steps))
+            return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * p))
+        return factor
+
+    return LambdaLR(optimizer, lr_lambda=[make(float(g["lr"])) for g in optimizer.param_groups])
+
+
 def initial_lrs(optimizer):
     """
     The learning rates this run STARTED from, one per param group.

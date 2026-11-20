@@ -64,6 +64,10 @@ class SBReconUnet(nn.Module):
 
     guide_domain = "image"         # the loops hand a guided net the coil-combined side image
 
+    # y, E and sigma_n are accepted and ignored: the net reads only image-domain tensors, so
+    # training/i2sb_recon.py may centre-crop and stack slices ("CROP TO BATCH")
+    image_domain_only = True
+
     def __init__(self, cond_x1=True, guided=False, predict="x0", **unet_kws):
         super().__init__()
         self.cond_x1 = bool(cond_x1)
