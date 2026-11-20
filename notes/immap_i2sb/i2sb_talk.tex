@@ -217,15 +217,11 @@
   \only<2->{\node[anchor=south east] at (220,192) {$\x_1$};}
   \only<3->{\draw[den] (P1) -- (G1); \fill[cmean] (G1) circle (2pt);}
   \only<4->{\draw[ren] (G1) -- (P2); \fill (P2) circle (2.2pt);}
-  % step 5: red + blue = a partial step toward the mean (h = 0.35 here), plus fresh noise
-  \only<5>{\coordinate (H) at ($(P1)!0.35!(G1)$);
-           \draw[->, black, very thick, dashed, shorten >=1pt] (P1) -- (H);
-           \fill (H) circle (2.2pt);
-           \draw[black!50, densely dotted, thick] (H) -- (P2);
-           \node[anchor=south west, font=\scriptsize, align=left, fill=white, fill opacity=0.8,
-                 text opacity=1, inner sep=1pt] at ($(H)+(8,-6)$)
-                {part way to the mean};
-           \node[anchor=east, font=\scriptsize, black!60] at ($(H)!0.5!(P2)+(-6,0)$) {noise};}
+  % step 5: red + blue = the whole step, from the start to the tip of the blue arrow
+  \only<5>{\draw[->, black, very thick, dashed, shorten <=1.5pt, shorten >=1.5pt] (P1) -- (P2);
+           \node[anchor=east, font=\scriptsize, fill=white, fill opacity=0.8, text opacity=1,
+                 inner sep=1pt] at ($(P1)!0.5!(P2)+(-8,0)$)
+                {\textcolor{cmean}{red} $+$ \textcolor{ca}{blue}};}
   \only<6->{\draw[den] (P2) -- (G2); \fill[cmean] (G2) circle (2pt);
             \draw[ren] (G2) -- (P3); \fill (P3) circle (2.2pt);}
   \only<7->{\draw[den] (P3) -- (G3); \fill[cmean] (G3) circle (2pt);
