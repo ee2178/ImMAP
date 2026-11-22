@@ -314,6 +314,30 @@ def test_single_pass_at_the_top_step():
                "single_pass setting")
 
 
+def test_single_pass_validation_runs_without_autograd():
+    """The one-step validation path (predict_x0_recon) builds no graph: with autograd on, an
+    sbunet's attention activations piled up across val batches and ran an 80 GB GPU out of
+    memory at the first validation (2026-11-20). Training steps keep autograd."""
+    import training.i2sb_recon as tir
+    grad_on, real = [], tir.predict_x0_recon
+
+    def spy(net, x_t, std_fwd, **kw):
+        out = real(net, x_t, std_fwd, **kw)
+        grad_on.append((net.training, torch.is_grad_enabled(), out.requires_grad))
+        return out
+
+    tir.predict_x0_recon = spy
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            run(make_net(), d, num_epochs=1, val_mode="single_pass")
+    finally:
+        tir.predict_x0_recon = real
+    val = [g for g in grad_on if not g[0]]
+    assert val, "validation never called the net"
+    assert not any(enabled or req for _, enabled, req in val), val
+    assert any(enabled for training, enabled, _ in grad_on if training)   # training: autograd
+
+
 def test_refuses_schedule_mismatch_and_embedding():
     with tempfile.TemporaryDirectory() as d:
         raises(ValueError, lambda: run(make_net(tau=0.2), d), "schedule mismatch")

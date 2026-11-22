@@ -647,6 +647,7 @@ def measurement_support(y, E, meas, thresh):
     return online_support(y, mask, acs, thresh, **(meas.get("online_smaps_kws") or {}))
 
 
+@torch.no_grad()   # the one-step path (predict_x0_recon) is otherwise run with autograd on
 def _validate(net, bridge, val_loader, device, *, val_seed, **kws):
     """-> mean {"loss", "psnr", "ssim", "nrmse", "zf_psnr", "zf_ssim", "zf_nrmse"} over the split.
 
