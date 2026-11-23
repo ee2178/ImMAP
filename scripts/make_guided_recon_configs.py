@@ -367,6 +367,24 @@ for _n in TGVN_CASCADE_SWEEP:
         model=dict(type="TGVN", params=dict(guided=True, cond_sigma=True, use_smaps=True,
                                             **dict(TGVN_SIZE, num_cascades=_n))))
 
+# SSDU LOSS (2026-11-23; training/ssdu.py, training.kspace_loss): the same three nets trained
+# without an image-domain loss -- each step the acquired lines are split into input lines and
+# held-out lines (40% of the non-ACS lines, the ACS stays in the input), and the loss is SSDU's
+# normalized l1 + l2 on the held-out multicoil k-space through the operator's maps. Tests whether
+# the horizontal streaks come from an image loss rewarding the reference's (correlated) noise.
+# Validation, the best-val checkpoint and every metric stay image-domain, on all acquired lines.
+# LGGS here is lggs_guide_w (the guide's own W_phi^g, W_alpha^g). By name: MODELS="... _ssdu".
+SSDU_TRAINING = dict(kspace_loss="ssdu", ssdu_rho=0.4)
+# TGVN's cells return the MAGNITUDE (upstream's output), which a k-space loss cannot score: its
+# SSDU cell returns the complex image instead (output="complex", which needs the known maps it
+# already uses). So tgvn_c6_ssdu differs from tgvn_c6 in the output too, not only the loss.
+for _base in ("lpdsnet", "tgvn_c6", "lggs_guide_w"):
+    MODELS[f"{_base}_ssdu"] = dict(
+        MODELS[_base], training=dict(MODELS[_base].get("training") or {}, **SSDU_TRAINING))
+MODELS["tgvn_c6_ssdu"]["model"] = dict(
+    MODELS["tgvn_c6"]["model"], params=dict(MODELS["tgvn_c6"]["model"]["params"],
+                                            output="complex"))
+
 # Bridge starting points for i2sb-TGVN (sb/i2sb_recon.py::bridge_start), at every sweep depth so
 # the launcher can pick the settled one: sbtgvn_c<N>_<start>.
 BRIDGE_STARTS = ("guide", "adjoint", "acs")

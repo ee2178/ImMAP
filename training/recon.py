@@ -34,6 +34,7 @@ from visualization.image import levels_panel, recon_panel, upsample_repeat
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
 from operators.fourier import ifftc
+from training.ssdu import KSPACE_LOSSES, kspace_nl1nl2, ssdu_split
 
 
 # `_embed` moved to training/common.py so evaluation/tasks.py can build the
@@ -398,6 +399,15 @@ def train_recon(
     val_kspace_type=None,
     ### Loss
     loss_type="complex-mse",
+    # K-SPACE TRAINING LOSS (training/ssdu.py), in place of `loss_type` for TRAINING only:
+    #   None         the image-domain `loss_type` against the reference (default)
+    #   "ssdu"       SSDU: the acquired lines split per step into input and held-out lines
+    #                (`ssdu_rho` of the non-ACS lines held out); loss on the held-out k-space
+    #   "unsampled"  input all acquired lines; loss on the measured k-space the net did NOT get
+    # Validation, its loss (best-val checkpoint, val backtracking) and every metric stay in the
+    # image domain against the reference, on the full acquired lines.
+    kspace_loss=None,
+    ssdu_rho=0.4,
     # `organ_mask` is the coil-sensitivity support the recon loader returns.
     # This ONE flag governs all three places it can act, because splitting it
     # would let the loss optimise one region while the curves scored another:
@@ -476,6 +486,21 @@ def train_recon(
     net.train()
 
     loss_fn = LOSS_REGISTRY[loss_type]
+    if kspace_loss is not None:
+        if kspace_loss not in KSPACE_LOSSES:
+            raise ValueError(f"kspace_loss must be None or one of {KSPACE_LOSSES}, "
+                             f"got {kspace_loss!r}")
+        if whiten_kspace:
+            raise ValueError("kspace_loss compares the net's k-space with y through the coil "
+                             "maps; not implemented with whiten_kspace")
+        if level_loss_weight:
+            raise ValueError("kspace_loss with per-level supervision is not implemented")
+        if kspace_loss == "unsampled" and kspace_type == "simulated":
+            raise ValueError("kspace_loss='unsampled' scores the MEASURED k-space; use "
+                             "kspace_type 'measurement_awgn' (or 'ssdu')")
+        print(f"k-space training loss: {kspace_loss}"
+              + (f" (rho {ssdu_rho} of the non-ACS lines held out)"
+                 if kspace_loss == "ssdu" else ""))
     ckpt_path = os.path.join(save_dir, "net.ckpt")
     bestval_path = os.path.join(save_dir, BESTVAL_CKPT)
     # A best-val checkpoint is trusted only on a RESUME. On a fresh start one
@@ -592,7 +617,18 @@ def train_recon(
             )
 
             smaps = extra["smaps"]
-            E = Mask(mask) @ FFT2D() @ Sense(smaps)
+            # k-space loss: what the net is given (y, the mask in E) and what it is scored
+            # against (k_loss on the lines m_loss). The maps above came from ALL acquired lines'
+            # ACS, which stays in the input either way.
+            in_mask = mask
+            if kspace_loss == "ssdu":
+                in_mask, m_loss = ssdu_split(mask, y.shape[0], ssdu_rho)
+                k_loss = m_loss * y
+                y = in_mask * y
+            elif kspace_loss == "unsampled":
+                m_loss = 1.0 - (mask != 0).to(torch.float32)
+                k_loss = m_loss * kspace
+            E = Mask(in_mask) @ FFT2D() @ Sense(smaps)
 
             # Solve on a grid the network can halve cleanly, measure on the one
             # the scanner used. T crops back and its adjoint zero-pads, so
@@ -616,11 +652,17 @@ def train_recon(
             if zinv is not None:
                 recon = zinv * recon
 
-            image_l, recon_l = apply_loss_mask(
-                image, recon, organ_mask, use_organ_mask,
-            )
-
-            loss = loss_fn(image_l, recon_l, sigma_n)
+            if kspace_loss is not None:
+                if not torch.is_complex(recon):
+                    raise ValueError(f"kspace_loss needs a complex reconstruction; "
+                                     f"{type(net).__name__} returned a real (magnitude) image "
+                                     f"(TGVN: output='complex')")
+                loss = kspace_nl1nl2(FFT2D()(Sense(smaps)(recon)), k_loss, m_loss)
+            else:
+                image_l, recon_l = apply_loss_mask(
+                    image, recon, organ_mask, use_organ_mask,
+                )
+                loss = loss_fn(image_l, recon_l, sigma_n)
             if level_weights:
                 loss = loss + _level_loss(net, lv.levels, recon_e, x0, image, organ_mask,
                                           T, zinv, use_organ_mask, level_weights,
