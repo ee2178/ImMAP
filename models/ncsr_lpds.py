@@ -35,12 +35,22 @@ Leave-one-out (`include_center=False`, default): the self window omits the pixel
 With it, a matched pixel predicts itself and the penalty on it can vanish (beta P_rr -> 1).
 
 COST / MEMORY. Prototype: everything is gathered offset by offset with `torch.roll` (periodic
-windows, as the circulant kernels), no materialised (B, M, W^2, H, W) tensor:
-  * `_WindowApply` applies Gamma (and its adjoint Gamma^H, the transposed pass the notes call
-    for) with a hand-written backward that saves only (Gamma, values);
-  * the weights are built under activation checkpointing (recomputed in the backward).
-Per layer that is O((W_s^2 + G W_g^2) M H W) work in a Python loop over offsets; fine for a
-prototype, a fused kernel later (circatt.py already has the transport forward and the dv pass).
+windows, as the circulant kernels), no materialised (B, M, W^2, H, W) tensor, and the weights
+built under activation checkpointing (recomputed in the backward). Two backends:
+
+  fused (CUDA + triton; `FUSED`, default "auto")  models/circulant_window.py's kernels, the ones
+      LGGS's triton_materialize path uses. A complex Gamma on complex codes is two REAL window
+      applies on [re | im] (channel chunks of <= 128): Gamma x = (A_r x_r - A_i x_i) +
+      i (A_r x_i + A_i x_r); Gamma^H x is the kernel's transpose with the sign of A_i flipped.
+      The weights' Re / Im (k^H q) and |k|^2 come from the window-dot kernel. Nothing of size
+      (M, W^2, H, W) is touched per offset.
+  roll (CPU, and the reference)  an offset loop over torch.roll with a hand-written backward
+      (`_WindowApply`). 2026-11-23: at knee size this ran 22 s / step on the GPU -- every
+      offset materialised a rolled copy of the 169-channel code, ~200 per apply, 3 applies per
+      layer, 30 layers, x3 for the backward; 86% of the time was the applies.
+
+Windows are always FULL (win x win, the kernels' layout); leave-one-out is the centre's score
+set to -inf, so its weight is exactly 0.
 """
 
 from __future__ import annotations
@@ -131,8 +141,99 @@ class _WindowApply(torch.autograd.Function):
         return gG, gx, None, None
 
 
-def window_apply(G, x, offsets, adjoint=False):
+# -- the fused backend (models/circulant_window.py) ---------------------------------------
+from models import circulant_window as cw          # noqa: E402
+
+#: True: always the fused path (on the CPU that is circulant_window's torch reference, which
+#: is how the tests check it); False: always the roll path; "auto": fused on CUDA with triton.
+FUSED = "auto"
+_CHUNK = 128                                        # the apply kernel's channel limit
+
+
+def _fused(t):
+    if FUSED == "auto":
+        return t.is_cuda and cw.HAVE_TRITON and not cw.FORCE_REFERENCE
+    return bool(FUSED)
+
+
+def _to_seq(x):
+    """(B, h, c, H, W) complex -> (B h, H W, 2c) real, [re | im] channel-last."""
+    B, h, c, H, W = x.shape
+    return torch.cat([x.real, x.imag], 2).reshape(B * h, 2 * c, H * W).transpose(1, 2).contiguous()
+
+
+def _real_apply(P, v, H, W, win, transpose):
+    """circulant_window.window_apply in channel chunks the kernel takes."""
+    outs = [cw.window_apply(P, v[..., i:i + _CHUNK], H, W, win, transpose)
+            for i in range(0, v.shape[-1], _CHUNK)]
+    return outs[0] if len(outs) == 1 else torch.cat(outs, -1)
+
+
+def _fused_apply(G, x, win, adjoint):
+    B, h, K, H, W = G.shape
+    c = x.shape[2]
+    Pr = G.real.reshape(B * h, K, H * W)
+    Pi = G.imag.reshape(B * h, K, H * W)
+    v = _to_seq(x)
+    Ar = _real_apply(Pr, v, H, W, win, adjoint)           # [A_r x_r | A_r x_i]
+    Ai = _real_apply(Pi, v, H, W, win, adjoint)           # [A_i x_r | A_i x_i]
+    if adjoint:                                           # conj(G)^T
+        re, im = Ar[..., :c] + Ai[..., c:], Ar[..., c:] - Ai[..., :c]
+    else:
+        re, im = Ar[..., :c] - Ai[..., c:], Ar[..., c:] + Ai[..., :c]
+    return torch.complex(re, im).transpose(1, 2).reshape(B, h, c, H, W)
+
+
+def window_apply(G, x, offsets, adjoint=False, win=None):
+    """Gamma x, or Gamma^H x. `win`: the full window the offsets are (enables the fused path)."""
+    if win is not None and _fused(x):
+        return _fused_apply(G, x, int(win), bool(adjoint))
     return _WindowApply.apply(G, x, tuple(offsets), bool(adjoint))
+
+
+def _dot_ref(x, y, H, W, win):
+    """(B, K, HW): <x_j, y_{j+o}> over the channels, offset by offset (torch reference)."""
+    return torch.stack([(x * cw._nb(y, dr, dc, H, W)).sum(-1) for dr, dc in cw._offsets(win)],
+                       dim=1)
+
+
+class _WindowDot(torch.autograd.Function):
+    """S[o, j] = <x_j, y_{j+o}> (real, channel-last (B, HW, C)). dx = A(g) y, dy = A(g)^T x."""
+
+    @staticmethod
+    def forward(ctx, x, y, H, W, win):
+        x, y = x.contiguous(), y.contiguous()
+        ctx.save_for_backward(x, y)
+        ctx.cfg = (H, W, win)
+        if cw._use_kernel(x):                     # channel chunks, as the apply kernel takes
+            return sum(cw._launch_dot(x[..., i:i + _CHUNK].contiguous(),
+                                      y[..., i:i + _CHUNK].contiguous(), H, W, win)
+                       for i in range(0, x.shape[-1], _CHUNK))
+        return _dot_ref(x, y, H, W, win)
+
+    @staticmethod
+    def backward(ctx, g):
+        x, y = ctx.saved_tensors
+        H, W, win = ctx.cfg
+        g = g.contiguous()
+        dx = _real_apply(g, y, H, W, win, False) if ctx.needs_input_grad[0] else None
+        dy = _real_apply(g, x, H, W, win, True) if ctx.needs_input_grad[1] else None
+        return dx, dy, None, None, None
+
+
+def _branch_scores_fused(q, k, win, eps):
+    """`_branch_scores` from three window dots: Re k^H q, Im k^H q, |k|^2."""
+    B, h, d, H, W = q.shape
+    K = int(win) ** 2
+    qs, ks = _to_seq(q), _to_seq(k)                       # [qr | qi], [kr | ki]
+    qj = torch.cat([qs[..., d:], -qs[..., :d]], -1)       # [qi | -qr]
+    re = _WindowDot.apply(qs, ks, H, W, win)              # sum kr qr + ki qi
+    im = _WindowDot.apply(qj, ks, H, W, win)              # sum kr qi - ki qr
+    kk = _WindowDot.apply(torch.ones_like(ks), ks.pow(2), H, W, win)    # sum |k|^2, 2d wide
+    mag = torch.sqrt(re ** 2 + im ** 2 + eps)
+    shape = (B, h, K, H, W)
+    return ((mag - 0.5 * kk).reshape(shape),
+            torch.complex(re / mag, im / mag).reshape(shape))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -151,11 +252,24 @@ def _branch_scores(q, k, offsets, eps):
     return torch.stack(s, dim=2), torch.stack(w, dim=2)
 
 
-def joint_adjacency(q, k_self, k_guides, self_offsets, guide_offsets, eps=1e-8):
-    """[G_self, G_guide_1, ...]: complex weights P * omega under one softmax over all of them."""
+def joint_adjacency(q, k_self, k_guides, self_offsets, guide_offsets, eps=1e-8,
+                    mask_center=False):
+    """[G_self, G_guide_1, ...]: complex weights P * omega under one softmax over all of them.
+    Full windows; `mask_center`: the self branch's centre gets weight 0 (leave-one-out)."""
     branches = [(k_self, self_offsets)] if len(self_offsets) else []
     branches += [(k, guide_offsets) for k in k_guides]
-    scores, phases = zip(*[_branch_scores(q, k, offs, eps) for k, offs in branches])
+
+    def scores_of(k, offs):
+        if _fused(q):
+            return _branch_scores_fused(q, k, int(round(len(offs) ** 0.5)), eps)
+        return _branch_scores(q, k, offs, eps)
+
+    scores, phases = map(list, zip(*[scores_of(k, offs) for k, offs in branches]))
+    if mask_center and len(self_offsets):
+        c = len(self_offsets) // 2                        # (0, 0) of a full window
+        keep = torch.ones(len(self_offsets), dtype=torch.bool, device=q.device)
+        keep[c] = False
+        scores[0] = scores[0].masked_fill(~keep.view(1, 1, -1, 1, 1), float("-inf"))
     P = torch.softmax(torch.cat(scores, dim=2), dim=2)
     G = P.to(phases[0].dtype) * torch.cat(phases, dim=2)
     return torch.split(G, [len(o) for _, o in branches], dim=2)
@@ -184,7 +298,11 @@ class NCSRAttention(nn.Module):
         self.window, self.guide_window = int(window), int(guide_window)
         self.include_center = bool(include_center)
         self.separate_guide_w = bool(separate_guide_w)
-        self.self_offsets = window_offsets(self.window, self.include_center)
+        # full windows (the kernels' layout); leave-one-out masks the centre's score. A 1x1
+        # leave-one-out self window is empty: the guide branches alone.
+        self.mask_center = not self.include_center and self.window > 1
+        self.self_offsets = (() if self.window == 1 and not self.include_center
+                             else window_offsets(self.window, True))
         self.guide_offsets = window_offsets(self.guide_window, True)
         pix = lambda: Conv2d(M, Mh, 1, bias=False, complex=True)        # noqa: E731
         self.Wtheta, self.Wphi = pix(), pix()
@@ -219,10 +337,10 @@ class NCSRAttention(nn.Module):
     def forward(self, u, v_guides, sigma=None):
         """The weights [G_self, G_1, ...] for the code u (B, M, H, W) and guide codes v_g."""
         q, k, kg = self._features(u, v_guides, sigma)
-        so, go, eps = self.self_offsets, self.guide_offsets, self.eps
+        so, go, eps, mc = self.self_offsets, self.guide_offsets, self.eps, self.mask_center
 
         def build(q, k, *kg):
-            return joint_adjacency(q, k, list(kg), so, go, eps)
+            return joint_adjacency(q, k, list(kg), so, go, eps, mask_center=mc)
 
         if self.checkpoint and torch.is_grad_enabled():
             return checkpoint(build, q, k, *kg, use_reentrant=False)
@@ -293,21 +411,23 @@ class NCSRLPDSLayer(nn.Module):
         """(I - beta Gamma_zz) u, on the code u."""
         if not attn.self_offsets:
             return u
-        Gu = window_apply(Gs, attn.heads(u), attn.self_offsets).reshape(u.shape)
+        Gu = window_apply(Gs, attn.heads(u), attn.self_offsets, win=attn.window).reshape(u.shape)
         return u - beta * Gu
 
     def _KH(self, z, Gs, attn, beta):
         """(I - beta Gamma_zz)^H z = z - Gamma_zz^H (beta z)."""
         if not attn.self_offsets:
             return z
-        Gz = window_apply(Gs, attn.heads(beta * z), attn.self_offsets, adjoint=True)
+        Gz = window_apply(Gs, attn.heads(beta * z), attn.self_offsets, adjoint=True,
+                          win=attn.window)
         return z - Gz.reshape(z.shape)
 
     def _offset(self, Gg, v, attn, beta):
         """b = beta sum_g Gamma_zw,g v_g."""
         b = 0
         for G, vg in zip(Gg, v):
-            b = b + window_apply(G, attn.heads(vg), attn.guide_offsets).reshape(vg.shape)
+            b = b + window_apply(G, attn.heads(vg), attn.guide_offsets,
+                                 win=attn.guide_window).reshape(vg.shape)
         return beta * b
 
     def adjacency(self, x, guides, attn, sigma, cache, dK):

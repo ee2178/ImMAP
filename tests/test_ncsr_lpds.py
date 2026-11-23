@@ -91,6 +91,52 @@ def test_transport_makes_the_guide_phase_irrelevant():
     assert torch.allclose(a, b), (a - b).abs().max()
 
 
+def test_window_dot_gradcheck():
+    import models.ncsr_lpds as m
+    x = torch.randn(1, 20, 3, dtype=torch.float64, requires_grad=True)
+    y = torch.randn(1, 20, 3, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(lambda x, y: m._WindowDot.apply(x, y, 4, 5, 3), (x, y))
+
+
+def test_leave_one_out_centre_has_zero_weight():
+    net = _small_net()
+    u = crandn(1, 8, 4, 4, dtype=torch.complex64)
+    Gs, Gg = net.attn(u, [crandn(1, 8, 4, 4, dtype=torch.complex64)])
+    c = len(net.attn.self_offsets) // 2
+    assert net.attn.self_offsets[c] == (0, 0) and float(Gs[:, :, c].abs().max()) == 0.0
+    tot = Gs.abs().sum(2) + Gg.abs().sum(2)
+    assert torch.allclose(tot, torch.ones_like(tot), atol=1e-5)
+
+
+def test_fused_path_matches_roll_path():
+    """FUSED=True routes Gamma's build and every apply through models/circulant_window.py (its
+    torch reference on the CPU: the same code path the triton kernels replace on CUDA); outputs
+    and every gradient must match the roll path. 9 code channels -> 18 real: crosses no chunk;
+    the chunking is checked separately with _CHUNK = 4."""
+    import models.ncsr_lpds as m
+    y = crandn(2, 1, 12, 12, dtype=torch.complex64)
+    w = crandn(2, 1, 12, 12, dtype=torch.complex64)
+    res = {}
+    for fused, chunk in ((False, 128), (True, 128), (True, 4)):
+        m.FUSED, m._CHUNK = fused, chunk
+        try:
+            net = _small_net(M=9, Mh=4, window=3, guide_window=5, separate_guide_w=True)
+            x, _ = net(y, guide=w)
+            x.abs().pow(2).sum().backward()
+            res[(fused, chunk)] = (x.detach(), {n: p.grad.clone() for n, p in
+                                                net.named_parameters() if p.grad is not None})
+        finally:
+            m.FUSED, m._CHUNK = "auto", 128
+    x0, g0 = res[(False, 128)]
+    for key in ((True, 128), (True, 4)):
+        x1, g1 = res[key]
+        assert torch.allclose(x0, x1, atol=1e-5), (key, (x0 - x1).abs().max())
+        assert g0.keys() == g1.keys()
+        for n in g0:
+            assert torch.allclose(g0[n], g1[n], rtol=1e-4, atol=1e-5), \
+                (key, n, (g0[n] - g1[n]).abs().max())
+
+
 def _small_net(**kw):
     p = dict(K=3, M=8, C=1, P=3, s=2, Mh=4, window=3, guide_window=3, dK=2,
              spectral_init=False)
