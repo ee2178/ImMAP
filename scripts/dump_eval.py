@@ -42,6 +42,8 @@ Output
     reference       (n, H, W) complex64   ground truth          } all three x organ_mask
     recon           (n, H, W) complex64   network output        } (attr images_masked)
     zero_filled     (n, H, W) complex64   E^H y -- the artifact to be removed
+    guide           (n, H, W) complex64   paired data only: the side scan, fully sampled,
+                                          coil-combined with the operator's maps
     organ_mask      (n, H, W) uint8       coil-support anatomy mask
     sampling_mask   (n, H, W) uint8       k-space pattern
     slice_index     (n,)      int32       source slice number in the volume
@@ -83,8 +85,8 @@ DUMP_VERSION = 1
 # ---------------------------------------------------------------------------
 # run discovery
 # ---------------------------------------------------------------------------
-def find_runs(root, only=None, exact=False):
-    """Every directory under `root` holding both a config.json and a net.ckpt.
+def find_runs(root, only=None, exact=False, ckpt="net.ckpt"):
+    """Every directory under `root` holding both a config.json and the checkpoint `ckpt`.
 
     `only` filters by the run's path relative to `root` -- a substring match, so
     `--only R8` takes every R=8 cell and `--only mglpds_R8` takes one. With
@@ -93,7 +95,7 @@ def find_runs(root, only=None, exact=False):
     """
     out = []
     for dirpath, _, filenames in os.walk(root):
-        if "config.json" in filenames and "net.ckpt" in filenames:
+        if "config.json" in filenames and ckpt in filenames:
             out.append(dirpath)
     out = sorted(out)
     if only and exact:
@@ -117,7 +119,8 @@ def for_checkpoint(cfg):
     return out
 
 
-def load_run(run_dir, device):
+def load_run(run_dir, device, ckpt="net.ckpt"):
+    """`ckpt`: net.ckpt (recon runs: lowest TRAINING loss) or net_bestval.ckpt (best val)."""
     from models import build_model            # imported late: pulls in CUDA bits
 
     with open(os.path.join(run_dir, "config.json")) as f:
@@ -129,7 +132,7 @@ def load_run(run_dir, device):
     set_planar_state(bool(cfg.get("training", {}).get("planar_state", False)))
 
     model = build_model(for_checkpoint(cfg)).to(device)
-    ckpt = torch.load(os.path.join(run_dir, "net.ckpt"), map_location=device,
+    ckpt = torch.load(os.path.join(run_dir, ckpt), map_location=device,
                       weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -204,7 +207,8 @@ def read_flagged(path, top=0):
 
 def same_source(a, b):
     """Do two val configs read the same images? Columns must, or the figure lies."""
-    keys = ("name", "anatomy", "kspace_root", "smap_root", "scale_fac")
+    keys = ("name", "anatomy", "kspace_root", "smap_root", "scale_fac",
+            "split_csv", "kspace_roots")          # the last two: paired (guided) knee data
     return all(a.get(k) == b.get(k) for k in keys)
 
 
@@ -296,6 +300,11 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         "metrics": list(metrics),
         # -1 = no CG-SENSE stored (HDF5 attributes cannot hold None)
         "cg_sense_lam": (-1.0 if cg_lam is None else float(cg_lam)),
+        "ckpt": str(getattr(args, "ckpt", "net.ckpt")),
+        # paired (guided) data: how the guide the net took was made. The stored `guide`
+        # dataset is the FULLY-SAMPLED side scan either way (evaluation/tasks.py::recon).
+        "guide_R": float(mri.get("guide_R") or 1),
+        "guide_val_offset": float(mri.get("guide_val_offset") or 0),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -348,6 +357,9 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         if "zero_filled" in extras:
             buf.setdefault("zero_filled", []).append(
                 keep(_np(extras["zero_filled"])).astype(np.complex64))
+        if "guide" in extras:
+            buf.setdefault("guide", []).append(
+                keep(_np(extras["guide"])).astype(np.complex64))
         if "cg_sense" in extras:
             buf.setdefault("cg_sense", []).append(
                 keep(_np(extras["cg_sense"])).astype(np.complex64))
@@ -413,6 +425,9 @@ def main():
                    help="with --cg-sense-lam, also store `cg_sense_stored`: the same solve "
                         "through the STORED maps (the reference's) instead of the online "
                         "estimate, to separate map mismatch from aliasing")
+    p.add_argument("--ckpt", default="net.ckpt",
+                   help="checkpoint file in each run dir: net.ckpt (recon runs: lowest "
+                        "training loss) or net_bestval.ckpt (best validation)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)
@@ -427,7 +442,7 @@ def main():
     metrics = build_metrics(args.metrics)
     warm_up(args.metrics, device)             # LPIPS downloads now, not mid-sweep
 
-    runs = find_runs(args.runs, args.only, exact=args.exact)
+    runs = find_runs(args.runs, args.only, exact=args.exact, ckpt=args.ckpt)
     if args.exact and args.only:
         missing = sorted(set(args.only) - {os.path.basename(os.path.normpath(r))
                                            for r in runs})
@@ -435,7 +450,7 @@ def main():
             print(f"[dump] no trained run named: {' '.join(missing)}  (skipped)")
     if not runs:
         raise SystemExit(
-            f"no runs with both config.json and net.ckpt under {args.runs}"
+            f"no runs with both config.json and {args.ckpt} under {args.runs}"
             + (f" matching {args.only}" if args.only else ""))
 
     # One volume list for the whole sweep, resolved from the first run's val
@@ -459,7 +474,7 @@ def main():
     for run_dir in runs:
         rel = os.path.relpath(run_dir, args.runs)
         try:
-            cfg, model, n_params, step = load_run(run_dir, device)
+            cfg, model, n_params, step = load_run(run_dir, device, args.ckpt)
         except Exception as e:                # a bad cell must not sink the sweep
             print(f"[skip] {rel}: {type(e).__name__}: {e}")
             continue

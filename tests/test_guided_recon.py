@@ -1527,6 +1527,113 @@ def test_train_joint_recon_end_to_end():
         assert os.path.exists(os.path.join(d, "net_bestval.ckpt"))
 
 
+def test_loader_volumes_filter():
+    """`volumes=` keeps exactly the named PDFS volumes, in the order given (what dump_eval
+    passes every run), and refuses a name that is not a usable pair."""
+    with tempfile.TemporaryDirectory() as root:
+        csv, _ = make_data(root)
+        ds = PairedKneeDataset(csv, root, volumes=["pdfs2", "pdfs0.h5"], start_slice=1,
+                               end_slice=3, enumerate_slices=True)
+        assert ds.files == ["pdfs2.h5", "pdfs0.h5"], ds.files
+        assert [ds.item_id(i) for i in range(len(ds))] == \
+            [("pdfs2", 1), ("pdfs2", 2), ("pdfs0", 1), ("pdfs0", 2)]
+        raises(ValueError, lambda: PairedKneeDataset(csv, root, volumes=["pdfs9"]), "pdfs9")
+        raises(ValueError, lambda: PairedKneeDataset(csv, root, volumes=["pdfs3"]), "pdfs3")
+
+
+class _Adjoint(torch.nn.Module):
+    """An UNGUIDED stand-in net (no `guide` argument): returns E^H y."""
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.ones(()))
+
+    def forward(self, y, E=None, sigma=None):
+        return self.w * E.adjoint(y)
+
+
+def test_dump_eval_guided_end_to_end():
+    """scripts/dump_eval.py on paired data: a guided net (LGGS) gets the same guide as in
+    training validation, an unguided one none; both dumps store the SAME fully-sampled side
+    scan as `guide`, and the viewer reads it as a shared `@guide` column."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import argparse
+    import dump_eval as de
+    import figures.common as fc
+    import physics.online_smaps as osm
+    from evaluation.metrics import build_metrics
+    from models.guided_lpds import LGGSNet
+
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as out:
+        csv, _ = make_data(root)
+        smap_root = make_maps(root, os.path.join(root, "maps"))
+        cfg = {"task": "recon", "model": {"type": "LGGSNet"},
+               "data": {"val": {"name": "fastmri_paired", "split_csv": csv,
+                                "kspace_roots": [root], "scale_fac": 1.0, "start_slice": 1,
+                                "end_slice": 2, "target": "sense", "smap_root": smap_root,
+                                "organ_mask_source": "smaps", "batch_size": 1,
+                                "num_workers": 0}},
+               "mri": {"R": 4, "acs_lines": 4, "kspace_type": "measurement_awgn",
+                       "online_smaps": "espirit", "guide_R": 1, "guide_val_offset": None},
+               "training": {"val_kspace_type": "measurement_awgn", "use_organ_mask": True,
+                            "val_noise_std": 0.0}}
+        vols = de.resolve_volumes(cfg["data"]["val"], None, 2)
+        assert vols == ["pdfs0", "pdfs1"], vols
+        args = argparse.Namespace(slices="1:3", workers=0, seed=0, limit=None,
+                                  ckpt="net_bestval.ckpt")
+        metrics = build_metrics(["psnr"])
+
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.full_like(y, C ** -0.5)  # no LAPACK here
+        try:
+            torch.manual_seed(0)
+            lggs = Spy(LGGSNet(K=2, M=8, P=3, s=2, Mh=4, guide_window=3,
+                               attn_backend="gather")).eval()
+            nets = {"lggs_R4_g1": lggs, "adj_R4": _Adjoint()}
+            for name, net in nets.items():
+                d = os.path.join(out, name)
+                n = de.dump_run(d, cfg, net, 1, 7, args, vols, metrics, 0.0,
+                                os.path.join(d, "eval_dump"))
+                assert n == 4, (name, n)
+        finally:
+            osm.online_smaps = real
+        assert lggs.guides == [(1, 1, H, W)] * 4, lggs.guides
+
+        expected = {}
+        for v in vols:                         # the PD scan through the operator's (flat) maps
+            with h5py.File(os.path.join(root, v.replace("pdfs", "pd") + ".h5")) as f:
+                k = torch.from_numpy(f["kspace"][1:3])
+            expected[v] = (ifftc(k) * C ** -0.5).sum(dim=1).numpy()
+        for name in nets:
+            for v in vols:
+                with h5py.File(os.path.join(out, name, "eval_dump", v + ".h5")) as f:
+                    for ds in ("reference", "recon", "zero_filled", "guide", "organ_mask",
+                               "sampling_mask", "slice_index", "psnr_slice"):
+                        assert ds in f, (name, v, ds)
+                    assert f["guide"].shape == (2, H, W)
+                    org = f["organ_mask"][()]
+                    assert np.allclose(f["guide"][()], expected[v] * org, atol=1e-5), (name, v)
+                    assert list(f["slice_index"][()]) == [1, 2]
+                    assert f.attrs["ckpt"] == "net_bestval.ckpt"
+                    assert f.attrs["guide_R"] == 1.0 and f.attrs["guide_val_offset"] == 0.0
+
+        # dump_eval --ckpt: a run with only net_bestval.ckpt is found under that name only
+        d = os.path.join(out, "lggs_R4_g1")
+        with open(os.path.join(d, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        open(os.path.join(d, "net_bestval.ckpt"), "wb").close()
+        assert de.find_runs(out, ckpt="net_bestval.ckpt") == [d]
+        assert de.find_runs(out) == []
+
+        fc.DUMP_ROOT = out
+        fc.COLUMNS = [("Zero-filled", "@zero_filled"), ("Guide", "@guide"),
+                      ("LGGS", "lggs_R4_g1"), ("Adjoint", "adj_R4"), ("Ground truth", None)]
+        fc._CACHE.clear()
+        assert fc.volumes() == vols, fc.volumes()
+        g = fc.load("@guide", "pdfs0")
+        assert g.img.shape == (2, H, W) and float(g.img.max()) > 0
+        assert np.allclose(g.img, fc.load("adj_R4:guide", "pdfs0").img)
+
+
 def main():
     tests = sorted((n, f) for n, f in globals().items() if n.startswith("test_") and callable(f))
     failed = 0

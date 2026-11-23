@@ -21,3 +21,4 @@ figures/out/
 # local writing and evaluation outputs
 docs/
 results/
+e2e_runs/

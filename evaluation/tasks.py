@@ -34,6 +34,7 @@ from __future__ import annotations
 import torch
 
 from operators import FFT2D, Identity, Mask, Sense
+from operators.fourier import ifftc
 from operators.noise import awgn
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from training.common import embed_for_net, prepare_measurement
@@ -62,8 +63,11 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None, call=None
     was trained and validated on -- a sweep that scored the whole image on a
     mask-trained run would not be summarising the curves it sits next to.
     """
+    # A paired (guided) loader adds the side scan: (..., side) or (..., side k, side maps).
+    from training.recon import _unpack
+    kspace, smaps, image, organ_mask, pad_hw, side = _unpack(batch)
     kspace, smaps, image, organ_mask, pad_hw = (
-        b.to(device, non_blocking=True) for b in batch)
+        b.to(device, non_blocking=True) for b in (kspace, smaps, image, organ_mask, pad_hw))
     mri = cfg["mri"]
     if not cfg.get("training", {}).get("use_organ_mask", False):
         organ_mask = None
@@ -103,7 +107,24 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None, call=None
     # different operator here than the val loop built, and the sweep would stop
     # reproducing the curves it is meant to summarise.
     E, T = embed_for_net(net, E, image, pad_hw)
-    out = T.forward((call or _call_net)(net, y, E, sigma_n))
+    # The guide, exactly as training/recon.py's val block builds it: the side scan undersampled
+    # per guide_R at the validation line offset, in the domain the net takes it, under the
+    # operator's maps. None for an unguided net (and for unpaired data).
+    guide = None
+    if side is not None:
+        from training.recon import _check_paired, _guide
+        _check_paired(net, val_kspace_type(cfg), mri.get("online_smaps"))
+        guide = _guide(net, side, extra["smaps"], T, device, mri.get("guide_R") or 1,
+                       mri.get("guide_acs_lines", 0), mri.get("guide_mask_dist", "uniform"),
+                       guide_offset=mri.get("guide_val_offset") or 0)
+    if guide is None:
+        out = T.forward((call or _call_net)(net, y, E, sigma_n))
+    else:
+        if call is not None:
+            raise ValueError("call= replaces an unguided forward; this net takes a guide")
+        from training.recon import _forward
+        out = _forward(net, y, E, sigma_n, guide)
+        out = T.forward(out[0] if isinstance(out, tuple) else out)
 
     if mri.get("whiten_kspace", False) and "Zinv" in extra:
         out = extra["Zinv"] * out
@@ -115,6 +136,16 @@ def recon(net, batch, cfg, device, sigma, generator=None, extras=None, call=None
         if mri.get("whiten_kspace", False) and "Zinv" in extra:
             zf = extra["Zinv"] * zf
         extras.update(zero_filled=zf, sampling_mask=mask, sigma_n=sigma_n)
+        if side is not None:
+            # The side scan for the viewer, FULLY SAMPLED and coil-combined under the operator's
+            # maps (the centre slice when the net takes several) -- the same image for every net
+            # in a comparison, guided or not, whatever domain a net took its own guide in. Coil
+            # RSS when the operator holds placeholder maps (a net estimating its own).
+            s = side["kspace"][:, side["kspace"].shape[1] // 2] if isinstance(side, dict) else side
+            c = ifftc(s.to(device, non_blocking=True))
+            extras["guide"] = (Sense(extra["smaps"]).adjoint(c)
+                               if getattr(net, "uses_operator_smaps", True)
+                               else c.abs().pow(2).sum(dim=1, keepdim=True).sqrt())
 
         # Optional Tikhonov CG-SENSE, (E^H E + lam I) x = E^H y, on the SAME
         # measurement and operator the net saw: the linear recon's leftover

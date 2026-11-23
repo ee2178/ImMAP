@@ -76,7 +76,9 @@ class PairedKneeDataset(Dataset):
                  enumerate_slices=False, pad_multiple=1, organ_mask_source="none",
                  organ_mask_kws=None, check_acquisition=True, target="rss", smap_root=None,
                  volume_scales=None, volume_stat="acs_p95", side_volume_stat="full_p95",
-                 volume_target=1.0, guide_slices=1):
+                 volume_target=1.0, guide_slices=1, volumes=None):
+        # volumes: keep only these PDFS volumes (names with or without .h5), in this order --
+        # scripts/dump_eval.py gives every run the same patients this way. None = every pair.
         # guide_slices: N_g side (PD) slices centred on the target slice, as the LGGS paper's
         # guide (arXiv 2610.22643, Sec. III-E). 1 = the same slice only, the batch exactly as
         # before. > 1 adds the OFFLINE maps of those slices (from the target's map file: same
@@ -138,6 +140,14 @@ class PairedKneeDataset(Dataset):
                 f"{len(missing)} PDFS volume(s) of {os.path.basename(split_csv)} have no offline "
                 f"maps in {smap_root}, e.g. {missing[:3]}: run torch/espirit_knee_pairs.sbatch")
         self.dropped = dropped
+        if volumes is not None:
+            by_name = {os.path.splitext(os.path.basename(p[1]))[0]: p for p in self.pairs}
+            want = [os.path.splitext(os.path.basename(str(v)))[0] for v in volumes]
+            absent = [v for v in want if v not in by_name]
+            if absent:
+                raise ValueError(f"{len(absent)} requested volume(s) are not usable PDFS volumes "
+                                 f"of {os.path.basename(split_csv)}, e.g. {absent[:3]}")
+            self.pairs = [by_name[v] for v in want]
         self.volume_scales = None
         if volume_scales:
             with open(volume_scales) as f:
@@ -178,6 +188,12 @@ class PairedKneeDataset(Dataset):
 
     def __len__(self):
         return len(self.index)
+
+    @property
+    def files(self):
+        """The PDFS (target) volume file names, one per pair -- what scripts/dump_eval.py reads
+        to resolve its volume list, and what `volumes=` and `item_id` name."""
+        return [os.path.basename(p[1]) for p in self.pairs]
 
     def item_id(self, idx):
         i, sl = self.index[idx]
@@ -241,7 +257,8 @@ def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, 
                            pad_multiple=1, organ_mask_source="none", organ_mask_kws=None,
                            check_acquisition=True, num_workers=8, task="recon", target="rss",
                            smap_root=None, volume_scales=None, volume_stat="acs_p95",
-                           side_volume_stat="full_p95", volume_target=1.0, guide_slices=1):
+                           side_volume_stat="full_p95", volume_target=1.0, guide_slices=1,
+                           volumes=None):
     """`task` is accepted (the recon configs carry it) and must be "recon"."""
     if task != "recon":
         raise ValueError(f"fastmri_paired serves recon batches only, got task={task!r}")
@@ -252,7 +269,8 @@ def get_paired_knee_loader(split_csv, kspace_roots, batch_size=1, shuffle=True, 
                            check_acquisition=check_acquisition, target=target,
                            smap_root=smap_root, volume_scales=volume_scales,
                            volume_stat=volume_stat, side_volume_stat=side_volume_stat,
-                           volume_target=volume_target, guide_slices=guide_slices)
+                           volume_target=volume_target, guide_slices=guide_slices,
+                           volumes=volumes)
     num_workers = int(num_workers)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
                       num_workers=num_workers, pin_memory=True,
