@@ -882,6 +882,33 @@ def test_offline_pairs_are_phase_corrected_and_convention_free():
     assert torch.allclose(x0.abs(), raw.abs(), atol=1e-5)                 # magnitudes untouched
 
 
+def test_measured_pair_matches_the_offline_training_pair():
+    """At validation and sampling (`_measure`: online ESPIRiT on y, phase_correct, the guide on the
+    operator's maps) the bridge pair is the training pair's: the guide is rotated by ITS OWN
+    centre-block phase, not by the target's (which the operator's maps carry)."""
+    from operators.fourier import ifftc
+    from training.i2sb_recon import _measure, _offline_pair
+    (b, _) = paired_phantom(1)
+    meas = dict(R=4, acs_lines=8, mask_dist="uniform", mask_offset=0, center_frac=None,
+                adjust_accel=False, noise_dist="uniform", online_smaps="espirit",
+                online_smaps_kws={"phase_correct": True, "thresh_eig": 0.0, "kernel_size": 4},
+                x1_source="guide", x0_source="operator", guide_R=1, guide_acs_lines=0,
+                guide_mask_dist="uniform", guide_maps="operator")
+    x0m, x1m, _, E, *_ = _measure(b, make_net(), "cpu", kspace_type="measurement_awgn",
+                                  noise_std=0.0, guide_offset=0, **meas)
+    x0o, x1o = _offline_pair(b, "cpu", acs_lines=8, center_frac=None)[:2]
+    sup = (x0o.abs() > 0.2 * x0o.abs().max())
+
+    def rms_deg(a, c):
+        z = (a * c.conj())[sup]
+        return float(torch.rad2deg(((z.abs() * torch.angle(z) ** 2).sum() / z.abs().sum()).sqrt()))
+    old_guide = Sense(next(o.smaps for o in E.ops if hasattr(o, "smaps"))).adjoint(ifftc(b[5]))
+    assert rms_deg(x0m, x0o) < 3.0, rms_deg(x0m, x0o)            # the target: same convention
+    assert rms_deg(x1m, x1o) < 3.0, rms_deg(x1m, x1o)            # the guide: its OWN low-res phase
+    assert rms_deg(old_guide, x1o) > 5 * max(rms_deg(x1m, x1o), 1.0), \
+        (rms_deg(old_guide, x1o), rms_deg(x1m, x1o))             # the target's rotation was not
+
+
 def test_training_on_offline_pairs():
     """The loop trains on offline pairs (full grid and cropped to batch), no measurement, and
     refuses the setups the pairs do not fit."""

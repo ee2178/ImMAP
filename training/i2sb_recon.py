@@ -76,6 +76,9 @@ rotation removes each ESPIRiT run's map-phase convention exactly and each scan's
 so both images come out near-real and aligned with each other. For training and testing to agree,
 the operator's online maps must be phase-corrected too (mri.online_smaps_kws.phase_correct, which is
 enforced): then E, validation and the sampler work in the same convention as the training pairs.
+At test time `_measure` rotates the guide by ITS OWN centre block as well: with guide_maps
+"operator" the operator's maps carry the TARGET's low-res phase, which would put the inter-scan
+phase back into x1 (79 deg RMS on the test phantom, 2026-11-23; `_phase_corrected_image`).
 Measurement noise does not enter the pair; validation still measures (the sampler needs y and E).
 
 Validation (`val_mode`, cfg["i2sb"]):
@@ -192,7 +195,14 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
                        acs_lines=resolve_acs_lines(g.shape[-1], acs_lines, center_frac)))
             guide_img = Sense(gmaps).adjoint(ifftc(g))
         elif guide_maps == "operator":
-            guide_img = Sense(extra["smaps"]).adjoint(ifftc(g))
+            if (online_smaps_kws or {}).get("phase_correct") and float(guide_R) == 1:
+                # E's maps are phase-corrected by the TARGET's centre block. Rotate them by the
+                # GUIDE's own instead, so the guide loses ITS low-res phase -- what the offline
+                # training pairs give it, and what "own" maps with phase_correct give it too
+                guide_img = _phase_corrected_image(extra["smaps"], g, acs_lines=acs_lines,
+                                                   center_frac=center_frac)
+            else:
+                guide_img = Sense(extra["smaps"]).adjoint(ifftc(g))
         else:
             raise ValueError(f"guide_maps {guide_maps!r} not in {GUIDE_MAPS}")
     x1 = bridge_start(y, E, x1_source, guide_image=guide_img)
@@ -204,6 +214,16 @@ def _measure(batch, net, device, *, R, acs_lines, mask_dist, mask_offset, center
     return x0, x1, y, E, sigma_n, organ_mask, image, guide
 
 
+def _phase_corrected_image(maps, k, *, acs_lines, center_frac):
+    """The scan `k` combined under `maps` after `phase_correct_maps` with ITS OWN centre-block
+    calibration image: |rho| e^{i(arg rho - arg rho_low)}, whatever per-pixel phase convention the
+    maps came with (module docstring, "OFFLINE PAIRS"). The centre block is the test mask's:
+    resolve_acs_lines' line count, box window, full readout -- as online_smaps' phase_correct."""
+    from physics.online_smaps import center_mask, phase_correct_maps
+    cm = center_mask(k, resolve_acs_lines(k.shape[-1], acs_lines, center_frac))
+    return Sense(phase_correct_maps(maps, ifftc(k * cm))).adjoint(ifftc(k))
+
+
 def _offline_pair(batch, device, *, acs_lines, center_frac):
     """One paired batch -> the "OFFLINE PAIRS" training pair, no measurement and no ESPIRiT:
     (x0, x1, None, None, sigma_n = 0, organ_mask, gt, None), shaped like `_measure`'s output.
@@ -211,7 +231,6 @@ def _offline_pair(batch, device, *, acs_lines, center_frac):
     Both scans are combined under the loader's offline PDFS maps, each after
     `phase_correct_maps` with its own centre-block calibration image (module docstring). gt is the
     stored image, as `_measure` returns it (metrics read its magnitude)."""
-    from physics.online_smaps import center_mask, phase_correct_maps
     kspace, smaps, image, organ_mask, _, side = _unpack(batch)
     if side is None or isinstance(side, dict):
         raise ValueError("train_pairs='offline' needs a paired loader with ONE guide slice "
@@ -220,13 +239,8 @@ def _offline_pair(batch, device, *, acs_lines, center_frac):
     if bool((S.abs().flatten(1).std(dim=1) == 0).any()):
         raise ValueError("train_pairs='offline' needs the offline coil maps, but the loader served "
                          "flat placeholder maps: set the data target to 'sense' (smap_root)")
-    W = k.shape[-1]
-    cm = center_mask(k, resolve_acs_lines(W, acs_lines, center_frac))
-
-    def corrected(kk):
-        return Sense(phase_correct_maps(S, ifftc(kk * cm))).adjoint(ifftc(kk))
-
-    x0, x1 = corrected(k), corrected(g)
+    kw = dict(acs_lines=acs_lines, center_frac=center_frac)
+    x0, x1 = _phase_corrected_image(S, k, **kw), _phase_corrected_image(S, g, **kw)
     return (x0, x1, None, None, torch.zeros(x0.shape[0], device=device),
             organ_mask.to(device), image.to(device), None)
 
