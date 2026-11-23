@@ -21,7 +21,7 @@ COLUMNS = [
     ("TGVN",             "tgvn_c6_R8_g1"),
     ("LGGS",             "lggs_R8_g1"),
     ("LGGS guide-W",     "lggs_guide_w_R8_g1"),
-    ("LGGS guide-conv",  "lggs_guide_conv_R8_g1"),
+    # ("LGGS guide-conv",  "lggs_guide_conv_R8_g1"),   # not copied to bigpurple: no dump
     ("Ground truth",     None),
 ]
 

@@ -75,13 +75,20 @@ IMMAP_ROOT="${IMMAP_ROOT:-$HOME/scratch/ImMAP}"
 cd "$IMMAP_ROOT" || { echo "no such dir: $IMMAP_ROOT" >&2; exit 1; }
 mkdir -p bigpurple/logs
 
-# A run still pointing at torch's k-space roots would die in the loader; say why up front.
+# A run not copied over (no config.json / checkpoint) is SKIPPED with a warning; the rest are
+# dumped. A run still pointing at torch's k-space roots would die in the loader; say why up front.
+FOUND=""
 for r in $ONLY; do
     d="$RUNS_ROOT/$r"
-    [ -f "$d/config.json" ] || { echo "no config.json in $d" >&2; exit 1; }
-    [ -f "$d/$CKPT" ] || { echo "no $CKPT in $d" >&2; exit 1; }
+    if [ ! -f "$d/config.json" ] || [ ! -f "$d/$CKPT" ]; then
+        echo "[skip] $r: no config.json or $CKPT in $d" >&2
+        continue
+    fi
     [ -f "$d/config.torch.json" ] || echo "[warn] $d has no config.torch.json -- run scripts/port_runs.py on it if it came from torch" >&2
+    FOUND="$FOUND $r"
 done
+[ -n "$FOUND" ] || { echo "none of the runs in ONLY exist under $RUNS_ROOT" >&2; exit 1; }
+ONLY="${FOUND# }"
 
 echo "host   : $(hostname)   $(date '+%F %T')"
 echo "runs   : $ONLY  (under $RUNS_ROOT, $CKPT)"
