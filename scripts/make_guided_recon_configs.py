@@ -233,6 +233,15 @@ JOINT_LGGS_PARAMS = dict(K=30, K0=10, M=169, P=7, s=2, Mh=64, window=15, lam0=1e
                          sim_fun="pidistance", init_strategy="semi_orthogonal",
                          attn_backend="triton")
 
+# NCSR-LPDS prototype (models/ncsr_lpds.py): LGGS's dictionary, depth, steps and refresh
+# schedule; leave-one-out 7x7 self window, 11x11 guide window, beta starting at 1/2. Complex
+# attention transforms; the PD guide's keys through their own W_phi^g (separate_guide_w, the
+# untied-per-contrast setting that has worked best for LGGS).
+NCSR_LPDS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=32, nheads=1, window=7, guide_window=11,
+                        include_center=False, lam0=1e-3, tau0=0.5, theta0=0.0, beta0=0.5,
+                        rho0=1.0, degrees=0, prox_degrees=1, dK=5, preproc="kspace",
+                        separate_guide_w=True)
+
 # How LGGS RUNS, not what it is: each changes no parameter and, to fp roundoff, no output or
 # gradient (checked against the original triton path beside an fp32 noise floor:
 # scripts/bench_lggs_materialize.py). Kept apart from LGGS_PARAMS, which stays Sljiva's grid
@@ -337,6 +346,14 @@ MODELS = {
     "joint_lggs": dict(task="joint_recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
                        model=dict(type="JointLGGS", params=JOINT_LGGS_PARAMS),
                        training=dict(guide_loss_weight=1.0)),
+    # NCSR-LPDS (2026-11-23, PROTOTYPE; models/ncsr_lpds.py): LPDS whose prior centres each code
+    # on a complex attention average of its own neighbours and the PD guide's codes,
+    # ||(I - beta Gamma_zz) A x - beta Gamma_zw A_g w||_1 -- the guide predicts code VALUES
+    # (phase-transported) where LGGS pools ENERGIES. LGGS's dictionary and depth; a narrower
+    # attention (Mh 32) and guide window (11) because the prototype gathers offset by offset.
+    # Not in DEFAULT_MODELS: launch by name.
+    "ncsr_lpds": dict(task="recon", guided=True, grid_base="mggrouplpds", pad_multiple=2,
+                      model=dict(type="NCSRLPDS", params=NCSR_LPDS_PARAMS)),
 }
 
 # Depth sweep for TGVN under the reduced budget: width held at E2E-VarNet's (chans 18,

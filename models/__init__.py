@@ -270,6 +270,13 @@ def build_model(cfg):
         from .joint_lggs import JointLGGSNet
         return JointLGGSNet(**params)
 
+    # NCSR-LPDS (models/ncsr_lpds.py, prototype): LPDS whose prior centres each code on a
+    # complex (phase-transported) attention average of its own neighbours and the guide's codes,
+    # ||(I - beta Gamma_zz) A x - beta Gamma_zw A_g w||_1 -- values shared, not energies.
+    elif model_type in ("NCSRLPDS", "NCSRLPDSNet"):
+        from .ncsr_lpds import NCSRLPDSNet
+        return NCSRLPDSNet(**params)
+
     elif model_type in ("LGGS", "GuidedLPDSNet", "LGGSNet"):
         params = dict(params)
         if params.get("guide_window", 1) <= 1:
