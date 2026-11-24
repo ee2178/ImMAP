@@ -34,7 +34,7 @@ from visualization.image import levels_panel, recon_panel, upsample_repeat
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from operators import Mask, FFT2D, Sense
 from operators.fourier import ifftc
-from training.ssdu import KSPACE_LOSSES, kspace_nl1nl2, ssdu_split
+from training.ssdu import KSPACE_LOSSES, SSDU_SPLIT_MODES, kspace_nl1nl2, ssdu_split
 
 
 # `_embed` moved to training/common.py so evaluation/tasks.py can build the
@@ -401,13 +401,25 @@ def train_recon(
     loss_type="complex-mse",
     # K-SPACE TRAINING LOSS (training/ssdu.py), in place of `loss_type` for TRAINING only:
     #   None         the image-domain `loss_type` against the reference (default)
-    #   "ssdu"       SSDU: the acquired lines split per step into input and held-out lines
-    #                (`ssdu_rho` of the non-ACS lines held out); loss on the held-out k-space
+    #   "ssdu"       SSDU: the acquired k-space split per step into input and held-out points
+    #                (`ssdu_rho` of |Omega| held out); loss on the held-out k-space
     #   "unsampled"  input all acquired lines; loss on the measured k-space the net did NOT get
     # Validation, its loss (best-val checkpoint, val backtracking) and every metric stay in the
     # image domain against the reference, on the full acquired lines.
     kspace_loss=None,
-    ssdu_rho=0.4,
+    ssdu_rho=0.2,
+    # SSDU split (training/ssdu.py): "points" (2D k-space samples, SSDU's own) or "lines" (whole
+    # phase-encode lines, the 2026-11-23 runs); Gaussian or uniform selection of the held-out
+    # points; a centre block of ssdu_center_scale / R of each dimension stays in the input.
+    ssdu_split_mode="points",
+    ssdu_selection="gaussian",
+    ssdu_center_scale=0.32,
+    # Validation: multiply the reconstruction by the support of the coil maps the REFERENCE was
+    # made with (the loader's maps), before every metric, the val loss and the panel -- as
+    # Sljiva's SSDU inference does (x_hat .*= sense_mask). A k-space-trained net is never told the
+    # reference is zero outside that support; the operator's online maps (thresh_eig 0) cover the
+    # whole FOV, so their support would mask nothing.
+    infer_on_support=False,
     # `organ_mask` is the coil-sensitivity support the recon loader returns.
     # This ONE flag governs all three places it can act, because splitting it
     # would let the loss optimise one region while the curves scored another:
@@ -498,9 +510,19 @@ def train_recon(
         if kspace_loss == "unsampled" and kspace_type == "simulated":
             raise ValueError("kspace_loss='unsampled' scores the MEASURED k-space; use "
                              "kspace_type 'measurement_awgn' (or 'ssdu')")
-        print(f"k-space training loss: {kspace_loss}"
-              + (f" (rho {ssdu_rho} of the non-ACS lines held out)"
-                 if kspace_loss == "ssdu" else ""))
+        if kspace_loss == "ssdu" and ssdu_split_mode not in SSDU_SPLIT_MODES:
+            raise ValueError(f"ssdu_split_mode must be one of {SSDU_SPLIT_MODES}, "
+                             f"got {ssdu_split_mode!r}")
+        if kspace_loss == "ssdu" and ssdu_split_mode == "points":
+            desc = (f" (rho {ssdu_rho} of the acquired points held out, {ssdu_selection} "
+                    f"selection, centre block {ssdu_center_scale}/R kept in the input)")
+        elif kspace_loss == "ssdu":
+            desc = f" (rho {ssdu_rho} of the non-ACS lines held out)"
+        else:
+            desc = ""
+        print(f"k-space training loss: {kspace_loss}{desc}")
+    if infer_on_support:
+        print("validation: reconstruction multiplied by the reference coil maps' support")
     ckpt_path = os.path.join(save_dir, "net.ckpt")
     bestval_path = os.path.join(save_dir, BESTVAL_CKPT)
     # A best-val checkpoint is trusted only on a RESUME. On a fresh start one
@@ -622,7 +644,9 @@ def train_recon(
             # ACS, which stays in the input either way.
             in_mask = mask
             if kspace_loss == "ssdu":
-                in_mask, m_loss = ssdu_split(mask, y.shape[0], ssdu_rho)
+                in_mask, m_loss = ssdu_split(mask, y.shape[0], ssdu_rho, R=R, shape=y.shape[-2:],
+                                             mode=ssdu_split_mode, selection=ssdu_selection,
+                                             center_scale=ssdu_center_scale)
                 k_loss = m_loss * y
                 y = in_mask * y
             elif kspace_loss == "unsampled":
@@ -872,6 +896,10 @@ def train_recon(
                         generator=val_gen,
                     )
 
+                    # the support of the maps the reference was made with (the loader's), taken
+                    # before the operator's own (online) maps replace them
+                    support_v = ((smaps_v.abs().pow(2).sum(1, keepdim=True) > 0)
+                                 if infer_on_support else None)
                     smaps_v = extra_v["smaps"]
                     E_v = Mask(mask_v) @ FFT2D() @ Sense(smaps_v)
                     E_v, T_v = _embed(net, E_v, image_v, pad_hw_v)
@@ -884,6 +912,8 @@ def train_recon(
 
                     if whiten_kspace and "Zinv" in extra_v:
                         recon_v = extra_v["Zinv"] * recon_v
+                    if support_v is not None:
+                        recon_v = recon_v * support_v.to(recon_v.dtype)
 
                     m = metrics(
                         image_v.abs(), recon_v.abs(),
@@ -911,6 +941,8 @@ def train_recon(
                     zf_v = T_v.forward(E_v.adjoint(y_v))
                     if whiten_kspace and "Zinv" in extra_v:
                         zf_v = extra_v["Zinv"] * zf_v
+                    if support_v is not None:
+                        zf_v = zf_v * support_v.to(zf_v.dtype)
 
                     # Show the same pixels the metrics scored. An unmasked
                     # panel next to a masked PSNR invites reading a background

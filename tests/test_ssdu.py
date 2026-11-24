@@ -15,22 +15,61 @@ import test_guided_recon as tg            # noqa: E402
 import torch                              # noqa: E402
 
 from physics.mask import get_mask_cached  # noqa: E402
-from training.ssdu import (center_run, kspace_nl1nl2, sampled_lines,  # noqa: E402
-                           ssdu_split)
+from training.ssdu import (center_block, center_run, kspace_nl1nl2,  # noqa: E402
+                           sampled_lines, ssdu_split, ssdu_split_lines)
 
 
-def _mask(W=64, R=4, acs=6):
-    return get_mask_cached(torch.zeros(1, 1, 16, W, dtype=torch.complex64), R=R,
+def _mask(W=64, R=4, acs=6, H=16):
+    return get_mask_cached(torch.zeros(1, 1, H, W, dtype=torch.complex64), R=R,
                            acs_lines=acs, mode="uniform", offset=0)
 
 
-def test_split_is_a_disjoint_cover_with_the_acs_in_the_input():
+def test_center_block_is_0p32_over_R_of_each_dimension():
+    b = center_block(640, 368, 8)
+    rows, cols = b.any(1).nonzero().flatten(), b.any(0).nonzero().flatten()
+    assert (rows.numel(), cols.numel()) == (26, 15)          # round(0.04 * 640), round(0.04 * 368)
+    assert int(b.sum()) == 26 * 15
+    assert rows.min() <= 320 <= rows.max() and cols.min() <= 184 <= cols.max()
+
+
+def test_point_split_is_a_disjoint_cover_with_the_centre_block_in_the_input():
+    R, H, W = 4, 64, 96
+    m = _mask(W=W, R=R, acs=8, H=H)
+    omega = (m.reshape(-1, H, W)[0] != 0)
+    keep = center_block(H, W, R) & omega
+    torch.manual_seed(0)
+    theta, lam = ssdu_split(m, 3, rho=0.2, R=R)                 # default: points, gaussian
+    assert theta.shape == lam.shape == (3, 1, H, W)
+    th, la = theta[:, 0] > 0, lam[:, 0] > 0
+    for b in range(3):
+        assert not (th[b] & la[b]).any()
+        assert ((th[b] | la[b]) == omega).all()
+        assert th[b][keep].all() and not la[b][keep].any()
+        assert int(la[b].sum()) == round(0.2 * int(omega.sum()))
+        # a point split, not a line split: held-out points share lines with input points
+        assert (la[b].any(0) & th[b].any(0)).sum() > 0
+    assert not (la[0] == la[1]).all(), "same split for every sample"
+
+
+def test_gaussian_selection_concentrates_near_the_centre():
+    R, H, W = 4, 128, 128
+    m = _mask(W=W, R=R, acs=8, H=H)
+    torch.manual_seed(0)
+    dist = {}
+    for sel in ("gaussian", "uniform"):
+        _, lam = ssdu_split(m, 8, rho=0.2, R=R, selection=sel)
+        yy, xx = lam[:, 0].nonzero()[:, 1:].float().unbind(1)
+        dist[sel] = float(((yy - H // 2) ** 2 + (xx - W // 2) ** 2).sqrt().mean())
+    assert dist["gaussian"] < 0.8 * dist["uniform"], dist
+
+
+def test_line_split_is_a_disjoint_cover_with_the_acs_in_the_input():
     m = _mask()
     lines = sampled_lines(m)
     acs = center_run(lines)
     assert int(acs.sum()) >= 6
     torch.manual_seed(0)
-    theta, lam = ssdu_split(m, 4, rho=0.4)
+    theta, lam = ssdu_split(m, 4, rho=0.4, mode="lines")
     th, la = theta[:, 0, 0] > 0, lam[:, 0, 0] > 0
     n_cand = int((lines & ~acs).sum())
     for b in range(4):
@@ -41,10 +80,12 @@ def test_split_is_a_disjoint_cover_with_the_acs_in_the_input():
     assert not all((la[0] == la[b]).all() for b in range(1, 4)), "same split for every sample"
 
 
-def test_split_refuses_a_non_line_mask():
+def test_line_split_refuses_a_non_line_mask():
     m = _mask().clone()
     m[..., 3, 1] = 1
-    tg.raises(ValueError, lambda: ssdu_split(m, 1), "line mask")
+    tg.raises(ValueError, lambda: ssdu_split_lines(m, 1), "line mask")
+    tg.raises(ValueError, lambda: ssdu_split(_mask(), 1, mode="rows"), "ssdu_split_mode")
+    tg.raises(ValueError, lambda: ssdu_split(_mask(), 1, selection="beta"), "ssdu_selection")
 
 
 def test_loss_is_normalized_and_ignores_unscored_lines():
@@ -61,7 +102,8 @@ def test_loss_is_normalized_and_ignores_unscored_lines():
 
 
 class Recorder(torch.nn.Module):
-    """Records the sampled columns of every y the wrapped net is called with."""
+    """Records the number of sampled k-space points of every y the wrapped net is called with
+    (and the last output's)."""
     def __init__(self, net):
         super().__init__()
         self.net, self.cols = net, []
@@ -71,7 +113,7 @@ class Recorder(torch.nn.Module):
         self.guided = tg.tr._wants_guide(net)          # this wrapper's own signature takes one
 
     def forward(self, y, E=None, sigma=None, guide=None):
-        self.cols.append((self.training, int((y.abs().sum(dim=(0, 1, 2)) > 0).sum())))
+        self.cols.append((self.training, int((y.abs().sum(dim=(0, 1)) > 0).sum())))
         kw = {} if guide is None else {"guide": guide}
         return self.net(y, E=E, sigma=sigma, **kw)
 
@@ -95,13 +137,43 @@ def test_ssdu_trains_on_fewer_lines_and_validates_on_all():
     torch.manual_seed(0)
     net = LGGSNet(K=2, M=8, P=3, s=2, Mh=4, guide_window=3, attn_backend="gather",
                   separate_guide_w=True)
-    rec, wb = _train(net, kspace_loss="ssdu", ssdu_rho=0.4)
-    train_cols = {c for t, c in rec.cols if t}
-    val_cols = {c for t, c in rec.cols if not t}
-    assert len(val_cols) == 1 and max(train_cols) < min(val_cols), (train_cols, val_cols)
-    losses = [c["train/loss"] for c in wb.calls if "train/loss" in c]
-    assert losses and all(torch.isfinite(torch.as_tensor(l)) for l in losses)
-    assert torch.isfinite(torch.as_tensor(wb.last("val/psnr")))
+    for mode in ("points", "lines"):
+        rec, wb = _train(net, kspace_loss="ssdu", ssdu_rho=0.2, ssdu_split_mode=mode)
+        train_pts = {c for t, c in rec.cols if t}
+        val_pts = {c for t, c in rec.cols if not t}
+        assert len(val_pts) == 1 and max(train_pts) < min(val_pts), (mode, train_pts, val_pts)
+        losses = [c["train/loss"] for c in wb.calls if "train/loss" in c]
+        assert losses and all(torch.isfinite(torch.as_tensor(l)) for l in losses)
+        assert torch.isfinite(torch.as_tensor(wb.last("val/psnr")))
+
+
+def test_infer_on_support_zeroes_the_recon_outside_the_reference_maps():
+    """infer_on_support: validation scores recon * (support of the loader's maps). With maps
+    that vanish on the outer columns, every validation output is zero there."""
+    import training.recon as tr
+    from models.guided_lpds import LGGSNet
+    torch.manual_seed(0)
+    net = LGGSNet(K=2, M=8, P=3, s=2, Mh=4, guide_window=3, attn_backend="gather")
+    seen, real = [], tr.compute_metrics
+
+    def spy(image, recon, **kw):
+        seen.append(recon.detach().clone())
+        return real(image, recon, **kw)
+
+    real_unpack = tr._unpack
+
+    def unpack(batch):
+        k, s, *rest = real_unpack(batch)
+        s = s.clone()
+        s[..., :3] = 0                                   # maps vanish on the first 3 columns
+        return (k, s, *rest)
+
+    tr.compute_metrics, tr._unpack = spy, unpack
+    try:
+        _train(net, kspace_loss="ssdu", infer_on_support=True)
+    finally:
+        tr.compute_metrics, tr._unpack = real, real_unpack
+    assert seen and all(float(r[..., :3].abs().max()) == 0.0 for r in seen[-1:])
 
 
 def test_unsampled_mode_and_the_other_nets_train():
@@ -140,6 +212,10 @@ def test_generator_cells():
     for base in ("lpdsnet", "tgvn_c6", "lggs_guide_w"):
         spec = g.MODELS[f"{base}_ssdu"]
         assert spec["training"]["kspace_loss"] == "ssdu"
+        assert {k: spec["training"][k] for k in ("ssdu_rho", "ssdu_split_mode", "ssdu_selection",
+                                                  "ssdu_center_scale", "infer_on_support")} == \
+            dict(ssdu_rho=0.2, ssdu_split_mode="points", ssdu_selection="gaussian",
+                 ssdu_center_scale=0.32, infer_on_support=True)
         assert spec["guided"] == g.MODELS[base]["guided"]
         if base != "tgvn_c6":                                  # its output changes (below)
             assert spec["model"] == g.MODELS[base]["model"]

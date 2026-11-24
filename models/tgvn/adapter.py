@@ -211,18 +211,29 @@ class TGVN(nn.Module):
         return v.expand(batch) if v.numel() == 1 else v
 
     # -- conversions ----------------------------------------------------------
-    @staticmethod
-    def _mask(E, batch, device):
-        """ImMAP mask (vertical phase-encode lines) -> the (B, 1, 1, W, 1) bool upstream uses."""
+    def _mask(self, E, batch, device):
+        """ImMAP mask (vertical phase-encode lines) -> the (B, 1, 1, W, 1) bool upstream uses.
+
+        With known maps (use_smaps) the mask is only used elementwise (the data-consistency
+        `where` and the CG's mask_delta), so a 2D mask -- SSDU's point split, which differs per
+        sample -- is passed as (B, 1, H, W, 1). Without them the upstream sensitivity net reads
+        `mask[:, 0, 0, :, 0]` for its ACS, which needs the line layout."""
         m = get_mask(E)
         while m.dim() < 4:
             m = m.unsqueeze(0)
-        col = m[..., :1, :]
-        if not torch.equal(m.to(torch.bool), col.to(torch.bool).expand_as(m)):
+        m = m.to(device=device, dtype=torch.bool)
+        H, W = m.shape[-2:]
+        if torch.equal(m, m[..., :1, :].expand_as(m)):            # vertical lines
+            out = m[..., :1, :].reshape(-1, 1, 1, W, 1)
+        elif self.use_smaps:
+            out = m.reshape(-1, 1, H, W, 1)
+        else:
             raise ValueError("TGVN expects a mask constant along the readout axis (vertical "
-                             "phase-encode lines), as physics/mask.py::make_acc_mask produces.")
-        return col.reshape(-1, 1, 1, col.shape[-1], 1)[:1].expand(
-            batch, 1, 1, col.shape[-1], 1).to(device=device, dtype=torch.bool)
+                             "phase-encode lines), as physics/mask.py::make_acc_mask produces "
+                             "(a 2D mask needs use_smaps=True).")
+        # one mask for the batch, or one per sample (SSDU draws its split per sample) -- each
+        # sample keeps its own; this used to take sample 0's for all of them
+        return out.expand(batch, *out.shape[1:])
 
     @staticmethod
     def _real_view(k):

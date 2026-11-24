@@ -368,13 +368,18 @@ for _n in TGVN_CASCADE_SWEEP:
                                             **dict(TGVN_SIZE, num_cascades=_n))))
 
 # SSDU LOSS (2026-11-23; training/ssdu.py, training.kspace_loss): the same three nets trained
-# without an image-domain loss -- each step the acquired lines are split into input lines and
-# held-out lines (40% of the non-ACS lines, the ACS stays in the input), and the loss is SSDU's
-# normalized l1 + l2 on the held-out multicoil k-space through the operator's maps. Tests whether
-# the horizontal streaks come from an image loss rewarding the reference's (correlated) noise.
-# Validation, the best-val checkpoint and every metric stay image-domain, on all acquired lines.
+# without an image-domain loss -- each step the acquired k-space is split into input points and
+# held-out points, and the loss is SSDU's normalized l1 + l2 on the held-out multicoil k-space
+# through the operator's maps. Tests whether the horizontal streaks come from an image loss
+# rewarding the reference's (correlated) noise. Validation, the best-val checkpoint and every
+# metric stay image-domain, on all acquired lines.
+# 2026-11-24: the split is SSDU's own -- 2D k-space points (it was whole lines), Gaussian
+# selection, rho 0.2 of |Omega| (was 0.4 of the non-ACS lines), a centre block of 0.32/R of each
+# dimension kept in the input (was the whole ACS run) -- and validation scores the recon on the
+# reference maps' support (infer_on_support).
 # LGGS here is lggs_guide_w (the guide's own W_phi^g, W_alpha^g). By name: MODELS="... _ssdu".
-SSDU_TRAINING = dict(kspace_loss="ssdu", ssdu_rho=0.4)
+SSDU_TRAINING = dict(kspace_loss="ssdu", ssdu_rho=0.2, ssdu_split_mode="points",
+                     ssdu_selection="gaussian", ssdu_center_scale=0.32, infer_on_support=True)
 # TGVN's cells return the MAGNITUDE (upstream's output), which a k-space loss cannot score: its
 # SSDU cell returns the complex image instead (output="complex", which needs the known maps it
 # already uses). So tgvn_c6_ssdu differs from tgvn_c6 in the output too, not only the loss.

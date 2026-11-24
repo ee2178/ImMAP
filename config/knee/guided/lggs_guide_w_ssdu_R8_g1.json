@@ -98,7 +98,11 @@
         "complex_conv": "planar",
         "guided_compile": true,
         "kspace_loss": "ssdu",
-        "ssdu_rho": 0.4
+        "ssdu_rho": 0.2,
+        "ssdu_split_mode": "points",
+        "ssdu_selection": "gaussian",
+        "ssdu_center_scale": 0.32,
+        "infer_on_support": true
     },
     "mri": {
         "R": 8,
