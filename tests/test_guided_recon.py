@@ -254,6 +254,79 @@ def run_recon(net, csv, root, d, data=None, **mri):
 
 
 # ---------------------------------------------------------------------------------------------
+def test_dump_eval_i2sb_recon_runs_the_sampler_with_and_without_cg():
+    """scripts/dump_eval.py on an i2sb_recon run (evaluation/tasks.py::i2sb_recon): the full
+    reverse-bridge sampler at the run's settings, the bridge started at the guide; the CG
+    (I2SB-Recon) recon is `recon`, the plain sampler on the same bridge noise `recon_nodc`, each
+    with its metrics; the sampler settings in the attrs; and two dumps of one run agree exactly
+    (the bridge noise is seeded per slice from the dump's generator)."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import argparse
+    import dump_eval as de
+    import physics.online_smaps as osm
+    from evaluation.metrics import build_metrics
+    from models.sb_recon_unet import SBReconUnet
+
+    tau, n_points = 0.1, 100
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as out:
+        csv, _ = make_data(root)
+        smap_root = make_maps(root, os.path.join(root, "maps"))
+        cfg = {"task": "i2sb_recon", "model": {"type": "SBReconUnet"},
+               "data": {"val": {"name": "fastmri_paired", "split_csv": csv,
+                                "kspace_roots": [root], "scale_fac": 1.0, "start_slice": 1,
+                                "end_slice": 2, "target": "sense", "smap_root": smap_root,
+                                "organ_mask_source": "smaps", "batch_size": 1,
+                                "num_workers": 0}},
+               "mri": {"R": 4, "acs_lines": 4, "kspace_type": "measurement_awgn",
+                       "online_smaps": "espirit", "guide_R": 1},
+               "training": {"val_kspace_type": "measurement_awgn", "use_organ_mask": True,
+                            "val_noise_std": 0.0},
+               "i2sb": {"kind": "brownian", "tau": tau, "n_points": n_points,
+                        "x1_source": "guide", "guide_maps": "operator", "val_nfe": 3,
+                        "dc_iters": 7, "dc_lam": 7e-5, "support_thresh": None}}
+        vols = de.resolve_volumes(cfg["data"]["val"], None, 2)
+        args = argparse.Namespace(slices="1:3", workers=0, seed=0, limit=None,
+                                  ckpt="net_bestval.ckpt")
+        metrics = build_metrics(["psnr"])
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.full_like(y, C ** -0.5)
+        try:
+            for name, cx1 in (("sb_R4", False), ("sb_x1_R4", True)):
+                torch.manual_seed(0)
+                net = SBReconUnet(cond_x1=cx1, model_channels=32, num_res_blocks=1,
+                                  channel_mult=(1, 2), attention_resolutions=(), image_size=H,
+                                  num_head_channels=32, kind="brownian", tau=tau,
+                                  n_points=n_points).eval()
+                with torch.no_grad():                   # a live output head (ADM zero-inits it)
+                    last = [m for m in net.modules() if isinstance(m, torch.nn.Conv2d)][-1]
+                    last.weight.normal_(std=0.01)
+                for rep in ("eval_dump", "again"):
+                    d = os.path.join(out, name)
+                    n = de.dump_run(d, cfg, net, 1, 7, args, vols, metrics, 0.0,
+                                    os.path.join(d, rep))
+                    assert n == 4, (name, n)
+        finally:
+            osm.online_smaps = real
+
+        for name in ("sb_R4", "sb_x1_R4"):
+            for v in vols:
+                p = os.path.join(out, name, "eval_dump", v + ".h5")
+                with h5py.File(p) as f, h5py.File(p.replace("eval_dump", "again")) as g:
+                    for ds in ("reference", "recon", "recon_nodc", "zero_filled", "guide",
+                               "bridge_start", "organ_mask", "sampling_mask", "psnr_slice",
+                               "psnr_nodc_slice"):
+                        assert ds in f, (name, v, ds)
+                    assert f.attrs["task"] == "i2sb_recon" and f.attrs["images_masked"]
+                    assert (f.attrs["nfe"], f.attrs["dc_iters"], f.attrs["sampler"]) == \
+                        (3, 7, "i2sb_recon")
+                    # the bridge starts at the (fully sampled) guide under the operator's maps
+                    assert np.allclose(f["bridge_start"][()], f["guide"][()], atol=1e-5)
+                    # CG changes the recon; the same run dumped twice is bit-identical
+                    assert not np.allclose(f["recon"][()], f["recon_nodc"][()])
+                    assert np.array_equal(f["recon"][()], g["recon"][()])
+                    assert np.array_equal(f["recon_nodc"][()], g["recon_nodc"][()])
+
+
 def test_vendored_tgvn_differs_from_upstream_only_in_imports():
     up = os.path.join(os.path.dirname(REPO), "TGVN", "src", "tgvn", "models.py")
     if not os.path.exists(up):

@@ -80,6 +80,14 @@ from evaluation.tasks import (EVAL_KSPACE_TYPE, build_adapter, default_sigma,
                               force_organ_mask, val_kspace_type)
 
 DUMP_VERSION = 1
+# tasks whose dumps are images of the anatomy (organ mask stored, images masked to it)
+IMAGE_TASKS = ("recon", "i2sb_recon")
+
+
+def _dc_setting(s):
+    """--dc ITERS:LAM -> (iters, lam)."""
+    it, _, lam = s.partition(":")
+    return int(it), float(lam)
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +140,14 @@ def load_run(run_dir, device, ckpt="net.ckpt"):
     set_planar_state(bool(cfg.get("training", {}).get("planar_state", False)))
 
     model = build_model(for_checkpoint(cfg)).to(device)
-    ckpt = torch.load(os.path.join(run_dir, ckpt), map_location=device,
-                      weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    if cfg.get("task") == "i2sb_recon":
+        # the weights validation SAMPLED with: net.ckpt's EMA when it carries one
+        from training.i2sb_recon import load_sampling_weights
+        ckpt = load_sampling_weights(model, os.path.join(run_dir, ckpt), device)
+    else:
+        ckpt = torch.load(os.path.join(run_dir, ckpt), map_location=device,
+                          weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     if getattr(model, "attn_backend", None) == "flex" and device.type == "cuda":
@@ -294,7 +307,7 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         "seed": int(args.seed),
         "scale_fac": float(val.get("scale_fac", 1.0) or 1.0),
         "use_organ_mask": bool(cfg.get("training", {}).get("use_organ_mask", False)),
-        "images_masked": bool(cfg["task"] == "recon"),
+        "images_masked": bool(cfg["task"] in IMAGE_TASKS),
         "n_params": int(n_params),
         "step": int(step or 0),
         "metrics": list(metrics),
@@ -307,6 +320,16 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         "guide_val_offset": float(mri.get("guide_val_offset") or 0),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
+    if cfg["task"] == "i2sb_recon":
+        # the sampler the images came from (evaluation/tasks.py::i2sb_recon: cfg["eval"] over
+        # the run's own i2sb settings)
+        i2, ev = cfg["i2sb"], cfg.get("eval", {}) or {}
+        base_attrs.update(
+            nfe=int(ev.get("nfe") or i2.get("val_nfe", 20)),
+            dc_iters=int(ev["dc_iters"] if "dc_iters" in ev else i2.get("dc_iters", 0)),
+            dc_lam=float(ev["dc_lam"] if "dc_lam" in ev else i2.get("dc_lam", 7e-5)),
+            sampler="inversion" if ev.get("inversion") else "i2sb_recon",
+            tau=float(i2["tau"]), x1_source=str(i2.get("x1_source", "adjoint")))
 
     buf, cur, written = {}, None, 0
 
@@ -344,7 +367,7 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         # display. Whether it entered the metrics is a separate question, and
         # `use_organ_mask` in the attrs is what answers it.
         organ = None
-        if cfg["task"] == "recon" and len(batch) >= 4:
+        if cfg["task"] in IMAGE_TASKS and len(batch) >= 4:
             organ = (np.abs(_np(batch[3])) > 0).astype(np.uint8)
             buf.setdefault("organ_mask", []).append(organ)
         # Every stored IMAGE is masked to the anatomy (`images_masked` attr):
@@ -369,11 +392,20 @@ def dump_run(run_dir, cfg, model, n_params, step, args, volumes, metrics,
         if "sampling_mask" in extras:
             buf.setdefault("sampling_mask", []).append(
                 (np.abs(_np(extras["sampling_mask"])) > 0).astype(np.uint8))
+        if "bridge_start" in extras:               # i2sb: x1, where the sampler started
+            buf.setdefault("bridge_start", []).append(
+                keep(_np(extras["bridge_start"])).astype(np.complex64))
+        alt = extras.get("alt_recons") or {}       # i2sb: e.g. "nodc", the plain sampler
+        for k, v in alt.items():
+            buf.setdefault(f"recon_{k}", []).append(keep(_np(v)).astype(np.complex64))
         buf.setdefault("slice_index", []).append(np.int32(sl))
 
         for name, fn in metrics.items():
             v = fn(gt, recon, mask=metric_mask).reshape(-1)[0]
             buf.setdefault(f"{name}_slice", []).append(np.float32(v.item()))
+            for k, a in alt.items():
+                v = fn(gt, a, mask=metric_mask).reshape(-1)[0]
+                buf.setdefault(f"{name}_{k}_slice", []).append(np.float32(v.item()))
         written += 1
 
     flush()
@@ -428,6 +460,18 @@ def main():
     p.add_argument("--ckpt", default="net.ckpt",
                    help="checkpoint file in each run dir: net.ckpt (recon runs: lowest "
                         "training loss) or net_bestval.ckpt (best validation)")
+    # i2sb_recon runs only (evaluation/tasks.py::i2sb_recon); default: each run's own settings
+    p.add_argument("--nfe", type=int,
+                   help="i2sb runs: sampler NFE (default: the run's val_nfe)")
+    p.add_argument("--dc", type=_dc_setting, metavar="ITERS:LAM",
+                   help="i2sb runs: CG data consistency on every x0 prediction (I2SB-Recon), "
+                        "e.g. 7:7e-5; 0:0 = the plain sampler (default: the run's dc_iters / "
+                        "dc_lam). With CG on, the plain sampler on the same noise draws is "
+                        "stored too, as `recon_nodc` (+ <metric>_nodc_slice)")
+    p.add_argument("--no-nodc", action="store_true",
+                   help="i2sb runs: do not also store the plain sampler (halves the time)")
+    p.add_argument("--inversion", action="store_true",
+                   help="i2sb runs: I2SB-Inversion's recon -> inversion -> recon instead")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device")
     p.add_argument("--workers", type=int, default=4)
@@ -490,6 +534,14 @@ def main():
             force_organ_mask(cfg)        # metrics inside the stored-map organ mask
         if args.val_kspace_type:
             cfg.setdefault("training", {})["val_kspace_type"] = args.val_kspace_type
+        if cfg["task"] == "i2sb_recon":
+            ev = cfg.setdefault("eval", {})
+            if args.nfe:
+                ev["nfe"] = args.nfe
+            if args.dc is not None:
+                ev["dc_iters"], ev["dc_lam"] = args.dc
+            ev["also_nodc"] = not args.no_nodc
+            ev["inversion"] = bool(args.inversion)
         sigma = args.sigma if args.sigma is not None else default_sigma(cfg)
         dest = out_dir(run_dir, args.runs, args.out)
         n = dump_run(run_dir, cfg, model, n_params, step, args, volumes,

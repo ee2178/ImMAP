@@ -214,9 +214,109 @@ def denoiser(net, batch, cfg, device, sigma, generator=None, extras=None):
     return gt, _call_net(net, noisy, Identity(), sigma_n), None
 
 
+_BRIDGES = {}
+
+
+def _bridge_for(cfg, net, device):
+    """The run's bridge schedule, built once per (run config, device)."""
+    key = (id(cfg), str(device))
+    if key not in _BRIDGES:
+        from sb.base import build_schedule
+        i2 = cfg["i2sb"]
+        b = build_schedule(kind=i2.get("kind", "brownian"), tau=i2["tau"],
+                           n_points=i2.get("n_points", 1000), beta_max=i2.get("beta_max", 0.3),
+                           device=device)
+        if hasattr(net, "assert_schedule_matches"):
+            net.assert_schedule_matches(b)
+        _BRIDGES.clear()                              # one run at a time
+        _BRIDGES[key] = b
+    return _BRIDGES[key]
+
+
+def i2sb_recon(net, batch, cfg, device, sigma, generator=None, extras=None):
+    """I2SB(-Recon) reconstruction: the FULL reverse-bridge sampler on one batch. Mirrors
+    training/i2sb_recon.py's full_recon validation -- the same `_measure` (measurement, bridge
+    start x1, the net's guide), the same sampler, CG data-consistency and support settings.
+
+    Sampler settings: `cfg["eval"]` (scripts/dump_eval.py --nfe / --dc / --inversion) overrides,
+    else the run's own `cfg["i2sb"]`: val_nfe NFE; dc_iters / dc_lam the CG step on every x0
+    prediction (I2SB-Recon, arXiv 2411.14269; 0 = plain I2SB); support_thresh / support_state;
+    "inversion": I2SB-Inversion's recon -> inversion -> recon (sb/i2sb_recon.py).
+
+    The bridge noise comes from torch's global RNG; it is seeded per slice from `generator`
+    (dump_eval resets that per run), so every run sees the same draws on the same slice. With
+    CG on and `extras`, the plain sampler is run as well on the SAME draws and returned in
+    extras["alt_recons"]["nodc"] (dump_eval stores it as `recon_nodc`)."""
+    from training.i2sb_recon import _measure, _unpack, measurement_support
+    from sb.i2sb_recon import (DC_LAM, bridge_noise_scale, i2sb_inversion_sample,
+                               i2sb_recon_sample)
+    from operators.accessors import get_mask as op_mask, get_sensitivity_map
+
+    i2, mri, tr = cfg["i2sb"], cfg["mri"], cfg.get("training", {})
+    ev = cfg.get("eval", {}) or {}
+    bridge = _bridge_for(cfg, net, device)
+    meas = dict(R=mri["R"], acs_lines=mri.get("acs_lines", 24),
+                mask_dist=mri.get("mask_dist", "uniform"), mask_offset=mri.get("mask_offset", 0),
+                center_frac=mri.get("center_frac"), adjust_accel=mri.get("adjust_accel", False),
+                noise_dist=tr.get("noise_dist", "uniform"), online_smaps=mri.get("online_smaps"),
+                online_smaps_kws=mri.get("online_smaps_kws"),
+                x1_source=i2.get("x1_source", "adjoint"),
+                x0_source=i2.get("x0_source", "operator"),
+                guide_R=mri.get("guide_R", 1), guide_acs_lines=mri.get("guide_acs_lines", 0),
+                guide_mask_dist=mri.get("guide_mask_dist", "uniform"),
+                guide_maps=i2.get("guide_maps", "operator"))
+    _, x1, y, E, sigma_n, organ_mask, gt, guide = _measure(
+        batch, net, device, kspace_type=val_kspace_type(cfg), noise_std=sigma,
+        generator=generator, guide_offset=0, **meas)
+    if not tr.get("use_organ_mask", False):
+        organ_mask = None
+
+    nfe = int(ev.get("nfe") or i2.get("val_nfe", 20))
+    dc_iters = int(ev["dc_iters"] if "dc_iters" in ev else i2.get("dc_iters", 0))
+    dc_lam = float(ev["dc_lam"] if "dc_lam" in ev else i2.get("dc_lam", DC_LAM))
+    thr = ev["support_thresh"] if "support_thresh" in ev else i2.get("support_thresh")
+    sup = None if thr is None else measurement_support(y, E, meas, thr)
+    kappa = bridge_noise_scale(x1, i2.get("tau_scale", "none"), i2.get("tau_ref"))
+    seed = 0 if generator is None else int(torch.randint(
+        0, 2 ** 31 - 1, (1,), generator=generator, device=generator.device).item())
+    devs = [device] if torch.device(device).type == "cuda" else []
+
+    def sample(iters):
+        with torch.random.fork_rng(devices=devs):
+            torch.manual_seed(seed)                   # the same bridge noise for every setting
+            if ev.get("inversion"):
+                return i2sb_inversion_sample(net, y, E, bridge, x1, sigma_n=sigma_n, nfe=nfe,
+                                             dc_iters=iters, dc_lam=dc_lam, guide=guide,
+                                             noise_scale=kappa,
+                                             posterior=i2.get("posterior", "ddpm"))[0]
+            return i2sb_recon_sample(net, y, E, bridge, sigma_n=sigma_n, x1=x1, nfe=nfe,
+                                     deterministic=bool(i2.get("deterministic", False)),
+                                     posterior=i2.get("posterior", "ddpm"), verbose=False,
+                                     guide=guide, noise_scale=kappa, dc_iters=iters,
+                                     dc_lam=dc_lam, support=sup,
+                                     support_state=bool(ev.get("support_state",
+                                                               i2.get("support_state", False))))[0]
+
+    rec = sample(dc_iters)
+
+    if extras is not None:
+        extras.update(zero_filled=E.adjoint(y), sampling_mask=op_mask(E), sigma_n=sigma_n,
+                      bridge_start=x1)
+        if dc_iters > 0 and ev.get("also_nodc", True):
+            extras.setdefault("alt_recons", {})["nodc"] = sample(0)
+        side = _unpack(batch)[5]
+        if side is not None:
+            # as recon(): the side scan FULLY sampled, coil-combined under the operator's maps
+            s = side["kspace"][:, side["kspace"].shape[1] // 2] if isinstance(side, dict) else side
+            extras["guide"] = Sense(get_sensitivity_map(E)).adjoint(
+                ifftc(s.to(device, non_blocking=True)))
+    return gt, rec, organ_mask
+
+
 REGISTRY = {
     "recon": recon,
     "denoiser": denoiser,
+    "i2sb_recon": i2sb_recon,
 }
 
 
