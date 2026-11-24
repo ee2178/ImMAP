@@ -530,6 +530,16 @@ MODELS["sbunet_inv_stable"] = dict(
     optimizer=dict(type="Adam", params=dict(lr=1e-5)),
     scheduler=dict(type="WarmupCosine",
                    params=dict(warmup_steps=RETRAIN_WARMUP, T_max=300000, eta_min=1e-7)))
+# "sbunet_inv_x1" (2026-11-24): sbunet_inv_stable's full-size 553M ADM and its whole stable recipe
+# (lr 1e-5, warmup + cosine, EMA 0.99, 2 crops per step, clip, collapse alarm, offline pairs),
+# with ONE change: cond_x1, so the regressor also sees x1 -- here the fully-sampled guide (PD)
+# image, the bridge's start -- as two extra planar input channels at every step, as
+# sbunet_small_x1 does over sbunet_small. The small pair showed the guide channel helps a lot
+# (paired data: structure transfers between contrasts); this is the same comparison at full scale.
+MODELS["sbunet_inv_x1"] = dict(
+    MODELS["sbunet_inv_stable"],
+    model=dict(MODELS["sbunet_inv_stable"]["model"],
+               params=dict(MODELS["sbunet_inv_stable"]["model"]["params"], cond_x1=True)))
 
 # GUIDE CONTRAST TRANSFER (models/contrast_transfer.py; task "contrast_transfer",
 # training/contrast_transfer.py): tiny nets mapping the PD guide -- as a guided net receives it,

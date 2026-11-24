@@ -338,6 +338,21 @@ def test_single_pass_validation_runs_without_autograd():
     assert any(enabled for training, enabled, _ in grad_on if training)   # training: autograd
 
 
+def test_sbunet_inv_x1_is_the_stable_baseline_plus_the_guide_channel():
+    """sbunet_inv_x1 = sbunet_inv_stable (553M ADM, its whole stable recipe) with cond_x1 on: the
+    regressor also sees x1, which for these cells IS the guide (x1_source 'guide')."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as g
+    a, b = g.MODELS["sbunet_inv_stable"], g.MODELS["sbunet_inv_x1"]
+    assert b["x1_source"] == "guide"
+    assert {k: v for k, v in b.items() if k != "model"} == {k: v for k, v in a.items()
+                                                             if k != "model"}
+    pa, pb = a["model"]["params"], b["model"]["params"]
+    assert pa["cond_x1"] is False and pb["cond_x1"] is True
+    assert {k: v for k, v in pb.items() if k != "cond_x1"} == \
+        {k: v for k, v in pa.items() if k != "cond_x1"}
+
+
 def test_refuses_schedule_mismatch_and_embedding():
     with tempfile.TemporaryDirectory() as d:
         raises(ValueError, lambda: run(make_net(tau=0.2), d), "schedule mismatch")

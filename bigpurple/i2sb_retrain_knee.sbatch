@@ -10,6 +10,8 @@
 #     2 sbunet_inv_stable  the BASELINE: I2SB-Inversion's 553M ADM (eps head, x_t only), at their
 #                          lr 1e-5 with EMA 0.99 and 2 crops per step -- the network that
 #                          collapsed at 5e-4, trained so that it cannot repeat it
+#     3 sbunet_inv_x1      the same full-size ADM and recipe, ALSO seeing the guide x1 at every
+#                          step (cond_x1) -- task 2 vs 3 is the guide channel at full scale
 #
 # Shared by every cell: a 5k-step linear warmup then cosine, clip 1.0, 320 x 320 crops,
 # train/grad_norm + train/zero_grad_frac logged, the collapse alarm (dead_grad_alarm 0.5: the run
@@ -25,13 +27,14 @@
 #
 # Submit all:    sbatch bigpurple/i2sb_retrain_knee.sbatch
 # One cell:      sbatch --array=2 bigpurple/i2sb_retrain_knee.sbatch                (sbunet_inv_stable)
+#                sbatch --array=3 bigpurple/i2sb_retrain_knee.sbatch                (sbunet_inv_x1)
 # Other cells:   MODELS="sbunet_small sbunet_small_x1 sbunet_inv_stable sbcdl" \
 #                    sbatch --array=0-3 --export=ALL bigpurple/i2sb_retrain_knee.sbatch
 # Start over:    FORCE_RESTART=1 sbatch --export=ALL bigpurple/i2sb_retrain_knee.sbatch
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-retrain
-#SBATCH --array=0-2
+#SBATCH --array=0-3
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
@@ -44,7 +47,7 @@
 #SBATCH --output=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.out
 #SBATCH --error=/gpfs/scratch/ee2178/ImMAP/bigpurple/logs/%x_%A_%a.err
 
-export MODELS="${MODELS:-sbunet_small sbunet_small_x1 sbunet_inv_stable}"
+export MODELS="${MODELS:-sbunet_small sbunet_small_x1 sbunet_inv_stable sbunet_inv_x1}"
 export TAU="${TAU:-0.19}"
 [ -n "${SLURM_ARRAY_TASK_ID}" ] || { echo "[i2sb-retrain] submit as an array job" >&2; exit 1; }
 echo "[i2sb-retrain] MODELS=\"${MODELS}\" TAU=${TAU}, task ${SLURM_ARRAY_TASK_ID}"
