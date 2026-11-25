@@ -17,12 +17,15 @@
 # --n defaults to 30 here. Results also in bigpurple/logs/guide_use_<time>.json.
 # Run it inside tmux if your VPN drops: losing the SSH session kills an srun --pty job.
 #
-# ANY GPU: an untyped gpu:1 on whichever of PARTITION's queues starts first. The one card that
+# ANY GPU on radiology: an untyped gpu:1. Only radiology by default (2026-11-25): jobs on
+# a100_short / gl40s_short died at once (a100_short also hands out GPUs held in
+# Exclusive_Process mode, bigpurple/i2sb_unet_nyumets.sbatch). Others opt in:
+# PARTITION=radiology,a100_short ... The one card that
 # cannot work is a V100 (compute capability 7.0: the installed torch build ships no kernels for
 # it, bigpurple/jupyter.sbatch), so the job checks the card first and stops on one -- then rerun,
 # or pin a type: GPU=a100:1 bash bigpurple/guide_use.sh
 
-PARTITION="${PARTITION:-radiology,a100_short,gl40s_short}"
+PARTITION="${PARTITION:-radiology}"
 GPU="${GPU:-1}"
 TIME="${TIME:-01:00:00}"
 MEM="${MEM:-32G}"

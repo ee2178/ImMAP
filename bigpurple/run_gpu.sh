@@ -15,12 +15,15 @@
 # it swaps in bigpurple's k-space roots itself. The TGVN run dir is the ported one
 # (scripts/port_runs.py), already on bigpurple's roots.
 #
-# ANY GPU: an untyped gpu:1 on whichever of PARTITION's queues starts first. A V100 (compute
+# ANY GPU on radiology: an untyped gpu:1. Only radiology by default (2026-11-25): jobs on
+# a100_short / gl40s_short died at once (a100_short also hands out GPUs held in
+# Exclusive_Process mode, bigpurple/i2sb_unet_nyumets.sbatch). Others opt in:
+# PARTITION=radiology,a100_short ... A V100 (compute
 # capability 7.0) has no kernels in the installed torch build, so the card is checked first and
 # a V100 stops the job -- rerun, or pin a type: GPU=a100:1.
 # Run it inside tmux if your VPN drops: losing the SSH session kills an srun --pty job.
 
-PARTITION="${PARTITION:-radiology,a100_short,gl40s_short}"
+PARTITION="${PARTITION:-radiology}"
 GPU="${GPU:-1}"
 TIME="${TIME:-01:00:00}"
 MEM="${MEM:-32G}"
