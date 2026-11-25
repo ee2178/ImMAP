@@ -96,8 +96,11 @@ def test_unguided_lggs_is_the_same_net_without_its_guide():
     handed to it anyway changes nothing -- every prox runs its self-only form."""
     from training.recon import _wants_guide
     torch.manual_seed(0)
+    # qk_init "torch": at Sljiva's "randn" scale this unrelated random guide gets ~no attention
+    # mass at init (the self branch scores its maximum), so "the guide matters" would not show;
+    # this test is about the wiring, not the init
     kw = dict(K=4, M=12, C=1, P=5, s=2, Mh=4, window=1, guide_window=5, dK=2, lam0=0.05,
-              preproc="image", attn_backend="gather", spectral_init=False)
+              preproc="image", attn_backend="gather", spectral_init=False, qk_init="torch")
     off = LGGSNet(guided=False, **kw).double()
     on = LGGSNet(**kw).double()
     on.load_state_dict(off.state_dict())                            # same weights

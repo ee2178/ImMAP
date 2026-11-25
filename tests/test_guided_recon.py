@@ -564,7 +564,7 @@ def test_generator_cells_and_config_keys():
     import make_guided_recon_configs as gen
     from models.guided_lpds import lggs_defaults
     from training.i2sb_recon import train_i2sb_recon
-    assert gen.LGGS_PARAMS == lggs_defaults(attn_backend="triton")[0]
+    assert gen.LGGS_PARAMS == lggs_defaults(attn_backend="triton", qk_init="torch")[0]
     assert gen.LGGS_PARAMS["sim_fun"] == "pidistance"
     names = [gen.cell_name(*c) for c in gen.cells()]
     assert names == ["lpdsnet_R8", "lggs_R8_g1", "tgvn_c6_R8_g1", "e2evarnet_R8"], names

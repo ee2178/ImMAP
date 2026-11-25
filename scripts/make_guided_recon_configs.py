@@ -226,14 +226,19 @@ LGGS_PARAMS = dict(K=30, M=169, C=1, P=7, s=2, Mh=64, window=1, guide_window=15,
                    joint_softmax=True, sim_fun="pidistance", lam0=1e-3, tau0=0.5, theta0=0.0,
                    degrees=0, prox_degrees=1,       # noise-adaptive threshold, constant steps
                    dK=5, nheads=1, init_strategy="semi_orthogonal", is_complex=True,
-                   preproc="kspace", attn_backend="triton")
+                   preproc="kspace", attn_backend="triton",
+                   # W_theta / W_phi init PINNED to torch's Conv2d default: what every LGGS run
+                   # here trained with. Since 2026-11-25 the model default is Sljiva's N(0, 1)
+                   # ("randn"; models/prox.py), so without this a fresh run of an existing cell
+                   # would silently start differently. The "_qkrandn" cells below take Sljiva's.
+                   qk_init="torch")
 # Joint LGGS (models/joint_lggs.py) at LGGS's grid point: the same depth, dictionary, attention
 # width, thresholds and refresh schedule; the joint window is LGGS's guide window. K0 = 10 of the
 # 30 layers are the independent-LPDS warm-up (a third, while both images are still aliased).
 JOINT_LGGS_PARAMS = dict(K=30, K0=10, M=169, P=7, s=2, Mh=64, window=15, lam0=1e-3, tau0=0.5,
                          theta0=0.0, degrees=0, prox_degrees=1, dK=5, nheads=1,
                          sim_fun="pidistance", init_strategy="semi_orthogonal",
-                         attn_backend="triton")
+                         attn_backend="triton", qk_init="torch")    # pinned, as LGGS_PARAMS
 
 # NCSR-LPDS prototype (models/ncsr_lpds.py): LGGS's dictionary, depth, steps and refresh
 # schedule; leave-one-out 7x7 self window, 11x11 guide window, beta starting at 1/2. Complex
@@ -393,6 +398,17 @@ SSDU_TRAINING = dict(kspace_loss="ssdu", ssdu_rho=0.2, ssdu_split_mode="points",
 # TGVN's cells return the MAGNITUDE (upstream's output), which a k-space loss cannot score: its
 # SSDU cell returns the complex image instead (output="complex", which needs the known maps it
 # already uses). So tgvn_c6_ssdu differs from tgvn_c6 in the output too, not only the loss.
+# THE W_theta / W_phi INIT A/B (2026-11-25): lggs and lggs_guide_w unchanged except for Sljiva's
+# init of the similarity transforms -- N(0, 1) entries ("randn"; models/prox.py), ~20x the scale
+# the existing runs started from (torch's Conv2d default, pinned in LGGS_PARAMS). At that scale,
+# with W_phi = W_theta, the self branch scores its maximum at every pixel, so a guide whose codes
+# differ from the target's (PD vs PDFS) starts with ~no attention mass: this pair tests whether the
+# guide still turns on. Their own names, so they never resume the old-init runs' directories:
+#     MODELS="lggs_qkrandn lggs_guide_w_qkrandn" sbatch --array=0-1 --export=ALL torch/guided_recon_knee.sbatch
+for _base in ("lggs", "lggs_guide_w"):
+    MODELS[f"{_base}_qkrandn"] = dict(
+        MODELS[_base], model=dict(MODELS[_base]["model"], params=dict(
+            MODELS[_base]["model"]["params"], qk_init="randn")))
 for _base in ("lpdsnet", "tgvn_c6", "lggs_guide_w"):
     MODELS[f"{_base}_ssdu"] = dict(
         MODELS[_base], training=dict(MODELS[_base].get("training") or {}, **SSDU_TRAINING))

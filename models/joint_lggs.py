@@ -98,7 +98,8 @@ class JointLGGSNet(nn.Module):
     def __init__(self, K=30, K0=10, M=169, P=7, s=2, Mh=64, window=15, lam0=1e-3, tau0=0.5,
                  theta0=0.0, degrees=0, prox_degrees=1, dK=5, nheads=1, sim_fun="pidistance",
                  rho0=1.0, gamma0=0.8, rho_inv=True, init_strategy="semi_orthogonal",
-                 attn_backend="gather", flex_block_size=128, spectral_init=True):
+                 attn_backend="gather", flex_block_size=128, spectral_init=True,
+                 qk_init="randn"):
         super().__init__()
         K, K0 = int(K), int(K0)
         if not 0 <= K0 <= K:
@@ -117,7 +118,8 @@ class JointLGGSNet(nn.Module):
         if K0 < K:
             group = dict(degrees=prox_degrees, nheads=nheads, dK=dK, sim_fun=sim_fun, rho0=rho0,
                          gamma0=gamma0, rho_inv=rho_inv, init_strategy=init_strategy,
-                         attn_backend=attn_backend, flex_block_size=flex_block_size)
+                         attn_backend=attn_backend, flex_block_size=flex_block_size,
+                         qk_init=qk_init)              # W_theta / W_phi init: models/prox.py
             joint = JointLPDSLayer(M, window=window, Mh=Mh, prox_kws=group, **common)
             joint.init_filters(weight)                         # every layer starts identical
             set_weight(joint.analysis, warm.analysis.weight)

@@ -56,6 +56,9 @@ from models.components import to_complex, to_planar
 TRITON_SIMS = ("pidistance", "pidot")
 
 EPS = 1e-8
+# GroupThreshold's W_theta / W_phi init: "randn" = N(0, 1) entries, Sljiva's (the default since
+# 2026-11-25); "torch" = nn.Conv2d's default, what every run trained before that started from.
+QK_INITS = ("randn", "torch")
 
 
 # ===========================================================================
@@ -394,8 +397,11 @@ class GroupThreshold(nn.Module):
                  rho_inv=True, sim_fun="distance", dK=1,
                  init_strategy="spectral_norm", subgrad_mode="rigorous",
                  attn_backend="gather", flex_block_size=128, flex_compile_mask=None,
-                 triton_block_m=64, eps=EPS, **_ignored):
+                 triton_block_m=64, eps=EPS, qk_init="randn", **_ignored):
         super().__init__()
+        if qk_init not in QK_INITS:
+            raise ValueError(f"qk_init must be one of {QK_INITS}, got {qk_init!r}")
+        self.qk_init = qk_init
         self.M, self.Mh = int(M), (None if Mh is None else int(Mh))
         self.nheads, self.window, self.dK = int(nheads), int(window), max(int(dK), 1)
         self.sim_fun, self.rho_inv, self.eps = sim_fun, bool(rho_inv), float(eps)
@@ -446,8 +452,17 @@ class GroupThreshold(nn.Module):
             # the widening helper treat all four transforms identically.
             self.Wbeta = PixelConv(M, self.Mh, groups=nheads)
             self._init_alpha_beta(init_strategy)
-            with torch.no_grad():                    # tie W_phi = W_theta at init
-                self.Wphi.weight.copy_(self.Wtheta.weight)
+            with torch.no_grad():
+                if qk_init == "randn":
+                    # Sljiva's init (2026-11-25): every LPDS / LISTA / MG layer hands its filter
+                    # init, `randnC32` (complex) or `Lux.randn32`, down to NonLocalSimilarity's
+                    # W_theta / W_phi convs -- unit-variance entries. Ours stay REAL (the paper's
+                    # W in R^{Mh x M}); a real N(0, 1) gives the same E|W z|^2 = (M / h) E|z|^2 as
+                    # their complex one. torch's Conv2d default (U(+-1/sqrt(M/h)), E w^2 = 1/(3M/h))
+                    # started the similarities ~3 M/h (~500x at M = 169) smaller: near-uniform
+                    # attention, so the guide branch began as a blur over its window.
+                    self.Wtheta.weight.normal_(0.0, 1.0)
+                self.Wphi.weight.copy_(self.Wtheta.weight)    # tie W_phi = W_theta at init
         else:
             self.Wtheta = self.Wphi = self.Walpha = self.Wbeta = None
 

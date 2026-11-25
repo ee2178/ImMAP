@@ -201,6 +201,33 @@ def test_layer_uses_its_own_dictionary_for_the_guide():
           torch.allclose(v, layer.analysis(w), atol=0))
 
 
+def test_similarity_transforms_start_at_sljivas_scale():
+    """W_theta / W_phi start as N(0, 1) entries (2026-11-25), as Sljiva's NonLocalSimilarity
+    does (every layer hands it `randnC32` / `Lux.randn32`), with W_phi = W_theta; torch's
+    Conv2d default (qk_init="torch", ~500x smaller similarities at M = 169) stays available."""
+    print("\n[W_theta / W_phi init]")
+    torch.manual_seed(0)
+    gt = GroupThreshold(169, Mh=64, nheads=1, window=1)
+    w = gt.Wtheta.weight
+    check("W_theta entries ~ N(0, 1)", abs(float(w.std()) - 1) < 0.03 and abs(float(w.mean())) < 0.03,
+          f"mean {float(w.mean()):.3f} std {float(w.std()):.3f}")
+    check("W_phi = W_theta at init", torch.equal(gt.Wphi.weight, w))
+    old = GroupThreshold(169, Mh=64, nheads=1, window=1, qk_init="torch")
+    check("qk_init='torch' keeps nn.Conv2d's default",
+          float(old.Wtheta.weight.abs().max()) <= 169 ** -0.5 + 1e-6)
+    try:
+        GroupThreshold(16, Mh=8, qk_init="xavier")
+        check("an unknown qk_init is refused", False)
+    except ValueError:
+        check("an unknown qk_init is refused", True)
+    net = LGGSNet(K=3, M=64, C=1, P=3, s=2, Mh=32, window=1, guide_window=3, sim_fun="pidistance",
+                  dK=2, is_complex=True, preproc="identity", spectral_init=False)
+    stds = [float(m.Wtheta.weight.std()) for m in net.modules()
+            if isinstance(m, GroupThreshold) and m.grouped]
+    check("every LGGS layer's W_theta starts at unit scale",
+          stds and all(0.85 < s < 1.15 for s in stds), str([round(s, 3) for s in stds]))
+
+
 def test_net_forward_backward():
     print("\n[LGGSNet forward / backward]")
     torch.manual_seed(0)
@@ -279,6 +306,7 @@ if __name__ == "__main__":
                test_complex_and_projection,
                test_joint_softmax_rejects_fused_backends,
                test_layer_uses_its_own_dictionary_for_the_guide,
+               test_similarity_transforms_start_at_sljivas_scale,
                test_net_forward_backward,
                test_registry):
         fn()

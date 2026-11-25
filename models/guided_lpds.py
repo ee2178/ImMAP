@@ -424,7 +424,8 @@ class LGGSNet(nn.Module):
                  guide_mean="per_guide", self_sim_fun=None, adj_blend=True,
                  similarity_scale="learned", prox_degrees=None, guide_transfer=None,
                  separate_guide_w=False, separate_guide_conv=False, trust_codes=False,
-                 trust_delta0=0.1, trust_cg_iters=5, trust_cg_iters0=10, guided=True):
+                 trust_delta0=0.1, trust_cg_iters=5, trust_cg_iters0=10, guided=True,
+                 qk_init="randn"):
         """W_theta, W_phi, W_alpha, W_beta and gamma are ONE set shared by the K layers (as in
         Sljiva's LGGS runs, `share:` in config/guided_lpdsnet.yaml, and the paper, Sec. IV-A);
         eta, theta, A, B, tau and rho stay per layer. There is no untied variant. A checkpoint
@@ -514,7 +515,13 @@ class LGGSNet(nn.Module):
                         flex_block_size=flex_block_size,
                         triton_materialize=triton_materialize, self_sim_fun=self_sim_fun,
                         adj_blend=adj_blend, similarity_scale=similarity_scale,
-                        separate_guide_w=separate_guide_w)
+                        separate_guide_w=separate_guide_w,
+                        # W_theta / W_phi init (models/prox.py QK_INITS): "randn" = Sljiva's;
+                        # "torch" = nn.Conv2d's default, every run trained before 2026-11-25.
+                        # With W_phi = W_theta at init the self branch scores its maximum (0) at
+                        # every pixel, so at "randn" scale a guide whose codes differ from the
+                        # target's (a cross-contrast one) starts with ~no attention mass.
+                        qk_init=qk_init)
         if guide_blend is not None:            # "additive": models/guided_prox.py
             prox_kws.update(guide_blend=guide_blend, guide_gain0=guide_gain0)
         layer_kws = dict(P=P, stride=s, lam0=lam0, tau0=tau0, theta0=theta0,
