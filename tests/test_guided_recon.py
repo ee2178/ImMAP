@@ -472,6 +472,30 @@ def test_train_recon_end_to_end_tgvn_and_baseline():
         assert spy0.guides and all(g is None for g in spy0.guides)
 
 
+def test_train_recon_end_to_end_e2evarnet_baseline():
+    """The e2evarnet cell (2026-11-25): the published E2E-VarNet trains on the paired PDFS data as
+    an UNGUIDED baseline -- never handed the guide, its own maps (it asks for no online ones, so
+    none are configured here), the grid's varnet block in the generated config."""
+    from models.e2evarnet import E2EVarNet
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = make_data(root)
+        net = E2EVarNet(acs_lines="mask", **TINY_TGVN)
+        assert not net.uses_operator_smaps and net.returns_magnitude
+        assert tr._wants_guide(net) is False       # the routing training applies to the real net
+        spy = Spy(net)
+        spy.guided = False                         # Spy's own forward has a `guide` arg: mirror it
+        wb = run_recon(spy, csv, root, d)
+        assert spy.guides and all(g is None for g in spy.guides), spy.guides
+        assert os.path.exists(os.path.join(d, "net.ckpt"))
+        assert any("val/psnr" in c for c in wb.calls), wb.calls
+    spec = gen.MODELS["e2evarnet"]
+    assert (spec["task"], spec["guided"], spec["grid_base"], spec["model"]) == \
+        ("recon", False, "varnet", None)
+    assert "e2evarnet" in gen.DEFAULT_MODELS
+
+
 def test_train_recon_end_to_end_lggs_gets_the_side_image():
     from models.guided_lpds import LGGSNet
     import physics.online_smaps as osm
@@ -543,7 +567,7 @@ def test_generator_cells_and_config_keys():
     assert gen.LGGS_PARAMS == lggs_defaults(attn_backend="triton")[0]
     assert gen.LGGS_PARAMS["sim_fun"] == "pidistance"
     names = [gen.cell_name(*c) for c in gen.cells()]
-    assert names == ["lpdsnet_R8", "lggs_R8_g1", "tgvn_c6_R8_g1"], names
+    assert names == ["lpdsnet_R8", "lggs_R8_g1", "tgvn_c6_R8_g1", "e2evarnet_R8"], names
     bridge = [f"sbtgvn_c8_{s}" for s in gen.BRIDGE_STARTS] + \
         [f"sblggs_{s}" for s in gen.BRIDGE_STARTS]
     assert [gen.cell_name(8, m, 1) for m in bridge] == [

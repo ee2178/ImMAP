@@ -5,9 +5,11 @@
 # torch/mg_recon_dump.sbatch, for the runs trained on torch and copied over:
 #
 #     lpdsnet_R8  tgvn_c6_R8_g1  lggs_R8_g1  lggs_guide_w_R8_g1  lggs_guide_conv_R8_g1
+#     e2evarnet_R8   (the published E2E-VarNet, unguided; added 2026-11-25 -- skipped until
+#                     it is trained and ported)
 #
 # under trained_nets/guided_recon/knee/s4_noise-vlow/. Port them first (once):
-#     python scripts/port_runs.py trained_nets/guided_recon/knee/s4_noise-vlow/{lpdsnet_R8,tgvn_c6_R8_g1,lggs_R8_g1,lggs_guide_w_R8_g1,lggs_guide_conv_R8_g1}
+#     python scripts/port_runs.py trained_nets/guided_recon/knee/s4_noise-vlow/{lpdsnet_R8,tgvn_c6_R8_g1,lggs_R8_g1,lggs_guide_w_R8_g1,lggs_guide_conv_R8_g1,e2evarnet_R8}
 #
 #   mkdir -p bigpurple/logs
 #   sbatch bigpurple/guided_recon_dump.sbatch                        # the defaults below
@@ -63,7 +65,7 @@
 # No `set -euo pipefail` -- it breaks conda activate (unset $PS1 / $CONDA_SHLVL under -u).
 
 RUNS_ROOT="${RUNS_ROOT:-trained_nets/guided_recon/knee/s4_noise-vlow}"
-ONLY="${ONLY:-lpdsnet_R8 tgvn_c6_R8_g1 lggs_R8_g1 lggs_guide_w_R8_g1 lggs_guide_conv_R8_g1}"
+ONLY="${ONLY:-lpdsnet_R8 e2evarnet_R8 tgvn_c6_R8_g1 lggs_R8_g1 lggs_guide_w_R8_g1 lggs_guide_conv_R8_g1}"
 CKPT="${CKPT:-net_bestval.ckpt}"       # net_bestval.ckpt | net.ckpt
 N_VOLUMES="${N_VOLUMES:-20}"           # first N val volumes in sorted order; 0 = every one
 VOLUMES="${VOLUMES:-}"                 # explicit PDFS volume names instead (no .h5)

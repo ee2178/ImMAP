@@ -20,6 +20,7 @@ DUMP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 COLUMNS = [
     ("Zero-filled",        "@zero_filled"),
     ("Guide (PD)",         "@guide"),
+    # ("E2E-VarNet",       "e2evarnet_R8"),   # unguided, own maps: uncomment once dumped
     ("LPDSNet",            "lpdsnet_R8"),
     ("TGVN",               "tgvn_c6_R8_g1"),
     ("LGGS",               "lggs_R8_g1"),

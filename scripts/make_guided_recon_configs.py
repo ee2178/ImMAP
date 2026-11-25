@@ -12,6 +12,8 @@ THE R8 SWEEP (the default cells; torch/guided_recon_knee.sbatch):
     lpdsnet_R8          LPDSNet, NO guide (the unguided baseline, on the same PDFS data)
     lggs_R8_g1          vanilla LGGS at Sljiva's grid point, phase-invariant similarity (triton)
     tgvn_c6_R8_g1       TGVN, E2E-VarNet width, 6 cascades, fully-sampled guide
+    e2evarnet_R8        the published E2E-VarNet, NO guide (2026-11-25): its own coil maps,
+                        12 cascades -- a second unguided baseline next to LPDSNet
 
 Since 2026-11-13 (user's call): vanilla LGGS only -- the guide-W / guide-conv / transfer variants
 showed no visual difference -- and TGVN at 6 cascades only (deeper TGVN is noticeably slower than
@@ -81,7 +83,7 @@ sys.path.insert(0, REPO)
 ANATOMY = "knee"
 ACCELS = (8,)
 GUIDE_ACCELS = (1,)
-DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c6")
+DEFAULT_MODELS = ("lpdsnet", "lggs", "tgvn_c6", "e2evarnet")
 # Run namespace. "s4" (2026-11-17) = "s3" with adjust_accel OFF: the masks sample every R-th line
 # plus the ACS (effective R ~6.1 at R=8 on the 368-wide knee) instead of widening the spacing to 11
 # (effective R 7.7) -- a different sampling problem, so a new set. "s3" = PER-VOLUME normalization
@@ -290,6 +292,14 @@ MODELS = {
                                                              **TGVN_SIZE, **SCHEDULE))),
     "lpdsnet": dict(task="recon", guided=False, grid_base="lpdsnet", pad_multiple=None,
                     model=None),                       # the grid's lpdsnet model block
+    # THE PUBLISHED E2E-VarNet (fastMRI's, models/e2evarnet; added 2026-11-25), a second unguided
+    # baseline next to LPDSNet: the grid's varnet cell unchanged -- 12 cascades, chans 18, its OWN
+    # sensitivity network calibrated on the mask's ACS (it never reads the operator's online maps),
+    # RSS magnitude out, no noise-level input. Against the PDFS SENSE target that is a fair
+    # magnitude comparison (unit-norm maps: RSS = |x| on the support). Not varnet_img below, which
+    # is TGVN with its guide off: the operator's maps and a sigma plane, i.e. TGVN's own control.
+    "e2evarnet": dict(task="recon", guided=False, grid_base="varnet", pad_multiple=1,
+                      model=None),                     # the grid's varnet model block
     "varnet_img": dict(task="recon", guided=False, grid_base="varnet", pad_multiple=1,
                        model=dict(type="TGVN", params=dict(guided=False, cond_sigma=True,
                                                            use_smaps=True, **TGVN_SIZE))),

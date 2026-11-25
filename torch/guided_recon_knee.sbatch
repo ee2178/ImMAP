@@ -13,7 +13,7 @@
 #SBATCH --mail-user=ee2178@nyu.edu
 #SBATCH --output=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.out
 #SBATCH --error=/home/ee2178/scratch/ee2178/ImMAP/torch/logs/slurm_%A_%a.err
-#SBATCH --array=0-2           # MUST equal the cell count; checked at runtime
+#SBATCH --array=0-3           # MUST equal the cell count; checked at runtime
 #
 # THE KNEE R8 SWEEP: PDFS main contrast, PD guide (fully sampled). One training budget for every
 # cell. A cell is (main R, model, guide R):
@@ -22,6 +22,11 @@
 #     0 lpdsnet_R8        LPDSNet, NO guide (unguided baseline)          task recon
 #     1 lggs_R8_g1        vanilla LGGS, Sljiva's grid point (triton)     task recon
 #     2 tgvn_c6_R8_g1     TGVN, 6 cascades (E2E-VarNet width)            task recon
+#     3 e2evarnet_R8      the published E2E-VarNet, NO guide, own maps   task recon
+#
+# 2026-11-25: e2evarnet added, a second unguided baseline (the grid's varnet cell: 12 cascades, its
+# own sensitivity net). With the first three already trained, run it alone:
+#     MODELS="e2evarnet" sbatch --array=0 --export=ALL torch/guided_recon_knee.sbatch
 #
 # 2026-11-13 (user's call): vanilla LGGS only (the guide-W / guide-conv / transfer variants showed
 # no visual difference) and TGVN at 6 cascades only (deeper TGVN is noticeably slower than LGGS);
@@ -72,7 +77,7 @@
 
 IMMAP_ROOT="${IMMAP_ROOT:-${HOME}/scratch/ee2178/ImMAP}"
 ACCELS="${ACCELS:-8}"
-MODELS="${MODELS:-lpdsnet lggs tgvn_c6}"
+MODELS="${MODELS:-lpdsnet lggs tgvn_c6 e2evarnet}"
 NOISE="${NOISE:-vlow}"          # added training noise U[0, 0.001]; see the header
 GUIDE_ACCELS="${GUIDE_ACCELS:-1}"
 REGENERATE="${REGENERATE:-1}"
