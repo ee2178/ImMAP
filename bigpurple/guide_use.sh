@@ -16,9 +16,14 @@
 # Arguments after the script go to the python script (python scripts/diagnose_guide_use.py -h);
 # --n defaults to 30 here. Results also in bigpurple/logs/guide_use_<time>.json.
 # Run it inside tmux if your VPN drops: losing the SSH session kills an srun --pty job.
+#
+# ANY GPU: an untyped gpu:1 on whichever of PARTITION's queues starts first. The one card that
+# cannot work is a V100 (compute capability 7.0: the installed torch build ships no kernels for
+# it, bigpurple/jupyter.sbatch), so the job checks the card first and stops on one -- then rerun,
+# or pin a type: GPU=a100:1 bash bigpurple/guide_use.sh
 
-PARTITION="${PARTITION:-radiology}"
-GPU="${GPU:-a100:1}"
+PARTITION="${PARTITION:-radiology,a100_short,gl40s_short}"
+GPU="${GPU:-1}"
 TIME="${TIME:-01:00:00}"
 MEM="${MEM:-32G}"
 CPUS="${CPUS:-4}"
@@ -64,4 +69,13 @@ case " $* " in *" --n "*) N_ARG=() ;; *) N_ARG=(--n 30) ;; esac
 JSON="bigpurple/logs/guide_use_$(date +%Y%m%d_%H%M%S).json"
 echo "host: $(hostname)   job: $SLURM_JOB_ID   $(date '+%F %T')"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+python - <<'PY' || exit 1
+import sys, torch
+if not torch.cuda.is_available():
+    sys.exit("no CUDA device visible")
+cc = torch.cuda.get_device_capability(0)
+if cc < (7, 5):
+    sys.exit(f"{torch.cuda.get_device_name(0)} is compute capability {cc[0]}.{cc[1]}: this torch "
+             f"build has no kernels for it. Rerun, or pin a type: GPU=a100:1 bash bigpurple/guide_use.sh")
+PY
 python -u scripts/diagnose_guide_use.py "${DIRS[@]}" "${N_ARG[@]}" --json "$JSON" "$@"
