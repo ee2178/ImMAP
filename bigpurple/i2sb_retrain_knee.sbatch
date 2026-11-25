@@ -31,6 +31,10 @@
 # Other cells:   MODELS="sbunet_small sbunet_small_x1 sbunet_inv_stable sbcdl" \
 #                    sbatch --array=0-3 --export=ALL bigpurple/i2sb_retrain_knee.sbatch
 # Start over:    FORCE_RESTART=1 sbatch --export=ALL bigpurple/i2sb_retrain_knee.sbatch
+# The sbunet_small_x1 family (2026-11-25), support-masked (loss + metrics on the anatomy, the
+# sampler's hard support at inference; runs in s4_noise-vlow_supp/):
+#                SUPPORT_MASK=1 MODELS="sbunet_small_x1 sbunet_small_x1_zf sbunet_small_x1_cg sbunet_small_x1_zf_cg" \
+#                    sbatch --array=0-3 --export=ALL bigpurple/i2sb_retrain_knee.sbatch
 
 #SBATCH --partition=radiology
 #SBATCH --job-name=i2sb-retrain

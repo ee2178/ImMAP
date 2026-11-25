@@ -81,6 +81,25 @@ At test time `_measure` rotates the guide by ITS OWN centre block as well: with 
 phase back into x1 (79 deg RMS on the test phantom, 2026-11-23; `_phase_corrected_image`).
 Measurement noise does not enter the pair; validation still measures (the sampler needs y and E).
 
+TRAINING-TIME DATA CONSISTENCY (`train_dc_iters`, `train_dc_lam`, cfg["i2sb"]; 0 = off, 2026-11-25):
+the loss scores the prediction AFTER the sampler's CG step, x0_dc = argmin ||y - E x||^2 +
+lam ||x - x0_hat||^2 (cg_data_consistency's problem, `train_dc_iters` CG iterations from x0_hat),
+instead of x0_hat itself. The CG step enters training, so the net is fit to what the sampler
+actually uses -- not to a prediction the CG then corrects (and can hallucinate from) at test time.
+Backprop runs through the solve IMPLICITLY (solvers/cg.py::tcg(implicit=True)): the gradient of a
+CG solve is another CG solve, d x0_dc / d x0_hat = lam (E^H E + lam I)^{-1}, O(1) memory: per
+eigen-direction of E^H E (eigenvalue s in [0, 1] for unit-norm maps), x0_dc keeps lam / (s + lam)
+of the prediction and takes the rest from the data -- all of it on the null space of E. With a
+tiny lam (I2SB-Recon's 7e-5) the step is a near-hard DC and the loss supervises only what the data
+cannot fix; at the configs' lam = 2 (I2SB_DC) it is a soft blend, at least 2/3 prediction even on
+fully measured directions, and well conditioned (7 iterations converge, so the implicit gradient
+is the exact one). Needs y and E: the measured pairs
+have them, and the offline pairs build them (`_offline_pair` with a mask: y = M (k + noise), E
+under the same phase-corrected offline maps as x0). Cropped to batch, each slice's crop is pasted
+back on its own full grid (zeros around it), solved there, and cropped again. Single-pass
+validation applies the same step; full_recon's sampler uses `dc_iters` / `dc_lam` (the generator
+sets them equal to these).
+
 Validation (`val_mode`, cfg["i2sb"]):
     "single_pass"   one bridge step per slice, one forward -- the training objective. The step
                     is random, or `val_step` for every slice (negative counts from the end, so
@@ -106,7 +125,7 @@ from operators.fourier import ifftc
 from physics.mask import get_mask_cached as get_mask, resolve_acs_lines
 from sb.base import build_schedule, n_steps, forward_sample, forward_std
 from sb.i2sb_recon import (DC_LAM, TAU_SCALES, X1_SOURCES, bridge_noise_scale, bridge_start,
-                           online_support,
+                           cg_data_consistency, online_support,
                            predict_x0_recon, i2sb_recon_sample)
 from training.common import (EMA, POSTFIX_EVERY, apply_loss_mask, embed_for_net, get_lr,
                              load_ckpt, prepare_measurement, save_ckpt)
@@ -224,13 +243,20 @@ def _phase_corrected_image(maps, k, *, acs_lines, center_frac):
     return Sense(phase_correct_maps(maps, ifftc(k * cm))).adjoint(ifftc(k))
 
 
-def _offline_pair(batch, device, *, acs_lines, center_frac):
-    """One paired batch -> the "OFFLINE PAIRS" training pair, no measurement and no ESPIRiT:
-    (x0, x1, None, None, sigma_n = 0, organ_mask, gt, None), shaped like `_measure`'s output.
+def _offline_pair(batch, device, *, acs_lines, center_frac, x1_source="guide", R=None,
+                  mask_dist="uniform", mask_offset=0, adjust_accel=False, noise_std=0.0,
+                  noise_dist="uniform", generator=None, **_):
+    """One paired batch -> the "OFFLINE PAIRS" training pair, no ESPIRiT:
+    (x0, x1, y, E, sigma_n, organ_mask, gt, None), shaped like `_measure`'s output.
 
     Both scans are combined under the loader's offline PDFS maps, each after
     `phase_correct_maps` with its own centre-block calibration image (module docstring). gt is the
-    stored image, as `_measure` returns it (metrics read its magnitude)."""
+    stored image, as `_measure` returns it (metrics read its magnitude).
+
+    With `R` (a sampling mask, as `_measure` draws it) the pair also carries a MEASUREMENT under
+    the same phase-corrected maps x0 is combined with: y = M (k + noise) (noise_std, as
+    measurement_awgn) and E = M F S_pc -- for x1_source "adjoint" (x1 = E^H y) and for the
+    training-time CG step. Without it: y = E = None and sigma_n = 0 (x1_source "guide" only)."""
     kspace, smaps, image, organ_mask, _, side = _unpack(batch)
     if side is None or isinstance(side, dict):
         raise ValueError("train_pairs='offline' needs a paired loader with ONE guide slice "
@@ -240,9 +266,30 @@ def _offline_pair(batch, device, *, acs_lines, center_frac):
         raise ValueError("train_pairs='offline' needs the offline coil maps, but the loader served "
                          "flat placeholder maps: set the data target to 'sense' (smap_root)")
     kw = dict(acs_lines=acs_lines, center_frac=center_frac)
-    x0, x1 = _phase_corrected_image(S, k, **kw), _phase_corrected_image(S, g, **kw)
-    return (x0, x1, None, None, torch.zeros(x0.shape[0], device=device),
-            organ_mask.to(device), image.to(device), None)
+    x0 = _phase_corrected_image(S, k, **kw)
+    y = E = None
+    sigma_n = torch.zeros(x0.shape[0], device=device)
+    if R is not None:
+        from operators.noise import kspace_awgn
+        from physics.online_smaps import center_mask, phase_correct_maps
+        cm = center_mask(k, resolve_acs_lines(k.shape[-1], acs_lines, center_frac))
+        S_pc = phase_correct_maps(S, ifftc(k * cm))            # x0 = S_pc^H F^-1 k, as above
+        mask = get_mask(x0, R=R, acs_lines=acs_lines, mode=mask_dist, offset=mask_offset,
+                        center_frac=center_frac, adjust_accel=adjust_accel)
+        y, sigma_n = kspace_awgn(k, mask, noise_std, noise_dist, generator=generator)
+        # a fixed std comes back as a plain number: one per sample either way
+        sigma_n = torch.as_tensor(sigma_n, dtype=x0.real.dtype, device=x0.device).reshape(-1)
+        sigma_n = sigma_n.expand(x0.shape[0]) if sigma_n.numel() == 1 else sigma_n
+        E = Mask(mask) @ FFT2D() @ Sense(S_pc)
+    if x1_source == "guide":
+        x1 = _phase_corrected_image(S, g, **kw)
+    elif x1_source == "adjoint":
+        if E is None:
+            raise ValueError("offline pairs with x1_source 'adjoint' need a measurement (R)")
+        x1 = E.adjoint(y)
+    else:
+        raise ValueError(f"offline pairs start from 'guide' or 'adjoint', not {x1_source!r}")
+    return (x0, x1, y, E, sigma_n, organ_mask.to(device), image.to(device), None)
 
 
 def _cat0(vs):
@@ -256,16 +303,47 @@ def _crop_stack(parts, crop, kappa_fn):
     x0, x1, the guide, gt and the organ mask are centre-cropped to `crop` and stacked. y and E stay
     on each slice's own grid and cannot be stacked, so they come back None: only an
     `image_domain_only` net takes this path. kappa is each slice's own, from its FULL x1.
-    -> (x0, x1, None, None, sigma_n, organ_mask, gt, guide, kappa)"""
+    dc: [(y, E, full x0 shape)] per slice, for the training-time CG step (_train_dc).
+    -> (x0, x1, None, None, sigma_n, organ_mask, gt, guide, kappa, dc)"""
     from training.contrast_transfer import _center_crop
-    x0, x1, _, _, sigma_n, organ, gt, guide = zip(*parts)
+    x0, x1, ys, Es, sigma_n, organ, gt, guide = zip(*parts)
+    dc = [(y_, E_, v.shape) for y_, E_, v in zip(ys, Es, x0)]
     kap = [kappa_fn(v) for v in x1]
     kappa = None if all(k is None for k in kap) else _cat0(
         [torch.as_tensor(k, device=v.device).reshape(-1) for k, v in zip(kap, x1)])
     crop_cat = lambda vs: torch.cat([_center_crop(v, crop) for v in vs], dim=0)   # noqa: E731
     guide = None if all(g is None for g in guide) else crop_cat(guide)
     return (crop_cat(x0), crop_cat(x1), None, None, _cat0(sigma_n), crop_cat(organ),
-            crop_cat(gt), guide, kappa)
+            crop_cat(gt), guide, kappa, dc)
+
+
+def _train_dc(pred, dc, crop, lam, iters):
+    """The training-time CG step ("TRAINING-TIME DATA CONSISTENCY"): cg_data_consistency's
+    problem solved by `iters` CG iterations from the prediction, differentiated implicitly.
+
+    `dc` is [(y, E, full shape)]: one entry for the whole batch (no crop: pred is on E's grid), or
+    one per slice (crop: each crop pasted at the centre of its slice's full grid, zeros around it,
+    solved there, and cropped back)."""
+    from solvers.cg import tcg
+    from training.contrast_transfer import _center_crop
+
+    def solve(x, y, E):
+        return tcg(lambda v: E.adjoint(E.forward(v)), float(lam), E.adjoint(y) + lam * x,
+                   implicit=True, tol=0.0, max_iter=int(iters), x0=x, stop="rhs")
+
+    if crop is None:
+        (y, E, _), = dc
+        return solve(pred, y, E)
+    out = []
+    for i, (y, E, shape) in enumerate(dc):
+        p = pred[i:i + 1]
+        H, W = shape[-2:]
+        h, w = p.shape[-2:]
+        top, left = (H - h) // 2, (W - w) // 2                  # _center_crop's placement
+        full = torch.zeros((1, *shape[1:]), dtype=p.dtype, device=p.device)
+        full[..., top:top + h, left:left + w] = p
+        out.append(_center_crop(solve(full, y, E), crop))
+    return torch.cat(out, dim=0)
 
 
 def train_i2sb_recon(
@@ -352,6 +430,8 @@ def train_i2sb_recon(
     dc_lam=DC_LAM,                   # (I2SB-Recon, arXiv 2411.14269); full_recon val only, see
                                      # sb/i2sb_recon.py::cg_data_consistency. With dc_iters > 0
                                      # the val metrics are WITH it and val/nodc_* without it
+    train_dc_iters=0,                # TRAINING-TIME DATA CONSISTENCY (module doc): score the
+    train_dc_lam=DC_LAM,             # prediction after this CG step, implicit backprop; 0 = off
     support_thresh=None,             # full_recon val: a HARD SUPPORT on every x0 prediction, from
     support_state=False,             # the operator's own online ESPIRiT eigenvalues > thresh
                                      # (sb/i2sb_recon.py::online_support); support_state masks
@@ -407,9 +487,10 @@ def train_i2sb_recon(
         if not getattr(net, "image_domain_only", False) or getattr(net, "guided", False):
             raise ValueError(f"train_pairs='offline' builds no measurement: it needs an unguided, "
                              f"image-domain net (image_domain_only), not {type(net).__name__}")
-        if x1_source != "guide" or int(guide_R) != 1:
-            raise ValueError("train_pairs='offline' builds x1 from the fully sampled guide: needs "
-                             f"x1_source 'guide' and guide_R 1 (got {x1_source!r}, {guide_R})")
+        if x1_source not in ("guide", "adjoint") or int(guide_R) != 1:
+            raise ValueError("train_pairs='offline' builds x1 from the fully sampled guide or the "
+                             "zero-filled measurement: needs x1_source 'guide' or 'adjoint' and "
+                             f"guide_R 1 (got {x1_source!r}, {guide_R})")
         if not (online_smaps and (online_smaps_kws or {}).get("phase_correct")):
             raise ValueError("train_pairs='offline' trains on phase-corrected pairs, so the "
                              "operator's online maps must be phase-corrected too "
@@ -419,6 +500,12 @@ def train_i2sb_recon(
         raise ValueError(f"dead_grad_alarm is a fraction in (0, 1], got {dead_grad_alarm}")
     if int(dc_iters) < 0 or float(dc_lam) < 0:
         raise ValueError(f"need dc_iters >= 0 and dc_lam >= 0, got {dc_iters}, {dc_lam}")
+    if int(train_dc_iters) < 0 or not float(train_dc_lam) > 0:
+        raise ValueError(f"need train_dc_iters >= 0 and train_dc_lam > 0, got {train_dc_iters}, "
+                         f"{train_dc_lam}")
+    if int(train_dc_iters) > 0:
+        print(f"[i2sb_recon] training-time data consistency: {int(train_dc_iters)} CG iterations, "
+              f"lam {float(train_dc_lam):g}, implicit backprop; the loss scores x0 after it")
 
     bridge = build_schedule(kind=kind, tau=tau, n_points=n_points, beta_max=beta_max,
                             device=device)
@@ -489,16 +576,22 @@ def train_i2sb_recon(
                     except StopIteration:
                         train_iter = iter(train_loader)
                         batch = next(train_iter)
+                    offline_meas = x1_source == "adjoint" or int(train_dc_iters) > 0
                     parts.append(
-                        _offline_pair(batch, device, acs_lines=acs_lines, center_frac=center_frac)
+                        _offline_pair(batch, device, acs_lines=acs_lines, center_frac=center_frac,
+                                      x1_source=x1_source, noise_std=noise_std,
+                                      noise_dist=noise_dist, mask_dist=mask_dist,
+                                      mask_offset=mask_offset, adjust_accel=adjust_accel,
+                                      R=R if offline_meas else None)
                         if train_pairs == "offline" else _measure(
                             batch, net, device, kspace_type=kspace_type, noise_std=noise_std,
                             guide_offset="random", **meas))
                 if crop is None:
                     x0, x1, y, E, sigma_n, organ_mask, gt, guide = parts[0]
                     kappa = kappa_fn(x1)
+                    dc = [(y, E, x0.shape)]
                 else:
-                    x0, x1, y, E, sigma_n, organ_mask, gt, guide, kappa = _crop_stack(
+                    x0, x1, y, E, sigma_n, organ_mask, gt, guide, kappa, dc = _crop_stack(
                         parts, crop, kappa_fn)
 
                 b = x0.shape[0]
@@ -508,6 +601,8 @@ def train_i2sb_recon(
                 std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
                 pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
                                         guide=guide)
+                if int(train_dc_iters) > 0:
+                    pred = _train_dc(pred, dc, crop, float(train_dc_lam), int(train_dc_iters))
                 if loss_target == "eps":
                     # eps_hat - eps = (x0 - x0_hat) / std_fwd: the eps-matching MSE, unweighted
                     # per sample (I2SB runner.py: F.mse_loss(pred, compute_label(step, x0, xt)))
@@ -610,7 +705,8 @@ def train_i2sb_recon(
                     noise_std=noise_std if val_noise_std is None else val_noise_std,
                     meas=meas, kappa_fn=kappa_fn, dc_iters=int(dc_iters), dc_lam=float(dc_lam),
                     metric_range=metric_range, support_thresh=support_thresh,
-                    support_state=bool(support_state),
+                    support_state=bool(support_state), train_dc_iters=int(train_dc_iters),
+                    train_dc_lam=float(train_dc_lam),
                     wandb=wandb, global_step=global_step, epoch=epoch)
                 if save_ckpt_fn and math.isfinite(val["psnr"]) and val["psnr"] > best_val_psnr:
                     best_val_psnr = val["psnr"]
@@ -680,7 +776,7 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
                    deterministic, val_step=None, posterior, loss_fn, loss_type, use_organ_mask, residual_gain,
                    kspace_type, noise_std, meas, kappa_fn, wandb, global_step, epoch,
                    dc_iters=0, dc_lam=DC_LAM, metric_range=1.0, support_thresh=None,
-                   support_state=False):
+                   support_state=False, train_dc_iters=0, train_dc_lam=DC_LAM):
     net.eval()
     compare = val_mode == "full_recon" and dc_iters > 0
     keys = ("loss", "psnr", "ssim", "nrmse", "zf_psnr", "zf_ssim", "zf_nrmse")
@@ -719,6 +815,8 @@ def _validate_pass(net, bridge, val_loader, device, *, gen, interval, val_mode, 
             std_fwd = forward_std(bridge, step, xdim=x0.shape[1:])
             pred = predict_x0_recon(net, x_t, std_fwd, x1=x1, y=y, E=E, sigma_n=sigma_n,
                                     guide=guide)
+            if train_dc_iters > 0:          # the step the net was trained through
+                pred = cg_data_consistency(pred, y, E, train_dc_lam, train_dc_iters)
         # unweighted in both modes, so val/loss is comparable across loss_weight settings
         loss = _bridge_loss(loss_fn, loss_type, x0, pred, organ_mask, use_organ_mask,
                             None, 1.0, std_fwd, "uniform")

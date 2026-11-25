@@ -738,9 +738,11 @@ def test_crop_to_batch():
         parts.append((x0, x1, "y", "E", torch.full((2,), 0.01 * (s + 1)),
                       torch.ones(2, 1, H, H, dtype=torch.bool), x0.abs(), None))
     kfn = lambda v: v.abs().flatten(1).mean(1)                 # noqa: E731
-    x0, x1, y, E, sn, org, gt, guide, kappa = _crop_stack(parts, (24, 20), kfn)
+    x0, x1, y, E, sn, org, gt, guide, kappa, dc = _crop_stack(parts, (24, 20), kfn)
     assert x0.shape == x1.shape == org.shape == gt.shape == (4, 1, 24, 20)
     assert y is None and E is None and guide is None and sn.shape == (4,)
+    # each slice's own measurement and full shape, for the training-time CG step
+    assert [d[:2] for d in dc] == [("y", "E")] * 2 and all(d[2] == (2, 1, H, H) for d in dc)
     full = torch.cat([kfn(p[1]) for p in parts])
     assert torch.allclose(kappa, full), "kappa must come from the uncropped x1"
     assert torch.equal(x0[2:], parts[1][0][..., 4:28, 6:26])   # the centre crop, in order
@@ -944,7 +946,7 @@ def test_training_on_offline_pairs():
             go(net, d, **extra)
             assert any(not torch.equal(a, c) for a, c in zip(before, net.parameters())), extra
     with tempfile.TemporaryDirectory() as d:
-        raises(ValueError, lambda: go(make_net(), d, x1_source="adjoint"), "x1_source 'guide'")
+        raises(ValueError, lambda: go(make_net(), d, x1_source="acs"), "x1_source 'guide'")
         raises(ValueError, lambda: go(make_net(), d, online_smaps_kws={}), "phase-corrected")
         net = make_net()
         net.image_domain_only = False
@@ -956,6 +958,127 @@ def test_training_on_offline_pairs():
         raises(ValueError, lambda: train_i2sb_recon(
             make_net(), torch.optim.Adam(make_net().parameters()), None, "cpu", dl_flat, None,
             save_dir=d, **base), "placeholder")
+
+
+OFF_KW = dict(acs_lines=8, center_frac=None, R=4, mask_dist="uniform", mask_offset=0,
+              adjust_accel=False, noise_std=0.0, noise_dist="uniform")
+
+
+def test_offline_pairs_carry_a_consistent_measurement():
+    """With a mask, the offline pair carries y = M k and E = M F S_pc under the SAME phase-corrected
+    maps x0 is combined with: E x0 = y exactly (the phantom is in the maps' span), the zero-filled
+    start is E^H y, and the guide start is unchanged."""
+    from training.i2sb_recon import _offline_pair
+    (b, _) = paired_phantom(2)
+    x0g, x1g, y0, E0, *_ = _offline_pair(b, "cpu", acs_lines=8, center_frac=None)
+    assert y0 is None and E0 is None                                     # no mask: as before
+    x0, x1, y, E, sn, *_ = _offline_pair(b, "cpu", x1_source="guide", **OFF_KW)
+    assert torch.allclose(x0, x0g) and torch.allclose(x1, x1g)
+    assert torch.allclose(E.forward(x0), y, atol=1e-4)
+    assert float(sn.abs().max()) == 0.0
+    _, x1z, yz, Ez, *_ = _offline_pair(b, "cpu", x1_source="adjoint", **OFF_KW)
+    assert torch.allclose(x1z, Ez.adjoint(yz))
+    raises(ValueError, lambda: _offline_pair(b, "cpu", x1_source="adjoint", acs_lines=8,
+                                             center_frac=None), "need a measurement")
+
+
+def test_train_dc_is_the_sampler_step_with_the_implicit_gradient():
+    """_train_dc's forward is cg_data_consistency; its (implicit) gradient matches backprop
+    through a converged CG; and the cropped path is the full-grid solve of the zero-padded crop."""
+    from sb.i2sb_recon import cg_data_consistency
+    from solvers.cg import batched_cg
+    from training.contrast_transfer import _center_crop
+    from training.i2sb_recon import _offline_pair, _train_dc
+    (b, _) = paired_phantom(1)
+    x0, _, y, E, *_ = _offline_pair(b, "cpu", x1_source="guide", **OFF_KW)
+    torch.manual_seed(0)
+    pred = (x0 + 0.1 * torch.randn_like(x0)).requires_grad_()
+    # a well-conditioned lam, so both solves converge in float32 (at lam 1e-2 the two gradients
+    # still agree to ~0.3%, the float32 CG floor -- measured, 2026-11-25)
+    lam, it = 1e-1, 60
+    out = _train_dc(pred, [(y, E, x0.shape)], None, lam, it)
+    assert torch.allclose(out, cg_data_consistency(pred.detach(), y, E, lam, it), atol=1e-5)
+    w = torch.randn_like(x0)
+    (g_imp,) = torch.autograd.grad((out.conj() * w).real.sum(), pred)
+    ref = batched_cg(lambda v: E.adjoint(E.forward(v)) + lam * v, E.adjoint(y) + lam * pred,
+                     x0=pred, tol=0.0, max_iter=it, stop="rhs")
+    (g_ref,) = torch.autograd.grad((ref.conj() * w).real.sum(), pred)
+    rel = float((g_imp - g_ref).norm() / g_ref.norm())
+    assert rel < 1e-3, rel
+    # cropped: paste at the centre of the full grid, solve there, crop back
+    c = (16, 20)
+    p_c = _center_crop(pred.detach(), c)
+    full = torch.zeros_like(x0)
+    top, left = (H - 16) // 2, (H - 20) // 2
+    full[..., top:top + 16, left:left + 20] = p_c
+    want = _center_crop(cg_data_consistency(full, y, E, lam, 7), c)
+    got = _train_dc(p_c, [(y, E, x0.shape)], c, lam, 7)
+    assert torch.allclose(got, want, atol=1e-5)
+
+
+def test_training_through_the_cg_step():
+    """The loop trains through the CG step on offline pairs from both starts, cropped to batch and
+    on the full grid, with the support-masked loss, and validates single-pass through it."""
+    (b, _) = paired_phantom(4)
+    dl = DataLoader(TensorDataset(*b), batch_size=1, shuffle=False)
+    base = dict(num_epochs=1, steps_per_epoch=2, val_every_epochs=1, kind="brownian", tau=TAU,
+                n_points=N, R=4, acs_lines=8, kspace_type="measurement_awgn",
+                online_smaps="espirit", online_smaps_kws={"phase_correct": True, "kernel_size": 4},
+                guide_maps="operator", train_pairs="offline", train_dc_iters=3,
+                train_dc_lam=1e-2, use_organ_mask=True, val_mode="single_pass", val_step=None,
+                val_seed=0, noise_std=(0.0, 0.001), val_noise_std=0.0)
+    for x1s in ("guide", "adjoint"):
+        for extra in ({}, dict(crop=(24, 24), crop_batch=2)):
+            with tempfile.TemporaryDirectory() as d:
+                net = make_net(cond_x1=True)
+                before = [p.detach().clone() for p in net.parameters()]
+                opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+                w = FakeWandb()
+                train_i2sb_recon(net, opt, None, "cpu", dl,
+                                 DataLoader(TensorDataset(*paired_phantom(1, seed=1)[0]),
+                                            batch_size=1), save_dir=d, wandb=w,
+                                 **dict(base, x1_source=x1s, **extra))
+                assert any(not torch.equal(a, c) for a, c in zip(before, net.parameters())), \
+                    (x1s, extra)
+                psnr = [v["val/psnr"] for _, v in w.calls if "val/psnr" in v]
+                assert psnr and np.isfinite(psnr[-1]), (x1s, extra)
+    with tempfile.TemporaryDirectory() as d:
+        raises(ValueError, lambda: train_i2sb_recon(
+            make_net(), torch.optim.Adam(make_net().parameters()), None, "cpu", dl, None,
+            save_dir=d, **dict(base, x1_source="guide", train_dc_lam=0.0)), "train_dc_lam > 0")
+
+
+def test_sbunet_small_x1_family_configs():
+    """The four cells: same net and recipe, start and training-time CG as named; with the
+    support mask, the masked loss / metrics and the sampler's hard support."""
+    import subprocess
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    names = ("sbunet_small_x1", "sbunet_small_x1_zf", "sbunet_small_x1_cg",
+             "sbunet_small_x1_zf_cg")
+    with tempfile.TemporaryDirectory() as out:
+        subprocess.run([sys.executable, os.path.join(REPO, "scripts",
+                                                     "make_guided_recon_configs.py"),
+                        "--out", out, "--support-mask", "--tau", "0.19", "--models", *names],
+                       check=True, cwd=REPO, stdout=subprocess.DEVNULL)
+        cfgs = {}
+        for n in names:
+            with open(os.path.join(out, "knee", "guided", f"{n}_R8_g1_tau0.19.json")) as f:
+                cfgs[n] = json.load(f)
+    ref = cfgs["sbunet_small_x1"]
+    for n, c in cfgs.items():
+        i2 = c["i2sb"]
+        assert c["model"] == ref["model"] and c["model"]["params"]["cond_x1"] is True, n
+        assert c["training"]["use_organ_mask"] is True, n
+        assert c["data"]["train"]["organ_mask_source"] == "smaps", n
+        assert i2["support_thresh"] == gen.I2SB_SUPPORT["support_thresh"], n
+        assert i2["train_pairs"] == "offline", n
+        assert i2["x1_source"] == ("adjoint" if "_zf" in n else "guide"), n
+        cg = n.endswith("_cg")
+        assert i2.get("train_dc_iters", 0) == (gen.I2SB_DC["dc_iters"] if cg else 0), n
+        if cg:
+            assert i2["dc_iters"] == i2["train_dc_iters"] and i2["dc_lam"] == i2["train_dc_lam"]
+        assert c["paths"]["save_dir"].split("/")[-2].endswith("_supp"), n
 
 
 def main():

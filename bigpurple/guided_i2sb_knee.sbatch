@@ -75,6 +75,9 @@ die() { echo "[i2sb-knee] $*" >&2; exit 1; }
 
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels 1)
+if [ "${SUPPORT_MASK:-}" = "1" ]; then
+    GEN+=(--support-mask)       # loss + val metrics on the offline maps' support, the sampler's hard
+fi                              # support at inference; run tag _supp
 if [ -n "${NOISE:-}" ]; then
     GEN+=(--noise "${NOISE}")   # added noise preset: vlow (default) | low | grid | none; own run tag
 fi

@@ -186,10 +186,13 @@ VOLUME_SCALES = "config/knee/guided/volume_scales.json"
 VOLUME_STAT, SIDE_VOLUME_STAT = "acs_p95", "full_p95"
 
 TAU = 0.03 * PDFS_SCALE_FAC / _OLD_SCALE_FAC
-# sampling-time CG data consistency (I2SB-Recon, arXiv 2411.14269; sb/i2sb_recon.py): the
-# paper's defaults. Validation only -- val/* is WITH it, val/nodc_* the plain sampler on the same
-# noise draws (val cost x2). dc_iters 0 turns it off.
-I2SB_DC = {"dc_iters": 7, "dc_lam": 7e-5}
+# sampling-time CG data consistency (I2SB-Recon, arXiv 2411.14269; sb/i2sb_recon.py): 7 CG
+# iterations (the paper's) at lam = 2 (2026-11-25, the user's call: the best FIXED lam found; the
+# paper's 7e-5 is a near-hard DC that amplifies noise and hallucinates along the bridge -- a
+# time-dependent schedule is the next step). Also the training-time CG of the _cg cells (TRAIN_DC).
+# Validation: val/* is WITH it, val/nodc_* the plain sampler on the same noise draws (val cost x2).
+# dc_iters 0 turns it off.
+I2SB_DC = {"dc_iters": 7, "dc_lam": 2.0}
 # Hard support at validation sampling: every x0 prediction is multiplied by the support of the
 # OPERATOR's own online ESPIRiT maps at eigenvalue 0.9 -- the offline target's threshold, so the
 # recon's background is 0 where the target's is. Test-time computable (the measurement alone).
@@ -572,6 +575,23 @@ for _name, _cx1 in (("sbunet_small", False), ("sbunet_small_x1", True)):
         type="SBReconUnet", params=dict(SBUNET_SMALL, cond_x1=_cx1, **SCHEDULE)))
 MODELS["sbcdl"] = dict(_RETRAIN, model=dict(type="SBReconCDL",
                                             params=dict(SBCDL_PARAMS, **SCHEDULE)))
+# THE sbunet_small_x1 FAMILY (2026-11-25): the small UNet that also sees x1 (cond_x1), on the
+# retraining recipe, from either start, with or without TRAINING-TIME DATA CONSISTENCY
+# (training/i2sb_recon.py: the loss scores x0 after the sampler's CG step, implicit backprop):
+#   sbunet_small_x1          guide (PD) -> target bridge                       (defined above)
+#   sbunet_small_x1_zf       zero-filled E^H y -> target bridge (no PD anywhere: x1 is the
+#                            measurement; offline pairs build y and E under the offline maps)
+#   sbunet_small_x1_cg       guide -> target, trained through the CG step
+#   sbunet_small_x1_zf_cg    zero-filled -> target, trained through the CG step
+# The _cg cells use the sampler's CG (I2SB_DC: 7 iterations, lam 2) in training, at single-pass
+# validation and in the full sampler alike. Run them with the support mask (SUPPORT_MASK=1: loss
+# and metrics on the anatomy, and the sampler's hard support on every x0 prediction).
+TRAIN_DC = dict(train_dc_iters=I2SB_DC["dc_iters"], train_dc_lam=I2SB_DC["dc_lam"], **I2SB_DC)
+MODELS["sbunet_small_x1_zf"] = dict(MODELS["sbunet_small_x1"], x1_source="adjoint")
+MODELS["sbunet_small_x1_cg"] = dict(MODELS["sbunet_small_x1"],
+                                    i2sb=dict(MODELS["sbunet_small_x1"]["i2sb"], **TRAIN_DC))
+MODELS["sbunet_small_x1_zf_cg"] = dict(MODELS["sbunet_small_x1_zf"],
+                                       i2sb=dict(MODELS["sbunet_small_x1_zf"]["i2sb"], **TRAIN_DC))
 # "sbunet_inv_stable": the BASELINE again -- I2SB-Inversion's 553M ADM, eps head, x_t only,
 # exactly sbunet_inv's network -- trained so that it cannot repeat the collapse. What blew up was
 # the activations (time embedding -> FiLM -> residual stream, ~10x per level), and under Adam the
@@ -830,6 +850,10 @@ def make_config(r, model, g, grid):
                        "tau_scale": TAU_SCALE, "tau_ref": tau_ref,
                        **I2SB_VAL, **I2SB_DC, **I2SB_SUPPORT}
         cfg["i2sb"].update(spec.get("i2sb") or {})
+        if SUPPORT_MASK:
+            # the support at INFERENCE too: every x0 prediction of the sampler times the hard
+            # support of the operator's own ESPIRiT eigenvalues > 0.9 (test-time computable)
+            cfg["i2sb"]["support_thresh"] = I2SB_SUPPORT["support_thresh"]
     return cfg
 
 
