@@ -592,6 +592,23 @@ MODELS["sbunet_small_x1_cg"] = dict(MODELS["sbunet_small_x1"],
                                     i2sb=dict(MODELS["sbunet_small_x1"]["i2sb"], **TRAIN_DC))
 MODELS["sbunet_small_x1_zf_cg"] = dict(MODELS["sbunet_small_x1_zf"],
                                        i2sb=dict(MODELS["sbunet_small_x1_zf"]["i2sb"], **TRAIN_DC))
+# I2SB-TGVN ON THE SAME RECIPE (2026-11-25): BridgeTGVN (models/tgvn/adapter.py; 6 cascades, the
+# tgvn_c6 size) as the whole regressor -- its cascades start at x_t and carry TGVN's own data
+# consistency on y and trust guidance on the PD side scan, so the expectation E[x0 | x_t, y, guide]
+# is ONE network and the sampler needs NO CG step (dc_iters 0). x1 needs no extra channel: the
+# guide start's x1 is the guide (TGVN's trust term reads it), the zero-filled start's is E^H y (its
+# data consistency reads y). The sbunet_small_x1 recipe otherwise -- offline phase-corrected pairs,
+# which now carry y, E and the side k-space for a net that reads them (no ESPIRiT per step), Adam
+# 1e-4 + warmup/cosine, clip 1, the collapse alarm, random-step validation, support masking via
+# SUPPORT_MASK=1 -- except the crop: TGVN reads (y, E) on each slice's full grid, so one uncropped
+# slice per step.
+for _src, _tag in (("guide", "guide"), ("adjoint", "zf")):
+    MODELS[f"sbtgvn_c6_rt_{_tag}"] = dict(
+        _RETRAIN, x1_source=_src,
+        model=dict(type="BridgeTGVN", params=dict(guided=True, cond_sigma=True,
+                                                  **dict(TGVN_SIZE, num_cascades=6), **SCHEDULE)),
+        i2sb=dict(RETRAIN_I2SB, dc_iters=0),
+        training=dict(RETRAIN_TRAINING, crop=None, crop_batch=1))
 # "sbunet_inv_stable": the BASELINE again -- I2SB-Inversion's 553M ADM, eps head, x_t only,
 # exactly sbunet_inv's network -- trained so that it cannot repeat the collapse. What blew up was
 # the activations (time embedding -> FiLM -> residual stream, ~10x per level), and under Adam the

@@ -948,9 +948,11 @@ def test_training_on_offline_pairs():
     with tempfile.TemporaryDirectory() as d:
         raises(ValueError, lambda: go(make_net(), d, x1_source="acs"), "x1_source 'guide'")
         raises(ValueError, lambda: go(make_net(), d, online_smaps_kws={}), "phase-corrected")
+        # a net that reads (y, E) trains on offline pairs too (they carry a measurement for it,
+        # test_bridge_tgvn_...); an image-domain net that takes a guide IMAGE is still refused
         net = make_net()
-        net.image_domain_only = False
-        raises(ValueError, lambda: go(net, d), "image-domain")
+        net.guided = True
+        raises(ValueError, lambda: go(net, d), "takes a guide image")
         raises(ValueError, lambda: go(make_net(), d, train_pairs="cached"), "train_pairs")
         flat = list(b)
         flat[1] = torch.full_like(b[1], NC ** -0.5)                         # placeholder maps
@@ -1079,6 +1081,103 @@ def test_sbunet_small_x1_family_configs():
         if cg:
             assert i2["dc_iters"] == i2["train_dc_iters"] and i2["dc_lam"] == i2["train_dc_lam"]
         assert c["paths"]["save_dir"].split("/")[-2].endswith("_supp"), n
+
+
+def test_bridge_tgvn_trains_on_offline_pairs_with_its_own_data_consistency():
+    """sbtgvn_c6_rt_*: BridgeTGVN on offline pairs -- the pair carries y, E and the side k-space
+    (TGVN's guide), from both starts, support-masked, no CG anywhere -- and the cells' configs."""
+    import subprocess
+    from models.tgvn import BridgeTGVN
+    from training.i2sb_recon import _offline_pair
+    (b, _) = paired_phantom(3)
+    tiny = dict(num_cascades=2, sens_chans=4, sens_pools=2, chans=4, pools=2, kind="brownian",
+                tau=TAU, n_points=N)
+    torch.manual_seed(0)
+    net = BridgeTGVN(guided=True, cond_sigma=True, **tiny)
+    x0, x1, y, E, sn, _, _, guide = _offline_pair(b, "cpu", x1_source="guide", net=net, **OFF_KW)
+    assert guide is not None and torch.equal(guide, b[5])         # the side k-space, fully sampled
+    dl = DataLoader(TensorDataset(*b), batch_size=1, shuffle=False)
+    base = dict(num_epochs=1, steps_per_epoch=2, val_every_epochs=1, kind="brownian", tau=TAU,
+                n_points=N, R=4, acs_lines=8, kspace_type="measurement_awgn",
+                online_smaps="espirit", online_smaps_kws={"phase_correct": True, "kernel_size": 4},
+                guide_maps="operator", train_pairs="offline", use_organ_mask=True,
+                val_mode="single_pass", val_step=None, val_seed=0, noise_std=(0.0, 0.001),
+                val_noise_std=0.0, dc_iters=0)
+    for x1s in ("guide", "adjoint"):
+        with tempfile.TemporaryDirectory() as d:
+            torch.manual_seed(0)
+            net = BridgeTGVN(guided=True, cond_sigma=True, **tiny)
+            before = [p.detach().clone() for p in net.parameters()]
+            w = FakeWandb()
+            train_i2sb_recon(net, torch.optim.Adam(net.parameters(), lr=1e-3), None, "cpu", dl,
+                             DataLoader(TensorDataset(*paired_phantom(1, seed=1)[0]),
+                                        batch_size=1), save_dir=d, wandb=w,
+                             **dict(base, x1_source=x1s))
+            assert any(not torch.equal(p, q) for p, q in zip(before, net.parameters())), x1s
+            psnr = [v["val/psnr"] for _, v in w.calls if "val/psnr" in v]
+            assert psnr and np.isfinite(psnr[-1]), x1s
+    with tempfile.TemporaryDirectory() as out:
+        subprocess.run([sys.executable, os.path.join(REPO, "scripts",
+                                                     "make_guided_recon_configs.py"),
+                        "--out", out, "--support-mask", "--tau", "0.19", "--models",
+                        "sbtgvn_c6_rt_guide", "sbtgvn_c6_rt_zf"],
+                       check=True, cwd=REPO, stdout=subprocess.DEVNULL)
+        for tag, src in (("guide", "guide"), ("zf", "adjoint")):
+            with open(os.path.join(out, "knee", "guided",
+                                   f"sbtgvn_c6_rt_{tag}_R8_g1_tau0.19.json")) as f:
+                c = json.load(f)
+            i2, p = c["i2sb"], c["model"]["params"]
+            assert c["model"]["type"] == "BridgeTGVN" and p["num_cascades"] == 6
+            assert p["tau"] == i2["tau"] == 0.19 and i2["x1_source"] == src
+            assert i2["dc_iters"] == 0 and i2.get("train_dc_iters", 0) == 0
+            assert i2["train_pairs"] == "offline" and i2["support_thresh"] == 0.9
+            assert c["training"]["crop"] is None and c["training"]["use_organ_mask"] is True
+            assert c["data"]["train"]["pad_multiple"] == 1
+
+
+def test_ascent_is_the_bridge_sampler_in_the_ve_coordinate():
+    """sb/ascent.py: on the bridge's own schedule with zeta 'ddpm' the ascent IS i2sb_recon_sample
+    (same noise draws); the swapped schedules share its endpoints and NFE; zeta 0 is
+    deterministic; an oracle regressor lands on x0 under every schedule and rule."""
+    from sb.ascent import ascent_sample, schedule_steps, sigma_eff
+    from sb.base import space_indices
+    _, smaps, image, _, _ = phantom(2)
+    E = operator(smaps, image)
+    y = E(image)
+    sched = build_schedule(kind="brownian", tau=TAU, n_points=N)
+    net = make_net(cond_x1=True).eval()
+    x1 = E.adjoint(y)
+    for nfe in (8, 20):
+        torch.manual_seed(3)
+        ref = i2sb_recon_sample(net, y, E, sched, x1=x1, nfe=nfe, verbose=False)[0]
+        torch.manual_seed(3)
+        got = ascent_sample(net, y, E, sched, x1, schedule_steps(sched, "bridge", nfe))
+        assert float((got - ref).norm() / ref.norm()) < 1e-4, nfe
+        b = space_indices(N, nfe + 1)
+        assert schedule_steps(sched, "bridge", nfe) == b
+        s = sigma_eff(sched)
+        for kind in ("geometric", "linear"):
+            st = schedule_steps(sched, kind, nfe)
+            assert len(st) == nfe + 1 and st[0] == 0 and st[-1] == N - 1
+            assert st == sorted(set(st))
+            assert abs(float(s[st[-2]]) - float(s[b[-2]])) < 0.05 * float(s[b[-2]])
+            assert abs(float(s[st[1]]) - float(s[b[1]])) < 0.05 * float(s[b[1]])
+    st = schedule_steps(sched, "geometric", 10)
+    outs = []
+    for seed in (0, 1):
+        torch.manual_seed(seed)
+        outs.append(ascent_sample(net, y, E, sched, x1, st, zeta=0.0))
+    assert torch.equal(outs[0], outs[1])
+
+    def oracle(x_t, sigma=None, **_):
+        return image, None
+    for kind in ("bridge", "geometric", "linear"):
+        for zeta in ("ddpm", 0.0, 0.5, 1.0):
+            torch.manual_seed(0)
+            rec = ascent_sample(oracle, y, E, sched, x1, schedule_steps(sched, kind, 10),
+                                zeta=zeta)
+            err = float((rec - image).abs().max() / image.abs().max())
+            assert err < 0.05, (kind, zeta, err)
 
 
 def main():

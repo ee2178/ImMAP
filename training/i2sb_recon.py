@@ -133,7 +133,8 @@ from training.common import backtrack as do_backtrack, resync_schedule
 from training.i2sb import _bridge_loss
 from training.losses import LOSS_REGISTRY
 from training.metrics import compute_metrics
-from training.recon import (_check_paired, _ckpt_field, _guide, _unpack, guide_display,
+from training.recon import (_check_paired, _ckpt_field, _guide, _unpack, _wants_guide,
+                            guide_display,
                             operator_maps, undersample_guide)
 from visualization.image import recon_panel
 from visualization.params import get_param_logs
@@ -245,7 +246,7 @@ def _phase_corrected_image(maps, k, *, acs_lines, center_frac):
 
 def _offline_pair(batch, device, *, acs_lines, center_frac, x1_source="guide", R=None,
                   mask_dist="uniform", mask_offset=0, adjust_accel=False, noise_std=0.0,
-                  noise_dist="uniform", generator=None, **_):
+                  noise_dist="uniform", generator=None, net=None, **_):
     """One paired batch -> the "OFFLINE PAIRS" training pair, no ESPIRiT:
     (x0, x1, y, E, sigma_n, organ_mask, gt, None), shaped like `_measure`'s output.
 
@@ -255,8 +256,13 @@ def _offline_pair(batch, device, *, acs_lines, center_frac, x1_source="guide", R
 
     With `R` (a sampling mask, as `_measure` draws it) the pair also carries a MEASUREMENT under
     the same phase-corrected maps x0 is combined with: y = M (k + noise) (noise_std, as
-    measurement_awgn) and E = M F S_pc -- for x1_source "adjoint" (x1 = E^H y) and for the
-    training-time CG step. Without it: y = E = None and sigma_n = 0 (x1_source "guide" only)."""
+    measurement_awgn) and E = M F S_pc -- for x1_source "adjoint" (x1 = E^H y), for the
+    training-time CG step, and for a regressor that reads (y, E) itself (BridgeTGVN). Without it:
+    y = E = None and sigma_n = 0 (x1_source "guide" only).
+
+    `net`, a regressor that takes a guide (training/recon.py::_wants_guide): its guide is built
+    from the fully-sampled side scan as at validation (training/recon.py::_guide, guide_R 1, under
+    E's maps) -- for a k-space guide (TGVN), the side k-space itself."""
     kspace, smaps, image, organ_mask, _, side = _unpack(batch)
     if side is None or isinstance(side, dict):
         raise ValueError("train_pairs='offline' needs a paired loader with ONE guide slice "
@@ -289,7 +295,14 @@ def _offline_pair(batch, device, *, acs_lines, center_frac, x1_source="guide", R
         x1 = E.adjoint(y)
     else:
         raise ValueError(f"offline pairs start from 'guide' or 'adjoint', not {x1_source!r}")
-    return (x0, x1, y, E, sigma_n, organ_mask.to(device), image.to(device), None)
+    guide = None
+    if net is not None and _wants_guide(net):
+        if E is None:
+            raise ValueError("a guided regressor on offline pairs needs the measurement (R)")
+        _, T = embed_for_net(net, E, x0, None)
+        guide = _guide(net, g, next(o.smaps for o in E.ops if hasattr(o, "smaps")), T, device,
+                       1, 0, "uniform", 0)
+    return (x0, x1, y, E, sigma_n, organ_mask.to(device), image.to(device), guide)
 
 
 def _cat0(vs):
@@ -484,9 +497,9 @@ def train_i2sb_recon(
     if train_pairs not in TRAIN_PAIRS:
         raise ValueError(f"train_pairs {train_pairs!r} not in {TRAIN_PAIRS}")
     if train_pairs == "offline":
-        if not getattr(net, "image_domain_only", False) or getattr(net, "guided", False):
-            raise ValueError(f"train_pairs='offline' builds no measurement: it needs an unguided, "
-                             f"image-domain net (image_domain_only), not {type(net).__name__}")
+        if getattr(net, "image_domain_only", False) and getattr(net, "guided", False):
+            raise ValueError(f"train_pairs='offline': {type(net).__name__} is image-domain but "
+                             f"takes a guide image -- not built on offline pairs")
         if x1_source not in ("guide", "adjoint") or int(guide_R) != 1:
             raise ValueError("train_pairs='offline' builds x1 from the fully sampled guide or the "
                              "zero-filled measurement: needs x1_source 'guide' or 'adjoint' and "
@@ -576,13 +589,16 @@ def train_i2sb_recon(
                     except StopIteration:
                         train_iter = iter(train_loader)
                         batch = next(train_iter)
-                    offline_meas = x1_source == "adjoint" or int(train_dc_iters) > 0
+                    # a measurement on the offline pair when anything reads it: the zero-filled
+                    # start, the training-time CG step, or a net that takes y / E itself
+                    offline_meas = (x1_source == "adjoint" or int(train_dc_iters) > 0
+                                    or not getattr(net, "image_domain_only", False))
                     parts.append(
                         _offline_pair(batch, device, acs_lines=acs_lines, center_frac=center_frac,
                                       x1_source=x1_source, noise_std=noise_std,
                                       noise_dist=noise_dist, mask_dist=mask_dist,
                                       mask_offset=mask_offset, adjust_accel=adjust_accel,
-                                      R=R if offline_meas else None)
+                                      R=R if offline_meas else None, net=net)
                         if train_pairs == "offline" else _measure(
                             batch, net, device, kspace_type=kspace_type, noise_std=noise_std,
                             guide_offset="random", **meas))
