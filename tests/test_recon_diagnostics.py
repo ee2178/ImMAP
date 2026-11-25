@@ -75,6 +75,28 @@ def test_smaps_check_sees_wrong_maps_and_ignores_the_espirit_phase():
     assert res_bad["full/online"]["support"]["psnr"] < res_ph["full/online"]["support"]["psnr"] - 10
 
 
+def test_smaps_check_swaps_in_this_clusters_roots():
+    """A config from the other cluster: missing roots become IMMAP_CLUSTER's; existing roots and
+    an unset IMMAP_CLUSTER leave the config alone."""
+    import make_guided_recon_configs as gen
+    old = os.environ.get("IMMAP_CLUSTER")
+    try:
+        with tempfile.TemporaryDirectory() as here:
+            cfg = {"data": {"train": {"kspace_roots": ["/no/such/root"]},
+                            "val": {"kspace_roots": [here]}}}
+            os.environ.pop("IMMAP_CLUSTER", None)
+            assert sc.use_cluster_roots(cfg)["data"]["train"]["kspace_roots"] == ["/no/such/root"]
+            os.environ["IMMAP_CLUSTER"] = "bigpurple"
+            sc.use_cluster_roots(cfg)
+            assert cfg["data"]["train"]["kspace_roots"] == gen.KNEE_ROOTS["bigpurple"]
+            assert cfg["data"]["val"]["kspace_roots"] == [here]          # exists: kept
+    finally:
+        if old is None:
+            os.environ.pop("IMMAP_CLUSTER", None)
+        else:
+            os.environ["IMMAP_CLUSTER"] = old
+
+
 def _tiny_tgvn():
     from models.tgvn import TGVN
     torch.manual_seed(0)

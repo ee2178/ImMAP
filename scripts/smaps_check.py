@@ -116,6 +116,24 @@ def evaluate_slice(kspace, s_off, image, mri, training, lams=(1e-3, 1e-2), cg_it
     return out, extras
 
 
+def use_cluster_roots(cfg):
+    """A config generated on the other cluster names k-space roots that do not exist here: swap
+    in THIS cluster's (IMMAP_CLUSTER; scripts/make_guided_recon_configs.py::KNEE_ROOTS) -- the
+    only data path that differs between torch and bigpurple. Roots that exist are left alone."""
+    cluster = os.environ.get("IMMAP_CLUSTER")
+    if not cluster:
+        return cfg
+    from scripts.make_guided_recon_configs import KNEE_ROOTS
+    for split in ("train", "val"):
+        d = cfg.get("data", {}).get(split)
+        if not d or "kspace_roots" not in d or all(os.path.isdir(r) for r in d["kspace_roots"]):
+            continue
+        print(f"[roots] {split}: {d['kspace_roots']} not found here -> {cluster}'s "
+              f"{KNEE_ROOTS[cluster]}")
+        d["kspace_roots"] = list(KNEE_ROOTS[cluster])
+    return cfg
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -134,6 +152,7 @@ def main():
     from training.recon import _unpack
     with open(a.config) as f:
         cfg = yaml.safe_load(f)
+    use_cluster_roots(cfg)
     dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     ds = val_subset(cfg)
     n = min(a.n, len(ds))
