@@ -115,8 +115,22 @@ NOISE = "vlow"                      # the default since 2026-11-13: U[0, 0.001],
 VAL_NOISE_STD = 0.0
 
 
+# SUPPORT-MASKED training and validation (2026-11-25; --support-mask / the launcher's
+# SUPPORT_MASK=1): the loss, every val metric and the wandb panel restricted to the anatomy --
+# the support of the OFFLINE ESPIRiT maps the reference is made with (organ_mask_source "smaps":
+# smaps.abs().sum(0) > 0; the reference is exactly 0 outside it). Without it the whole frame is
+# scored, and smaps_check.py measured what that costs: a perfect recon under the operator's online
+# maps scores 34.3 dB over the frame (background noise where the reference is 0) but 57.9 dB inside
+# the support -- the nets were partly learning to blank the background. The mask is a TRAINING /
+# SCORING device only: the nets never see it, and their output outside the support is unconstrained
+# (dump_eval and the viewer mask it, as for every run). Its own run tag ("_supp"), so masked runs
+# never resume an unmasked run's dir.
+SUPPORT_MASK = False
+
+
 def run_tag():
-    return RUN_TAG if NOISE == "grid" else f"{RUN_TAG}_noise-{NOISE}"
+    tag = RUN_TAG if NOISE == "grid" else f"{RUN_TAG}_noise-{NOISE}"
+    return f"{tag}_supp" if SUPPORT_MASK else tag
 
 
 def _noise_suffix():
@@ -392,6 +406,16 @@ for _n in TGVN_CASCADE_SWEEP:
         task="recon", guided=True, grid_base="varnet", pad_multiple=1,
         model=dict(type="TGVN", params=dict(guided=True, cond_sigma=True, use_smaps=True,
                                             **dict(TGVN_SIZE, num_cascades=_n))))
+
+# TGVN WITH ITS OWN COIL MAPS (2026-11-25): tgvn_c6 with map estimation ON -- upstream's
+# SensitivityModel calibrated on the mask's ACS, as the paper's TGVN_1S; the guide is coil-combined
+# with those estimated maps, and the output is the MAGNITUDE (estimated maps share no phase reference
+# with the target). The estimated-map twin of e2evarnet (the grid's E2E-VarNet, its own maps too).
+# Both are scored against the offline-SENSE magnitude like every cell, a convention their RSS-like
+# output does not share (smaps_check.py: the fully-sampled RSS scores 28.6 dB inside the anatomy).
+MODELS["tgvn_c6_ownmaps"] = dict(
+    MODELS["tgvn_c6"], model=dict(MODELS["tgvn_c6"]["model"], params=dict(
+        MODELS["tgvn_c6"]["model"]["params"], use_smaps=False, output="magnitude")))
 
 # SSDU LOSS (2026-11-23; training/ssdu.py, training.kspace_loss): the same three nets trained
 # without an image-domain loss -- each step the acquired k-space is split into input points and
@@ -716,6 +740,8 @@ def make_config(r, model, g, grid):
     if NOISE_PRESETS[NOISE] is not None:
         training.update(NOISE_PRESETS[NOISE], noise_dist="uniform")
     training["val_noise_std"] = VAL_NOISE_STD
+    if SUPPORT_MASK:
+        training["use_organ_mask"] = True
     if TRAIN_RECIPE == "sljiva":
         training["clip_grad"] = SLJIVA_RECIPE["clip_grad"]
     speed = spec.get("speed") or {}
@@ -751,6 +777,13 @@ def make_config(r, model, g, grid):
     }
     if speed.get("params"):
         cfg["model"]["params"].update(speed["params"])
+    if SUPPORT_MASK:
+        for split in ("train", "val"):
+            if cfg["data"][split].get("target") != "sense":
+                raise ValueError(f"--support-mask needs the offline SENSE target (its maps' "
+                                 f"support is the mask); {name} has target "
+                                 f"{cfg['data'][split].get('target')!r}")
+            cfg["data"][split]["organ_mask_source"] = "smaps"
     if spec.get("model_params"):
         # a cell's own params on top of the grid's model block (model=None takes that block)
         cfg["model"]["params"].update(spec["model_params"])
@@ -844,13 +877,17 @@ def main():
                         "vlow U[0, 0.001], none; "
                         "validation adds none (VAL_NOISE_STD); non-grid presets get their own "
                         "run tag")
+    p.add_argument("--support-mask", action="store_true",
+                   help="restrict the training loss and the val metrics to the offline maps' "
+                        "support (SUPPORT_MASK); the run tag gets '_supp'")
     p.add_argument("--tau", type=float, default=None,
                    help="one bridge tau for every i2sb cell (no per-start calibration); the cell "
                         "names get a _tau<value> suffix")
     args = p.parse_args()
-    global TAU_OVERRIDE, NOISE
+    global TAU_OVERRIDE, NOISE, SUPPORT_MASK
     TAU_OVERRIDE = args.tau
     NOISE = args.noise
+    SUPPORT_MASK = bool(args.support_mask)
     write_config = _write_config()
 
     todo = cells(args.accels, args.models, args.guide_accels)

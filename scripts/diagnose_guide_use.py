@@ -121,13 +121,17 @@ def _ablate(guide, how, smaps=None):
     raise ValueError(how)
 
 
-def _score(run, m, recon):
+def _score(run, m, recon, region="organ"):
+    """Metrics as training validates them (the run's metric_range), over `region`: "organ" the
+    stored maps' support (the anatomy -- every run scored on the same pixels, whatever it trained
+    with), "frame" the whole image."""
     rng = run["cfg"]["training"].get("metric_range", 1.0)
-    out = compute_metrics(m["gt"].abs(), recon.abs(), data_range=rng)
+    mask = m.get("support") if region == "organ" else None
+    out = compute_metrics(m["gt"].abs(), recon.abs(), data_range=rng, mask=mask)
     return {k: float(v.mean() if torch.is_tensor(v) else v) for k, v in out.items()}
 
 
-def diagnose(run_dir, n, noise, device, scales=(0.35, 0.1)):
+def diagnose(run_dir, n, noise, device, scales=(0.35, 0.1), region="organ"):
     run = load_recon_run(run_dir, device=device)
     ds = val_subset(run["cfg"])
     n = min(n, len(ds))
@@ -147,8 +151,8 @@ def diagnose(run_dir, n, noise, device, scales=(0.35, 0.1)):
                 mass.append(gm.calls)
             else:
                 recon = reconstruct(run, mm)
-            scores[c].append(_score(run, m, recon))
-    res = {"run": run["name"], "guided": guided, "n_slices": n}
+            scores[c].append(_score(run, m, recon, region))
+    res = {"run": run["name"], "guided": guided, "n_slices": n, "region": region}
     for c in conds:
         res[c] = {k: statistics.mean(s[k] for s in scores[c]) for k in scores[c][0]}
         if c != "true":
@@ -168,16 +172,21 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--scales", type=float, nargs="*", default=[0.35, 0.1],
                     help="guide scale factors to test (empty: none)")
+    ap.add_argument("--region", choices=("organ", "frame"), default="organ",
+                    help="score inside the stored maps' support (organ, default since "
+                         "2026-11-25: the anatomy, the same pixels for every run) or the whole "
+                         "frame (what runs trained without a support mask validate on)")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     compile_glue.set_mode(None)          # eager joint softmax, so the mass hook sees it
 
     results = []
     for rd in a.runs:
-        r = diagnose(rd, a.n, a.noise, a.device, scales=a.scales)
+        r = diagnose(rd, a.n, a.noise, a.device, scales=a.scales, region=a.region)
         results.append(r)
         t = r["true"]
-        print(f"\n== {r['run']}  ({r['n_slices']} val slices)")
+        print(f"\n== {r['run']}  ({r['n_slices']} val slices, scored over the "
+              f"{'anatomy (stored maps support)' if r['region'] == 'organ' else 'whole frame'})")
         print(f"  {'guide':10s}{'PSNR':>9s}{'SSIM':>9s}{'NRMSE':>9s}")
         for c in [k for k in r if k in ("true", "rotated", "zero") or
                   (k.startswith("x") and isinstance(r[k], dict))]:

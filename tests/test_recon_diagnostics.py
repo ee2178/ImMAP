@@ -97,6 +97,100 @@ def test_smaps_check_swaps_in_this_clusters_roots():
             os.environ["IMMAP_CLUSTER"] = old
 
 
+def test_support_mask_configs():
+    """--support-mask: loss + val metrics inside the offline maps' support, own run tag; off
+    leaves the configs as they were."""
+    import json
+    import subprocess
+    with tempfile.TemporaryDirectory() as out:
+        for flag in ([], ["--support-mask"]):
+            subprocess.run([sys.executable, os.path.join(tg.REPO, "scripts",
+                                                         "make_guided_recon_configs.py"),
+                            "--out", out, "--accels", "8", "--models", "lpdsnet",
+                            "lggs_guide_w", *flag], check=True, cwd=tg.REPO,
+                           stdout=subprocess.DEVNULL)
+            for name in ("lpdsnet_R8", "lggs_guide_w_R8_g1"):
+                with open(os.path.join(out, "knee", "guided", f"{name}.json")) as f:
+                    c = json.load(f)
+                masked = bool(flag)
+                assert c["mri"]["R"] == 8
+                assert bool(c["training"].get("use_organ_mask")) == masked, name
+                for split in ("train", "val"):
+                    assert (c["data"][split]["organ_mask_source"] == "smaps") == masked
+                assert c["paths"]["save_dir"].split("/")[-2].endswith("_supp") == masked
+
+
+def test_masked_training_runs_on_the_support():
+    """use_organ_mask with the loader's 'smaps' support: trains and validates."""
+    from models.guided_lpds import LGGSNet
+    import physics.online_smaps as osm
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = tg.make_data(root)
+        maps = tg.make_maps(root, os.path.join(root, "maps"))
+        real = osm.online_smaps
+        osm.online_smaps = lambda y, mask, **kw: torch.full_like(y, tg.C ** -0.5)
+        try:
+            torch.manual_seed(0)
+            net = LGGSNet(K=2, M=8, P=3, s=2, Mh=4, guide_window=3, attn_backend="gather")
+            wb = tg.run_recon(net, csv, root, d, online_smaps="espirit", use_organ_mask=True,
+                              data=dict(target="sense", smap_root=maps,
+                                        organ_mask_source="smaps"))
+        finally:
+            osm.online_smaps = real
+    assert torch.isfinite(torch.as_tensor(wb.last("val/psnr")))
+
+
+def test_tgvn_ownmaps_cell_trains_masked_without_operator_maps():
+    """tgvn_c6_ownmaps: TGVN estimating its own maps (magnitude out, never reads the operator's),
+    trained with the support-masked loss on the paired data -- the online map estimate is never
+    called."""
+    import make_guided_recon_configs as gen
+    import physics.online_smaps as osm
+    from models import build_model
+    p = gen.MODELS["tgvn_c6_ownmaps"]["model"]["params"]
+    assert p["use_smaps"] is False and p["output"] == "magnitude" and p["num_cascades"] == 6
+    assert gen.MODELS["tgvn_c6"]["model"]["params"]["use_smaps"] is True     # untouched
+    small = dict(p, **tg.TINY_TGVN)
+    net = build_model({"model": {"type": "TGVN", "params": small}})
+    assert not net.uses_operator_smaps and net.returns_magnitude
+    calls = []
+    real = osm.online_smaps
+
+    def spy(y, mask, **kw):
+        calls.append(1)
+        return real(y, mask, **kw)
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+        csv, _ = tg.make_data(root)
+        maps = tg.make_maps(root, os.path.join(root, "maps"))
+        osm.online_smaps = spy
+        try:
+            torch.manual_seed(0)
+            wb = tg.run_recon(net, csv, root, d, online_smaps="espirit", use_organ_mask=True,
+                              data=dict(target="sense", smap_root=maps,
+                                        organ_mask_source="smaps"))
+        finally:
+            osm.online_smaps = real
+    assert not calls, "the online map estimate ran for a net that estimates its own maps"
+    assert torch.isfinite(torch.as_tensor(wb.last("val/psnr")))
+
+
+def test_guide_test_scores_the_anatomy_by_default():
+    """diagnose_guide_use._score: 'organ' ignores everything outside the stored maps' support,
+    'frame' does not."""
+    import diagnose_guide_use as dg
+    torch.manual_seed(0)
+    gt = torch.zeros(1, 1, 16, 16, dtype=torch.complex64)
+    gt[..., 4:12, 4:12] = 1 + torch.rand(1, 1, 8, 8)
+    support = gt.abs() > 0
+    recon = gt + 0.01 * torch.randn_like(gt)
+    junk = recon + 5.0 * (~support)
+    run = {"cfg": {"training": {"metric_range": 1.0}}}
+    m = {"gt": gt, "support": support}
+    a, b = dg._score(run, m, recon), dg._score(run, m, junk)
+    assert abs(a["psnr"] - b["psnr"]) < 1e-6
+    assert dg._score(run, m, junk, "frame")["psnr"] < dg._score(run, m, recon, "frame")["psnr"] - 10
+
+
 def _tiny_tgvn():
     from models.tgvn import TGVN
     torch.manual_seed(0)

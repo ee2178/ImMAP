@@ -64,6 +64,13 @@
 # Noise:           default U[0, 0.001] (vlow); NOISE=low|grid|none ... sbatch --export=ALL ... for
 #                  U[0, 0.01] / U[0.01, 0.02] / none;
 #                  runs go to trained_nets/guided_recon/knee/s4_noise-<preset>/, grid to s4/)
+# Support mask:    SUPPORT_MASK=1: the training loss and every val metric inside the offline maps'
+#                  support (the anatomy; the reference is 0 outside it), runs in s4_noise-vlow_supp/.
+#                  The R8 family, fully-sampled guide (2026-11-25):
+#                  SUPPORT_MASK=1 MODELS="lggs_guide_w_qkrandn lpdsnet e2evarnet tgvn_c6_ownmaps" \
+#                      sbatch --array=0-3 --export=ALL torch/guided_recon_knee.sbatch
+#                  (LGGS: untied guide W's + Sljiva's N(0,1) W init; E2E-VarNet and TGVN estimate
+#                  their own coil maps, magnitude out)
 # Timing:          python scripts/time_guided_nets.py        (fwd+bwd per step of these cells)
 # Multicontrast LGGS, no extra network: the knee LGGS cell with the guide's own W_phi, W_alpha
 #                  (lggs_guide_w) or its own analysis conv per layer (lggs_guide_conv):
@@ -92,6 +99,9 @@ mkdir -p torch/logs
 
 GEN=(python scripts/make_guided_recon_configs.py --accels ${ACCELS} --models ${MODELS}
      --guide-accels ${GUIDE_ACCELS})
+if [ "${SUPPORT_MASK:-}" = "1" ]; then
+    GEN+=(--support-mask)       # loss + val metrics inside the offline maps' support; run tag _supp
+fi
 if [ -n "${NOISE:-}" ]; then
     GEN+=(--noise "${NOISE}")   # added noise preset: vlow (default here) | low | grid | none; own run tag
 fi

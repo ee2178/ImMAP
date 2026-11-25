@@ -68,6 +68,9 @@ def measure(run, item, noise=None, seed=0):
     mri, tr = cfg["mri"], cfg["training"]
     kspace, smaps, image, organ, pad_hw, side = _unpack(_batched(item))
     kspace, smaps, image = (t.to(dev) for t in (kspace, smaps, image))
+    # the anatomy: the support of the loader's STORED maps (the offline ones the reference is made
+    # with, target 'sense'; exactly where the reference is nonzero) -- not the operator's maps
+    support = smaps.abs().sum(dim=1, keepdim=True) > 0
     noise = tr.get("val_noise_std", 0.0) if noise is None else noise
     mask = get_mask_cached(image, R=mri["R"], acs_lines=mri.get("acs_lines"),
                            mode=mri.get("mask_dist", "uniform"), offset=mri.get("mask_offset", 0),
@@ -90,6 +93,7 @@ def measure(run, item, noise=None, seed=0):
                    mri.get("guide_mask_dist", "uniform"),
                    guide_offset=mri.get("guide_val_offset", 0))
     return dict(y=y, E=E, T=T, sigma=sigma, guide=guide, gt=image, zf=E0.adjoint(y), mask=mask,
+                support=support,
                 smaps=maps, side=side, acs_lines=acs)
 
 
