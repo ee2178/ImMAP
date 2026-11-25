@@ -472,6 +472,44 @@ def test_train_recon_end_to_end_tgvn_and_baseline():
         assert spy0.guides and all(g is None for g in spy0.guides)
 
 
+def test_e2evarnet_maps_cell_trains_on_the_operator_maps():
+    """e2evarnet_maps: the grid's E2E-VarNet with use_smaps / output "sense" -- no sensitivity
+    network, the operator's (online) maps in every cascade, a complex SENSE output -- and it trains
+    on the paired data like the unrolled nets."""
+    from models import build_model
+    import physics.online_smaps as osm
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import make_guided_recon_configs as gen
+    with tempfile.TemporaryDirectory() as out:
+        subprocess.run([sys.executable, os.path.join(REPO, "scripts", "make_guided_recon_configs.py"),
+                        "--out", out, "--models", "e2evarnet_maps"], check=True, cwd=REPO,
+                       stdout=subprocess.DEVNULL)
+        with open(os.path.join(out, "knee", "guided", "e2evarnet_maps_R8.json")) as f:
+            cfg = json.load(f)
+    p = cfg["model"]["params"]
+    assert cfg["model"]["type"] == "E2EVarNet" and p["use_smaps"] and p["output"] == "sense"
+    assert p["num_cascades"] == 12 and "own" not in cfg["model"]["_comment"]
+    assert cfg["mri"]["online_smaps"] == "espirit"
+    assert "use_smaps" not in (gen.MODELS["e2evarnet"].get("model_params") or {})
+    small = dict(p, num_cascades=2, chans=4, pools=2, sens_chans=4, sens_pools=2)
+    net = build_model({"model": {"type": "E2EVarNet", "params": small}})
+    assert net.uses_operator_smaps and not net.returns_magnitude and net.net.sens_net is None
+    seen = []
+    real = osm.online_smaps
+    osm.online_smaps = lambda y, mask, **kw: torch.full_like(y, C ** -0.5)
+    try:
+        orig = net.forward
+        net.forward = lambda y, E=None, sigma=None, **k: (seen.append(orig(y, E=E, sigma=sigma))
+                                                           or seen[-1])
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as d:
+            csv, _ = make_data(root)
+            wb = run_recon(net, csv, root, d, online_smaps="espirit")
+    finally:
+        osm.online_smaps = real
+    assert seen and all(torch.is_complex(o[0]) for o in seen)
+    assert math.isfinite(float(wb.last("val/psnr")))
+
+
 def test_train_recon_end_to_end_e2evarnet_baseline():
     """The e2evarnet cell (2026-11-25): the published E2E-VarNet trains on the paired PDFS data as
     an UNGUIDED baseline -- never handed the guide, its own maps (it asks for no online ones, so

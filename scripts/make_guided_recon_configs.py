@@ -305,6 +305,17 @@ MODELS = {
     # is TGVN with its guide off: the operator's maps and a sigma plane, i.e. TGVN's own control.
     "e2evarnet": dict(task="recon", guided=False, grid_base="varnet", pad_multiple=1,
                       model=None),                     # the grid's varnet model block
+    # E2E-VarNet ON THE OPERATOR'S MAPS (2026-11-25): the same net (12 cascades, chans 18), its
+    # sensitivity network removed, the cascades run on the online ESPIRiT maps every other net
+    # here gets (use_smaps), and the output SENSE-combined with them -- complex, as the unrolled
+    # nets' (output "sense"). The like-for-like unguided baseline: the same maps and output as
+    # LPDSNet / LGGS / TGVN, so the comparison is about the reconstruction alone. e2evarnet above
+    # stays the published configuration.
+    "e2evarnet_maps": dict(task="recon", guided=False, grid_base="varnet", pad_multiple=1,
+                           model=None, model_params=dict(use_smaps=True, output="sense"),
+                           model_comment="fastMRI E2E-VarNet on the operator's coil maps "
+                                         "(online ESPIRiT; no sensitivity network), SENSE-"
+                                         "combined complex output."),
     "varnet_img": dict(task="recon", guided=False, grid_base="varnet", pad_multiple=1,
                        model=dict(type="TGVN", params=dict(guided=False, cond_sigma=True,
                                                            use_smaps=True, **TGVN_SIZE))),
@@ -740,6 +751,11 @@ def make_config(r, model, g, grid):
     }
     if speed.get("params"):
         cfg["model"]["params"].update(speed["params"])
+    if spec.get("model_params"):
+        # a cell's own params on top of the grid's model block (model=None takes that block)
+        cfg["model"]["params"].update(spec["model_params"])
+        if spec.get("model_comment"):
+            cfg["model"]["_comment"] = spec["model_comment"]
     if spec.get("transfer"):
         # the frozen guide transfer: the pretrained cell's best-validation weights
         ct = spec["transfer"]
