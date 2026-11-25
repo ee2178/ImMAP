@@ -65,6 +65,23 @@ def test_ablations():
     assert torch.equal(dg._ablate(g5, "rotated")[:, 1], torch.flip(g5[:, 1], dims=(-2, -1)))
 
 
+def test_kspace_guide_rotates_as_an_image_through_the_operator_maps():
+    """TGVN's multicoil k-space guide: 'rotated' is S F^H-combine, rotate, re-expand -- the coil-
+    combined image (with the same maps) is exactly the rotated combined image, and the coils carry
+    the UNROTATED maps, not flipped sensitivities."""
+    from operators.fourier import ifftc
+    torch.manual_seed(0)
+    C, H, W = 4, 8, 6
+    sm = cplx(1, C, H, W).to(torch.complex128)
+    sm = sm / sm.abs().pow(2).sum(1, keepdim=True).sqrt()         # unit RSS
+    g = cplx(1, C, H, W).to(torch.complex128)
+    rot = dg._ablate(g, "rotated", sm)
+    comb = lambda k: (sm.conj() * ifftc(k)).sum(1, keepdim=True)    # noqa: E731
+    assert torch.allclose(comb(rot), torch.flip(comb(g), dims=(-2, -1)))
+    assert torch.allclose(ifftc(rot), sm * comb(rot))               # coil images = maps x image
+    assert not torch.allclose(rot, torch.flip(g, dims=(-2, -1)))    # not the raw k-space flip
+
+
 def test_diagnose_end_to_end_with_stubbed_run(monkeypatch, cpu_triton):
     """The whole flow on a stub run: the three guides are scored, the rotated and zero guides
     change the recon, and the guide mass is reported per layer."""

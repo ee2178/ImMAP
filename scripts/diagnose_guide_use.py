@@ -93,12 +93,28 @@ class GuideMass:
 
 
 # --------------------------------------------------------------------------------------------
-def _ablate(guide, how):
+def _rotate_kspace_guide(g, smaps):
+    """A MULTICOIL k-space guide (TGVN's) rotated 180 degrees as an IMAGE: coil-combined with the
+    operator's maps, rotated, re-expanded through the same maps. Flipping the coil k-space itself
+    would rotate every coil's sensitivity too, which TGVN then combines with the target's
+    UNROTATED maps -- a guide degraded by coil mismatch on top of the wrong anatomy, so a harsher
+    control than LGGS's (a coil-combined image, simply rotated). This way both nets get the same
+    anatomy rotation and nothing else."""
+    from operators.fourier import fftc, ifftc
+    img = (smaps.conj() * ifftc(g)).sum(dim=1, keepdim=True)
+    return fftc(smaps * torch.flip(img, dims=(-2, -1)))
+
+
+def _ablate(guide, how, smaps=None):
+    """`smaps`: the operator's maps, given for a multicoil k-space guide (see
+    _rotate_kspace_guide); None for an image guide."""
     if guide is None or how == "true":
         return guide
     if how.startswith("x"):
         return guide * float(how[1:])
     if how == "rotated":
+        if smaps is not None:
+            return _rotate_kspace_guide(guide, smaps)
         return torch.flip(guide, dims=(-2, -1))
     if how == "zero":
         return torch.zeros_like(guide)
@@ -116,6 +132,7 @@ def diagnose(run_dir, n, noise, device, scales=(0.35, 0.1)):
     ds = val_subset(run["cfg"])
     n = min(n, len(ds))
     guided = _wants_guide(run["net"])
+    kspace_guide = getattr(run["net"], "guide_domain", "image") == "kspace"
     conds = (("true", "rotated", "zero") + tuple(f"x{s:g}" for s in scales)
              if guided else ("true",))
     scores = {c: [] for c in conds}
@@ -123,7 +140,7 @@ def diagnose(run_dir, n, noise, device, scales=(0.35, 0.1)):
     for i in range(n):
         m = measure(run, ds[i], noise=noise, seed=i)
         for c in conds:
-            mm = dict(m, guide=_ablate(m["guide"], c))
+            mm = dict(m, guide=_ablate(m["guide"], c, m["smaps"] if kspace_guide else None))
             if c == "true" and guided:
                 with GuideMass() as gm:
                     recon = reconstruct(run, mm)
