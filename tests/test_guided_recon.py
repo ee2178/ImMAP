@@ -602,7 +602,7 @@ def test_generator_cells_and_config_keys():
                 assert isinstance(cfg["i2sb"]["dc_lam"], float), (name, cfg["i2sb"]["dc_lam"])
                 assert cfg["i2sb"]["dc_iters"] > 0, name
             assert cfg["mri"]["guide_R"] == 1
-            assert cfg["training"]["metric_range"] == "gt_max", name
+            assert cfg["training"]["metric_range"] == 1.0, name       # fixed peak (2026-11-24)
 
 
 def test_noise_presets():

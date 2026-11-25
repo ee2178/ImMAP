@@ -95,7 +95,7 @@ def train_joint_recon(
     noise_dist="uniform",
     val_noise_std=0.0,
     val_seed=0,
-    metric_range="gt_max",
+    metric_range=1.0,                # PSNR/SSIM peak fixed at 1 (normalized data); "gt_max" per slice
     use_organ_mask=False,            # accepted for the recon configs' keys; not used
     backtrack_thresh=None,           # (train.py's resume contract; no backtracking here)
     backtrack_factor=0.9,

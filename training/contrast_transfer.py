@@ -96,7 +96,7 @@ def train_contrast_transfer(
     noise_dist="uniform",
     val_noise_std=0.0,
     val_seed=0,
-    metric_range="gt_max",
+    metric_range=1.0,                # PSNR/SSIM peak fixed at 1 (normalized data); "gt_max" per slice
     backtrack_count=0,                # carried for train.py's resume contract; no backtracking
     best_loss=float("inf"),
     # ---- measurement (cfg["mri"]) ----

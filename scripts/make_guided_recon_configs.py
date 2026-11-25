@@ -608,10 +608,11 @@ def bridge_tau(start, r, root=REPO, normalization=None):
         return float(f"{TAU_MARGIN_ABS * cal['tau_abs']:.4g}"), None, True
     return (float(f"{TAU_MARGIN * cal['tau_rel']:.4g}"), float(f"{cal['tau_ref']:.4g}"), True)
 
-# PSNR / SSIM against each slice's own peak |gt| (training/metrics.py). The paired loader only
-# multiplies by a fixed scale_fac, so slice peaks sit well below 1 and vary across a volume:
-# the default data_range=1 inflated PSNR by -20 log10(peak) dB, most on the dimmest slices.
-METRIC_RANGE = "gt_max"
+# PSNR / SSIM with a FIXED peak of 1 (the user's call, 2026-11-24): the per-volume normalization
+# (VOLUME_STAT -> volume_target 1) is meant to bring magnitudes to roughly [0, 1], so 1 is the
+# range, and a per-slice peak |gt| ("gt_max", used before) would let a single bright spot -- common
+# in MR -- move a slice's score. The same convention as scripts/dump_eval.py.
+METRIC_RANGE = 1.0
 
 
 def grid_cells(r, tags):
