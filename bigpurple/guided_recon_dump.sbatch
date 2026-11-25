@@ -15,13 +15,14 @@
 #   CKPT=net.ckpt sbatch bigpurple/guided_recon_dump.sbatch          # lowest-train-loss weights
 #
 # I2SB RUNS (task i2sb_recon; evaluation/tasks.py::i2sb_recon): the full reverse-bridge sampler
-# with each run's own settings -- val_nfe NFE, CG data consistency dc_iters / dc_lam on every x0
-# prediction (I2SB-Recon) -- the same volumes, slices and measurement as the end-to-end dumps, so
+# with each run's own val_nfe NFE and CG data consistency on every x0 prediction (I2SB-Recon) at
+# DC below (7 iters, lam 2 by default) -- the same volumes, slices and measurement as the end-to-end dumps, so
 # their columns sit next to them in figures/configs/guided_knee_R8.py. With CG on, the plain
 # sampler on the SAME bridge noise is stored too (`recon_nodc`, a "<run>:recon_nodc" column).
 # Trained on bigpurple, so no port_runs.py (the config.torch.json warning is harmless):
 #   ONLY="sbunet_small_R8_g1_tau0.19 sbunet_small_x1_R8_g1_tau0.19" sbatch bigpurple/guided_recon_dump.sbatch
-#   ... NFE=50 DC=7:7e-5 ...        override the sampler (DC=0:0: plain I2SB only)
+#   ... NFE=50 DC=7:0.5 ...         override the sampler (DC=0:0: plain I2SB only; DC= : the
+#                                   run's own dc_iters / dc_lam, 7 / 7e-5)
 #   ... NODC=1 ...                  skip the plain-sampler copy (half the time)
 #
 # WHAT IT WRITES, per run: <run>/eval_dump/<volume>.h5 with reference, recon, zero_filled, guide
@@ -73,7 +74,9 @@ SIGMA="${SIGMA:-}"                     # empty = each run's val_noise_std (0)
 WORKERS="${WORKERS:-4}"
 EXTRA="${EXTRA:-}"                     # anything else, e.g. EXTRA="--limit 20"
 NFE="${NFE:-}"                         # i2sb runs: sampler NFE (empty = each run's val_nfe)
-DC="${DC:-}"                           # i2sb runs: ITERS:LAM CG step (empty = each run's own)
+# i2sb runs: ITERS:LAM CG step. Default 7:2 -- lam 2, the best of a lam sweep on the sbunet_small
+# runs (2026-11-24; the runs' own 7e-5 under-regularizes). DC= (set, empty) = each run's own.
+DC="${DC-7:2}"
 NODC="${NODC:-}"                       # i2sb runs: 1 = do not also store the plain sampler
 INVERSION="${INVERSION:-}"             # i2sb runs: 1 = I2SB-Inversion's sampler instead
 

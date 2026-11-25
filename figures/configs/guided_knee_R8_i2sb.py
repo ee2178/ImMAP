@@ -2,7 +2,7 @@
 # with the small bridge UNet, without and with the guide as extra input channels.
 #
 # The I2SB columns are the FULL reverse-bridge sampler (evaluation/tasks.py::i2sb_recon) at each
-# run's own settings -- 20 NFE, CG data consistency (7 iters, lam 7e-5) on every x0 prediction --
+# run's own 20 NFE, CG data consistency (7 iters, lam 2: the sbatch's DC default) on every x0 prediction --
 # on the same volumes, slices and measurement as the end-to-end dumps. Their bridge starts at the
 # guide (x1_source "guide"); "+ guide" also feeds that guide to the net at every step (cond_x1).
 # "<run>:recon_nodc" is the plain sampler (no CG) on the same bridge noise.
